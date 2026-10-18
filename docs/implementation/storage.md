@@ -1,6 +1,6 @@
 # SQLite、统一事务、数据表与崩溃恢复
 
-阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/008/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过；P1 身份/联系人持久化与邀请一次性消费（迁移 0003，无计划书编号）也已实测通过；STORAGE-004/005 未开始。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
+阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/008/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过；P1 身份/联系人持久化与邀请一次性消费（迁移 0003，无计划书编号）与 P1 MLS 群状态/provider 记录持久化（迁移 0004，CRYPTO-004/010 的持久化切片）也已实测通过；STORAGE-004/005 的正式语义（与加密层同事务的 provider 写入）仍未接入。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
 
 状态补充（2026-10-18）：`store.rs` 已有独立的未加密 P0 事务试验表，覆盖 T1/C01 意图与准备任务和 T2 MLS/attempt/outbox 崩溃断点，局部证据见 [P0-03 报告](../P0_PERSISTENCE.md)。`crates/storage/src/formal/` 新增正式加密存储路径，实现 STORAGE-001/003/006/007/009/010/011 与 002 的迁移器，证据见下文“P0-04 正式存储路径实现记录”；其余 STORAGE-004/005/008 仍未实现，MLS 加密语义（CRYPTO-004 等）也未接入。
 
@@ -9,6 +9,8 @@
 状态补充（2026-10-18，竖直切片）：STORAGE-008 `apply_verified_entry` 已实现（新增 `crates/storage/src/formal/entry.rs`，并新增 `WriteScope::inbound` 作用域、`MESSAGE_ID_CONFLICT` 错误码与 `conversation-metadata` 封装用途），证据见下文“已验证条目写入实现记录（STORAGE-008）”。本轮仍未新增迁移（会话摘要复用 `conversations.protected_metadata`），未改动 `store.rs`/`persistence.rs`/`crash_worker.rs`。
 
 状态补充（2026-10-18，P1 身份持久化）：新增迁移 [0003_identity.sql](../../crates/storage/migrations/0003_identity.sql)（**只新增表，未改动 0001/0002 任何内容**）与 [crates/storage/src/formal/identity.rs](../../crates/storage/src/formal/identity.rs)，实现身份账户（单账户/单设备）、联系人、邀请一次性消费的正式持久化；同时新增 `WriteScope::identity` 作用域、`IDENTITY_ACCOUNT_CONFLICT` 错误码与 `identity-account`/`contact-record` 两个封装用途。schema 版本由 2 提升到 3（既有库在 `open_store` 时自动迁移，校验和机制不变；库内版本更高仍返回 `SCHEMA_TOO_NEW`）。证据见下文“身份/联系人持久化与邀请一次性消费实现记录”。
+
+状态补充（2026-10-18，MLS 状态持久化）：新增迁移 [0004_mls_state.sql](../../crates/storage/migrations/0004_mls_state.sql)（**只新增表，未改动 0001/0002/0003 任何内容**）与 [crates/storage/src/formal/mls_state.rs](../../crates/storage/src/formal/mls_state.rs)，提供 `save_mls_group_state`/`load_mls_group_state`/`save_mls_record`/`load_mls_record`（另含 `load_mls_records`），把已提交 MLS 群状态与 provider 记录加密落盘；新增 `WriteScope::mls_state`、`STALE_EPOCH` 错误码与 `mls-group-state`/`mls-record` 封装用途。schema 版本 3 → 4；证据见下文“MLS 群状态与 provider 记录持久化实现记录”。
 
 Rust storage 唯一拥有客户端核心数据库；节点库单独实现于 node-services，不能复用客户端敏感数据写入口。默认先验证全库加密或等价方案，因为会话 ID、索引、时间戳同样敏感。事务句柄不跨 FFI、不跨网络 await；读分页使用稳定快照。
 
@@ -96,7 +98,79 @@ cargo test --offline -p chat-storage -p chat-core   # 两 crate 全绿（core：
 3. `contact_id` 与 `account_index` 是确定性哈希（可枚举同一账户在不同库中的键），不提供跨库不可链接性；时间戳与行数是明文元数据（与既有正式路径一致）。
 4. 联系人状态机由 core 用 identity 的冻结迁移表执行；storage 只校验状态属于白名单，直接调用 storage 的更低层路径可以写入任意合法状态（本轮 core 是唯一调用方）。
 5. 未接入身份模块的设备凭据/撤销集合持久化（`device_credentials` 仍由 0001 的旧表承载、正式路径未写）；启动恢复不重建身份表（身份只由显式保存写入）。
-6. 迁移 0003 使 schema 版本变为 3：外部工具若硬编码“版本 2”需要同步更新（本轮已更新 `crates/storage` 内断言与 `crates/crypto/tests/formal_master_key.rs` 的版本断言为 `>= 2`）。
+6. 迁移 0003/0004 使 schema 版本变为 4：外部工具若硬编码更早的版本需要同步更新（`crates/storage` 内的断言已更新为 4；`crates/crypto/tests/formal_master_key.rs` 使用 `>= 2`，因此不受后续迁移影响）。
+
+## MLS 群状态与 provider 记录持久化实现记录（2026-10-18，Windows x64）
+
+对应 [crypto.md](crypto.md) 的 CRYPTO-004/010 持久化切片：让已提交的 MLS 群状态与
+provider 秘密在正式加密库里耐久保存，重启后仍能继续加解密。
+
+实现位置：
+
+- [crates/storage/migrations/0004_mls_state.sql](../../crates/storage/migrations/0004_mls_state.sql)：新迁移（`mls_group_state` / `mls_record`），只新增表，0001/0002/0003 未被改动。
+- [crates/storage/src/formal/mls_state.rs](../../crates/storage/src/formal/mls_state.rs)：全部读写、epoch 单调校验、密封与有界校验。
+- [crates/storage/src/formal/migrations.rs](../../crates/storage/src/formal/migrations.rs)：`MIGRATIONS` 追加版本 4（`target_version() = 4`）。
+- [crates/storage/src/formal/seal.rs](../../crates/storage/src/formal/seal.rs)：新增封装用途 `mls-group-state` / `mls-record`。
+- [crates/storage/src/formal/error.rs](../../crates/storage/src/formal/error.rs)：新增 `STALE_EPOCH`。
+- [crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)：新增 `WriteScope::mls_state()` 作用域（`WriteScopeKind::MlsState`）。
+- [crates/storage/src/formal_crash_worker.rs](../../crates/storage/src/formal_crash_worker.rs)：新增 `mls` 崩溃断点模式（`state` / `records` / `commit`）。
+
+表结构（明文只有不透明 ID、epoch、版本与时间戳，其余全部密封）：
+
+| 表 | 列 | 说明 |
+|---|---|---|
+| `mls_group_state` | `group_id`(PK)、`epoch`、`state_version`、`protected_state`、`updated_at` | 每群一行；`protected_state` 是群级状态密封记录（用途 `mls-group-state`，AAD 绑定 `(group_id, epoch, 格式版本)`） |
+| `mls_record` | `group_id`、`record_key`(PK 之一)、`record_epoch`、`protected_value`、`updated_at` | provider 记录（群状态、epoch 秘密、签名密钥）；值用途 `mls-record`，AAD 绑定 `(group_id, epoch, record_key, 格式版本)` |
+
+API 与语义：
+
+- `Store::save_mls_group_state(MlsGroupStateInput) -> MlsGroupStateRecord`：单笔
+  `WriteScope::mls_state` 事务内写群状态行并**整组替换** provider 记录快照。同 epoch
+  重复保存 = 快照替换（`state_version + 1`）；epoch 前进时旧记录全部删除；旧 epoch
+  （`offered < stored`）返回 `STALE_EPOCH`，绝不覆盖新 epoch。
+- `Store::save_mls_group_state_with_checkpoint(input, checkpoint)`：同上，带
+  `AfterGroupState`/`AfterRecords`/`BeforeCommit` 故障注入点（供 abort 崩溃测试）。
+- `Store::load_mls_group_state(group_id) -> Option<MlsGroupStateRecord>`：解密群状态；
+  密封记录被篡改/挪行/换主密钥一律 `STATE_CORRUPTED`。
+- `Store::save_mls_record(group_id, epoch, key, value)`：在已保存的群上更新单条记录；
+  未初始化群 `INVALID_INPUT`；旧 epoch `STALE_EPOCH`；比群 epoch 更超前
+  `INVALID_INPUT`（必须先写群状态快照，避免半套记录）。
+- `Store::load_mls_record` / `Store::load_mls_records`：只返回当前 epoch 的记录；
+  发现记录 epoch 与群 epoch 不一致返回 `STALE_EPOCH`（旧状态不可用于新 epoch）。
+- 有界：群 ID ≤128 字节、记录键 1..=512 字节、单条记录值 ≤256 KiB、单群记录
+  ≤4096 条且总计 ≤4 MiB、群状态 ≤512 KiB；记录键重复、空状态、越界一律
+  `INVALID_INPUT`。
+
+复现命令（全程离线，本轮实测）：
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-storage                      # 9 lib + 2 formal_crash + 1 formal_crash_mls + 7 formal_entry + 8 formal_identity + 6 formal_mls_state + 8 formal_outbox + 7 formal_query + 17 formal_store = 65 passed
+cargo test --offline -p chat-storage -p chat-crypto       # 两 crate 全绿（crypto：3 lib + 9 attachment_chunks + 5 formal_master_key + 4 formal_mls_state + 7 p0_persistence = 28 passed）
+```
+
+证据（测试名 → 契约点）：
+
+- `formal_mls_state::mls_group_state_round_trips_and_epoch_is_monotonic`：往返读写、同 epoch 快照替换（`state_version` 递增）、epoch 前进后旧记录整组退役、旧 epoch 保存 `STALE_EPOCH` 且不覆盖、重开读回。
+- `formal_mls_state::mls_record_updates_are_epoch_checked`：未初始化群 `INVALID_INPUT`；同 epoch 覆盖更新；旧 epoch `STALE_EPOCH`；超前 epoch `INVALID_INPUT`；epoch 前进后旧记录读不出来。
+- `formal_mls_state::mls_state_rejects_unbounded_input`：4097 条记录、超长记录键、重复键、空状态、非法群 ID、空记录键 `INVALID_INPUT`；`mls_state` 作用域事务可用。
+- `formal_mls_state::wrong_key_and_tampered_mls_state_are_state_corrupted`：错误主密钥拒绝打开；篡改群状态 → `STATE_CORRUPTED`。
+- `formal_mls_state::relocated_record_ciphertext_is_rejected`：把某条记录密文挪到另一记录键 → `STATE_CORRUPTED`（AAD 绑定记录键），原记录仍可解。
+- `formal_mls_state::mls_state_material_is_not_stored_in_plaintext`：提交后扫描 .db/-wal，群状态与 provider 记录值明文不出现；重开仍能解密。
+- `formal_crash_mls::mls_export_abort_before_commit_leaves_the_previous_epoch_only`：真实 `std::process::abort()`（`state`/`records`/`commit` 三个断点）后重开只剩上一 epoch 的完整状态，绝无半套记录；随后同一写入可正常提交。
+
+已知限制：
+
+1. provider 记录的**键**（`record_key`）以明文保存：它是 openmls 的不透明存储标签
+   （如 group state 标签 + 群 ID），不含秘密材料；值才是机密。若未来要求连标签也
+   隐藏，需要引入键哈希索引，属于后续 ADR。
+2. epoch 单调只在单库内生效：跨设备/跨库的 epoch 一致由同步与正式群操作保证
+   （CRYPTO-006/007 未实现）。存储层不知道“哪个 epoch 是权威”，只拒绝回退。
+3. 一次`save_mls_group_state` 是**整组快照替换**：同一群的多写者必须串行（正式路径
+   由每群串行执行器保证；本层依赖 `open_store` 的独占写者锁）。
+4. 本层不验证 provider 记录的内容（不做 MLS 语义校验）；记录格式由 [crypto.md](crypto.md)
+   的 export/import 负责，非法内容在 crypto 侧显式失败。
+5. 迁移 0004 让 schema 版本变为 4（见上一节限制 6 的版本说明）。
 
 ## 分页查询与 outbox 租约实现记录（2026-10-18，Windows x64）
 

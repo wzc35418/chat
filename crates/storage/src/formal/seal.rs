@@ -55,6 +55,10 @@ pub enum SealPurpose {
     IdentityAccount,
     /// `contacts.protected_record`：对端账户、显示名、观测指纹与联系人状态。
     ContactRecord,
+    /// `mls_group_state.protected_state`：已提交 MLS 群级状态（含秘密）。
+    MlsGroupState,
+    /// `mls_record.protected_value`：MLS provider 记录（群状态、epoch 秘密、签名密钥）。
+    MlsRecord,
 }
 
 impl SealPurpose {
@@ -70,6 +74,8 @@ impl SealPurpose {
             Self::ConversationMetadata => b"conversation-metadata",
             Self::IdentityAccount => b"identity-account",
             Self::ContactRecord => b"contact-record",
+            Self::MlsGroupState => b"mls-group-state",
+            Self::MlsRecord => b"mls-record",
         }
     }
 }

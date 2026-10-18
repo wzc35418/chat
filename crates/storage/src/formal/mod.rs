@@ -15,6 +15,7 @@ mod cursor;
 mod entry;
 mod error;
 mod identity;
+mod mls_state;
 mod migrations;
 mod outbox_lease;
 mod query;
@@ -30,6 +31,11 @@ pub use identity::{
     ACCOUNT_SEED_BYTES, ContactRecord, ContactUpsertInput, ConsumedInviteRecord, DEVICE_SEED_BYTES,
     FINGERPRINT_BYTES, IdentityAccountInput, IdentityAccountRecord, MAX_CONTACTS,
     MAX_IDENTITY_DISPLAY_NAME_BYTES, PUBLIC_KEY_BYTES, contact_id_for,
+};
+pub use mls_state::{
+    MAX_MLS_GROUP_ID_BYTES, MAX_MLS_GROUP_RECORD_BYTES, MAX_MLS_GROUP_STATE_BYTES,
+    MAX_MLS_RECORDS_PER_GROUP, MAX_MLS_RECORD_BYTES, MAX_MLS_RECORD_KEY_BYTES, MlsGroupStateInput,
+    MlsGroupStateRecord, MlsRecordInput, MlsRecordRecord, MlsWriteCheckpoint,
 };
 pub use migrations::MigrationReport;
 pub use outbox_lease::{
@@ -284,6 +290,8 @@ pub enum WriteScopeKind {
     Inbound,
     /// 身份账户/联系人/邀请消费（P1 身份持久化）：只动身份表，不绑定会话。
     Identity,
+    /// MLS 群状态与 provider 记录（CRYPTO-004/010 持久化切片）：只动 mls_* 表。
+    MlsState,
 }
 
 /// 受限写事务的作用域。
@@ -344,6 +352,15 @@ impl WriteScope {
     pub fn identity() -> Self {
         Self {
             kind: WriteScopeKind::Identity,
+            conversation_id: None,
+            expected_version: None,
+        }
+    }
+
+    /// MLS 状态持久化作用域（不受单会话限制；只动 mls_group_state/mls_record）。
+    pub fn mls_state() -> Self {
+        Self {
+            kind: WriteScopeKind::MlsState,
             conversation_id: None,
             expected_version: None,
         }

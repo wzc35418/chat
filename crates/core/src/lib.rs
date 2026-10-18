@@ -2,6 +2,7 @@
 //! p0 contains real ephemeral MLS/iroh verification; product services remain planned.
 #![forbid(unsafe_code)]
 pub mod attachments;
+pub mod core_events;
 pub mod group_actions;
 pub mod groups;
 pub mod node_submitter;

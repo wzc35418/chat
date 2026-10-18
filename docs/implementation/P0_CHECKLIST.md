@@ -52,6 +52,14 @@ P0-03 局部实验已通过客户端单连接事务及独立节点接受事务�
 - [x] 独立节点 P0 Ed25519 回执：调用方提供签名种子，实验库固定公钥并拒绝换钥重开；验证端用预先固定的公钥核对群、提交、密文摘要、序号和哈希链；错误公钥/改动字段与库中篡改回执均拒绝。正式密钥托管、公钥分发和回执编码未验收。
 - [x] 2026-10-18 14:56 的 `tools/verify-p0.ps1` 不刷新锁文件完整复跑通过，Rust、Kotlin 原生链路、Compose P0/预览渲染与展示层检查、Android arm64 APK 均通过。
 
+2026-10-18 追加局部实验（MLS 群状态持久化，证据见 `crates/storage/tests/formal_mls_state.rs`、`formal_crash_mls.rs`、`crates/crypto/tests/formal_mls_state.rs`，文档见 [storage.md](storage.md)、[crypto.md](crypto.md)）：
+
+- [x] 群状态整组快照与 epoch 版本存入正式加密存储（`0004_mls_state`，密封 + AAD 绑 group/epoch）；两设备建群→加密→关闭→同主密钥重开→继续加密，对端解密到原文。
+- [x] 旧 epoch 保存被 `STALE_EPOCH` 拒绝且不覆盖；篡改记录/错误主密钥 `STATE_CORRUPTED`。
+- [x] 真实 `abort()` 三个断点后只保留上一 epoch 的完整状态（不产生半状态）。
+
+注意：这仍是"提交后一次性写库"，**不是** OpenMLS provider 在调用方事务内读写，所以下面正式退出条件保持未勾选。
+
 下面仍为正式跨端/全场景退出条件，未因局部实验打勾：
 
 - [ ] OpenMLS provider 的每次读写绑定同一 CoreTransaction，不暗中独立 commit。

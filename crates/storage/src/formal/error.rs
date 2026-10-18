@@ -66,6 +66,9 @@ pub enum StorageError {
     /// 单账户身份已绑定到另一个账户或另一份密钥材料；不覆盖已有身份。
     #[error("identity account conflict: {0}")]
     IdentityAccountConflict(String),
+    /// MLS epoch 单调性被破坏：旧 epoch 不得覆盖新 epoch，也不得被读出使用。
+    #[error("stale MLS epoch: stored {stored}, offered {offered}")]
+    StaleEpoch { stored: u64, offered: u64 },
 }
 
 impl StorageError {
@@ -91,6 +94,7 @@ impl StorageError {
             Self::JobLeaseConflict(_) => "JOB_LEASE_CONFLICT",
             Self::InvalidStateTransition(_) => "INVALID_STATE_TRANSITION",
             Self::IdentityAccountConflict(_) => "IDENTITY_ACCOUNT_CONFLICT",
+            Self::StaleEpoch { .. } => "STALE_EPOCH",
         }
     }
 }

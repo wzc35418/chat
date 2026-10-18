@@ -31,6 +31,7 @@ use chat_identity::{
     ContactState, DeviceKeys, Fingerprint, IdentityError, LocalAccount, MAX_DISPLAY_NAME_BYTES,
 };
 use chat_protocol::{AccountId, ConversationId, DeviceId, MessageId, OperationId};
+use chat_sync::error::SyncError;
 use sha2::{Digest, Sha256};
 use chat_storage::formal::{
     MASTER_KEY_BYTES, MAX_ID_BYTES, MAX_SESSION_TITLE_BYTES, KeyProvenance, MessageContent,
@@ -87,6 +88,14 @@ pub fn error_code(error: &anyhow::Error) -> &'static str {
     if let Some(identity) = error.downcast_ref::<IdentityError>() {
         return identity.code().as_str();
     }
+    // 发送编排（SYNC-003/004 执行侧）与调度决策都用冻结码表。
+    if let Some(sync) = error.downcast_ref::<SyncError>() {
+        return sync.code().as_str();
+    }
+    // 事件流的有界拒绝（容量/单批上限）。
+    if let Some(event) = error.downcast_ref::<crate::core_events::EventError>() {
+        return event.as_str();
+    }
     if let Some(core) = error.downcast_ref::<CoreError>() {
         return core.code();
     }
@@ -121,6 +130,206 @@ pub struct DraftView {
     pub state: String,
     /// 关联的 SubmissionId（尚无准备尝试时为 `None`）。
     pub submission_id: Option<String>,
+}
+
+/// CORE-010 草稿状态投影：只含状态与可执行动作，**不含正文**。
+///
+/// 与 [`DraftView`] 的区别：`DraftView` 是“新建草稿的返回值”（带明文正文，只给可信
+/// UI 路径）；本类型是“当前真实状态”（无正文），供列表/按钮态与事件合并使用。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftStatusView {
+    /// 本地草稿 ID（storage 派生；原样回传）。
+    pub draft_id: String,
+    /// 会话 ID。
+    pub conversation_id: String,
+    /// 用户操作幂等键（PROTOCOL-001 文本）。
+    pub operation_id: String,
+    /// 有效状态：`queued` / `prepared` / `submitted` / `accepted` / `rejected` /
+    /// `unknown` / `cancelled` / `failed`（见 [`draft_status_view`] 的推导表）。
+    pub status: String,
+    /// 最新尝试的 SubmissionId（尚无尝试时为 `None`）。
+    pub submission_id: Option<String>,
+    /// 最新尝试的重建序号（0 = 首次尝试；尚无尝试时为 `None`）。
+    pub attempt_index: Option<u32>,
+    /// 已尝试次数（含被拒绝的重建尝试）。
+    pub attempts: u32,
+    /// 可观测的最后活动时间（Unix 毫秒）。schema 没有 `drafts.updated_at`，这里取
+    /// 草稿创建时间与发送任务 `retry_at`/`lease_until` 的最大值，不伪造写入时间。
+    pub updated_at_ms: u64,
+    /// 现在调用 `retry_draft` 是否会真正推进（已接受/已取消/结果未知/租约被占时为 `false`）。
+    pub can_retry: bool,
+    /// 现在调用 `cancel_draft` 是否还有意义（已接受 → `CancelTooLate`，已取消 → 无意义）。
+    pub can_cancel: bool,
+}
+
+/// 发送任务行的只读投影（状态查询用；不修改任何状态）。
+struct DraftSendJobRow {
+    retry_at: i64,
+    lease_until: Option<i64>,
+}
+
+fn draft_attempt_rows(
+    store: &Store,
+    draft_id: &str,
+) -> Result<Vec<(String, String)>, StorageError> {
+    let connection = store.connection();
+    let mut statement = connection
+        .prepare(
+            "SELECT submission_id, state FROM message_attempts
+              WHERE draft_id = ?1 ORDER BY rowid ASC",
+        )
+        .map_err(StorageError::from)?;
+    let rows = statement
+        .query_map([draft_id], |row| {
+            Ok((row.get::<usize, String>(0)?, row.get::<usize, String>(1)?))
+        })
+        .map_err(StorageError::from)?;
+    let mut attempts = Vec::new();
+    for row in rows {
+        attempts.push(row.map_err(StorageError::from)?);
+    }
+    Ok(attempts)
+}
+
+fn draft_send_job_row(
+    store: &Store,
+    submission_id: &str,
+) -> Result<Option<DraftSendJobRow>, StorageError> {
+    let dedup_key = format!("send:{submission_id}");
+    let connection = store.connection();
+    let mut statement = connection
+        .prepare("SELECT retry_at, lease_until FROM outbox_jobs WHERE dedup_key = ?1")
+        .map_err(StorageError::from)?;
+    let rows = statement
+        .query_map([dedup_key.as_str()], |row| {
+            Ok(DraftSendJobRow {
+                retry_at: row.get::<usize, i64>(0)?,
+                lease_until: row.get::<usize, Option<i64>>(1)?,
+            })
+        })
+        .map_err(StorageError::from)?;
+    let mut found = None;
+    for row in rows {
+        found = Some(row.map_err(StorageError::from)?);
+    }
+    Ok(found)
+}
+
+/// 有效状态推导：草稿状态优先（accepted/cancelled/failed 是终态），
+/// 否则取最新尝试的状态（acceptance 是权威事实，所以 attempt accepted 也算 accepted）。
+fn effective_draft_status(draft_state: &str, attempt_state: Option<&str>) -> String {
+    match draft_state {
+        "accepted" | "delivered" => "accepted".to_owned(),
+        "cancelled" => "cancelled".to_owned(),
+        "failed" => "failed".to_owned(),
+        _ => match attempt_state {
+            None => "queued".to_owned(),
+            Some(state) => state.to_owned(),
+        },
+    }
+}
+
+/// CORE-010：按存储投影草稿状态（`ConversationCore` 与 `SendService` 共用同一实现）。
+///
+/// - 未知草稿返回 `Ok(None)`；
+/// - 状态查询**不解密正文**（正文损坏只在发送路径与 `draft_status` 的 body 投影上显式失败）；
+/// - `can_retry`/`can_cancel` 由状态与冻结规则推导，见下方推导表，绝不臆造：
+///
+/// | 有效状态 | can_retry | can_cancel |
+/// |---|---|---|
+/// | queued / prepared / submitted（无有效租约） | true | true |
+/// | queued / prepared / submitted（发送任务有效租约被占） | false（等租约） | true |
+/// | rejected（attempt_index < MAX_ATTEMPT_INDEX） | true（新 SubmissionId 重建） | true |
+/// | rejected（预算用尽） | false | true |
+/// | unknown | false（只能对账） | true（`CancelUnknown` 只记意图） |
+/// | accepted | false（`AlreadyAccepted`） | false（`CancelTooLate`） |
+/// | cancelled / failed | false | false |
+pub fn draft_status_view(
+    store: &Store,
+    draft_id: &str,
+) -> Result<Option<DraftStatusView>, StorageError> {
+    if !is_local_draft_id(draft_id) {
+        return Err(StorageError::InvalidInput(
+            "draft_id must be the opaque identifier returned by create_draft".to_owned(),
+        ));
+    }
+    let row: Option<(String, String, String, i64)> = {
+        let connection = store.connection();
+        let mut statement = connection
+            .prepare(
+                "SELECT conversation_id, operation_id, state, created_at
+                   FROM drafts WHERE draft_id = ?1",
+            )
+            .map_err(StorageError::from)?;
+        let rows = statement
+            .query_map([draft_id], |row| {
+                Ok((
+                    row.get::<usize, String>(0)?,
+                    row.get::<usize, String>(1)?,
+                    row.get::<usize, String>(2)?,
+                    row.get::<usize, i64>(3)?,
+                ))
+            })
+            .map_err(StorageError::from)?;
+        let mut found = None;
+        for row in rows {
+            found = Some(row.map_err(StorageError::from)?);
+        }
+        found
+    };
+    let Some((conversation_id, operation_id, draft_state, created_at)) = row else {
+        return Ok(None);
+    };
+
+    let attempts = draft_attempt_rows(store, draft_id)?;
+    let attempts_len = attempts.len();
+    let latest = attempts.last();
+    let submission_id = latest.map(|(submission, _)| submission.clone());
+    let attempt_index = if attempts_len == 0 {
+        None
+    } else {
+        Some(u32::try_from(attempts_len - 1).unwrap_or(u32::MAX))
+    };
+    let status = effective_draft_status(
+        &draft_state,
+        latest.map(|(_, state)| state.as_str()),
+    );
+
+    let job = match submission_id.as_deref() {
+        Some(submission) => draft_send_job_row(store, submission)?,
+        None => None,
+    };
+    let now = now_unix_ms().unwrap_or(0);
+    let lease_until = job.as_ref().and_then(|row| row.lease_until);
+    let lease_active = lease_until.is_some_and(|until| until > now);
+    let mut updated_at = created_at;
+    if let Some(row) = job.as_ref() {
+        updated_at = updated_at.max(row.retry_at);
+        if let Some(until) = row.lease_until {
+            updated_at = updated_at.max(until);
+        }
+    }
+    let can_retry = match status.as_str() {
+        "queued" | "prepared" | "submitted" => !lease_active,
+        "rejected" => attempt_index
+            .map(|index| index < chat_sync::send::MAX_ATTEMPT_INDEX)
+            .unwrap_or(false),
+        _ => false,
+    };
+    let can_cancel = !matches!(status.as_str(), "accepted" | "cancelled");
+
+    Ok(Some(DraftStatusView {
+        draft_id: draft_id.to_owned(),
+        conversation_id,
+        operation_id,
+        status,
+        submission_id,
+        attempt_index,
+        attempts: u32::try_from(attempts_len).unwrap_or(u32::MAX),
+        updated_at_ms: u64::try_from(updated_at).unwrap_or(0),
+        can_retry,
+        can_cancel,
+    }))
 }
 
 /// 会话列表投影（CORE-005）。
@@ -386,13 +595,16 @@ fn parse_device(text: &str) -> anyhow::Result<DeviceId> {
 }
 
 /// 草稿 ID 是 storage 派生的本地标识，不是 PROTOCOL-001 文本：只做有界结构校验。
-fn validate_local_draft_id(draft_id: &str) -> anyhow::Result<()> {
-    let valid = !draft_id.is_empty()
+fn is_local_draft_id(draft_id: &str) -> bool {
+    !draft_id.is_empty()
         && draft_id.len() <= MAX_ID_BYTES
         && draft_id.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
-        });
-    if !valid {
+        })
+}
+
+fn validate_local_draft_id(draft_id: &str) -> anyhow::Result<()> {
+    if !is_local_draft_id(draft_id) {
         return Err(invalid_input(
             "draft_id must be the opaque identifier returned by create_draft",
         ));
@@ -526,6 +738,17 @@ impl ConversationCore {
             state: record.state,
             submission_id,
         }))
+    }
+
+    /// CORE-010：读取草稿的真实状态投影（无正文），未知草稿返回 `None`。
+    ///
+    /// 与 `draft_status` 的区别：本方法不解密正文，返回按钮态（`can_retry`/`can_cancel`）
+    /// 与最新尝试信息，供 UI 与事件合并使用。
+    pub fn get_draft_status(&self, draft_id: &str) -> anyhow::Result<Option<DraftStatusView>> {
+        validate_local_draft_id(draft_id)?;
+        let guard = self.store_guard()?;
+        let store = guard.as_ref().ok_or_else(closed)?;
+        draft_status_view(store, draft_id).map_err(anyhow::Error::new)
     }
 
     /// 写入一条已验证条目（STORAGE-008），返回可展示的消息行。

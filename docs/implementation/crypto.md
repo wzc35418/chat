@@ -1,6 +1,6 @@
 # MLS、单群串行状态与附件密码学
 
-阶段：P0 → P3。状态：函数级设计；CRYPTO-011/012 附件分块 AEAD 与 P0-04 存储主密钥/敏感列加密基础已实现（Windows x64 实测，见下文实现记录），CRYPTO-001..010 的 MLS 语义仍未实现。目标源码：[crates/crypto/src/engine.rs](../../crates/crypto/src/engine.rs)、[crates/crypto/src/attachment.rs](../../crates/crypto/src/attachment.rs) 与 [crates/crypto/src/key_store.rs](../../crates/crypto/src/key_store.rs)。
+阶段：P0 → P3。状态：函数级设计；CRYPTO-011/012 附件分块 AEAD、P0-04 存储主密钥/敏感列加密基础、以及 CRYPTO-004/010 的**状态持久化切片**（已提交 MLS 群状态与 provider 秘密落到正式加密库、重启后可继续加解密）已实现（Windows x64 实测，见下文实现记录）；CRYPTO-001..010 的完整 MLS 语义（同事务 provider、pending Commit、正式群操作、回执应用）仍未实现。目标源码：[crates/crypto/src/engine.rs](../../crates/crypto/src/engine.rs)、[crates/crypto/src/attachment.rs](../../crates/crypto/src/attachment.rs) 与 [crates/crypto/src/key_store.rs](../../crates/crypto/src/key_store.rs)。
 
 必须使用成熟实现。TxnCryptoProvider 在同一 storage 事务中读写；如果 OpenMLS provider 不能安全接入，则先 ADR 决策并实现幂等日志恢复再继续。PreparedWrite 不是已正式发布的新内存状态。每群串行执行，网络等待不跨持有 SQLite 写事务。
 
@@ -13,7 +13,7 @@ CRYPTO-004/006/007/008 的 MLS 语义仍未实现；本轮实现的是它们共�
 - 派生：Argon2id（v0x13）输出固定 32 字节；内存成本 8 MiB..=1 GiB、迭代 1..=16、并行度 1..=8、盐 16..=64 字节、口令 1..=1024 字节，越界或畸形输入全部有界拒绝；参数与盐作为 KeyProvenance 写入库，重开必须完全一致。
 - 加载：密钥文件必须恰好 32 字节，缺失、超出或非普通文件都显式失败，不截断也不补零。
 - 使用：主密钥只以 ProtectedStorageKey 形式在可信核心路径内存在（Drop 清零、Debug 不输出字节、不实现 Clone）；草稿正文、MLS 记录值、密钥校验记录、隔离诊断各自派生独立子密钥；错误密钥、来源不一致、篡改密文统一返回 STATE_CORRUPTED。
-- 尚未实现：MLS provider 接入（TxnCryptoProvider，CRYPTO-004/005/006 的真正语义）、附件分块加解密（CRYPTO-011/012）、系统密钥槽封装与恢复 KDF 的 ADR 决策、全库加密方案。
+- 后续进展：MLS 状态的正式持久化切片已实现（见下文 CRYPTO-004/010 记录）；仍**未实现**同事务 `TxnCryptoProvider`（把 provider 写入并入调用方的 storage 事务）、pending Commit / 正式群操作语义（CRYPTO-005/006/007/008）、系统密钥槽封装与恢复 KDF 的 ADR 决策、全库加密方案。
 
 复现命令（全程离线）：
 
@@ -41,6 +41,68 @@ cargo test --offline -p chat-crypto --test attachment_chunks   # 9 passed
 ```
 
 已知限制：未对照 RFC 8439 官方测试向量（实现来自 chacha20poly1305 =0.11.0）；nonce 随机生成而非冻结的计数器方案，唯一性靠 96-bit 随机 + 每附件 100 块量级的概率论证，尚无形式化证明；分块层不校验“块数覆盖”与整文件摘要，这两项由导出流程负责。
+
+## CRYPTO-004/010 MLS 状态持久化切片实现记录（2026-10-18，Windows x64）
+
+目标：已提交的 MLS 群状态与 provider 秘密在**正式加密库**里耐久保存，进程重启后
+仍能用同一个群继续加解密（对端能解密到原文）。存储侧见
+[storage.md](storage.md) 的“MLS 群状态与 provider 记录持久化实现记录”。
+
+实现位置：[crates/crypto/src/engine.rs](../../crates/crypto/src/engine.rs)
+
+- `MlsDevice::export_to_store(&mut formal::Store) -> MlsExportSummary`（CRYPTO-010 切片）：
+  取当前已提交群的 `group_id`/`epoch`，把 credential 名、签名公钥与群 ID 编码成群级
+  头（版本化二进制，含长度上限），再把 `OpenMlsRustCrypto` 内存 provider 的**全部**
+  记录按键排序快照，一次性写入 `mls_group_state` + `mls_record`（单笔
+  `WriteScope::mls_state` 事务 = 要么全提交、要么全回滚）。
+- `MlsDevice::import_from_store(&Store, group_key) -> MlsDevice`（恢复路径）：
+  解密群级头与记录 → 重建 `OpenMlsRustCrypto` 的 provider 存储 → 用
+  `SignatureKeyPair::read` 取回签名密钥 → `MlsGroup::load` 恢复群；随后校验群 ID、
+  epoch、签名公钥三者一致，任何不符显式失败（不新建空群）。
+- `MlsDevice::advance_epoch_with_self_update()`：本地自更新 commit 并立即合并，
+  用于验证“epoch 前进后旧状态不可用/不可覆盖”。对端处理该 commit 属于 CRYPTO-007，
+  未实现，因此调用方必须自己负责投递。
+- 错误码：存储层的 `STALE_EPOCH`（旧 epoch 覆盖）、`STATE_CORRUPTED`（错误主密钥/
+  篡改/挪行记录）与 `INVALID_INPUT`（越界或畸形输入）原样经 `anyhow` 传播，测试用
+  `downcast_ref::<StorageError>()` 断言稳定码。
+
+复现命令（全程离线，本轮实测）：
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-crypto --test formal_mls_state   # 4 passed
+cargo test --offline -p chat-storage -p chat-crypto           # 全绿（28 + 65 passed）
+```
+
+证据（测试名 → 契约点）：
+
+- `formal_mls_state::committed_group_survives_close_and_reopen`：两设备建群 → 加密一条 →
+  双方导出 → 释放设备与库句柄（模拟进程退出）→ 同主密钥重开 → 双方恢复 → Alice 继续
+  加密、Bob 解密到**原文**（含中文与 emoji），反方向同样可用；密文不含明文；
+  同 epoch 再次导出是快照替换（`state_version` 递增）且不改变 epoch。
+- `formal_mls_state::epoch_advance_makes_previous_state_stale`：自更新推进到 epoch 2 后
+  再导出；用 epoch 1 的旧快照覆盖 → `STALE_EPOCH` 且库里仍是 epoch 2；重开恢复
+  epoch 2；仍停留在 epoch 1 的设备**解不开** epoch 2 的消息（旧状态不可用于新消息）。
+- `formal_mls_state::wrong_master_key_and_tampered_records_are_state_corrupted`：错误
+  主密钥拒绝打开；篡改 provider 记录或群级状态 → 导入显式 `STATE_CORRUPTED`；
+  不存在的群明确失败（不新建空群）。
+- `formal_mls_state::failed_export_keeps_the_previous_complete_state`：非法写入被
+  有界拒绝后，上一次提交的群状态完整可用且可继续加密（无半状态）。
+- 崩溃断点（真实 `abort`）：`formal_crash_mls::mls_export_abort_before_commit_leaves_the_previous_epoch_only`（storage 侧）。
+
+已知限制：
+
+1. **不是同事务 provider**：本切片在 `export_to_store` 时一次性写库；CRYPTO-004 要求的
+   “在调用方 T2 事务内由 provider 直接读写”仍未实现，因此应用消息的加密与其状态
+   更新目前是两个动作（调用方必须在提交失败时回滚内存状态）。
+2. **pending Commit / 正式群操作未实现**（CRYPTO-005/006/007）：epoch 前进只支持本地
+   自更新 commit，不能建/删成员、不能把 Commit 投递给成员并由对端处理。
+3. **provider 记录全量快照**：每次导出写全部记录（2 人群规模很小）；大群需要增量
+   差异方案与写入预算。
+4. 群级头里的名字/签名公钥来自本机 credential，未与 account/device 身份表交叉校验
+   （身份绑定由 IDENTITY 与 CRYPTO-001/002 负责）。
+5. 旧 `persistence.rs`（P0-03 未加密 SQLite 实验）与 `p0-crash-worker` 保持原样，
+   正式路径不复用它们。
 
 ## 函数导航
 
@@ -185,10 +247,12 @@ prepare_application(input: AuthenticatedLocalEvent, tx: CryptoTransaction) -> Re
 
 **完成验收**：
 
-- [ ] 每个 crash point 恢复不复用已消费状态。
-- [ ] 相同重试不再次调用 encrypt。
+- [ ] 每个 crash point 恢复不复用已消费状态。（未验证：同事务 provider 未实现，见下）
+- [x] 相同重试不再次调用 encrypt：持久化切片保证同一 `(group_id, epoch)` 的导出是幂等快照替换（`formal_mls_state::committed_group_survives_close_and_reopen` 的再次导出断言 `state_version` 递增但 epoch 不变），不会因重开/重试产生新 epoch 或重新加密既有消息。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（仅状态持久化切片）。本轮实现的是 CRYPTO-004 依赖的“已提交群状态 + provider 秘密落正式加密库、可恢复继续加解密”：
+`MlsDevice::export_to_store` / `MlsDevice::import_from_store`（见 [engine.rs](../../crates/crypto/src/engine.rs)）配合 STORAGE 的 `mls_group_state`/`mls_record` 表。证据：`cargo test --offline -p chat-crypto --test formal_mls_state`（4 passed）。
+**仍未实现**：真正在调用方 T2 事务内由 provider 直接加密并写 attempt/outbox（`TxnCryptoProvider`）、`PreparedWrite` 生成、外层候选签名与 SubmissionId 分配——因此“加密一次 + 同事务落盘”的完整语义尚不可用。
 
 <a id="crypto-005"></a>
 
@@ -384,10 +448,11 @@ publish_committed_state(group: GroupId, committed: CommitToken) -> Result<()>
 
 **完成验收**：
 
-- [ ] 提交前不显示正式成员。
-- [ ] 回调丢失后查询仍正确。
+- [ ] 提交前不显示正式成员。（未验证：提交回调由 core 接线，未实现）
+- [ ] 回调丢失后查询仍正确。（未验证：事件桥未实现；但持久化状态可从库重读，见下）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（持久化切片）。`MlsDevice::export_to_store` 是“把已提交状态写成正式持久状态”的实现路径：`MlsDevice::import_from_store` 可在任意时刻从库重读同一状态（等价于“回调丢失后重新查询”），并被 `formal_mls_state::committed_group_survives_close_and_reopen` 覆盖。
+**仍未实现**：与 `STORAGE-009 commit_transaction` 返回的 `CommitToken` 绑定的提交后替换流程、事件桥通知与串行执行器状态替换；目前的导出不校验 CommitToken（调用方在正式提交后调用）。
 
 <a id="crypto-011"></a>
 

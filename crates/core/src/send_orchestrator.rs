@@ -89,6 +89,9 @@ fn storage_failure(error: StorageError) -> SyncError {
         // storage 仍在演进：新增的冲突类错误一律按“状态冲突/存储失败”显式失败，
         // 绝不因为未知变体而放行（fail-closed）。
         StorageError::IdentityAccountConflict(_) => ErrorCode::InvalidStateTransition,
+        // MLS epoch 单调性被破坏：PROTOCOL-014 有 STALE_EPOCH，DOMAIN-010 归类为
+        // “先同步再重建”，不能降级成普通失败或成功。
+        StorageError::StaleEpoch { .. } => ErrorCode::StaleEpoch,
     };
     SyncError::new(code, storage_detail(code))
 }

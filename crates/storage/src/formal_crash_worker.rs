@@ -6,9 +6,11 @@
 //! 用法：
 //!   storage-crash-worker intent  <db> <key-hex> <checkpoint> <conversation> <operation> <text>
 //!   storage-crash-worker attempt <db> <key-hex> <checkpoint> <conversation> <draft> <submission> <epoch> <cipher-hex> <secret>
+//!   storage-crash-worker mls     <db> <key-hex> <checkpoint> <group> <epoch> <state> <record-key> <record-value>
 use chat_storage::formal::{
-    KeyProvenance, PreparedWrite, ProtectedStorageKey, StoreOptions, ValidatedSendRequest,
-    WriteCheckpoint, WriteScope, commit_transaction, open_store, persist_prepared_attempt_with_checkpoint,
+    KeyProvenance, MlsGroupStateInput, MlsRecordInput, MlsWriteCheckpoint, PreparedWrite,
+    ProtectedStorageKey, StoreOptions, ValidatedSendRequest, WriteCheckpoint, WriteScope,
+    commit_transaction, open_store, persist_prepared_attempt_with_checkpoint,
     persist_send_intent_with_checkpoint,
 };
 use chat_storage::formal::{CryptoRecordChange, MessageContent, MessageOrigin};
@@ -23,6 +25,39 @@ fn main() {
     let mode = arguments[1].as_str();
     let path = PathBuf::from(&arguments[2]);
     let key = ProtectedStorageKey::try_from_slice(&decode_hex(&arguments[3])).unwrap();
+    if mode == "mls" {
+        // MLS 群状态 + provider 记录快照的原子写入断点（epoch 前进场景）。
+        let target = match arguments[4].as_str() {
+            "state" => MlsWriteCheckpoint::AfterGroupState,
+            "records" => MlsWriteCheckpoint::AfterRecords,
+            "commit" => MlsWriteCheckpoint::BeforeCommit,
+            other => panic!("unknown mls checkpoint: {other}"),
+        };
+        let group = arguments[5].clone();
+        let epoch: u64 = arguments[6].parse().expect("mls epoch");
+        let input = MlsGroupStateInput {
+            group_id: group,
+            epoch,
+            state: arguments[7].clone().into_bytes(),
+            records: vec![MlsRecordInput {
+                record_key: arguments[8].clone().into_bytes(),
+                value: arguments[9].clone().into_bytes(),
+            }],
+        };
+        let mut store = open_store(StoreOptions::new(path, KeyProvenance::Raw32), key)
+            .expect("open formal store");
+        let mut checkpoint = |stage: MlsWriteCheckpoint| {
+            if stage == target {
+                eprintln!("STORAGE_CRASH_CHECKPOINT={stage:?}");
+                std::process::abort();
+            }
+            Ok(())
+        };
+        store
+            .save_mls_group_state_with_checkpoint(input, &mut checkpoint)
+            .expect("persist mls group state");
+        panic!("mls crash checkpoint {target:?} was not reached");
+    }
     let target = match arguments[4].as_str() {
         "draft" => WriteCheckpoint::AfterDraft,
         "prepare-job" => WriteCheckpoint::AfterPrepareJob,
@@ -97,7 +132,10 @@ fn main() {
 }
 
 fn decode_hex(value: &str) -> Vec<u8> {
-    assert!(value.len() % 2 == 0, "hex value must have an even length");
+    assert!(
+        value.len().is_multiple_of(2),
+        "hex value must have an even length"
+    );
     let mut bytes = Vec::with_capacity(value.len() / 2);
     for index in (0..value.len()).step_by(2) {
         let byte = u8::from_str_radix(&value[index..index + 2], 16).expect("valid hex");

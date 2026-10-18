@@ -1,6 +1,6 @@
 # 客户端内核与 Kotlin 业务服务映射
 
-阶段：P1 → P2。状态：函数级设计；竖直切片（`ConversationCore` 的 open / create_draft / draft_status / apply_verified_entry / list_conversations / list_messages / close）与 P1 身份持久化增量（save_identity_account / load_identity_account / upsert_contact / list_contacts / consume_invite）已在 Windows x64 实测通过；CORE-007 的发送编排（[crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)）已把「意图 → 一次真实 MLS 加密 → 提交 → Accepted/Unknown/Rejected 落库」接通（节点端口可注入，真实节点链路见 `node_submitter` 记录），CORE-008 重试 / CORE-009 取消 / outbox 结果对账 `reconcile` 也已实现（同一文件，只加方法）；其余 CORE 函数未开始。目标源码：[crates/core/src/service.rs](../../crates/core/src/service.rs) 与 [crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)。
+阶段：P1 → P2。状态：函数级设计；竖直切片（`ConversationCore` 的 open / create_draft / draft_status / apply_verified_entry / list_conversations / list_messages / close）与 P1 身份持久化增量（save_identity_account / load_identity_account / upsert_contact / list_contacts / consume_invite）已在 Windows x64 实测通过；CORE-007 的发送编排（[crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)）已把「意图 → 一次真实 MLS 加密 → 提交 → Accepted/Unknown/Rejected 落库」接通（节点端口可注入，真实节点链路见 `node_submitter` 记录），CORE-008 重试 / CORE-009 取消 / outbox 结果对账 `reconcile` 也已实现（同一文件，只加方法）；CORE-010 草稿状态视图（`DraftStatusView` + 共用投影 `draft_status_view`）与 CORE-003 的拉取式事件流（`crates/core/src/core_events.rs`：有界缓冲 + 单调序号 + 溢出 resync）同样已实测通过；其余 CORE 函数未开始。目标源码：[crates/core/src/service.rs](../../crates/core/src/service.rs) 与 [crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)。
 
 本层编排，不把各子模块的事务拆成独立提交。函数名与 Kotlin 的 camelCase 一一对应；底层 TaskId/AttemptId 不必全暴露 UI。start/close 是幂等生命周期，所有查询都来自 Rust 持久真相。身份与群、附件服务分别委托对应章节。
 
@@ -189,10 +189,10 @@ observe_events(listener: EventListener, capacity: u32) -> Result<SubscriptionHan
 
 **完成验收**：
 
-- [ ] 消费者慢导致 resync 仍可查询完整状态。
-- [ ] release 后无回调。
+- [x] 消费者慢导致 resync 仍可查询完整状态：`draft_status_events::overflow_returns_resync_required_instead_of_dropping_silently`（慢消费者游标落在缓冲起点之前时返回 `resync_required = true` 与一条 `ResyncRequired`，调用方据此整体重查；仍在窗口内的游标可继续增量读）。
+- [ ] release 后无回调：本轮是**拉取式** `poll_events`（没有 `EventListener` 回调注册），因此“释放订阅后不再回调”暂不适用；`shutdown` 后只追加一条 `CoreClosed` 且不再发布任何事件。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（拉取式最小切片，Windows x64 实测）。`crates/core/src/core_events.rs` 提供 `CoreEvent`（`DraftChanged`/`ConversationChanged`/`ResyncRequired`/`CoreClosed`，只含 ID 与状态文本）、`EventBus`（有界环形缓冲，容量 `1..=MAX_EVENT_CAPACITY = 4096`，默认 256；序号从 1 单调递增；单批上限 `MAX_EVENT_BATCH = 256`）与 `SendService::poll_events(since_seq, limit)`。与契约的差异：契约是“登记 listener + 串行转发 + 释放订阅”，本轮改为“事件进入有界缓冲，调用方按序号增量拉取”，因此没有 `SubscriptionHandle`/回调释放，取而代之的是 `shutdown` + `CoreClosed`；这部分留给 BRIDGE-003/004 的事件桥接任务。证据：`draft_status_events::events_are_monotonic_and_repeat_polling_is_idempotent`、`draft_status_events::overflow_returns_resync_required_instead_of_dropping_silently`、`draft_status_events::events_never_carry_message_content_or_keys`、`draft_status_events::shutdown_publishes_core_closed_and_rejects_later_calls`。
 
 <a id="core-004"></a>
 
@@ -428,10 +428,26 @@ get_draft_status(draft: DraftId) -> Result<DraftStatus>
 
 **完成验收**：
 
-- [x] 同意图多尝试可追踪：`service::end_to_end_draft_then_verified_entry_then_pages`（`DraftView.submission_id` 取该草稿最近的 attempt，没有 attempt 时为 `None`；本切片未产生 attempt，接线后由 STORAGE-007 写入）。
-- [ ] 节点存信箱状态独立展示：未开始（需要节点信箱与 outbox 结果投影）。
+- [x] 同意图多尝试可追踪：`draft_status_events::draft_status_tracks_every_lifecycle_step`（`DraftStatusView.attempt_index` / `attempts` / `submission_id` 直接来自按序枚举的 `message_attempts`：拒绝后重建得到 `attempt_index = 1`、`attempts = 2` 与新 SubmissionId；状态查询还给 `ConversationCore::draft_status` 的正文投影复用同一实现）。
+- [ ] 节点存信箱状态独立展示：未开始（需要节点信箱与 outbox 结果投影；本轮 `updated_at_ms` 只取草稿创建时间与发送任务的 `retry_at`/`lease_until`）。
 
-**实现状态**：切片实现。`ConversationCore::draft_status(draft_id)` 读取 STORAGE-006 的草稿投影并解密正文，附带 `submission_id`；未知草稿返回 `None`（不报错、不伪造），草稿 ID 只做本地有界结构校验（storage 派生的 `draft-<32 hex>` 不是 PROTOCOL-001 文本）。证据：`service::end_to_end_draft_then_verified_entry_then_pages`。
+**实现状态**：已实现（切片，Windows x64 实测）。共用投影 `service::draft_status_view(store, draft_id)`，两个入口：`ConversationCore::get_draft_status(draft_id)`（持有 `Store` 的服务对象）与 `SendService::get_draft_status(draft_id)`（包装编排器的发送服务）。返回 `DraftStatusView { draft_id, conversation_id, operation_id, status, submission_id, attempt_index, attempts, updated_at_ms, can_retry, can_cancel }`，**不含正文**（不解密 `drafts.protected_content`，正文损坏只在 `draft_status` 的 body 投影与发送路径上显式 `STATE_CORRUPTED`）；未知草稿返回 `None`，畸形草稿 ID 返回 `INVALID_INPUT`。
+
+有效状态推导（草稿状态优先，其余取最新 attempt）：`drafts.state` 为 `accepted`/`delivered` → `accepted`；`cancelled` → `cancelled`；`failed` → `failed`；否则最新 attempt 的 `prepared`/`submitted`/`accepted`/`rejected`/`unknown` 原样作为状态，没有 attempt → `queued`（acceptance 是权威事实：`attempt accepted` 即使草稿还没落 accepted 也显示 `accepted`）。
+
+可执行动作推导（由状态与冻结规则推导，不臆造）：
+
+| 有效状态 | can_retry | can_cancel |
+|---|---|---|
+| queued / prepared / submitted（无有效租约） | true | true |
+| queued / prepared / submitted（发送任务有效租约被占） | false（等租约） | true |
+| rejected（`attempt_index < MAX_ATTEMPT_INDEX = 64`） | true（新 SubmissionId 重建） | true |
+| rejected（预算用尽） | false | true |
+| unknown | false（只能对账） | true（`CancelUnknown` 只记意图） |
+| accepted | false（`AlreadyAccepted`） | false（`CancelTooLate`） |
+| cancelled / failed | false | false |
+
+证据：`draft_status_events::draft_status_tracks_every_lifecycle_step`（queued → prepared → accepted、unknown、rejected → 重建、cancelled、未知/畸形草稿、以及 `ConversationCore` 与 `SendService` 同一投影）。
 
 <a id="core-011"></a>
 
@@ -773,4 +789,83 @@ cargo test --offline -p chat-core   # 14 lib + 6 identity + 5 node_submitter + 2
 4. **`retry_draft` 的未知分支不主动查询**：它只报告 `AwaitingReconciliation`，避免在“重试”语义里偷偷产生网络调用；对账仍由 `dispatch`/`reconcile` 完成（`node_submitter` 记录的限制 4 即此入口）。
 5. **`cancel_requested` 仍是原始 SQL 投影**：storage 没有“标记取消”的正式入口（与 STORAGE-014 的 `cancel_requested` 语义一致），本层在 outbox 事务内直接更新；storage 补 API 后应替换。
 6. **两笔事务窗口只能事后收敛**：`Accepted` 仍是“outbox 结果 + 草稿状态”两笔事务，崩溃窗口内的不一致必须由 `reconcile` 或下一次 `dispatch` 的 `Release` 分支修复，本轮无后台恢复任务。
+
+## 草稿状态与事件流实现记录（CORE-010 / CORE-003，2026-10-18，Windows x64）
+
+实现位置：[crates/core/src/core_events.rs](../../crates/core/src/core_events.rs)（新增，`lib.rs` 加一行 `pub mod core_events;`）+ [crates/core/src/service.rs](../../crates/core/src/service.rs)（`DraftStatusView` 与共用投影 `draft_status_view`、`ConversationCore::get_draft_status`），测试：[crates/core/tests/draft_status_events.rs](../../crates/core/tests/draft_status_events.rs)（5 个用例）。**没有改** `send_orchestrator.rs` 的编排逻辑：事件在 service 层包装（[`SendService`]）里发布。
+
+公开面：
+
+~~~text
+// CORE-010（service.rs）
+pub struct DraftStatusView {
+    pub draft_id: String, pub conversation_id: String, pub operation_id: String,
+    pub status: String,                 // queued/prepared/submitted/rejected/unknown/accepted/cancelled/failed
+    pub submission_id: Option<String>,  // 最新尝试
+    pub attempt_index: Option<u32>,     // 0 = 首次尝试；无 attempt 为 None
+    pub attempts: u32,                  // 已尝试次数（含被拒绝的重建）
+    pub updated_at_ms: u64,             // 可观测最后活动时间（非伪造写入时间）
+    pub can_retry: bool, pub can_cancel: bool,
+}
+pub fn draft_status_view(store: &Store, draft_id: &str) -> Result<Option<DraftStatusView>, StorageError>;
+impl ConversationCore { pub fn get_draft_status(&self, draft_id: &str) -> anyhow::Result<Option<DraftStatusView>>; }
+
+// CORE-003（core_events.rs）
+pub enum CoreEvent {
+    DraftChanged { draft_id, conversation_id, status, submission_id: Option<String> },
+    ConversationChanged { conversation_id },
+    ResyncRequired { reason: String },
+    CoreClosed,
+}
+pub struct EventBatch { pub events: Vec<CoreEvent>, pub next_seq: u64, pub resync_required: bool }
+pub struct EventBus { .. }  // new(capacity 1..=4096) / push / poll(since_seq, limit 1..=256) / latest_seq / len
+pub struct SendService<S: NodeSubmitter, C: CryptoEngine, K: Clock> { .. }
+impl SendService {
+    pub fn new(store, submitter, engine, clock, worker) -> anyhow::Result<Self>;
+    pub fn with_event_capacity(.., event_capacity) -> anyhow::Result<Self>;
+    pub fn begin_send/prepare/dispatch/retry_draft/cancel_draft/reconcile(..)  // 转发编排器并发布事件
+    pub fn get_draft_status(&self, draft_id: &str) -> anyhow::Result<Option<DraftStatusView>>;
+    pub fn poll_events(&self, since_seq: u64, limit: u32) -> anyhow::Result<EventBatch>;
+    pub fn shutdown(&mut self)   // 释放存储句柄并发布 CoreClosed（重复调用幂等）
+}
+~~~
+
+事件语义（CORE-003 的最小实现，拉取式）：
+
+- **只通知变化**：每次写调用（`begin_send`/`prepare`/`dispatch`/`retry_draft`/`cancel_draft`/`reconcile`）成功后才查询真实状态，只有**有效状态变化**才发布 `DraftChanged` + `ConversationChanged`；幂等重放（状态没变）不产生事件。
+- **单调序号**：序号从 1 单调递增，`poll_events(since_seq, limit)` 返回 `since_seq` 之后的增量，`next_seq` 是本批最后一条的序号；`since_seq = 0` 表示从头。
+- **重复 poll 幂等**：poll 只读，同参数重复调用返回同一批；连续两批序号严格递增、无重复无空档。
+- **溢出显式 resync**：有界环形缓冲（默认 256，上限 4096）；游标早于缓冲起点（事件已丢）或超前于本实例时返回 `resync_required = true` 与一条 `ResyncRequired`，绝不静默丢事件；仍在窗口内的游标可以继续增量读。
+- **不含敏感材料**：`CoreEvent` 只有 ID 与稳定状态文本，没有正文/密钥/指纹；测试用正文标记反证 `Debug` 输出里不出现正文。
+- **关闭**：`shutdown` 丢弃编排器（释放独占存储句柄）后追加一条 `CoreClosed`，之后所有方法显式 `CORE_CLOSED`；重复 `shutdown` 不重复发事件。
+
+错误码：`service::error_code` 新增两条投影——`SyncError`（发送编排/调度决策的冻结码）与 `core_events::EventError`（`INVALID_EVENT_CAPACITY`/`INVALID_EVENT_LIMIT`），因此 `SendService` 的错误在 FFI 层能保持精确码而不是退化成 `CORE_FAILURE`。
+
+**跨 crate 联动（例外改动，已获 Lead 批准）**：`crates/storage/src/formal/error.rs` 在本轮期间由 storage 侧（R-23 MLS epoch CAS）新增了 `StorageError::StaleEpoch { stored, offered }`，导致 `send_orchestrator.rs` 的 `storage_failure` 穷尽 match 断裂。为恢复编译，该文件只增加一行 `StorageError::StaleEpoch { .. } => ErrorCode::StaleEpoch`（PROTOCOL-014 有 `STALE_EPOCH`，DOMAIN-010 归类为“先同步再重建”），其余逻辑未动；按 Lead 裁决保持穷尽 match（不改 catch-all），未来由 storage 侧集中提供 `StorageError::code()` 映射解决。
+
+复现命令（全程离线，本轮实测）：
+
+~~~powershell
+. .	oolsactivate.ps1
+cargo test --offline -p chat-core   # 14 lib + 5 draft_status_events + 6 identity + 5 node_submitter + 2 p0 + 14 send_orchestrator + 5 service = 51 passed（既有 46 个继续通过）
+cargo build --locked --offline -p chat-core   # 成功，Cargo.lock 未变化
+~~~
+
+证据（测试名 → 覆盖的契约点）：
+
+- `draft_status_events::draft_status_tracks_every_lifecycle_step`：queued（无 attempt、可重试可取消）→ prepared（`attempt_index = 0`、新 SubmissionId）→ accepted（不可重试不可取消、提交 1 次）；unknown（不可重试、可发起取消）；rejected（可重试、重建后 `attempt_index = 1`/`attempts = 2` 且新 SubmissionId）；cancelled（都不可）；未知草稿 `None`、畸形 ID `INVALID_INPUT`；`ConversationCore` 与 `SendService` 用同一投影（同库第二个句柄返回 `STORAGE_LOCKED`，不静默成功）。
+- `draft_status_events::events_are_monotonic_and_repeat_polling_is_idempotent`：空 poll（`next_seq = 0`）→ begin_send 2 条事件（`DraftChanged` + `ConversationChanged`）→ 同参数重复 poll 完全一致 → prepare/dispatch 各 2 条且状态正确 → 幂等重放不再产生事件 → 分页拼接得到序号 `1..=6` 严格单调。
+- `draft_status_events::overflow_returns_resync_required_instead_of_dropping_silently`：容量 4 时第 5/6 条事件挤掉最早的 1/2 条 → 游标 0 返回 `resync_required = true` 与仅一条 `ResyncRequired`（`next_seq = 6`）；游标 4 仍在窗口内可增量读到 accepted 事件；超前游标 99 同样要求 resync；`limit = 0`/超上限 → `INVALID_EVENT_LIMIT`，容量越界 → `INVALID_EVENT_CAPACITY`。
+- `draft_status_events::events_never_carry_message_content_or_keys`：事件 `Debug` 输出不含正文标记，且 `DraftChanged` 只有 ID/状态字段。
+- `draft_status_events::shutdown_publishes_core_closed_and_rejects_later_calls`：shutdown 后追加一条 `CoreClosed`，`get_draft_status`/`begin_send` 返回 `CORE_CLOSED`，重复 shutdown 不再发事件。
+
+已知限制（本切片不覆盖）：
+
+1. **拉取式而非回调式**：没有 `EventListener`/`SubscriptionHandle`（BRIDGE-003/004 的事件桥接任务），因此“release 后无回调”的验收未勾选；UI 侧用 `poll_events` + `ResyncRequired` 全局重查（PRESENTATION-008）即可。
+2. **单缓冲，无每订阅队列**：所有消费者共享一个环形缓冲；一个慢消费者不会拖慢别人，但它自己会收到 `ResyncRequired`。多订阅隔离要等桥接层。
+3. **事件不是可靠日志**：进程重启后缓冲从 0 开始（`next_seq` 归零），跨进程游标会被判为“超前”并触发 resync；调用方不得把事件当消息数据。
+4. **事件覆盖范围**：本轮只有发送草稿路径（`SendService`）发布事件；`apply_verified_entry`/群/身份路径尚未发 `ConversationChanged`（需要把它们也搬到 service 包装层）。
+5. **`updated_at_ms` 不是写入时间**：schema 没有 `drafts.updated_at`，取 `drafts.created_at` 与发送任务 `retry_at`/`lease_until` 的最大值；attempt 行没有时间戳。
+6. **状态查询不解密正文**：`drafts.protected_content` 被篡改时状态查询仍返回状态（只看 `state` 列），正文损坏只在 `draft_status`（body 投影）与发送路径上显式 `STATE_CORRUPTED`。
+
 
