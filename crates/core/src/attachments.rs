@@ -877,6 +877,17 @@ impl PersistedAttachmentStore {
         })
     }
 
+    /// crate 内部：借出正式库句柄做只读查询（例如从持久身份派生节点设备凭据）。
+    ///
+    /// 不对外公开：库对象（含主密钥派生能力）不进入任何 DTO，也不跨越 FFI 边界。
+    pub(crate) fn with_formal_store<T>(
+        &self,
+        query: impl FnOnce(&FormalStore) -> AttachmentResult<T>,
+    ) -> AttachmentResult<T> {
+        let store = self.lock_store()?;
+        query(&store)
+    }
+
     /// 导入文件：先写本地加密缓存，再把非秘密元数据写入正式存储记录。
     pub fn import_file(
         &self,

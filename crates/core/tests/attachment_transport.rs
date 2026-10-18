@@ -422,8 +422,10 @@ async fn download_from_the_node_decrypts_the_original_plaintext() {
     // 与本地记录不一致的清单必须在任何节点读取之前被拒。
     let mut wrong = manifest.clone();
     let mut digest = wrong.ciphertext_digest.clone();
-    digest.pop();
-    digest.push('0');
+    // 必须真的改掉一个字符：原摘要末位可能就是 '0'，直接 push('0') 会是空改动（曾因此偶发失败）。
+    let last = digest.pop().expect("digest is not empty");
+    digest.push(if last == '0' { '1' } else { '0' });
+    assert_ne!(digest, wrong.ciphertext_digest, "the mutation must change the digest");
     wrong.ciphertext_digest = digest;
     let error = store
         .download_attachment(

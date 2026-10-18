@@ -31,6 +31,10 @@ import chat.presentation.preview.withConversations
 import chat.presentation.preview.withDraft
 import chat.presentation.preview.updateExportPath
 import chat.presentation.preview.updateImportPath
+import chat.presentation.preview.updateSendNodeId
+import chat.presentation.preview.updateSendNodePublicKey
+import chat.presentation.preview.updateSendNodeUrl
+import chat.presentation.preview.withSendStep
 import chat.presentation.preview.withCancel
 import chat.presentation.preview.withDraftStatus
 import chat.presentation.preview.withExported
@@ -214,6 +218,89 @@ fun main() = application {
                 storeState = storeState.beginBusy()
                 runCatching { store.cancelDraft(latest.draftId) }
                     .onSuccess { storeState = storeState.withCancel(it) }
+                    .onFailure { error ->
+                        storeState = storeState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+        updateSendNodeUrl = { value -> storeState = storeState.updateSendNodeUrl(value) },
+        updateSendNodeId = { value -> storeState = storeState.updateSendNodeId(value) },
+        updateSendNodePublicKey = { value -> storeState = storeState.updateSendNodePublicKey(value) },
+        configureSendNode = {
+            scope.launch {
+                if (store == null) return@launch
+                storeState = storeState.beginBusy()
+                val key = storeState.sendNodePublicKey.trim().ifEmpty { null }
+                runCatching { store.configureSendNode(storeState.sendNodeUrl.trim(), storeState.sendNodeId.trim(), key) }
+                    .onSuccess {
+                        storeState = storeState.copy(
+                            busy = false,
+                            notice = "节点配置已保存（未联网校验）；发送需要设备已注册且已加入群。",
+                        )
+                    }
+                    .onFailure { error ->
+                        storeState = storeState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+        sendPrepare = {
+            scope.launch {
+                if (store == null) return@launch
+                val draft = storeState.drafts.lastOrNull() ?: return@launch
+                storeState = storeState.beginBusy()
+                runCatching { store.sendPrepare(draft.draftId) }
+                    .onSuccess { storeState = storeState.withSendStep(it) }
+                    .onFailure { error ->
+                        storeState = storeState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+        sendDispatch = {
+            scope.launch {
+                if (store == null) return@launch
+                val draft = storeState.drafts.lastOrNull() ?: return@launch
+                storeState = storeState.beginBusy()
+                runCatching { store.sendDispatch(draft.draftId) }
+                    .onSuccess { storeState = storeState.withSendStep(it) }
+                    .onFailure { error ->
+                        storeState = storeState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+        sendRetry = {
+            scope.launch {
+                if (store == null) return@launch
+                val draft = storeState.drafts.lastOrNull() ?: return@launch
+                storeState = storeState.beginBusy()
+                runCatching { store.sendRetry(draft.draftId) }
+                    .onSuccess { storeState = storeState.withSendStep(it) }
+                    .onFailure { error ->
+                        storeState = storeState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+        sendReconcile = {
+            scope.launch {
+                if (store == null) return@launch
+                val draft = storeState.drafts.lastOrNull() ?: return@launch
+                storeState = storeState.beginBusy()
+                runCatching { store.sendReconcile(draft.draftId) }
+                    .onSuccess { storeState = storeState.withSendStep(it) }
                     .onFailure { error ->
                         storeState = storeState.withError(
                             (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",

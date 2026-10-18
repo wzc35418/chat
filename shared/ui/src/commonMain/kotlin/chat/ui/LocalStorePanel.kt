@@ -42,6 +42,14 @@ data class StoreHandlers(
     val createDraft: () -> Unit = {},
     val cancelLatestDraft: () -> Unit = {},
     val pollEvents: () -> Unit = {},
+    val updateSendNodeUrl: (String) -> Unit = {},
+    val updateSendNodeId: (String) -> Unit = {},
+    val updateSendNodePublicKey: (String) -> Unit = {},
+    val configureSendNode: () -> Unit = {},
+    val sendPrepare: () -> Unit = {},
+    val sendDispatch: () -> Unit = {},
+    val sendRetry: () -> Unit = {},
+    val sendReconcile: () -> Unit = {},
 ) {
     companion object {
         val None = StoreHandlers()
@@ -206,6 +214,73 @@ fun LocalStorePanel(
                     }
                 }
 
+                HorizontalDivider(color = Color(0xFFE1E6E1))
+                Text("发送（真节点）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "节点地址只保存不联网；未配置或未加入群时会显式失败，不会伪造成功。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF5F6B63),
+                )
+                OutlinedTextField(
+                    value = state.sendNodeUrl,
+                    onValueChange = handlers.updateSendNodeUrl,
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("节点地址，例如 http://127.0.0.1:8080") },
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = state.sendNodeId,
+                        onValueChange = handlers.updateSendNodeId,
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                        label = { Text("节点 ID") },
+                    )
+                    OutlinedTextField(
+                        value = state.sendNodePublicKey,
+                        onValueChange = handlers.updateSendNodePublicKey,
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                        label = { Text("节点公钥（可选）") },
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    TextButton(
+                        onClick = handlers.configureSendNode,
+                        enabled = state.ready && !state.busy && state.sendNodeUrl.isNotBlank() && state.sendNodeId.isNotBlank(),
+                    ) { Text("保存节点配置", style = MaterialTheme.typography.labelMedium) }
+                    TextButton(
+                        onClick = handlers.sendPrepare,
+                        enabled = state.ready && !state.busy && state.drafts.isNotEmpty(),
+                    ) { Text("准备并加密", style = MaterialTheme.typography.labelMedium) }
+                    TextButton(
+                        onClick = handlers.sendDispatch,
+                        enabled = state.ready && !state.busy && state.drafts.isNotEmpty(),
+                    ) { Text("发送", style = MaterialTheme.typography.labelMedium) }
+                    TextButton(
+                        onClick = handlers.sendRetry,
+                        enabled = state.ready && !state.busy && state.drafts.isNotEmpty(),
+                    ) { Text("重试", style = MaterialTheme.typography.labelMedium) }
+                    TextButton(
+                        onClick = handlers.sendReconcile,
+                        enabled = state.ready && !state.busy && state.drafts.isNotEmpty(),
+                    ) { Text("对账", style = MaterialTheme.typography.labelMedium) }
+                }
+                state.sendStep?.let { step ->
+                    Text(
+                        "结果：" + step.status + if (step.settled) "（已确定）" else "（未确定，只能对账）",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Medium,
+                        color = if (step.status == "accepted") Color(0xFF2E7D32) else Color(0xFF5F6B63),
+                    )
+                    Text(
+                        "提交 " + (step.submissionId ?: "-") + " · 尝试序号 " + (step.attemptIndex ?: 0) + " · " + step.detail,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color(0xFF5F6B63),
+                    )
+                }
+
+                HorizontalDivider(color = Color(0xFFE1E6E1))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("核心事件（拉取式）", style = MaterialTheme.typography.labelLarge)
                     TextButton(

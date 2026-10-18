@@ -15,6 +15,15 @@ rand.workspace = true
 uniffi.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# ATT-U：附件上传/下载的端到端用例在进程内起真实 node-api 服务（loopback）。
+chat-node-api.workspace = true
+chat-node-client = { path = "../node-client" }
+chat-node-services.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["net"] }
+ed25519-dalek.workspace = true
+
 [features]
 bindgen = ["uniffi/cli"]
 

@@ -627,5 +627,58 @@ cargo test --offline -p chat-ffi -p chat-core           # 25 + 81 passed
 3. `configure_send_node` 只保存配置：不验证节点可达性，也不注册设备；设备注册/建群仍由既有流程完成。
 4. 附件与正文的联合发送（引用块）不在本轮；`send_dispatch` 只提交正文条目。
 
+## 附件上传/下载 FFI 契约（AttachmentFfi，ATT-U，task-34，2026-10-18，Windows x64）
+
+代码：[crates/ffi/src/attachments_ffi.rs](../../crates/ffi/src/attachments_ffi.rs)（薄封装）+ [crates/core/src/attachment_node.rs](../../crates/core/src/attachment_node.rs)（装配：持久身份 → 设备凭据 → NodeBlobTransport → 编排层）；
+测试：[crates/ffi/tests/attachment_node.rs](../../crates/ffi/tests/attachment_node.rs)（5 个，真 axum 节点 + 临时持久库）。
+
+### 两种后端（由构造方式决定）
+
+| 构造 | 后端 | 能力 |
+|---|---|---|
+| `AttachmentFfi::new(cache_root)` | 仅内存缓存 | import / status / export / cancel；`upload`/`download` → `INVALID_STATE_TRANSITION`（无持久记录与身份库） |
+| `AttachmentFfi::open(database_path, master_key_hex, cache_root)` | 正式加密库 + 缓存 | 全部：状态真实落 attachments 表，upload/download 走真节点 |
+
+`open` 的库是**独占单写者**：调用前必须释放其它持有同一库的对象（`ConversationCore` / `LocalStoreFfi`）。
+
+### 方法
+
+~~~text
+upload(attachment_id, endpoint_url, node_id, node_public_key_hex?, group_id, source_seq) -> Result<AttachmentView, FfiError>
+download(blob_id, target_path, endpoint_url, node_id, node_public_key_hex?, group_id, source_seq) -> Result<AttachmentDownloadView, FfiError>
+~~~
+
+- 设备签名钥由库里的**持久身份**派生（`load_identity_seeds` → `signing_key_from_seed`，与 send 链路同一条路径）；本层**不接受任何种子/口令入参**。
+- `group_id` 是 PROTOCOL-001 群文本，`source_seq` 是本设备已接受的日志序号（NODE-012 的上传授权关联）；下载只需要凭据（NODE-015：上传设备本人恒可读），但端口构造仍要求两个参数合法（可传上传时相同的值）。
+- `AttachmentView` 新增 `transferred_chunks`（已传块数；失败后保留，不是协议确认）；其余字段与旧契约一致。
+- `AttachmentDownloadView { attachment_id, written_bytes, content_digest }`：不含正文/密钥。
+
+### 状态与错误码
+
+- 状态真实迁移：`imported → uploading → available`（storage 白名单）；成功后 `state = "available"`；失败保留缓存与进度、状态停在 `uploading` 可重试；已 `available` 时重复上传是**幂等无操作（零发送）**。
+- 错误码（`FfiError::Store.code`，全部冻结）：`INVALID_TARGET`（端点/群/序号非法）、`INVALID_SIGNATURE`（节点公钥格式错）、`GROUP_NOT_FOUND` / `PERMISSION_DENIED`（节点授权）、`ATTACHMENT_NOT_FOUND`（记录不存在）、`ATTACHMENT_CORRUPTED`（远端数据与本地记录不一致）、`ATTACHMENT_KEY_UNAVAILABLE`（无进程内 FileKey）、`NODE_UNAVAILABLE` / `QUOTA_EXCEEDED` / `CONTENT_TOO_LARGE` 等节点码、`INVALID_STATE_TRANSITION`（内存后端调用 upload/download）。
+
+### 证据
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi --test attachment_node   # 5 passed
+cargo test --offline -p chat-ffi -p chat-core             # 30 + 81 passed
+~~~
+
+- `attachment_node::upload_reaches_the_node_and_download_returns_the_original_bytes`：导入 → 上传（state 真为 `available`、available_chunks = chunk_count）→ 从**节点**下载并认证解密，写出的字节与原文逐字节一致、回执摘要一致；重开对象后状态仍是 `available`；另一实例下载 → `ATTACHMENT_KEY_UNAVAILABLE` 且不产生文件。
+- `attachment_node::repeated_upload_is_idempotent_and_sends_nothing`：上传成功后**关掉节点**再上传 → 仍返回 `available`（证明幂等路径零发送）。
+- `attachment_node::wrong_credentials_and_unknown_groups_fail_explicitly`：未知群 / 非本设备 source_seq / 坏端点 / 坏公钥 / 设备未在节点注册，全部显式失败且状态**不会被标成 available**。
+- `attachment_node::in_memory_object_refuses_upload_and_download`：内存后端调用 upload/download → `INVALID_STATE_TRANSITION`。
+- `attachment_node::download_without_a_record_is_rejected`：未知附件 → `ATTACHMENT_NOT_FOUND`，不写文件。
+
+已知限制：
+
+1. **跨进程/跨实例下载**需要 E2EE SecretDescriptor（FileKey 不落盘），当前显式 `ATTACHMENT_KEY_UNAVAILABLE` —— 设计边界，不伪造可下载。
+2. **节点块上限已对齐客户端分块**：节点默认 `max_chunk_bytes` 1 MiB（硬上限 4 MiB）≥ 客户端 256 KiB 密文块，多块附件可上传（见 [attachments.md](attachments.md) 的“节点块传输适配实现记录”）。
+3. 下载不写本地加密缓存（直接写出目标路径），因此下载后不能离线再 export。
+4. 上传/下载是**同步阻塞**调用（FFI 的 `Mutex` 串行化）：不要在 UI 线程上直接跑大文件。
+
+
 
 

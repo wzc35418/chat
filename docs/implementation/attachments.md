@@ -1,6 +1,6 @@
 # 文件导入、分块上传、下载和导出
 
-阶段：P2。状态：函数级设计；本地导入/导出与本地状态机（ATTACHMENTS-001/002/004/006/007 的本地部分）已实现；ATTACHMENTS-003 上传与 ATTACHMENTS-005 下载已通过可注入的块传输端口（`BlobTransport`）接通编排与状态机（节点客户端由适配层 `NodeBlobTransport` 实现并已接真节点（NODE-012~015，crates/core/src/attachment_transport.rs））；节点配额与回执验签已由适配层完成；含 FileKey 的 E2EE SecretDescriptor、跨进程下载能力与持久化进度仍未实现。目标源码：[crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)（编排）与 [crates/core/src/attachment_transport.rs](../../crates/core/src/attachment_transport.rs)（节点适配）。
+阶段：P2。状态：函数级设计；本地导入/导出与本地状态机（ATTACHMENTS-001/002/004/006/007 的本地部分）已实现；ATTACHMENTS-003 上传与 ATTACHMENTS-005 下载已通过可注入的块传输端口（`BlobTransport`）接通编排与状态机（节点客户端由适配层 `NodeBlobTransport` 实现并已接真节点（NODE-012~015，crates/core/src/attachment_transport.rs））；节点配额与回执验签已由适配层完成；含 FileKey 的 E2EE SecretDescriptor、跨进程下载能力与持久化进度仍未实现。FFI 侧通过 `AttachmentFfi::open` 暴露 upload/download 给 Kotlin（ATT-U，见文末记录）。目标源码：[crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)（编排）与 [crates/core/src/attachment_transport.rs](../../crates/core/src/attachment_transport.rs)（节点适配）。
 
 平台 file token 仅代表用户授权的一次访问，不将任意路径传入内核。默认单附件 25 MiB，按完整原文大小计；节点配额按密文实际字节计。文件密钥只在受保护本地记录和 E2EE 描述中，不能放节点 URL 或公开清单。
 
@@ -348,7 +348,7 @@ impl PersistedAttachmentStore {
 复现命令（全程离线，本轮实测）：
 
 ~~~powershell
-. .	oolsactivate.ps1
+. .\tools\activate.ps1
 cargo test --offline -p chat-core --lib attachments   # 20 passed（14 既有 + 6 新增：上传 2 + 下载 4）
 cargo test --offline -p chat-core                     # 70 passed（既有 64 个继续通过）
 ~~~
@@ -365,6 +365,11 @@ cargo test --offline -p chat-core                     # 70 passed（既有 64 �
 已知限制（本切片不覆盖）：
 
 1. **节点适配在独立文件**：端口 `BlobTransport` 的节点实现是 [crates/core/src/attachment_transport.rs](../../crates/core/src/attachment_transport.rs) 的 `NodeBlobTransport`（NODE-012~015，含节点配额与回执验签），本文件（编排层）不含任何 HTTP/节点依赖；见下文“节点块传输适配实现记录”。
+2. **进度不落盘**：附件表没有进度列，`transferred_chunks` 只在进程内；重启后重试从头重发（同序号同字节，端口侧幂等）。验收项“重启从位图续传”因此未勾选。
+3. **下载不写本地加密缓存**：本轮直接认证解密写到目标路径（不重新加密入缓存），因此下载后不能离线 `export_attachment`；“只拉缺块”的位图也未实现。
+4. **FileKey 仍只在进程内**：下载与导出都要求“本进程导入过”，E2EE SecretDescriptor（含 FileKey 的受保护记录）与下载能力令牌/CAPABILITY_EXPIRED 仍未实现。
+5. **取消与传输的竞争**：`cancel_transfer` 会把状态置 cancelled；若此时上传/下载已在进行，端口调用不会被中断（没有网络流句柄），完成回写会因白名单拒绝而显式失败（cancelled 是终态）。
+6. **节点侧“同块只计一次配额”**属于 NODE-013 的记账，本层只保证重发同一字节。
 
 ## 节点块传输适配实现记录（NodeBlobTransport，ATTACHMENTS-003/005 的节点侧，2026-10-18，Windows x64）
 
@@ -406,7 +411,7 @@ pub const CIPHERTEXT_CHUNK_OVERHEAD: usize;   // 1 + nonce(12) + tag(16) = 29（
 复现命令（全程离线；节点在进程内起真 axum 服务，loopback）：
 
 ~~~powershell
-. .	oolsactivate.ps1
+. .\tools\activate.ps1
 cargo test --offline -p chat-core --test attachment_transport   # 6 passed
 cargo test --offline -p chat-core                                # 76 passed（既有 70 个继续通过）
 ~~~
@@ -416,23 +421,73 @@ cargo test --offline -p chat-core                                # 76 passed（�
 - `attachment_transport::upload_publishes_chunks_the_node_returns_verbatim`：上传后节点读回的密文块与本地缓存**逐字节一致**、节点内容里没有明文；`TransportStats` 显示 begin/put/complete 各 1 次；记录落 available；重复上传不建会话、不发块（幂等）。
 - `attachment_transport::download_from_the_node_decrypts_the_original_plaintext`：新 transport 从节点取回分块密文并解出原文（与源文件逐字节一致、回执摘要一致、读取次数 = 块数）；与本地记录不一致的清单在**任何节点读取之前**被 `ATTACHMENT_CORRUPTED` 拒绝。
 - `attachment_transport::broken_link_keeps_the_attempt_retryable_and_retry_is_idempotent`：节点不可达 → `NETWORK_UNAVAILABLE`，状态停在 uploading、缓存块完整、记录未 available；换真节点重试成功（同 operation、同密文字节），之后再上传幂等无操作。
-- `attachment_transport::multi_chunk_attachments_are_rejected_by_the_node_chunk_policy`：3 块附件被节点以 `CONTENT_TOO_LARGE` 拒绝（码保真），本地尺寸未被篡改、记录未 available。
+- `attachment_transport::multi_chunk_attachments_pass_the_node_chunk_policy_and_publish`：3 块（256 KiB 明文/块）附件在默认节点策略下真正发布为 `available`，本地尺寸未被篡改（节点块上限对齐后由后续任务改为正例断言）。
 - `attachment_transport::published_blob_survives_a_node_restart`：文件库节点上传→**关闭节点→用同一库文件重启**→新客户端仍能下载并解出原文。
 - `attachment_transport::node_errors_keep_their_stable_codes`：设备配额只够一份附件时第二份被 `QUOTA_EXCEEDED` 拒绝；签名钥错误时保留鉴权类冻结码；错误文本不含内容。
 
 已知限制（本切片不覆盖）：
 
-1. **节点块上限 < 客户端分块**：节点 `BlobPolicy::max_chunk_bytes` 默认 32 KiB、硬上限 60 KiB，而客户端附件分块是 256 KiB 明文（密文 +29）。因此**只有单块附件（密文 ≤ 策略上限）能走通**；多块附件会被节点以 `CONTENT_TOO_LARGE` 显式拒绝（本层不隐藏、不篡改）。要打通多块，需要 node 侧提高块上限或客户端改用更小分块参数（两者都不在本任务写入范围）。
+1. **节点块上限已对齐客户端分块（后续任务修正）**：节点 `BlobPolicy` 现在提供 `CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES`（256 KiB + 29 字节封装开销），默认 `max_chunk_bytes` 1 MiB、硬上限 4 MiB，且编译期断言 `DEFAULT_BLOB_CHUNK_BYTES >= CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES`。因此 256 KiB 分块的多块附件可以真正发布（用例 `multi_chunk_attachments_pass_the_node_chunk_policy_and_publish`）；本层的 `chunk_bytes` 换算不变，若节点策略再次收紧，该用例会立刻变红。
 2. **断链时无“部分进度>0”的真实场景**：单块附件在第一次块写入前就失败（transferred = 0）；真正的“已发 2 块后失败”由编排层单元测试（假端口）覆盖。多块场景受限制 1 阻断。
 3. **没有取消/超时的网络流句柄**：`cancel_transfer` 只改本地状态，进行中的 HTTP 请求不会被中断（与编排层记录的限制一致）。
 4. **下载仍要求进程内 FileKey**：跨进程/重启的下载需要 E2EE SecretDescriptor（未实现），因此“节点重启后下载”用例保持同一个客户端 store 句柄。
 5. **一个 transport 绑定一个群 + 一条 source 条目**：多附件（不同 source seq）需要按消息构造 transport 或多绑定表；本轮按“一消息一附件一组”的切片构造。
 6. **节点授权需先有本设备的已接受日志条目**：附件上传前必须已有一条本设备条目（测试用 append 真实写入），不存在“先传附件再发消息”的路径。
 
-2. **进度不落盘**：附件表没有进度列，`transferred_chunks` 只在进程内；重启后重试从头重发（同序号同字节，端口侧幂等）。验收项“重启从位图续传”因此未勾选。
-3. **下载不写本地加密缓存**：本轮直接认证解密写到目标路径（不重新加密入缓存），因此下载后不能离线 `export_attachment`；“只拉缺块”的位图也未实现。
-4. **FileKey 仍只在进程内**：下载与导出都要求“本进程导入过”，E2EE SecretDescriptor（含 FileKey 的受保护记录）与下载能力令牌/CAPABILITY_EXPIRED 仍未实现。
-5. **取消与传输的竞争**：`cancel_transfer` 会把状态置 cancelled；若此时上传/下载已在进行，端口调用不会被中断（没有网络流句柄），完成回写会因白名单拒绝而显式失败（cancelled 是终态）。
-6. **节点侧“同块只计一次配额”**属于 NODE-013 的记账，本层只保证重发同一字节。
+## 附件上传/下载接 FFI（ATT-U，2026-10-18，Windows x64）
+
+代码：[crates/ffi/src/attachments_ffi.rs](../../crates/ffi/src/attachments_ffi.rs)（UniFFI 薄封装）+ [crates/core/src/attachment_node.rs](../../crates/core/src/attachment_node.rs)（装配：持久身份 → 设备凭据 → `NodeBlobTransport` → ATTACHMENTS-003/005 编排）；
+测试：[crates/ffi/tests/attachment_node.rs](../../crates/ffi/tests/attachment_node.rs)（5 个，真 axum 节点 + 临时持久库）。
+
+### 公开面（Kotlin 侧可见）
+
+~~~text
+// 持久后端：正式加密库（attachments 表 + 持久身份）+ 加密缓存目录
+AttachmentFfi::open(database_path, master_key_hex, cache_root) -> Arc<AttachmentFfi>
+// 旧的内存后端（保留兼容）：只有 import/status/export/cancel，upload/download 显式失败
+AttachmentFfi::new(cache_root) -> Arc<AttachmentFfi>
+
+upload(attachment_id, endpoint_url, node_id, node_public_key_hex?, group_id, source_seq) -> AttachmentView
+download(blob_id, target_path, endpoint_url, node_id, node_public_key_hex?, group_id, source_seq) -> AttachmentDownloadView
+~~~
+
+- `AttachmentView` 新增 `transferred_chunks`（已传块数，失败后保留；不是协议确认）；
+- `AttachmentDownloadView { attachment_id, written_bytes, content_digest }`；
+- 设备签名钥由库里的**持久身份**派生（`load_identity_seeds` → `signing_key_from_seed`，与 send 链路同一条路径），FFI **不接受任何种子/口令入参**；
+- `group_id`/`source_seq` 是 NODE-012 的上传授权关联（本设备已接受条目）；下载只需凭据（NODE-015），但端口构造仍要求两参数合法。
+
+### 状态与错误（真实迁移，不伪造）
+
+- 状态走 storage 白名单 `imported → uploading → available`；成功后 `state = "available"`、`available_chunks = chunk_count`；
+  失败保留本地缓存与进度、状态停在 `uploading` 可重试；已 `available` 时重复上传是**幂等无操作（零发送）**。
+- 错误码全部冻结：`INVALID_TARGET` / `INVALID_SIGNATURE` / `GROUP_NOT_FOUND` / `PERMISSION_DENIED` /
+  `ATTACHMENT_NOT_FOUND` / `ATTACHMENT_CORRUPTED` / `ATTACHMENT_KEY_UNAVAILABLE` / `NODE_UNAVAILABLE` /
+  `QUOTA_EXCEEDED` / `CONTENT_TOO_LARGE` / `INVALID_STATE_TRANSITION`（内存后端调用 upload/download）。
+
+复现命令（全程离线；节点在进程内起真 axum 服务，loopback）：
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi --test attachment_node   # 5 passed
+cargo test --offline -p chat-ffi -p chat-core             # 30 + 81 passed（既有 25 / 81 继续通过）
+~~~
+
+证据：
+
+- `attachment_node::upload_reaches_the_node_and_download_returns_the_original_bytes`：导入 → 上传（`available`）→ 从**节点**下载并认证解密，写出字节与原文逐字节一致、回执摘要一致；重开对象后状态仍 `available`；另一实例下载 → `ATTACHMENT_KEY_UNAVAILABLE` 且不产生文件。
+- `attachment_node::repeated_upload_is_idempotent_and_sends_nothing`：上传成功后**关掉节点**再上传 → 仍 `available`（幂等路径零发送）。
+- `attachment_node::wrong_credentials_and_unknown_groups_fail_explicitly`：未知群 / 非本设备 `source_seq` / 坏端点 / 坏公钥 / 设备未在节点注册，全部显式失败，状态不会被标成 `available`。
+- `attachment_node::in_memory_object_refuses_upload_and_download`：内存后端 → `INVALID_STATE_TRANSITION`。
+- `attachment_node::download_without_a_record_is_rejected`：未知附件 → `ATTACHMENT_NOT_FOUND`，不写文件。
+
+### 已知限制
+
+1. **跨进程/跨实例下载**需要 E2EE SecretDescriptor（FileKey 不落盘），当前显式 `ATTACHMENT_KEY_UNAVAILABLE`；本轮用例因此用“导入同一实例下载”证明往返，并单独断言“另一实例诚实失败”。
+2. **节点块上限已对齐客户端分块**：默认 1 MiB（硬上限 4 MiB）≥ 客户端 256 KiB 密文块，因此多块附件也能上传；见上文节点块传输适配记录与 `multi_chunk_attachments_pass_the_node_chunk_policy_and_publish`。
+3. `AttachmentFfi::open` 的库是**独占单写者**：与 `ConversationCore`/`LocalStoreFfi` 不能同时打开同一库，调用方需先关闭另一个对象。
+4. 上传/下载是同步阻塞调用（FFI `Mutex` 串行化），大文件不要在 UI 线程直接跑。
+5. `Cargo.lock` 变化：`chat-ffi` 新增 dev-dependencies（`chat-node-api`/`chat-node-client`/`chat-node-services`/`axum`/`tokio`/`ed25519-dalek`）供端到端用例起真节点；这些包在锁文件中已存在，无版本变动。
+
+
 
 

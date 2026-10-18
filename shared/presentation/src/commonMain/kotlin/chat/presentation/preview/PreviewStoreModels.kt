@@ -40,6 +40,12 @@ data class PreviewStoreState(
     val nextEventSeq: Long = 0,
     /** 事件窗口溢出时界面必须整体重查。 */
     val resyncRequired: Boolean = false,
+    /** 发送节点配置（只保存，不联网）。 */
+    val sendNodeUrl: String = "",
+    val sendNodeId: String = "",
+    val sendNodePublicKey: String = "",
+    /** 最近一次发送步骤结果（真实状态，不含正文）。 */
+    val sendStep: chat.api.SendStep? = null,
 )
 
 fun PreviewStoreState.opened(databasePath: String, notice: String): PreviewStoreState = copy(
@@ -156,3 +162,23 @@ fun PreviewStoreState.withCancel(result: chat.api.DraftCancelOutcome): PreviewSt
         lastErrorCode = if (result.outcome == "cancel_too_late" || result.outcome == "cancel_unknown") null else null,
     )
 }
+
+fun PreviewStoreState.updateSendNodeUrl(value: String): PreviewStoreState = copy(sendNodeUrl = value)
+
+fun PreviewStoreState.updateSendNodeId(value: String): PreviewStoreState = copy(sendNodeId = value)
+
+fun PreviewStoreState.updateSendNodePublicKey(value: String): PreviewStoreState = copy(sendNodePublicKey = value)
+
+/** 记录一次真实发送步骤结果；文案严格按 settled/status 区分"已接受/待对账/失败"。 */
+fun PreviewStoreState.withSendStep(step: chat.api.SendStep): PreviewStoreState = copy(
+    busy = false,
+    sendStep = step,
+    notice = when {
+        step.status == "accepted" -> "节点已接受（提交 " + (step.submissionId ?: "?") + "）"
+        step.status == "unknown" || !step.settled -> "结果未确定：只能对账，不要重发。"
+        step.status == "rejected" -> "被节点拒绝，可按提示重试。"
+        step.status == "prepared" || step.status == "submitted" -> "已加密待提交（尝试 " + (step.attemptIndex ?: 0) + "）"
+        else -> step.detail
+    },
+    lastErrorCode = null,
+)

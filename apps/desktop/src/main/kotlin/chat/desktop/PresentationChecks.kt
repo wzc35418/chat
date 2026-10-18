@@ -11,6 +11,7 @@ import chat.api.IdentityInviteSummary
 import chat.api.StoredConversation
 import chat.api.StoredDraft
 import chat.api.LocalAttachment
+import chat.api.SendStep
 import chat.api.StoredDraftStatus
 import chat.presentation.display.toBadge
 import chat.api.StoredMessage
@@ -94,6 +95,7 @@ import chat.presentation.preview.selecting
 import chat.presentation.preview.withConversations
 import chat.presentation.preview.withDraft
 import chat.presentation.preview.withDraftStatus
+import chat.presentation.preview.withSendStep
 import chat.presentation.preview.withError
 import chat.presentation.preview.withMessages
 import chat.presentation.preview.addSampleMessage
@@ -144,6 +146,7 @@ fun main() = runBlocking {
     checkStorePanelState()
     checkDraftStatusProjection()
     checkAttachmentBadges()
+    checkSendStepProjection()
     checkPreviewStates()
     checkPreviewInviteValidation()
     checkConversationDisplayMerger()
@@ -395,6 +398,36 @@ private fun checkErrorPresentation() {
     val nonRetryableStorage = presentError(CoreFailure("STORAGE_FAILURE", false, null, null))
     check(nonRetryableStorage.action == ErrorAction.NONE)
     println("PASS DS-04 known/unknown/non-retryable error mapping")
+}
+
+private fun checkSendStepProjection() {
+    fun step(status: String, settled: Boolean, submissionId: String? = "sub-1") = SendStep(
+        draftId = "draft-" + "ab".repeat(16),
+        status = status,
+        submissionId = submissionId,
+        attemptIndex = 0,
+        detail = "静态说明",
+        settled = settled,
+    )
+
+    var state = PreviewStoreState().opened("/tmp/demo.db", "opened")
+    state = state.withSendStep(step("accepted", settled = true))
+    check(state.notice?.contains("节点已接受") == true)
+    check(state.sendStep?.settled == true)
+
+    state = state.withSendStep(step("unknown", settled = false))
+    check(state.notice?.contains("只能对账") == true) { "未知结果必须提示只对账，不能提示成功" }
+
+    state = state.withSendStep(step("rejected", settled = true))
+    check(state.notice?.contains("拒绝") == true)
+
+    state = state.withSendStep(step("prepared", settled = true))
+    check(state.notice?.contains("已加密待提交") == true) { "prepared 不得显示为已接受" }
+
+    state = state.withSendStep(step("submitted", settled = false))
+    check(state.notice?.contains("只能对账") == true)
+
+    println("PASS send steps: accepted/unknown/rejected/prepared map to honest labels (unknown never claims success)")
 }
 
 private fun checkAttachmentBadges() {
