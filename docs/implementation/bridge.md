@@ -907,6 +907,37 @@ cargo test --offline -p chat-ffi                   # 42 passed（既有 39 继�
 5. `node_public_key_hex` 必填（运行时拒绝未固定节点公钥的配置）。
 6. 本对象只暴露 start/stop/status，不含待办队列/重试策略（那属 core 运行时内部）。
 
+## 自移除提案编排 FFI（GroupFfi.group_prepare_leave / group_process_proposal / group_commit_proposals，2026-10-18）
+
+~~~text
+group_prepare_leave(group_id) -> LeaveProposalFfi
+group_process_proposal(group_id, epoch, sender_identity, payload: Vec<u8>) -> ProposalViewFfi
+group_commit_proposals(group_id) -> GroupViewFfi
+
+LeaveProposalFfi { group_id, base_epoch, epoch, removed, has_welcome, proposal: Vec<u8>,
+                   proposal_digest, leaving_at_ms, state_version }
+ProposalViewFfi  { kind, by, epoch, targets, proposals_pending }
+~~~
+
+- 全部纯数据（提案字节可转发，无密钥）；`GroupViewFfi` 新增 `dissolved / dissolved_at_ms / left_at_ms / leaving_at_ms`。
+- 设备照旧用 `load_group_device` 从持久库恢复；错误码沿用 groups 的冻结码。
+- 测试：[crates/ffi/tests/groups_proposal_ffi.rs](../../crates/ffi/tests/groups_proposal_ffi.rs)（3 个，真双设备两库，全程经 FFI）。
+
+错误码：`PERMISSION_DENIED`（群主发起）、`INVALID_STATE_TRANSITION`（已解散/重复发起/已有 pending）、
+`STALE_EPOCH` / `MISSING_LOG_ENTRIES`（乱序）、`INVALID_CIPHERTEXT`（作者不符）、
+`NO_PENDING_PROPOSALS` / `PENDING_COMMIT_EXISTS`、`INVALID_CANDIDATE`（空 payload）。
+
+已知限制：提案字节需由上层转发（本轮不投递）；一个对象同时只允许一条 pending 提交；
+对端处理提案后仍需本机处理那条 Commit 才会 `self_removed`。
+
+复现命令：
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi --test groups_proposal_ffi   # 3 passed
+cargo test --offline -p chat-core -p chat-ffi                  # 170 + 45 passed
+~~~
+
 
 
 

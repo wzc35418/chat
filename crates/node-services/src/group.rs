@@ -5,8 +5,9 @@
 //! 各自是单个 IMMEDIATE 事务；崩溃只会回滚整个事务，不会留下半条日志。
 //! 节点不读 MLS 明文，只做公开元数据校验；安全校验失败一律显式返回错误。
 use chat_protocol::{
-    CandidateKind, ControlHead, ControlMetadata, ControlOperation, Digest, GroupId, DeviceId,
-    ProtocolVersion, SubmissionId, UnsignedCandidate, candidate_signing_bytes, receipt_signing_bytes,
+    CandidateKind, ControlHead, ControlMetadata, ControlOperation, Digest, DomainOperation,
+    DomainOperationDeclaration, GroupId, DeviceId, ProtocolVersion, SubmissionId, UnsignedCandidate,
+    candidate_signing_bytes, receipt_signing_bytes,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -218,11 +219,85 @@ impl GroupRegistration {
 }
 
 /// 候选附带的公开控制元数据（不含群名等正文）。
+///
+/// 刻意保持**两个字段**：扩散的传输结构（node-api / core / 测试）都按字面量构造它，
+/// 加字段会撕裂不在本包写作用域的调用点。领域操作声明因此走**传输层的可选字段**
+/// `CandidateDomainOperation`（见下），最终仍被折叠进 PROTOCOL-004 的字段 55/56 参与签名。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateControlMetadata {
     /// invite/remove/set_role/set_muted/rename/transfer_ownership/leave/dissolve。
     pub operation: String,
     pub target_digest: String,
+}
+
+/// 领域操作声明（PROTOCOL-004 字段 55/56 的**传输层**形态）。
+///
+/// 它不在 `control_metadata` 里，而是作为候选请求的可选字段传入；节点会把它折叠进
+/// `ControlMetadata.domain_operation` 再算签名原文与候选摘要——因此“只改声明不改签名”会验签失败。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateDomainOperation {
+    /// 领域操作文本：set_role / transfer_ownership / leave_self / dissolve（白名单）。
+    #[serde(alias = "domainOperation")]
+    pub operation: String,
+    /// 目标摘要（非零 32 字节 hex）。
+    #[serde(alias = "domainTargetDigest")]
+    pub target_digest: String,
+}
+
+impl CandidateDomainOperation {
+    /// 解析成协议枚举 + 目标摘要；未知文本/非法 hex/全零都显式 `INVALID_CANDIDATE`。
+    pub fn to_declaration(&self) -> NodeResult<DomainOperationDeclaration> {
+        let operation = domain_operation(&self.operation)?;
+        // 长度/非法 hex 与“未知枚举”同属声明不合法 → 统一 INVALID_CANDIDATE。
+        let target_digest = Digest::from_bytes(
+            hex_decode::<32>("domain target digest", &self.target_digest)
+                .map_err(|_| NodeError::InvalidCandidate)?,
+        );
+        if target_digest == Digest::ZERO {
+            return Err(NodeError::InvalidCandidate);
+        }
+        Ok(DomainOperationDeclaration {
+            operation,
+            target_digest,
+        })
+    }
+}
+
+/// 领域操作文本 → 协议枚举（白名单；未知文本显式 INVALID_CANDIDATE）。
+fn domain_operation(value: &str) -> NodeResult<DomainOperation> {
+    match value {
+        "set_role" => Ok(DomainOperation::SetRole),
+        "transfer_ownership" => Ok(DomainOperation::TransferOwnership),
+        "leave_self" => Ok(DomainOperation::LeaveSelf),
+        "dissolve" => Ok(DomainOperation::Dissolve),
+        _ => Err(NodeError::InvalidCandidate),
+    }
+}
+
+/// 协议枚举 → 节点侧稳定文本（写入日志元数据投影）。
+pub fn domain_operation_text(operation: DomainOperation) -> &'static str {
+    match operation {
+        DomainOperation::SetRole => "set_role",
+        DomainOperation::TransferOwnership => "transfer_ownership",
+        DomainOperation::LeaveSelf => "leave_self",
+        DomainOperation::Dissolve => "dissolve",
+    }
+}
+
+/// 领域声明与公开控制操作的合法组合（与 PROTOCOL-004 `validate_domain_declaration` 同规则）。
+fn domain_pairing_is_valid(operation: ControlOperation, domain: DomainOperation) -> bool {
+    match domain {
+        DomainOperation::SetRole => operation == ControlOperation::SetRole,
+        // MLS 把转让表达为 SelfUpdate（公开层 set_role）；直连路径也可能直接给 transfer。
+        DomainOperation::TransferOwnership => {
+            matches!(
+                operation,
+                ControlOperation::SetRole | ControlOperation::TransferOwnership
+            )
+        }
+        DomainOperation::LeaveSelf => operation == ControlOperation::Leave,
+        DomainOperation::Dissolve => operation == ControlOperation::Dissolve,
+    }
 }
 
 /// 传输层候选字段（文本形式，具体规范编码由 PROTOCOL-004 冻结）。
@@ -257,8 +332,20 @@ fn control_operation(value: &str) -> NodeResult<ControlOperation> {
 }
 
 impl GroupCandidate {
-    /// 转换到协议层候选：解析规范 ID、校验密文上限与控制元数据一致性。
+    /// 转换到协议层候选（不含领域操作声明；旧客户端字节完全不变）。
     pub fn to_unsigned(&self, max_ciphertext: usize) -> NodeResult<UnsignedCandidate> {
+        self.to_unsigned_with_domain(max_ciphertext, None)
+    }
+
+    /// 转换到协议层候选，并把可选的领域操作声明折叠进 PROTOCOL-004 的字段 55/56。
+    ///
+    /// 声明与公开 `control_metadata` 的组合必须合法（非法组合 → `INVALID_CANDIDATE`）；
+    /// 声明只能出现在 `kind = control` 的候选上。旧调用方传 `None` 时与旧行为逐字节一致。
+    pub fn to_unsigned_with_domain(
+        &self,
+        max_ciphertext: usize,
+        domain: Option<&CandidateDomainOperation>,
+    ) -> NodeResult<UnsignedCandidate> {
         let kind = match self.kind.as_str() {
             KIND_APPLICATION => CandidateKind::Application,
             KIND_CONTROL => CandidateKind::Control,
@@ -267,16 +354,31 @@ impl GroupCandidate {
         validate_timestamp("policy version", self.policy_version)?;
         validate_timestamp("mls epoch", self.mls_epoch)?;
         let control_metadata = match &self.control_metadata {
-            Some(metadata) => Some(ControlMetadata {
-                operation: control_operation(&metadata.operation)?,
-                target_digest: Digest::from_bytes(hex_decode::<32>(
-                    "control target digest",
-                    &metadata.target_digest,
-                )?),
-                // 节点接收路径暂不解析领域操作声明（PROTOCOL-004 的 55/56 由客户端声明）。
-                domain_operation: None,
-            }),
-            None => None,
+            Some(metadata) => {
+                let operation = control_operation(&metadata.operation)?;
+                let mut resolved = ControlMetadata::new(
+                    operation,
+                    Digest::from_bytes(hex_decode::<32>(
+                        "control target digest",
+                        &metadata.target_digest,
+                    )?),
+                );
+                if let Some(declaration) = domain {
+                    let declaration = declaration.to_declaration()?;
+                    if !domain_pairing_is_valid(operation, declaration.operation) {
+                        return Err(NodeError::InvalidCandidate);
+                    }
+                    resolved = resolved.with_domain_operation(declaration);
+                }
+                Some(resolved)
+            }
+            None => {
+                // 应用候选不携带控制元数据，也就不可能声明领域操作。
+                if domain.is_some() {
+                    return Err(NodeError::InvalidCandidate);
+                }
+                None
+            }
         };
         Ok(UnsignedCandidate {
             protocol_version: ProtocolVersion {
@@ -303,6 +405,35 @@ impl GroupCandidate {
             )?,
             control_metadata,
         })
+    }
+}
+
+impl SignedCandidate {
+    /// 节点日志里的领域操作投影（标准化文本 + 规范化目标摘要 hex）；未声明返回 `None`。
+    ///
+    /// 组合合法性已在 `GroupCandidate::to_unsigned_with_domain` 校验；这里再核一次
+    /// （投影写进日志列，宁可重复校验也不写一条与公开操作不符的语义）。
+    pub fn domain_projection(
+        &self,
+        domain: Option<&CandidateDomainOperation>,
+    ) -> NodeResult<Option<(String, String)>> {
+        let Some(domain) = domain else {
+            return Ok(None);
+        };
+        let declaration = domain.to_declaration()?;
+        let metadata = self
+            .candidate
+            .control_metadata
+            .as_ref()
+            .ok_or(NodeError::InvalidCandidate)?;
+        let operation = control_operation(&metadata.operation)?;
+        if !domain_pairing_is_valid(operation, declaration.operation) {
+            return Err(NodeError::InvalidCandidate);
+        }
+        Ok(Some((
+            domain_operation_text(declaration.operation).to_owned(),
+            hex_encode(declaration.target_digest.as_bytes()),
+        )))
     }
 }
 
@@ -466,6 +597,12 @@ impl SignedLogHead {
 pub struct LogEntry {
     pub candidate: SignedCandidate,
     pub receipt: AppendResult,
+    /// 节点侧的领域操作投影（PROTOCOL-004 字段 55 的文本形式）；未声明为 `None`。
+    #[serde(default)]
+    pub domain_operation: Option<String>,
+    /// 领域操作目标摘要（小写 hex）；未声明为 `None`。
+    #[serde(default)]
+    pub domain_target_digest: Option<String>,
 }
 
 /// 一页日志 + 签名 head + 位置。
@@ -754,7 +891,23 @@ impl NodeService {
         actor: &AuthenticatedDevice,
         now: u64,
     ) -> NodeResult<AppendResult> {
-        self.append_group_entry_with_checkpoint(group, candidate, actor, now, |_| {})
+        self.append_group_entry_inner(group, candidate, None, actor, now, |_| {})
+    }
+
+    /// NODE-006：带**可选领域操作声明**的追加（PROTOCOL-004 字段 55/56）。
+    ///
+    /// 声明参与作者签名原文与候选摘要（因此“只改声明不改签名”会 `INVALID_SIGNATURE`），
+    /// 并写入日志条目的元数据投影：`group_log.domain_operation` / `domain_target_digest`，
+    /// 读日志时通过 `LogEntry.domain_operation` 暴露。旧客户端不传 → 行为与旧路径逐字节一致。
+    pub fn append_group_entry_with_domain(
+        &mut self,
+        group: &str,
+        candidate: &SignedCandidate,
+        domain: Option<&CandidateDomainOperation>,
+        actor: &AuthenticatedDevice,
+        now: u64,
+    ) -> NodeResult<AppendResult> {
+        self.append_group_entry_inner(group, candidate, domain, actor, now, |_| {})
     }
 
     /// 与 [`Self::append_group_entry`] 完全一致，只是允许注入崩溃/审计检查点。
@@ -770,6 +923,19 @@ impl NodeService {
         now: u64,
         checkpoint: impl Fn(AppendCheckpoint),
     ) -> NodeResult<AppendResult> {
+        self.append_group_entry_inner(group, candidate, None, actor, now, checkpoint)
+    }
+
+    /// 追加路径的唯一实现：可选领域声明在**验签之前**参与签名原文重建。
+    fn append_group_entry_inner(
+        &mut self,
+        group: &str,
+        candidate: &SignedCandidate,
+        domain: Option<&CandidateDomainOperation>,
+        actor: &AuthenticatedDevice,
+        now: u64,
+        checkpoint: impl Fn(AppendCheckpoint),
+    ) -> NodeResult<AppendResult> {
         validate_timestamp("now", now)?;
         validate_bounded_id("group id", group, MAX_GROUP_ID_BYTES)?;
         let group_key = GroupId::parse(group).map_err(|_| NodeError::InvalidRequest("group id"))?;
@@ -781,10 +947,21 @@ impl NodeService {
             return Err(NodeError::PermissionDenied);
         }
         let author_key = self.registered_device_key(&actor.device_id)?;
-        candidate.verify_author(&author_key, max_ciphertext)?;
-        let candidate_hash = candidate.candidate_hash(max_ciphertext)?;
+        // 签名原文与候选摘要都按“含领域声明”的形态重建：只改声明不改签名 → 验签失败。
+        let unsigned = candidate
+            .candidate
+            .to_unsigned_with_domain(max_ciphertext, domain)?;
+        let signing_bytes = candidate_signing_bytes(&unsigned)
+            .map_err(|_| NodeError::InvalidCandidate)?;
+        let signature = hex_decode::<64>("author signature", &candidate.author_signature)?;
+        verify_ed25519(&author_key, signing_bytes.as_bytes(), &signature, || {
+            NodeError::InvalidSignature
+        })?;
+        let candidate_hash = sha256(signing_bytes.as_bytes());
         let submission_id = candidate.candidate.submission_id.clone();
         let kind = candidate.candidate.kind.clone();
+        // 领域操作投影（PROTOCOL-004 字段 55/56）：非法声明在写库之前就失败。
+        let domain_projection = candidate.domain_projection(domain)?;
         let declared_control_head = hex_decode::<32>(
             "expected control head",
             &candidate.candidate.expected_control_head,
@@ -868,8 +1045,9 @@ impl NodeService {
         tx.execute(
             "INSERT INTO group_log
                  (group_id, group_seq, submission_id, author_device_id, kind, candidate_hash,
-                  previous_hash, log_hash, immutable_entry, signed_receipt)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  previous_hash, log_hash, immutable_entry, signed_receipt,
+                  domain_operation, domain_target_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 group,
                 to_i64("seq", seq)?,
@@ -880,7 +1058,9 @@ impl NodeService {
                 group_row.last_hash.as_slice(),
                 log_hash.as_slice(),
                 immutable_entry,
-                serde_json::to_vec(&receipt)?
+                serde_json::to_vec(&receipt)?,
+                domain_projection.as_ref().map(|(operation, _)| operation),
+                domain_projection.as_ref().map(|(_, digest)| digest)
             ],
         )?;
         checkpoint(AppendCheckpoint::AfterLogInsert);
@@ -935,7 +1115,8 @@ impl NodeService {
         let mut entries: Vec<LogEntry> = Vec::new();
         {
             let mut statement = tx.prepare(
-                "SELECT group_seq, candidate_hash, previous_hash, log_hash, immutable_entry, signed_receipt
+                "SELECT group_seq, candidate_hash, previous_hash, log_hash, immutable_entry,
+                        signed_receipt, domain_operation, domain_target_digest
                  FROM group_log
                  WHERE group_id = ?1 AND group_seq >= ?2 AND (?3 IS NULL OR group_seq < ?3)
                  ORDER BY group_seq LIMIT ?4",
@@ -963,7 +1144,14 @@ impl NodeService {
                 {
                     return Err(NodeError::StorageUnavailable);
                 }
-                entries.push(LogEntry { candidate, receipt });
+                let domain_operation: Option<String> = row.get(6)?;
+                let domain_target_digest: Option<String> = row.get(7)?;
+                entries.push(LogEntry {
+                    candidate,
+                    receipt,
+                    domain_operation,
+                    domain_target_digest,
+                });
             }
         }
         let next_after = entries
@@ -1034,7 +1222,8 @@ impl NodeService {
         let mut previous = ZERO_HASH;
         {
             let mut statement = tx.prepare(
-                "SELECT group_seq, candidate_hash, previous_hash, log_hash, immutable_entry, signed_receipt
+                "SELECT group_seq, candidate_hash, previous_hash, log_hash, immutable_entry,
+                        signed_receipt, domain_operation, domain_target_digest
                  FROM group_log WHERE group_id = ?1 ORDER BY group_seq",
             )?;
             let mut rows = statement.query([group])?;
@@ -1044,27 +1233,61 @@ impl NodeService {
                 let candidate_hash = bytes32("candidate hash", row.get(1)?)?;
                 let stored_previous = bytes32("previous hash", row.get(2)?)?;
                 let log_hash = bytes32("log hash", row.get(3)?)?;
-                let candidate: SignedCandidate = serde_json::from_slice(&row.get::<_, Vec<u8>>(4)?)?;
-                let receipt: AppendResult = serde_json::from_slice(&row.get::<_, Vec<u8>>(5)?)?;
+                let immutable_entry: Vec<u8> = row.get(4)?;
+                let signed_receipt: Vec<u8> = row.get(5)?;
+                let candidate: SignedCandidate = serde_json::from_slice(&immutable_entry)?;
+                let receipt: AppendResult = serde_json::from_slice(&signed_receipt)?;
+                receipt.verify(&snapshot.node_public_key)?;
                 if seq != expected_seq + 1 || stored_previous != previous {
                     return Err(NodeError::StorageUnavailable);
                 }
-                if candidate.candidate_hash(max_ciphertext)? != candidate_hash {
+                // 领域声明参与签名原文/链摘要：自检必须按日志里记录的声明重建，否则会误判。
+                let domain = match (
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ) {
+                    (Some(operation), Some(target_digest)) => Some(CandidateDomainOperation {
+                        operation,
+                        target_digest,
+                    }),
+                    _ => None,
+                };
+                let rebuilt = candidate
+                    .candidate
+                    .to_unsigned_with_domain(max_ciphertext, domain.as_ref())?;
+                let rebuilt_bytes = candidate_signing_bytes(&rebuilt)
+                    .map_err(|_| NodeError::InvalidCandidate)?;
+                if sha256(rebuilt_bytes.as_bytes()) != candidate_hash {
                     return Err(NodeError::StorageUnavailable);
                 }
-                if log_hash != log_chain_hash(group, seq, &previous, &candidate_hash) {
+                if receipt.seq != seq
+                    || receipt.candidate_hash != hex_encode(&candidate_hash)
+                    || receipt.previous_hash != hex_encode(&stored_previous)
+                    || receipt.log_hash != hex_encode(&log_hash)
+                    || log_hash != log_chain_hash(group, seq, &stored_previous, &candidate_hash)
+                {
                     return Err(NodeError::StorageUnavailable);
                 }
-                receipt.verify(&snapshot.node_public_key)?;
-                receipt.verify_candidate(&candidate, max_ciphertext)?;
-                if receipt.seq != seq {
-                    return Err(NodeError::StorageUnavailable);
-                }
-                expected_seq = seq;
                 previous = log_hash;
+                expected_seq = seq;
             }
         }
+        // 日志末尾必须与群行的 last_seq/last_hash 一致（否则自检结论不可信）。
         if expected_seq != group_row.last_seq || previous != group_row.last_hash {
+            return Err(NodeError::StorageUnavailable);
+        }
+        // head 必须能验签并与末尾日志/控制头一致。
+        let control = load_control(&tx, group)?.ok_or(NodeError::StorageUnavailable)?;
+        let head = build_head(
+            &snapshot,
+            group,
+            &group_row.coordinator_id,
+            group_row.last_seq,
+            &group_row.last_hash,
+            &control,
+        )?;
+        head.verify(&snapshot.node_public_key)?;
+        if head.seq != expected_seq || head.log_hash != hex_encode(&previous) {
             return Err(NodeError::StorageUnavailable);
         }
         tx.commit()?;

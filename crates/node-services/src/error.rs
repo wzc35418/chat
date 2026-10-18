@@ -9,6 +9,8 @@ use std::fmt;
 pub enum NodeError {
     /// 请求形状/字段不合法（含超长、非法字符、非法十六进制）。
     InvalidRequest(&'static str),
+    /// 候选/控制元数据本身不合法（非法组合、未知枚举、零目标摘要）。
+    InvalidCandidate,
     /// 请求正文超过上限。
     PayloadTooLarge,
     /// 未知、已用尽保留期或与节点不匹配的挑战。
@@ -97,6 +99,7 @@ impl NodeError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::InvalidRequest(_) => "INVALID_REQUEST",
+            Self::InvalidCandidate => "INVALID_CANDIDATE",
             Self::PayloadTooLarge => "PAYLOAD_TOO_LARGE",
             Self::InvalidChallenge => "INVALID_CHALLENGE",
             Self::NodeIdMismatch => "NODE_ID_MISMATCH",
@@ -156,6 +159,7 @@ impl NodeError {
             Self::PermissionDenied => "request is not authorized for this target",
             Self::ChallengeCapacityExceeded => "node challenge capacity is exhausted",
             Self::RateLimited { .. } => "rate limited",
+            Self::InvalidCandidate => "candidate or control metadata is not valid",
             Self::GroupNotFound => "group is unknown to this node",
             Self::GroupIdConflict => "group id was already registered with other content",
             Self::GroupCapacityExceeded => "group member capacity exceeded",

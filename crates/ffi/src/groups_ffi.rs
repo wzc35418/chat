@@ -153,6 +153,14 @@ pub struct GroupViewFfi {
     pub pending: Option<GroupPendingFfi>,
     /// 最近一次被丢弃控制提交的审计。
     pub last_control_cleared: Option<GroupClearedFfi>,
+    /// 群是否已解散（解散后所有治理都会显式失败）。
+    pub dissolved: bool,
+    /// 解散时间（Unix 毫秒；未解散为 `None`）。
+    pub dissolved_at_ms: Option<i64>,
+    /// 本机退出时间（Unix 毫秒；未退出为 `None`）。
+    pub left_at_ms: Option<i64>,
+    /// 本机已提交自移除提案的时间（Unix 毫秒；未提交为 `None`）。
+    pub leaving_at_ms: Option<i64>,
 }
 
 fn member_view(member: &GroupMemberView) -> GroupMemberFfi {
@@ -204,6 +212,10 @@ fn group_view(view: GroupView) -> GroupViewFfi {
         pending_removed: view.pending_removed.iter().map(member_view).collect(),
         pending: view.pending.as_ref().map(pending_view),
         last_control_cleared: view.last_control_cleared.as_ref().map(cleared_view),
+        dissolved: view.dissolved,
+        dissolved_at_ms: view.dissolved_at_ms,
+        left_at_ms: view.left_at_ms,
+        leaving_at_ms: view.leaving_at_ms,
     }
 }
 
@@ -388,6 +400,69 @@ fn receipt_back(record: &ControlReceiptFfi) -> ControlReceiptView {
             node_public_key: record.head.node_public_key.clone(),
             signature: record.head.signature.clone(),
         },
+    }
+}
+
+
+/// 自移除提案投影（纯数据：可转发字节 + 公开绑定信息，不含密钥）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct LeaveProposalFfi {
+    /// 协议群 ID。
+    pub group_id: String,
+    /// 生成提案时的本地 epoch。
+    pub base_epoch: u64,
+    /// 当前真实 epoch（生成提案不推进 epoch）。
+    pub epoch: u64,
+    /// 预期移除的成员数（恒为 1：只有本机）。
+    pub removed: u32,
+    /// 是否携带 Welcome（恒为 false）。
+    pub has_welcome: bool,
+    /// 序列化的 MLS 提案字节（交给另一名成员提交）。
+    pub proposal: Vec<u8>,
+    /// 提案摘要（小写 hex）。
+    pub proposal_digest: String,
+    /// 本机标记离开的时间（Unix 毫秒）。
+    pub leaving_at_ms: i64,
+    /// 写入后的快照版本。
+    pub state_version: u64,
+}
+
+/// 对端独立提案的处理结果（纯数据）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ProposalViewFfi {
+    /// 提案种类（P0 控制切片恒为 `remove`）。
+    pub kind: String,
+    /// 已认证的提案作者身份。
+    pub by: String,
+    /// 提案所属 epoch。
+    pub epoch: u64,
+    /// 提案目标成员身份。
+    pub targets: Vec<String>,
+    /// 本地待提交的提案数。
+    pub proposals_pending: u32,
+}
+
+fn leave_proposal_ffi(view: &chat_core::groups::LeaveProposalView) -> LeaveProposalFfi {
+    LeaveProposalFfi {
+        group_id: view.group_id.clone(),
+        base_epoch: view.base_epoch,
+        epoch: view.epoch,
+        removed: view.removed,
+        has_welcome: view.has_welcome,
+        proposal: view.proposal.clone(),
+        proposal_digest: view.proposal_digest.clone(),
+        leaving_at_ms: view.leaving_at_ms,
+        state_version: view.state_version,
+    }
+}
+
+fn proposal_view_ffi(view: &chat_core::groups::ProposalOutcomeView) -> ProposalViewFfi {
+    ProposalViewFfi {
+        kind: view.kind.clone(),
+        by: view.by.clone(),
+        epoch: view.epoch,
+        targets: view.targets.clone(),
+        proposals_pending: view.proposals_pending,
     }
 }
 
@@ -609,5 +684,47 @@ impl GroupFfi {
             .group_accept_with_receipt(&group_id, &view)
             .map_err(|error| failure!(error))?;
         Ok(group_view(accepted))
+    }
+
+    /// GROUPS-013：本机发起自移除提案（离开群的第一步）。
+    ///
+    /// 群主必须先转让（`PERMISSION_DENIED`）；重复发起 `INVALID_STATE_TRANSITION`；
+    /// 不推进 epoch、不产生 pending 控制提交，返回可转发的提案字节。
+    pub fn group_prepare_leave(&self, group_id: String) -> Result<LeaveProposalFfi, FfiError> {
+        let mut core = self.lock()?;
+        let view = core
+            .group_prepare_leave(&group_id)
+            .map_err(|error| failure!(error))?;
+        Ok(leave_proposal_ffi(&view))
+    }
+
+    /// GROUPS-013（收侧）：处理对端独立提案（epoch 不变，提案入本地 store）。
+    pub fn group_process_proposal(
+        &self,
+        group_id: String,
+        epoch: u64,
+        sender_identity: String,
+        payload: Vec<u8>,
+    ) -> Result<ProposalViewFfi, FfiError> {
+        let input = chat_core::groups::ProposalEntryInput::new(
+            group_id,
+            epoch,
+            sender_identity,
+            payload,
+        );
+        let mut core = self.lock()?;
+        let view = core
+            .group_process_proposal(&input)
+            .map_err(|error| failure!(error))?;
+        Ok(proposal_view_ffi(&view))
+    }
+
+    /// GROUPS-013（提交侧）：把本地待提交提案打包成 pending 控制提交（epoch 不推进）。
+    pub fn group_commit_proposals(&self, group_id: String) -> Result<GroupViewFfi, FfiError> {
+        let mut core = self.lock()?;
+        let view = core
+            .group_commit_proposals(&group_id)
+            .map_err(|error| failure!(error))?;
+        Ok(group_view(view))
     }
 }

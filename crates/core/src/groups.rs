@@ -56,7 +56,7 @@ pub const GROUP_POLICY_VERSION: u32 = 1;
 ///
 /// v3：增加 `pending_removed`（已本地生效但尚未被接受合并的移除）与
 /// `last_control_cleared`（最近一次被丢弃的控制提交，CRYPTO-008）。
-const SNAPSHOT_VERSION: u8 = 4;
+const SNAPSHOT_VERSION: u8 = 5;
 /// 快照记录的 storage group_id 命名空间前缀。
 const SNAPSHOT_GROUP_PREFIX: &str = "grpmeta/";
 /// 快照记录体上限（字节）。
@@ -270,6 +270,10 @@ pub struct GroupView {
     /// 退出是**本地策略层**语义：本机已从确认成员里移除，但 MLS 叶子仍留在群里
     /// （CRYPTO-005 的自移除护栏禁止 `remove_members` 移除本机设备），需协调者移除。
     pub left_at_ms: Option<i64>,
+    /// 本机已提交**自移除提案**的时间（Unix 毫秒；未提交为 `None`）。
+    ///
+    /// 提案被对端打包成 Commit 并合并后才真正离群（那时 `self_removed` 为真）。
+    pub leaving_at_ms: Option<i64>,
 }
 
 /// 被丢弃控制提交的投影（只含公开绑定信息与稳定原因码）。
@@ -321,6 +325,9 @@ struct GroupRecord {
     /// 本机退出时间（Unix 毫秒；未退出为 0）。
     #[serde(default)]
     left_at_ms: i64,
+    /// 本机已提交自移除提案的时间（Unix 毫秒；未提交为 0）。
+    #[serde(default)]
+    leaving_at_ms: i64,
 }
 
 /// 被丢弃的控制提交（只含公开绑定信息与稳定原因码）。
@@ -375,7 +382,7 @@ impl GroupRecord {
                 "persisted group dissolve state and timestamp disagree",
             ));
         }
-        if self.left_at_ms < 0 {
+        if self.left_at_ms < 0 || self.leaving_at_ms < 0 {
             return Err(GroupError::corrupted(
                 "persisted group has a negative leave timestamp",
             ));
@@ -703,6 +710,7 @@ fn project(
         dissolved: record.dissolved,
         dissolved_at_ms: (record.dissolved_at_ms > 0).then_some(record.dissolved_at_ms),
         left_at_ms: (record.left_at_ms > 0).then_some(record.left_at_ms),
+        leaving_at_ms: (record.leaving_at_ms > 0).then_some(record.leaving_at_ms),
         last_control_cleared: record
             .last_control_cleared
             .as_ref()
@@ -917,6 +925,7 @@ pub fn create_group_with_welcome(
         dissolved: false,
         dissolved_at_ms: 0,
         left_at_ms: 0,
+        leaving_at_ms: 0,
     };
     record.validate()?;
     // 建群时先自检策略快照不变量（全零头 + 唯一群主）。
@@ -1678,6 +1687,7 @@ pub fn group_join_from_welcome(
         dissolved: false,
         dissolved_at_ms: 0,
         left_at_ms: 0,
+        leaving_at_ms: 0,
     };
     record.validate()?;
     let _ = domain_snapshot(&record)?;
@@ -1844,6 +1854,275 @@ pub fn dissolve_group(
     record.validate()?;
     let saved = persist_snapshot(store, &record, record.mls_epoch)?;
     Ok(project(&record, record.mls_epoch, None, saved))
+}
+/// 自移除提案的投影（只含可转发字节与公开绑定信息）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaveProposalView {
+    /// 协议群 ID。
+    pub group_id: String,
+    /// 生成提案时的本地 epoch（提案必须在该 epoch 被提交覆盖）。
+    pub base_epoch: u64,
+    /// 当前真实 epoch（生成提案不推进 epoch）。
+    pub epoch: u64,
+    /// 预期移除的成员数（恒为 1：只有本机）。
+    pub removed: u32,
+    /// 是否携带 Welcome（恒为 false）。
+    pub has_welcome: bool,
+    /// 序列化的 MLS 提案字节（交给另一名成员提交）。
+    pub proposal: Vec<u8>,
+    /// 提案摘要（小写 hex，绑定 group/base_epoch/提案字节）。
+    pub proposal_digest: String,
+    /// 本机标记离开的时间（Unix 毫秒）。
+    pub leaving_at_ms: i64,
+    /// 写入后的快照版本。
+    pub state_version: u64,
+}
+
+/// 对端独立提案的输入（外层已验证的公开绑定字段）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalEntryInput {
+    /// 协议群 ID。
+    pub group_id: String,
+    /// 外层已验证的条目 epoch（必须等于本机快照 epoch）。
+    pub epoch: u64,
+    /// 外层已验证的作者凭据身份。
+    pub sender_identity: String,
+    /// MLS 提案字节。
+    pub payload: Vec<u8>,
+}
+
+impl ProposalEntryInput {
+    /// 构造输入。
+    pub fn new(
+        group_id: impl Into<String>,
+        epoch: u64,
+        sender_identity: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            group_id: group_id.into(),
+            epoch,
+            sender_identity: sender_identity.into(),
+            payload,
+        }
+    }
+}
+
+/// 对端独立提案的处理结果（epoch 不变）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalOutcomeView {
+    /// 提案种类（P0 控制切片恒为 `remove`）。
+    pub kind: String,
+    /// 已认证的提案作者身份。
+    pub by: String,
+    /// 提案所属 epoch。
+    pub epoch: u64,
+    /// 提案目标成员身份（自移除提案的目标就是作者本机）。
+    pub targets: Vec<String>,
+    /// 本地 proposal store 里待提交的提案数。
+    pub proposals_pending: u32,
+    /// 处理后的群投影（epoch 不变）。
+    pub view: GroupView,
+}
+
+/// GROUPS-013：本机发起"自移除提案"（离开群的第一步）。
+///
+/// 为什么是提案而不是提交：MLS 1.0 禁止一条 Commit 移除提交者自己，唯一合法的自移除原语是
+/// "本机对自己发起 Remove 提案，再由群里另一名成员把提案包进 Commit"。
+///
+/// 语义：
+/// - 群主必须先转让群主，否则 `PERMISSION_DENIED`；
+/// - 已解散 `INVALID_STATE_TRANSITION`；本机已发起过自移除提案 `INVALID_STATE_TRANSITION`；
+/// - 有未决控制提交时拒绝（语义与 crypto 的 `PENDING_COMMIT_EXISTS` 一致）；
+/// - 生成提案**不推进 epoch、不产生 pending 控制提交**，本机仍在群里（能收发），
+///   并被标记 `leaving_at_ms`（快照如实报告）；
+/// - 返回可转发的提案字节；对端处理后由对端 `group_commit_proposals` 打包成 Commit。
+pub fn group_prepare_leave(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    group_id: &str,
+) -> GroupResult<LeaveProposalView> {
+    let (mut record, _) = load_record(store, group_id)?;
+    reject_dissolved(&record)?;
+    if record.leaving_at_ms > 0 {
+        return Err(GroupError::new(
+            "INVALID_STATE_TRANSITION",
+            "a self-removal proposal is already pending for this device",
+        ));
+    }
+    if record.left_at_ms > 0 {
+        return Err(GroupError::new(
+            "INVALID_STATE_TRANSITION",
+            "the local device has already left this group",
+        ));
+    }
+    let group_key = device
+        .group_key()
+        .map_err(|_| GroupError::invalid_target("the local device has no MLS group"))?;
+    if group_key != record.mls_group_key {
+        return Err(GroupError::invalid_target(
+            "the local device is not in this group",
+        ));
+    }
+    let epoch = device
+        .epoch()
+        .map_err(|_| GroupError::corrupted("MLS group epoch is unavailable"))?;
+    if epoch != record.mls_epoch {
+        return Err(GroupError::new(
+            "STALE_EPOCH",
+            "the local MLS epoch does not match the persisted group",
+        ));
+    }
+    let local = record
+        .members
+        .iter()
+        .find(|member| member.is_local)
+        .ok_or_else(|| GroupError::invalid_target("the local device is not a confirmed member"))?;
+    if local.role == MemberRole::Owner.as_u64() {
+        return Err(GroupError::new(
+            "PERMISSION_DENIED",
+            "the owner must transfer ownership before leaving the group",
+        ));
+    }
+    if device.pending_control().map_err(GroupError::from)?.is_some() {
+        return Err(GroupError::new(
+            "INVALID_STATE_TRANSITION",
+            "a control commit is pending; resolve it before leaving the group",
+        ));
+    }
+    let proposal = device.prepare_self_removal(store).map_err(GroupError::from)?;
+    // 生成提案不推进 epoch，也不改策略版本；只记录"本机已发起离开"。
+    record.leaving_at_ms = now_ms();
+    record.validate()?;
+    let saved = persist_snapshot(store, &record, record.mls_epoch)?;
+    Ok(LeaveProposalView {
+        group_id: record.group_id.clone(),
+        base_epoch: proposal.base_epoch,
+        epoch: epoch,
+        removed: proposal.removed,
+        has_welcome: proposal.has_welcome,
+        proposal_digest: hex_lower(&proposal.proposal_digest),
+        proposal: proposal.proposal,
+        leaving_at_ms: record.leaving_at_ms,
+        state_version: saved,
+    })
+}
+
+/// GROUPS-013（收侧）：处理对端的独立提案（CRYPTO-005 `process_proposal_entry`）。
+///
+/// - 已解散 / 群 ID / epoch 不符 / 作者与 MLS 认证作者不符 → 显式冻结码，**epoch 不变**；
+/// - 提案进入本地 proposal store（随群状态一起落库），等待后续 Commit 覆盖；
+/// - 重复提案 → `DUPLICATE_PROPOSAL`；非 Remove 提案 → `UNSUPPORTED_ENTRY`。
+pub fn group_process_proposal(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    input: &ProposalEntryInput,
+) -> GroupResult<ProposalOutcomeView> {
+    let (record, state_version) = load_record(store, &input.group_id)?;
+    reject_dissolved(&record)?;
+    let group_key = device
+        .group_key()
+        .map_err(|_| GroupError::invalid_target("the local device has no MLS group"))?;
+    if group_key != record.mls_group_key {
+        return Err(GroupError::invalid_target(
+            "the local device is not in this group",
+        ));
+    }
+    validate_credential(&input.sender_identity)?;
+    if input.payload.is_empty() {
+        return Err(GroupError::invalid_candidate("proposal payload must not be empty"));
+    }
+    if input.epoch != record.mls_epoch {
+        let code = if input.epoch < record.mls_epoch {
+            "STALE_EPOCH"
+        } else {
+            "MISSING_LOG_ENTRIES"
+        };
+        return Err(GroupError::new(
+            code,
+            "proposal epoch does not match the local snapshot",
+        ));
+    }
+    let entry = VerifiedGroupEntry {
+        group_id: record.mls_group_key.clone(),
+        epoch: input.epoch,
+        sender_identity: input.sender_identity.clone(),
+        expectation: None,
+        payload: input.payload.clone(),
+    };
+    let outcome = device
+        .process_proposal_entry(&entry)
+        .map_err(GroupError::from)?;
+    // 提案进了 provider storage：导出到正式库才真正持久化（失败则不改变快照）。
+    device.export_to_store(store).map_err(|_| {
+        GroupError::new(
+            "STORAGE_FAILURE",
+            "the proposal could not be persisted",
+        )
+    })?;
+    let epoch = device
+        .epoch()
+        .map_err(|_| GroupError::corrupted("MLS group epoch is unavailable"))?;
+    if epoch != record.mls_epoch {
+        return Err(GroupError::corrupted(
+            "processing a proposal must not change the epoch",
+        ));
+    }
+    Ok(ProposalOutcomeView {
+        kind: outcome.kind.code().to_owned(),
+        by: outcome.by,
+        epoch: outcome.epoch,
+        targets: outcome.targets,
+        proposals_pending: outcome.proposals_pending,
+        view: project(&record, epoch, None, state_version),
+    })
+}
+
+/// GROUPS-013（提交侧）：把本地待提交提案打包成一条控制提交（CRYPTO-005
+/// `commit_pending_proposals`）。
+///
+/// - 已解散 → `INVALID_STATE_TRANSITION`；没有待提交提案 → `NO_PENDING_PROPOSALS`；
+/// - 已有 pending 控制提交 → `PENDING_COMMIT_EXISTS`；
+/// - 生成本机 pending 控制提交但**不推进 epoch**；快照如实报告 `pending`（成员不变），
+///   接受/合并之后 epoch 才前进、成员才真的减少。
+pub fn group_commit_proposals(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    group_id: &str,
+) -> GroupResult<GroupView> {
+    let (record, _) = load_record(store, group_id)?;
+    reject_dissolved(&record)?;
+    let group_key = device
+        .group_key()
+        .map_err(|_| GroupError::invalid_target("the local device has no MLS group"))?;
+    if group_key != record.mls_group_key {
+        return Err(GroupError::invalid_target(
+            "the local device is not in this group",
+        ));
+    }
+    let epoch = device
+        .epoch()
+        .map_err(|_| GroupError::corrupted("MLS group epoch is unavailable"))?;
+    if epoch != record.mls_epoch {
+        return Err(GroupError::new(
+            "STALE_EPOCH",
+            "the local MLS epoch does not match the persisted group",
+        ));
+    }
+    let pending = device
+        .commit_pending_proposals(store)
+        .map_err(GroupError::from)?;
+    // 提交只产生 pending：epoch 必须没变（crypto 已保证，这里再明确断言一次）。
+    let epoch_after = device
+        .epoch()
+        .map_err(|_| GroupError::corrupted("MLS group epoch is unavailable"))?;
+    if epoch_after != record.mls_epoch {
+        return Err(GroupError::corrupted(
+            "committing proposals must not advance the epoch",
+        ));
+    }
+    let saved = persist_snapshot(store, &record, record.mls_epoch)?;
+    Ok(project(&record, epoch_after, Some(&pending), saved))
 }
 
 

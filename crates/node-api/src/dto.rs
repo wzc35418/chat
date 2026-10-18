@@ -5,6 +5,7 @@
 use axum::http::HeaderMap;
 use chat_node_services::auth::{AuthChallenge, ChallengePurpose, SignedAuth};
 use chat_node_services::capability::{CapabilityGrant, CapabilityScope};
+use chat_node_services::group::CandidateDomainOperation;
 use chat_node_services::blob::{
     BlobReceipt, ChunkReceipt, CipherManifest, PublicBlobDescriptor, UploadSession,
 };
@@ -212,16 +213,25 @@ pub struct AppendGroupEntryRequestDto {
     pub candidate: GroupCandidate,
     /// 作者设备对 PROTOCOL-004 签名原文的 Ed25519 签名。
     pub author_signature: String,
+    /// 可选的领域操作声明（PROTOCOL-004 字段 55/56）。
+    ///
+    /// 声明参与作者签名原文：客户端必须**先按含声明的形态**算签名再提交，否则 `INVALID_SIGNATURE`。
+    /// 不传 = 旧客户端行为（字节不变）。
+    #[serde(default, alias = "domainOperation")]
+    pub domain_operation: Option<CandidateDomainOperation>,
 }
 
 impl AppendGroupEntryRequestDto {
-    /// 校验版本并转换为服务层候选。
-    pub fn into_signed(self) -> Result<SignedCandidate, ApiError> {
+    /// 校验版本并转换为服务层候选（含可选的领域操作声明）。
+    pub fn into_request(self) -> Result<(SignedCandidate, Option<CandidateDomainOperation>), ApiError> {
         check_schema_version(self.schema_version)?;
-        Ok(SignedCandidate {
-            candidate: self.candidate,
-            author_signature: self.author_signature,
-        })
+        Ok((
+            SignedCandidate {
+                candidate: self.candidate,
+                author_signature: self.author_signature,
+            },
+            self.domain_operation,
+        ))
     }
 }
 

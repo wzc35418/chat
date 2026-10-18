@@ -29,6 +29,7 @@ const MIGRATION_0002: &str = include_str!("../migrations/0002_node_auth.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_group_mailbox.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_blob_attachments.sql");
 const MIGRATION_0005: &str = include_str!("../migrations/0005_retention_capabilities.sql");
+const MIGRATION_0006: &str = include_str!("../migrations/0006_domain_operation.sql");
 const MIGRATION_CHECKSUM_SLOT: &str = ":checksum";
 
 /// 节点鉴权与注册策略。所有字段在启动时校验，不接受 0 或越界配置。
@@ -990,6 +991,28 @@ fn migrate(connection: &Connection) -> NodeResult<()> {
         }
     }
     verify_migration_checksum(connection, 5, MIGRATION_0005)?;
+    let current: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if current < 6 {
+        let sql = MIGRATION_0006.replace(MIGRATION_CHECKSUM_SLOT, &checksum(MIGRATION_0006));
+        connection
+            .execute_batch(&sql)
+            .map_err(|_| NodeError::MigrationFailed("domain operation migration failed"))?;
+        let applied: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if applied < 6 {
+            return Err(NodeError::MigrationFailed(
+                "domain operation migration did not record its version",
+            ));
+        }
+    }
+    verify_migration_checksum(connection, 6, MIGRATION_0006)?;
     Ok(())
 }
 

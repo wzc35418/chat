@@ -241,11 +241,19 @@ pub async fn append_group_entry(
 ) -> Result<Response, ApiError> {
     ensure_body_bounded(&state, body.len())?;
     let request: AppendGroupEntryRequestDto = parse_body(&body)?;
-    let candidate = request.into_signed()?;
+    let (candidate, domain) = request.into_request()?;
     let now = state.now();
     let actor = authenticate(&state, &headers, &uri, "POST", &body, now)?;
-    let result = state
-        .with_service(|service| service.append_group_entry(&group_id, &candidate, &actor, now))?;
+    // 带领域声明走 with_domain 路径（声明参与验签与日志投影）；不带则与旧行为完全一致。
+    let result = state.with_service(|service| {
+        service.append_group_entry_with_domain(
+            &group_id,
+            &candidate,
+            domain.as_ref(),
+            &actor,
+            now,
+        )
+    })?;
     Ok(Json(AppendGroupEntryResponseDto::new(result)).into_response())
 }
 

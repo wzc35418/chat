@@ -9,8 +9,8 @@ use chat_node_api::state::{AppState, Clock, FixedClock};
 use chat_node_services::auth::{ChallengePurpose, RequestMeta, AuthChallenge};
 use chat_node_services::canonical::{hex_decode, hex_encode, sha256};
 use chat_node_services::group::{
-    AppendResult, CandidateControlMetadata, GroupCandidate, GroupCreation, GroupMemberSpec,
-    GroupRegistration, KIND_APPLICATION, KIND_CONTROL, SignedGroupCreation, SignedLogHead,
+    AppendResult, CandidateControlMetadata, CandidateDomainOperation, GroupCandidate, GroupCreation,
+    GroupMemberSpec, GroupRegistration, KIND_APPLICATION, KIND_CONTROL, SignedGroupCreation, SignedLogHead,
 };
 use chat_node_services::mailbox::{AckSummary, MailboxPage, MailboxReceipt};
 use chat_node_services::registration::{
@@ -1463,7 +1463,6 @@ async fn capability_tokens_authorize_blob_chunks_over_http() {
     assert_eq!(chunk.status, 200);
     assert_eq!(chunk.body, second);
 
-    // 上传令牌不能当下载令牌用（用途不符）。
     let wrong_scope = read_chunk_with_capability(&node, 21, &blob, 0, &upload_token).await;
     assert_eq!(wrong_scope.status, 403);
     assert_eq!(wrong_scope.error_code(), "INVALID_CAPABILITY");
@@ -1527,4 +1526,144 @@ async fn capability_tokens_are_bound_to_one_object_and_one_device() {
     let bad_scope = issue_capability(&node, 21, &upload_a, "blob:delete", None).await;
     assert_eq!(bad_scope.status, 400);
     assert_eq!(bad_scope.error_code(), "INVALID_REQUEST");
+}
+
+// ---------------------------------------------------------------- DM 包领域操作声明
+
+/// 带领域声明的控制候选请求体（客户端先按含声明的形态签名）。
+fn declared_entry_body(
+    candidate: &GroupCandidate,
+    signature: &str,
+    declaration: Option<&CandidateDomainOperation>,
+) -> Vec<u8> {
+    let mut body = serde_json::json!({
+        "schema_version": 1,
+        "candidate": candidate,
+        "author_signature": signature,
+    });
+    if let Some(declaration) = declaration {
+        body["domainOperation"] = serde_json::to_value(declaration).expect("declaration json");
+    }
+    serde_json::to_vec(&body).expect("declared entry body")
+}
+
+/// 构造控制候选本身（不带签名）。
+fn control_candidate_struct(
+    group: &str,
+    author_seed: u8,
+    submission_seed: u8,
+    payload: &[u8],
+    expected_control_head: [u8; 32],
+) -> GroupCandidate {
+    GroupCandidate {
+        protocol_major: 1,
+        protocol_minor: 0,
+        submission_id: submission_text(submission_seed),
+        group_id: group.to_owned(),
+        author_device_id: device_text(author_seed),
+        kind: KIND_CONTROL.to_owned(),
+        expected_control_head: hex_encode(&expected_control_head),
+        policy_version: 1,
+        mls_epoch: 0,
+        encrypted_payload: hex_encode(payload),
+        control_metadata: Some(CandidateControlMetadata {
+            operation: "invite".into(),
+            target_digest: hex_encode(&[0x33_u8; 32]),
+        }),
+    }
+}
+
+#[tokio::test]
+async fn domain_operation_declaration_is_accepted_and_visible_in_the_log_api() {
+    let (node, group) = setup(NodeAuthPolicy::default()).await;
+    let mut candidate = control_candidate_struct(&group, 21, 251, b"sealed control commit", INITIAL_CONTROL_HEAD);
+    candidate.control_metadata = Some(CandidateControlMetadata {
+        operation: "set_role".into(),
+        target_digest: hex_encode(&[0x33_u8; 32]),
+    });
+    let declaration = CandidateDomainOperation {
+        operation: "transfer_ownership".into(),
+        target_digest: hex_encode(&[0x5a_u8; 32]),
+    };
+    let unsigned = candidate
+        .to_unsigned_with_domain(chat_protocol::MAX_CIPHERTEXT_BYTES, Some(&declaration))
+        .expect("candidate converts");
+    let signing = candidate_signing_bytes(&unsigned).expect("signing bytes");
+    let signature: Signature = device(21).sign(signing.as_bytes());
+    let body = declared_entry_body(&candidate, &hex_encode(&signature.to_bytes()), Some(&declaration));
+    let path = format!("/v1/groups/{group}/entries");
+    let headers = request_headers(&node, 21, "POST", &path, "", &body).await;
+    let appended = http(&node.address, "POST", &path, &headers, &body).await;
+    assert_eq!(
+        appended.status,
+        200,
+        "declared candidate: {}",
+        String::from_utf8_lossy(&appended.body)
+    );
+    assert_eq!(appended.json()["result"]["seq"], 1);
+
+    // 日志接口暴露节点侧投影（文本 + 目标摘要 hex）。
+    let log_path = format!("/v1/groups/{group}/log");
+    let headers = request_headers(&node, 21, "GET", &log_path, "after=0&limit=10", b"").await;
+    let page = http(&node.address, "GET", &format!("{log_path}?after=0&limit=10"), &headers, b"").await;
+    assert_eq!(page.status, 200);
+    let entry = &page.json()["page"]["entries"][0];
+    assert_eq!(entry["domain_operation"], "transfer_ownership");
+    assert_eq!(entry["domain_target_digest"], hex_encode(&[0x5a_u8; 32]));
+}
+
+#[tokio::test]
+async fn illegal_domain_operation_declarations_are_rejected() {
+    let (node, group) = setup(NodeAuthPolicy::default()).await;
+    let mut candidate = control_candidate_struct(&group, 21, 252, b"sealed", INITIAL_CONTROL_HEAD);
+    // 公开操作 invite + 声明 transfer_ownership：协议层不允许这种组合。
+    candidate.control_metadata = Some(CandidateControlMetadata {
+        operation: "invite".into(),
+        target_digest: hex_encode(&[0x33_u8; 32]),
+    });
+    let declaration = CandidateDomainOperation {
+        operation: "transfer_ownership".into(),
+        target_digest: hex_encode(&[0x5a_u8; 32]),
+    };
+    assert_eq!(
+        candidate
+            .to_unsigned_with_domain(chat_protocol::MAX_CIPHERTEXT_BYTES, Some(&declaration))
+            .expect_err("illegal combination")
+            .code(),
+        "INVALID_CANDIDATE"
+    );
+    // 未知枚举被拒。
+    let unknown = CandidateDomainOperation {
+        operation: "rotate_everything".into(),
+        target_digest: hex_encode(&[0x5a_u8; 32]),
+    };
+    assert_eq!(
+        candidate
+            .to_unsigned_with_domain(chat_protocol::MAX_CIPHERTEXT_BYTES, Some(&unknown))
+            .expect_err("unknown domain operation")
+            .code(),
+        "INVALID_CANDIDATE"
+    );
+    let _ = node;
+}
+
+#[tokio::test]
+async fn legacy_entry_requests_without_a_declaration_still_work() {
+    let (node, group) = setup(NodeAuthPolicy::default()).await;
+    let candidate = control_candidate_struct(&group, 21, 253, b"legacy sealed", INITIAL_CONTROL_HEAD);
+    let unsigned = candidate
+        .to_unsigned(chat_protocol::MAX_CIPHERTEXT_BYTES)
+        .expect("candidate converts");
+    let signing = candidate_signing_bytes(&unsigned).expect("signing bytes");
+    let signature: Signature = device(21).sign(signing.as_bytes());
+    let body = entry_body(&candidate, &hex_encode(&signature.to_bytes()));
+    let path = format!("/v1/groups/{group}/entries");
+    let headers = request_headers(&node, 21, "POST", &path, "", &body).await;
+    let appended = http(&node.address, "POST", &path, &headers, &body).await;
+    assert_eq!(appended.status, 200);
+    let log_path = format!("/v1/groups/{group}/log");
+    let headers = request_headers(&node, 21, "GET", &log_path, "after=0&limit=10", b"").await;
+    let page = http(&node.address, "GET", &format!("{log_path}?after=0&limit=10"), &headers, b"").await;
+    assert_eq!(page.status, 200);
+    assert!(page.json()["page"]["entries"][0]["domain_operation"].is_null());
 }

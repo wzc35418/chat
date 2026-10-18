@@ -20,6 +20,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 # ATT-U：附件上传/下载的端到端用例在进程内起真实 node-api 服务（loopback）。
+# GROUPS-013：提案编排用例需要真双设备（建群产出 Welcome、对端用 Welcome 加入）。
+chat-crypto.workspace = true
 chat-node-api.workspace = true
 chat-node-client = { path = "../node-client" }
 chat-node-services.workspace = true

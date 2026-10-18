@@ -831,3 +831,89 @@ cargo test --offline -p chat-core                        # 128 passed（本记�
 - **旧入口不再猜**：只在能证明唯一语义时提交（本地仍是群主的 SelfUpdate → `set_role`）；已降级设备的 SelfUpdate 无法区分转让/管理员改角色 → 显式 `PROTOCOL_UNSUPPORTED` 且**不触网**。
 - **证据**：`cargo test -p chat-core` 中 `group_node` 新增 4 单测 + 2 真节点集成——真节点上转让的日志元数据为 `transfer_ownership` 且目标摘要≠提交摘要，回执接受后 epoch 2、群主易主；同一 pending 用旧入口被拒且节点日志为空。
 - **协议待补**：PROTOCOL-004 无“通用 self_update”值（建议 `PendingControl` 记领域操作或协议加字段）；`set_muted`/`rename_group` 无 MLS 提交不经过映射；`leave_group`/`dissolve_group` 本切片仍不产生 MLS 提交，故 `LeaveSelf`/`Dissolve` 映射已实现并单测但端到端不可达（文档不冒充已运行通路）。
+
+## 自移除提案编排（GROUPS-013，2026-10-18，Windows x64）
+
+背景：MLS 1.0 禁止一条 Commit 移除提交者自己，唯一致命合法路径是"本机对自己发起 Remove 提案 → 群里
+另一名成员把提案包进 Commit → 本机合并该 Commit（`self_removed`）"。crypto 侧三步已就绪
+（`prepare_self_removal` / `process_proposal_entry` / `commit_pending_proposals`），本轮把编排接进
+core/groups 与 FFI。
+
+代码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)、[crates/ffi/src/groups_ffi.rs](../../crates/ffi/src/groups_ffi.rs)；
+测试：[crates/core/tests/groups_proposal.rs](../../crates/core/tests/groups_proposal.rs)（4 个，真双设备两库）、
+[crates/ffi/tests/groups_proposal_ffi.rs](../../crates/ffi/tests/groups_proposal_ffi.rs)（3 个，经 FFI）。
+
+### 公开面
+
+~~~text
+pub fn group_prepare_leave(device, store, group_id) -> GroupResult<LeaveProposalView>
+pub fn group_process_proposal(device, store, &ProposalEntryInput) -> GroupResult<ProposalOutcomeView>
+pub fn group_commit_proposals(device, store, group_id) -> GroupResult<GroupView>
+
+LeaveProposalView { group_id, base_epoch, epoch, removed, has_welcome, proposal: Vec<u8>,
+                    proposal_digest, leaving_at_ms, state_version }
+ProposalEntryInput { group_id, epoch, sender_identity, payload }
+ProposalOutcomeView { kind, by, epoch, targets, proposals_pending, view }
+~~~
+
+`GroupView` 新增 `leaving_at_ms`；持久记录 v4 → **v5**（`leaving_at_ms` 为 `serde(default)` 字段）。
+
+### 关键语义
+
+1. **发起自移除（group_prepare_leave）**：群主必须先转让（`PERMISSION_DENIED`）；已解散/
+   已发起过/有未决控制提交 → `INVALID_STATE_TRANSITION`。生成 MLS 提案（`device.leave_group`）
+   **不推进 epoch、不产生 pending 控制提交**，本机仍在群里（能收发），快照记 `leaving_at_ms`。
+2. **对端收提案（group_process_proposal）**：epoch/作者/群全部复核（`STALE_EPOCH` /
+   `MISSING_LOG_ENTRIES` / `INVALID_CIPHERTEXT`）；提案进本地 proposal store 并导出到正式库；
+   **epoch 不变**；返回 kind/by/epoch/targets/proposals_pending。
+3. **对端打包（group_commit_proposals）**：没有待提交提案 → `NO_PENDING_PROPOSALS`；
+   已有 pending → `PENDING_COMMIT_EXISTS`；生成 pending 控制提交但 **epoch 不推进**、成员不变，
+   快照如实报告 `pending`（operation=remove_members、base→target）。
+4. **本机合并**：复用 GROUPS-013 之前的 `group_process_peer_entry`（对端 Commit）→
+   `self_removed = true`、epoch +1、本机从成员里消失；此后本机**无法加解密**（crypto fail-closed）。
+5. **已解散的群**：三个新入口都显式 `INVALID_STATE_TRANSITION`。
+
+### 错误码（既有冻结码）
+
+`PERMISSION_DENIED`（群主发起）、`INVALID_STATE_TRANSITION`（已解散/重复发起/已有 pending）、
+`STALE_EPOCH` / `MISSING_LOG_ENTRIES`（乱序）、`INVALID_CIPHERTEXT`（作者不符/认证失败）、
+`DUPLICATE_PROPOSAL`、`NO_PENDING_PROPOSALS`、`PENDING_COMMIT_EXISTS`、`UNSUPPORTED_ENTRY`
+（非 Remove 提案）、`INVALID_CANDIDATE`（空 payload）。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test groups_proposal       # 4 passed
+cargo test --offline -p chat-ffi --test groups_proposal_ffi    # 3 passed
+cargo test --offline -p chat-core -p chat-ffi                  # 170 + 45 passed（既有 166 + 42 继续通过）
+~~~
+
+### 证据
+
+- `groups_proposal::self_removal_proposal_end_to_end`：A 建群 + B 用 Welcome 加入 → A 转让群主给 B
+  （A 合并后 epoch 2，B 用 `group_process_peer_entry` 合并同一条）→ A `group_prepare_leave`（base 2、
+  removed 1、无 Welcome、摘要 64 hex、epoch/策略版本不变、无 pending、`leaving_at_ms` 有值、成员仍 2）→
+  B `group_process_proposal`（kind=remove、by=alice、epoch 2、targets=[alice]、pending 1、B 的 epoch 不变）→
+  B `group_commit_proposals`（epoch 仍 2、成员仍 2、pending=remove_members base2→target3 removed1）→
+  A `group_process_peer_entry` 合并该提交（**self_removed=true**、epoch 3、成员只剩 bob）→
+  **A 无法再加解密**（`encrypt` 显式失败）。
+- `groups_proposal::owner_cannot_prepare_leave`：群主发起 → `PERMISSION_DENIED`，快照完全不变。
+- `groups_proposal::duplicate_and_invalid_proposals_are_rejected`：重复发起 `INVALID_STATE_TRANSITION`；
+  超前 epoch `MISSING_LOG_ENTRIES`、落后 `STALE_EPOCH`（都在解密之前拒绝，不消耗消息）；作者不符
+  `INVALID_CIPHERTEXT`；无提案打包 `NO_PENDING_PROPOSALS`；未知群 `INVALID_TARGET`。
+- `groups_proposal::dissolved_group_rejects_the_proposal_flow`：解散后三个入口全部 `INVALID_STATE_TRANSITION`。
+- `groups_proposal_ffi::member_prepare_leave_process_and_commit_through_ffi`（经 FFI）：发起 → 重复发起被拒 →
+  对端 process_proposal → 对端 commit_proposals（pending remove_members base2→target3）→ 再次打包显式失败。
+- `groups_proposal_ffi::owner_prepare_leave_is_rejected_through_ffi` / `process_proposal_rejects_wrong_epoch_through_ffi`。
+
+### 已知限制
+
+1. **提案不能跨设备自动投递**：`proposal` 字节要由上层（消息/节点）转发；本轮只产出与校验，不投递。
+2. **合并提交仍需本机主动处理**：`self_removed` 只有在本机处理那条 Commit 后才生效；在此之前本机仍能收发。
+3. **对端角色不随 Commit 传播**：MLS Commit 只带成员增删，不含策略角色变化，因此"转让群主"这类纯策略
+   变更需要另外的已验证控制日志同步（测试里两侧各自落地）。
+4. **提交侧不校验权限**：任何确认成员都可以把已入队的提案打包成 Commit（MLS 允许）；策略层是否要收紧
+   （例如只有群主/管理员能打包移除他人的提案）尚未决定。
+5. **一次一条 pending**：提案打包后必须先接受/丢弃才能继续（既有语义）。
+6. **节点公开元数据**：自移除提案目前不走节点日志；等接线时需要为提案/提交补 kind 映射。

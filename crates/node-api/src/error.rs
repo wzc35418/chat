@@ -88,6 +88,7 @@ impl ApiError {
     pub fn from_node(error: NodeError) -> Self {
         let status = match &error {
             NodeError::InvalidRequest(_)
+            | NodeError::InvalidCandidate
             | NodeError::InvalidCursor
             | NodeError::InvalidAckBatch => StatusCode::BAD_REQUEST,
             NodeError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,

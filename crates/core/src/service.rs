@@ -1607,6 +1607,45 @@ impl ConversationCore {
         .map_err(anyhow::Error::new)
     }
 
+    // ------------------------------------------------ 自移除提案编排（GROUPS-013）
+
+    /// GROUPS-013：本机发起自移除提案（离开群的第一步；不推进 epoch、无 pending 控制提交）。
+    ///
+    /// 群主必须先转让（否则 `PERMISSION_DENIED`）；重复发起显式 `INVALID_STATE_TRANSITION`。
+    pub fn group_prepare_leave(
+        &mut self,
+        group_id: &str,
+    ) -> anyhow::Result<crate::groups::LeaveProposalView> {
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        let mut device =
+            crate::groups::load_group_device(store, group_id).map_err(anyhow::Error::new)?;
+        crate::groups::group_prepare_leave(&mut device, store, group_id).map_err(anyhow::Error::new)
+    }
+
+    /// GROUPS-013（收侧）：处理对端的独立提案（epoch 不变，提案入本地 store）。
+    pub fn group_process_proposal(
+        &mut self,
+        input: &crate::groups::ProposalEntryInput,
+    ) -> anyhow::Result<crate::groups::ProposalOutcomeView> {
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        let mut device =
+            crate::groups::load_group_device(store, &input.group_id).map_err(anyhow::Error::new)?;
+        crate::groups::group_process_proposal(&mut device, store, input)
+            .map_err(anyhow::Error::new)
+    }
+
+    /// GROUPS-013（提交侧）：把本地待提交提案打包成一条 pending 控制提交（epoch 不推进）。
+    pub fn group_commit_proposals(&mut self, group_id: &str) -> anyhow::Result<GroupView> {
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        let mut device =
+            crate::groups::load_group_device(store, group_id).map_err(anyhow::Error::new)?;
+        crate::groups::group_commit_proposals(&mut device, store, group_id)
+            .map_err(anyhow::Error::new)
+    }
+
     /// 持久身份的设备 ID（未入库身份 → `INVALID_STATE_TRANSITION`）。
     fn persisted_device_id(&self) -> anyhow::Result<String> {
         let guard = self.store_guard()?;

@@ -293,6 +293,34 @@ append_group_entry(group: GroupId, candidate: SignedCandidate, actor: Authentica
 - 前置状态竞争：`stale_control_head_and_epoch_are_rejected`（两个管理员基于同一 expected_control_head，第二个 STALE_CONTROL_HEAD；epoch 不符 STALE_EPOCH）。
 - 越权与畸形输入：`unauthorized_appends_are_rejected`（跨群/代签/篡改签名/超上限密文/未知群）、`append_requires_bound_authentication_and_matching_group`（缺鉴权头、换方法/路径/正文、路径与正文 group 不一致、挑战重放）。
 
+**DM 包补充（领域操作声明，PROTOCOL-004 字段 55/56）**：追加路径新增
+`NodeService::append_group_entry_with_domain(&mut self, group, candidate, domain: Option<&CandidateDomainOperation>, actor, now)`，
+`append_group_entry` 就是它的 `domain = None` 形态（旧客户端字节与行为完全不变）。
+
+1. **接收**：`CandidateDomainOperation { operation, target_digest }` 是**传输层**声明（不在 `control_metadata` 里，
+   因此既有调用点不被撕裂）；节点把它折叠成 PROTOCOL-004 的 `ControlMetadata.domain_operation`，字段 55（枚举
+   1=set_role/2=transfer_ownership/3=leave_self/4=dissolve）与 56（32 字节摘要）进入**作者签名原文与候选摘要**。
+2. **校验（全在写库之前，码固定 `INVALID_CANDIDATE`）**：未知枚举文本、摘要非 32 字节 hex 或全零、声明与公开
+   `control_metadata.operation` 的组合非法（set_role↔set_role、transfer_ownership↔set_role|transfer_ownership、
+   leave_self↔leave、dissolve↔dissolve）、以及“应用候选夹带声明”，一律拒绝；不给声明就保持 `None`。
+3. **签名绑定**：“只改声明不改签名”必然 `INVALID_SIGNATURE`——验签用的是**含声明**的签名原文，不是候选原本的字节。
+4. **日志投影**：迁移 `0006_domain_operation.sql` 给 `group_log` 加 `domain_operation` / `domain_target_digest`
+   两列（NULL = 未声明，旧条目读出仍是 `None`）；接受后客户端在 `GET /v1/groups/{id}/log` 的
+   `entry.domain_operation` / `entry.domain_target_digest` 直接看到节点侧文本与摘要。`audit_group_log` 自检时按这两列
+   重建签名原文，因此“声明参与哈希链”是被自检强制执行的。
+
+验证证据：`domain_operation::declared_domain_operation_is_accepted_and_visible_in_the_log`（声明被接受 + 日志投影可见 +
+自检通过）、`domain_operation::illegal_declarations_are_rejected_before_any_write`（非法组合/未知枚举/全零/长度错/应用候选
+夹带全部 INVALID_CANDIDATE 且日志为空）、`domain_operation::legacy_clients_without_a_declaration_still_work`（旧客户端可用、
+投影为 None、事后补声明 → INVALID_SIGNATURE）、`domain_operation::domain_texts_map_to_the_frozen_protocol_enum`；
+HTTP 端：`group_mailbox_http::domain_operation_declaration_is_accepted_and_visible_in_the_log_api`、
+`group_mailbox_http::illegal_domain_operation_declarations_are_rejected`、
+`group_mailbox_http::legacy_entry_requests_without_a_declaration_still_work`。
+
+已知限制：声明只是**公开元数据**，节点仍不解析 MLS 明文、也不验证“该声明与实际 MLS commit 语义一致”（那是客户端与
+DOMAIN 层的事）；节点不因声明做额外授权判断（授权仍按 actor 成员资格与 CAS）；投影两列不进回执签名（回执仍绑定候选摘要，
+而候选摘要已含声明）。
+
 已知限制（诚实的不完整状态，不是模拟成功）：
 
 - 节点不解析 MLS 明文，也不做 MLS/DOMAIN 控制结果验证（PROTOCOL-005、DOMAIN-001/002 的控制语义尚未交付）。因此接受控制候选后，节点回执只声明“该条控制日志的位置”，不声明“MLS 状态已按此 commit 推进”。公开的 policy_version/mls_epoch 在本阶段被当作 CAS 常量：客户端应按注册时声明的值签名，直到“客户端验证过的控制应用路径”落地。这是明确的能力缺口，节点不会猜测 epoch += 1。

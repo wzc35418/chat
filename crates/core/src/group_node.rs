@@ -687,6 +687,7 @@ mod tests {
             dissolved: false,
             dissolved_at_ms: None,
             left_at_ms: None,
+            leaving_at_ms: None,
         }
     }
 

@@ -130,18 +130,19 @@ fun main() = application {
             }
     }
 
-    // PLATFORM-001/002 接线：主密钥由桌面密钥槽封装（口令派生 AES-256-GCM），
-    // 磁盘只留盐与密文；启动时 unwrap，首次运行生成并 wrap。演示口令固定，
-    // 正式产品应改为用户输入或操作系统密钥链（未接线，如实标注）。
+    // PLATFORM-001/002 接线：Windows 用 DPAPI（当前用户作用域），其它平台回退口令派生槽。
+    // 磁盘只存密文/blob；启动时 unwrap，首次运行生成并 wrap。
     LaunchedEffect(Unit) {
         if (identityDir == null) {
             keySlotSummary = "密钥槽不可用（目录创建失败）"
             return@LaunchedEffect
         }
-        val slot = PassphraseKeySlot(
-            File(identityDir, "keyslot").apply { mkdirs() },
-            DEMO_KEY_PASSPHRASE.toCharArray(),
-        )
+        val slotDirectory = File(identityDir, "keyslot").apply { mkdirs() }
+        val slot: chat.platform.KeyProtection = if (System.getProperty("os.name", "").lowercase().contains("windows")) {
+            DpapiKeySlot(slotDirectory)
+        } else {
+            PassphraseKeySlot(slotDirectory, DEMO_KEY_PASSPHRASE.toCharArray())
+        }
         keySlotSummary = slot.protectionSummary()
         val alias = "storage-main"
         val restored = runCatching {
