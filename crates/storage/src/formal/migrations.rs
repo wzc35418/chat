@@ -53,6 +53,11 @@ pub(crate) const MIGRATIONS: &[MigrationDef] = &[
         name: "0006_device_credentials",
         sql: include_str!("../../migrations/0006_device_credentials.sql"),
     },
+    MigrationDef {
+        version: 7,
+        name: "0007_attachment_secrets",
+        sql: include_str!("../../migrations/0007_attachment_secrets.sql"),
+    },
 ];
 
 /// 迁移结果。

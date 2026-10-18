@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 use super::error::StorageError;
 use super::seal::{ProtectedStorageKey, RecordSealer, SealPurpose};
 use super::{
-    CoreTransaction, Result, Store, WriteScope, commit_transaction, ensure_id, now_ms,
+    CoreTransaction, Result, Store, WriteScope, commit_transaction, ensure_id, hex, now_ms,
     rollback_transaction,
 };
 
@@ -568,4 +568,310 @@ fn mark_attachment_state_inner(
         updated_at_ms: now,
         ..existing
     })
+}
+
+// ==== 附件 FileKey 的持久化（迁移 0007_attachment_secrets.sql） ====
+
+/// FileKey 长度（字节），与 crypto 的 FILE_KEY_BYTES 一致。
+pub const ATTACHMENT_FILE_KEY_BYTES: usize = 32;
+/// FileId 长度（字节），与 crypto 的 FILE_ID_BYTES 一致。
+pub const ATTACHMENT_FILE_ID_BYTES: usize = 16;
+/// 附件密钥记录格式版本（进入 AAD 与明文列）。
+const ATTACHMENT_SECRET_RECORD_VERSION: u8 = 1;
+/// 附件密钥密封记录的 AAD 版本。
+const ATTACHMENT_SECRET_AAD_VERSION: &[u8] = b"attachment-secret-v1";
+/// 附件密钥明文负载长度：version(1) + file_id(16) + file_key(32)。
+const ATTACHMENT_SECRET_PLAINTEXT_BYTES: usize =
+    1 + ATTACHMENT_FILE_ID_BYTES + ATTACHMENT_FILE_KEY_BYTES;
+
+/// 附件密钥写入输入。file_key 是机密材料：Debug 只打印长度，
+/// storage 内部立即转为 Zeroizing 缓冲并在落盘前清零。
+pub struct AttachmentSecretInput {
+    /// 本地附件 ID（必须已存在对应的 attachments 记录）。
+    pub attachment_id: String,
+    /// 附件文件标识（进入每块 AAD，决定能否解密已有缓存块）。
+    pub file_id: [u8; ATTACHMENT_FILE_ID_BYTES],
+    /// 文件内容密钥（恰好 32 字节；只在内存与密封缓冲中出现）。
+    pub file_key: Vec<u8>,
+    /// 创建时间（Unix 毫秒；只在首次写入时使用）。
+    pub created_at_ms: i64,
+}
+
+impl std::fmt::Debug for AttachmentSecretInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AttachmentSecretInput")
+            .field("attachment_id", &self.attachment_id)
+            .field("file_id", &hex(&self.file_id))
+            .field("file_key_len", &self.file_key.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AttachmentSecretInput {
+    /// 有界结构校验（密钥长度由调用方传入的缓冲校验，见 [Store::save_attachment_secret]）。
+    pub fn validate_with_key(&self, file_key: &[u8]) -> Result<()> {
+        validate_attachment_id(&self.attachment_id)?;
+        if file_key.len() != ATTACHMENT_FILE_KEY_BYTES {
+            return Err(StorageError::InvalidInput(format!(
+                "attachment file key must be exactly {ATTACHMENT_FILE_KEY_BYTES} bytes"
+            )));
+        }
+        if self.created_at_ms < 0 {
+            return Err(StorageError::InvalidInput(
+                "attachment secret created_at_ms must be non-negative".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 附件密钥投影：file_key 用 Zeroizing 缓冲，Drop 时清零；Debug 不输出密钥。
+pub struct AttachmentSecretRecord {
+    /// 本地附件 ID。
+    pub attachment_id: String,
+    /// 附件文件标识。
+    pub file_id: [u8; ATTACHMENT_FILE_ID_BYTES],
+    /// 文件内容密钥（32 字节；Drop 时清零）。
+    pub file_key: Zeroizing<Vec<u8>>,
+    /// 记录格式版本。
+    pub version: u8,
+    /// 创建时间。
+    pub created_at_ms: i64,
+    /// 最近更新时间。
+    pub updated_at_ms: i64,
+    /// 本次调用是否命中既有记录（读取路径恒为 true）。
+    pub already_existed: bool,
+}
+
+impl std::fmt::Debug for AttachmentSecretRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AttachmentSecretRecord")
+            .field("attachment_id", &self.attachment_id)
+            .field("file_id", &hex(&self.file_id))
+            .field("file_key_len", &self.file_key.len())
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
+fn attachment_secret_aad(attachment_id: &str) -> [&[u8]; 2] {
+    [attachment_id.as_bytes(), ATTACHMENT_SECRET_AAD_VERSION]
+}
+
+fn seal_attachment_secret(
+    key: &ProtectedStorageKey,
+    attachment_id: &str,
+    file_id: &[u8; ATTACHMENT_FILE_ID_BYTES],
+    file_key: &[u8],
+) -> Result<Vec<u8>> {
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(ATTACHMENT_SECRET_PLAINTEXT_BYTES));
+    plaintext.push(ATTACHMENT_SECRET_RECORD_VERSION);
+    plaintext.extend_from_slice(file_id);
+    plaintext.extend_from_slice(file_key);
+    let sealer = RecordSealer::new(key, SealPurpose::AttachmentSecret);
+    sealer.seal(&attachment_secret_aad(attachment_id), plaintext.as_slice())
+}
+
+fn open_attachment_secret(
+    key: &ProtectedStorageKey,
+    attachment_id: &str,
+    sealed: &[u8],
+) -> Result<([u8; ATTACHMENT_FILE_ID_BYTES], Zeroizing<Vec<u8>>, u8)> {
+    let sealer = RecordSealer::new(key, SealPurpose::AttachmentSecret);
+    let plaintext = sealer.open(&attachment_secret_aad(attachment_id), sealed)?;
+    if plaintext.len() != ATTACHMENT_SECRET_PLAINTEXT_BYTES {
+        return Err(StorageError::StateCorrupted(
+            "stored attachment secret has an invalid length".to_owned(),
+        ));
+    }
+    let version = plaintext[0];
+    if version != ATTACHMENT_SECRET_RECORD_VERSION {
+        return Err(StorageError::StateCorrupted(
+            "stored attachment secret has an unsupported record version".to_owned(),
+        ));
+    }
+    let mut file_id = [0u8; ATTACHMENT_FILE_ID_BYTES];
+    file_id.copy_from_slice(&plaintext[1..1 + ATTACHMENT_FILE_ID_BYTES]);
+    let file_key = Zeroizing::new(
+        plaintext[1 + ATTACHMENT_FILE_ID_BYTES..ATTACHMENT_SECRET_PLAINTEXT_BYTES].to_vec(),
+    );
+    Ok((file_id, file_key, version))
+}
+
+fn load_attachment_secret_row(
+    connection: &Connection,
+    key: &ProtectedStorageKey,
+    attachment_id: &str,
+) -> Result<Option<AttachmentSecretRecord>> {
+    let row: Option<(i64, Vec<u8>, i64, i64)> = connection
+        .query_row(
+            "SELECT version, protected_secret, created_at, updated_at
+               FROM attachment_secrets WHERE attachment_id = ?1",
+            [attachment_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((version, sealed, created_at, updated_at)) = row else {
+        return Ok(None);
+    };
+    if version <= 0 || version > i64::from(u8::MAX) || created_at < 0 || updated_at < 0 {
+        return Err(StorageError::StateCorrupted(
+            "stored attachment secret has invalid numeric columns".to_owned(),
+        ));
+    }
+    let (file_id, file_key, record_version) =
+        open_attachment_secret(key, attachment_id, &sealed)?;
+    Ok(Some(AttachmentSecretRecord {
+        attachment_id: attachment_id.to_owned(),
+        file_id,
+        file_key,
+        version: record_version,
+        created_at_ms: created_at,
+        updated_at_ms: updated_at,
+        already_existed: true,
+    }))
+}
+
+fn save_attachment_secret_inner(
+    transaction: &mut CoreTransaction<'_>,
+    input: &AttachmentSecretInput,
+    file_key: &[u8],
+) -> Result<AttachmentSecretRecord> {
+    // 附件记录必须存在（外键也会兜底，这里给出确定的错误码）。
+    let attachment_exists: Option<i64> = transaction
+        .connection()
+        .query_row(
+            "SELECT 1 FROM attachments WHERE attachment_id = ?1",
+            [&input.attachment_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if attachment_exists.is_none() {
+        return Err(StorageError::AttachmentNotFound(input.attachment_id.clone()));
+    }
+    if let Some(existing) = load_attachment_secret_row(
+        transaction.connection(),
+        transaction.key,
+        &input.attachment_id,
+    )? {
+        // 幂等：同 file_id + 同密钥返回既有记录；否则显式冲突（绝不静默换钥）。
+        let same_key = existing.file_key.len() == file_key.len()
+            && existing
+                .file_key
+                .iter()
+                .zip(file_key.iter())
+                .all(|(left, right)| left == right);
+        if existing.file_id == input.file_id && same_key {
+            return Ok(existing);
+        }
+        return Err(StorageError::OperationIdConflict(
+            "attachment secret is already bound to a different file key".to_owned(),
+        ));
+    }
+    let count: i64 =
+        transaction
+            .connection()
+            .query_row("SELECT COUNT(*) FROM attachment_secrets", [], |row| row.get(0))?;
+    if u64::try_from(count).unwrap_or(u64::MAX) >= u64::from(MAX_ATTACHMENTS) {
+        return Err(StorageError::InvalidInput(format!(
+            "attachment secret limit of {MAX_ATTACHMENTS} reached"
+        )));
+    }
+    let sealed = seal_attachment_secret(
+        transaction.key,
+        &input.attachment_id,
+        &input.file_id,
+        file_key,
+    )?;
+    let now = now_ms();
+    transaction.transaction.execute(
+        "INSERT INTO attachment_secrets
+             (attachment_id, version, protected_secret, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            input.attachment_id,
+            i64::from(ATTACHMENT_SECRET_RECORD_VERSION),
+            sealed,
+            input.created_at_ms,
+            now
+        ],
+    )?;
+    transaction.note(1);
+    Ok(AttachmentSecretRecord {
+        attachment_id: input.attachment_id.clone(),
+        file_id: input.file_id,
+        file_key: Zeroizing::new(file_key.to_vec()),
+        version: ATTACHMENT_SECRET_RECORD_VERSION,
+        created_at_ms: input.created_at_ms,
+        updated_at_ms: now,
+        already_existed: false,
+    })
+}
+
+impl Store {
+    /// 保存（或幂等重放）附件 FileKey。
+    ///
+    /// 同 attachment_id 同 file_id + 同密钥是幂等重放；换密钥返回 OPERATION_ID_CONFLICT，
+    /// 绝不静默覆盖（否则已有缓存块将永久无法解密）。附件记录不存在返回 ATTACHMENT_NOT_FOUND。
+    pub fn save_attachment_secret(
+        &mut self,
+        mut input: AttachmentSecretInput,
+    ) -> Result<AttachmentSecretRecord> {
+        self.ensure_ready()?;
+        // 立刻把调用方交来的密钥接管到 Zeroizing 缓冲，避免中途失败时明文残留。
+        let file_key = Zeroizing::new(std::mem::take(&mut input.file_key));
+        input.validate_with_key(file_key.as_slice())?;
+        let mut transaction = self.begin_transaction(WriteScope::attachments())?;
+        match save_attachment_secret_inner(&mut transaction, &input, file_key.as_slice()) {
+            Ok(record) => {
+                commit_transaction(transaction)?;
+                Ok(record)
+            }
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                Err(error)
+            }
+        }
+    }
+
+    /// 读取附件 FileKey；不存在返回 None，损坏返回 STATE_CORRUPTED。
+    pub fn load_attachment_secret(
+        &self,
+        attachment_id: &str,
+    ) -> Result<Option<AttachmentSecretRecord>> {
+        self.ensure_ready()?;
+        validate_attachment_id(attachment_id)?;
+        load_attachment_secret_row(self.connection(), &self.key, attachment_id)
+    }
+
+    /// 删除附件 FileKey；返回是否真的删除了记录。
+    pub fn delete_attachment_secret(&mut self, attachment_id: &str) -> Result<bool> {
+        self.ensure_ready()?;
+        validate_attachment_id(attachment_id)?;
+        let mut transaction = self.begin_transaction(WriteScope::attachments())?;
+        let outcome = (|| -> Result<bool> {
+            let deleted = transaction.transaction.execute(
+                "DELETE FROM attachment_secrets WHERE attachment_id = ?1",
+                [attachment_id],
+            )?;
+            if deleted > 0 {
+                transaction.note(deleted);
+            }
+            Ok(deleted > 0)
+        })();
+        match outcome {
+            Ok(deleted) => {
+                commit_transaction(transaction)?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                Err(error)
+            }
+        }
+    }
 }

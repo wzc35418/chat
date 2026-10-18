@@ -941,7 +941,7 @@ cargo test --offline -p chat-core                        # lib 15（含 stub_por
 附件编排在 [crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)，详细记录见 [attachments.md 的上传/下载接块传输端口实现记录](attachments.md)。core 层只做两件事，不引入节点依赖：
 
 - `PersistedAttachmentStore::upload_attachment(attachment_id, &mut transport)`：按 storage 的 `mark_attachment_state` 白名单迁移 `imported → uploading → available`，从本地加密缓存按序上传分块**密文**，节点 complete 后才标 available；已 available 时幂等无操作；中断保留缓存与进程内进度可重试。
-- `PersistedAttachmentStore::download_attachment(blob_id, expected_manifest, destination, &mut transport)`：先用 manifest 与本地记录比对（不一致在任何网络读取前 `ATTACHMENT_CORRUPTED`），逐块 `read_chunk` → CRYPTO-012 认证解密 → 临时文件 → 校验密文摘要 + 明文总长 + 明文 SHA-256 后 rename；失败删临时文件、状态留在 `downloading` 可重试；没有进程内 FileKey 时 `ATTACHMENT_KEY_UNAVAILABLE` 且零读取。
+- `PersistedAttachmentStore::download_attachment(blob_id, expected_manifest, destination, &mut transport)`：先用 manifest 与本地记录比对（不一致在任何网络读取前 `ATTACHMENT_CORRUPTED`），逐块 `read_chunk` → CRYPTO-012 认证解密 → 临时文件 → 校验密文摘要 + 明文总长 + 明文 SHA-256 后 rename；失败删临时文件、状态留在 `downloading` 可重试；本进程没有 FileKey 时先从 `attachment_secrets` 取回（重启后可下载），只有密钥记录确实缺失才 `ATTACHMENT_KEY_UNAVAILABLE` 且零读取。
 - 节点交互抽象为 `BlobTransport` 端口（begin_upload / put_chunk / complete / read_chunk），真实节点适配是 [crates/core/src/attachment_transport.rs](../../crates/core/src/attachment_transport.rs) 的 `NodeBlobTransport`（NODE-012~015，真 axum 节点实测）；端口失败用 `AttachmentError::Transport { code, detail }` 保留冻结码（节点码优先，其次 PROTOCOL-014 码，如 `NODE_UNAVAILABLE` / `NETWORK_UNAVAILABLE` / `QUOTA_EXCEEDED` / `MANIFEST_MISMATCH`）。
 
 `NodeBlobTransport` 的三条关键约定（详见 [attachments.md 的节点块传输适配实现记录](attachments.md)）：
@@ -951,6 +951,32 @@ cargo test --offline -p chat-core                        # lib 15（含 stub_por
 - 错误保真：节点/网络错误一律 `AttachmentError::Transport{code, detail}`，细节只含静态说明，不含 URL/正文/密钥。
 
 证据：`cargo test --offline -p chat-core` → 76 passed（26 lib + 7 cancel_events + 5 draft_status_events + 6 identity + 5 node_submitter + 2 p0 + 6 attachment_transport + 14 send_orchestrator + 5 service；既有 70 个继续通过）；`--test attachment_transport` 6 passed（真节点上传/下载往返、断链可重试、节点重启后仍可下载、配额/鉴权码保真、多块被节点策略拒绝）。
+
+## 附件 FileKey 持久化在 core 层的接线（R-36/X 包，2026-10-18，Windows x64）
+
+目标：让“关掉重开仍可导出/下载”成为真实行为。ADR 见
+[docs/design/FILE_KEY_PERSISTENCE.md](../design/FILE_KEY_PERSISTENCE.md)（第 1 步已落地）。代码仍在
+[crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)，存储侧见
+[storage.md 的附件 FileKey 持久化实现记录](storage.md)，描述符格式见 [crypto.md](crypto.md)。
+
+- `import_file`：写缓存 + 附件记录后，把 file_id + FileKey 写入正式库的 `attachment_secrets`
+  （storage 用用途子密钥密封、AAD 绑 attachment_id）；任一步失败清掉刚写入的缓存与记录。
+- `ensure_cache_record`：导出/下载前若进程内没有缓存记录，就从 `attachment_secrets` 取回
+  file_id + FileKey 并重建缓存记录（`AttachmentStore::restore_record`），然后照旧走逐块认证解密；
+  密钥记录缺失仍显式 `ATTACHMENT_KEY_UNAVAILABLE`。
+- `export_secret_descriptor(attachment_id, wrapping_key)`：把 FileKey 封装成 crypto 的
+  `SecretDescriptor`，供 E2EE 内层事件携带（包装密钥由上层从 MLS application secret 派生，未接线）。
+- 密钥副本（`AttachmentSecretMaterial`）只在写库边界出现：拿到后立即交给 storage 并显式清零，
+  Debug 不输出密钥，不进入任何 DTO/日志。
+
+证据：`cargo test --offline -p chat-core --lib` → 29 passed（含新增
+`persisted_export_works_after_restart_with_persisted_secret`、`persisted_secret_tamper_is_state_corrupted`、
+`persisted_delete_removes_the_stored_secret`、`persisted_export_secret_descriptor_roundtrip`、
+`download_works_after_restart_and_rejects_unknown_blobs`）；
+`cargo test --offline -p chat-storage -p chat-crypto -p chat-core` → 84/44/90 全绿。
+
+已知限制：包装密钥派生与送达（跨设备）未接线；未做密钥轮换/重封；FFI 层“另一实例必须失败”的旧断言
+需由 crates/ffi 任务同步更新（现在同库同主密钥的第二实例可以真实下载）。
 
 ## 发送链路接真实节点（SND，task-33，2026-10-18，Windows x64）
 

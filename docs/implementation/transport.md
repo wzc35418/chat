@@ -1,6 +1,6 @@
 # 设备直连、中继与节点客户端
 
-阶段：P0 → P1。状态：函数级设计，尚未实现。目标源码：[crates/transport/src/network.rs](../../crates/transport/src/network.rs)。
+阶段：P0 → P1。状态：Rust **纯逻辑传输核心**已实现于 [crates/transport](../../crates/transport/src)（会话建立、连接状态机、帧编解码/分片重组、确定性重试退避，见下方「Rust 纯逻辑传输核心」章节）；P0 仅 loopback 的 iroh/QUIC 实验仍在 [network.rs](../../crates/transport/src/network.rs)。真正的直连/穿透/中继与节点客户端（TRANSPORT-006~012）尚未实现。目标源码：[crates/transport/src/network.rs](../../crates/transport/src/network.rs)。
 
 网络层传送相同不可变协议帧，不负责判断已送达。节点公钥与 HTTPS 身份均验证；用户配置明确替换公共发现/中继。连接句柄不可给 UI 或插件。认证细节在 node-api 的函数计划中定义。
 
@@ -20,6 +20,91 @@
 - [TRANSPORT-010 ack_mailbox](transport.md#transport-010)
 - [TRANSPORT-011 subscribe_node_hints](transport.md#transport-011)
 - [TRANSPORT-012 shutdown_transport](transport.md#transport-012)
+
+## Rust 纯逻辑传输核心（chat-transport，本轮实现）
+
+本轮只实现**不需要真实网络**的四块：会话建立、连接状态机、帧编解码/分片重组、重试退避。不引入新的网络依赖（iroh 仍只用于既有 P0 loopback 实验）、不联网、不 sleep、无 `unsafe`。crate 为 `crates/transport`（包名 `chat-transport`）。
+
+### 覆盖范围与文档函数的关系
+
+| 本轮交付（任务 ID） | API | 与文档契约的关系 |
+|---|---|---|
+| TRANSPORT-001 会话建立 | `TransportSession::open` / `open_session` | `start_endpoint` 的纯逻辑子集：端点/设备标识、协商结果、初始连接态、会话预算；真实端点启动、密钥装载、运行时与入站队列未实现 |
+| TRANSPORT-002 连接状态机 | `ConnectionStateMachine` / `next_state` / `TRANSITIONS` | `connect_peer` 的连接生命周期子集：只做合法迁移与幂等判定，不发起网络 |
+| TRANSPORT-003 帧编解码 | `FrameCodec` / `FragmentAssembler` | `send_peer_frame`/`read_peer_frame` 的帧边界子集：长度前缀、分片、重组与拒绝；ACK/队列/背压未实现 |
+| TRANSPORT-004 重试退避 | `RetryPolicy` / `RetryTracker` | `connect_peer` 的 `ConnectBudget` 与全局「网络类错误按持久退避」策略；不执行等待 |
+
+TRANSPORT-002（verify_discovery_record）与 TRANSPORT-006~012（节点 append/fetch/mailbox/WS/shutdown）仍未实现；P0 的 loopback 端到端实验不等于这些函数完成。
+
+### 会话建立（TRANSPORT-001）
+
+- 输入：本机/对端 `EndpointId`（32 字节，非零且互不相同）、本机/对端 `DeviceId`（非零且互不相同）、可选 `SessionCapabilities`（PROTOCOL-011 的协商输出）、建立时间、`SessionLimits`。
+- 校验顺序：预算 → 标识 → 互斥关系 → 协商结果。协商结果必须：版本受支持、包含必需能力 `e2ee.v1`/`mls.v1`、协商的 `max_frame_bytes` 不小于会话上限（**只能收紧、不能放大**）；否则 `CAPABILITY_MISMATCH`。
+- 初始状态固定 `Disconnected`；未协商（`negotiated: None`）时允许建立会话对象，但 `Connect` 事件返回 `CAPABILITY_NOT_NEGOTIATED`。
+- 会话预算：帧 ≤64 KiB、入站/出站队列 1–4096、重连次数 1–100、握手超时 1–60 s；非法配置显式拒绝。
+
+### 连接状态机（TRANSPORT-002）
+
+状态：`Disconnected`、`Connecting`、`Connected`、`Degraded`、`Closed`；事件：`Connect`、`Connected`、`Degrade`、`Recover`、`Disconnect`、`Close`。冻结迁移表（19 条合法迁移，自环为幂等重放）：
+
+| 当前状态 | 合法事件 → 目标 |
+|---|---|
+| Disconnected | Connect → Connecting；Disconnect → Disconnected；Close → Closed |
+| Connecting | Connect → Connecting；Connected → Connected；Disconnect → Disconnected；Close → Closed |
+| Connected | Connect → Connected；Connected → Connected；Degrade → Degraded；Recover → Connected；Disconnect → Disconnected；Close → Closed |
+| Degraded | Degrade → Degraded；Connected → Connected；Recover → Connected；Disconnect → Disconnected；Close → Closed |
+| Closed | Close → Closed（其余事件一律拒绝） |
+
+表外迁移返回 `INVALID_TRANSITION` 且状态不变；`TransitionTableCheck::verify()` 可在宿主启动时自检表一致性（状态/事件/合法/非法计数为 5/6/19/11）。
+
+### 帧编解码与分片重组（TRANSPORT-003）
+
+冻结线格式（每片一条记录）：
+
+```text
+[u32 BE wire_len][u32 BE frame_id][u16 BE index][u16 BE count][u32 BE total_len][payload]
+```
+
+- `wire_len = 12 + payload_len`（不含自身 4 字节）；解码先核对前缀与实际长度，再解析字段。
+- 分片大小固定为配置的 `max_fragment_bytes`（协商结果的一部分）：`count = ceil(total_len / max_fragment_bytes)`，非末尾分片长度必须等于该值；非规范切分直接 `MALFORMED_FRAME`。
+- 上限：帧 1–64 KiB、分片 1–`max_frame_bytes`、分片数 1–1024，且 `max_fragments_per_frame` 必须足够切分最大帧（否则 `INVALID_FRAME_LIMITS`）。所有长度先检查后分配：声明超大总长/前缀不会触发大内存分配。
+- 重组严格有序：索引必须从 0 连续递增。重复分片 `DUPLICATE_FRAGMENT`、乱序 `OUT_OF_ORDER_FRAGMENT`、旧帧 `STALE_FRAME`、未收齐换帧或总长不一致 `INCOMPLETE_FRAME`；`reset()` 丢弃在途状态。
+
+### 重试退避（TRANSPORT-004）
+
+- 基础延迟 `min(base × 2^(n-1), max)`；`max_delay_ms` 受 PROTOCOL-014 的 5 分钟上限约束（`MAX_RETRY_AFTER_MS`）。
+- jitter：`[0, jitter_max_ms]` 内的确定性偏移（splitmix64 混淆，仅用于打散同步重试，**不是安全随机**），最终延迟仍封顶；固定 seed 使测试完全可复现。
+- 预算：连续失败超过 `max_attempts`（默认 8，上限 100）返回 `RetryOutcome::Stop { BudgetExhausted }`，不无限重试；成功后可 `reset()`；`next_attempt_at_ms` 饱和。
+- 本模块不 sleep：只返回延迟与下一次尝试时间，由宿主执行等待。
+
+### 传输层稳定错误码（登记）
+
+| 码 | 触发 | 可重试 | 与 PROTOCOL-014 关系 |
+|---|---|---|---|
+| `INVALID_TRANSPORT_CONFIG` | 会话/端点/设备/预算非法 | 否 | 本层新增码，未进冻结表 |
+| `INVALID_TRANSITION` | 状态机表外迁移 | 否 | 本层新增码 |
+| `CAPABILITY_MISMATCH` | 协商版本/必需能力/帧上限不兼容 | 否 | **复用** `PROTOCOL_UNSUPPORTED`（`frozen_code()` 可映射） |
+| `CAPABILITY_NOT_NEGOTIATED` | 未协商即连接 | 否 | 本层新增码 |
+| `MALFORMED_FRAME` | 帧结构/长度/规范切分非法 | 否 | **复用**冻结码 `MALFORMED_FRAME` |
+| `CONTENT_TOO_LARGE` | 帧/分片/记录超限 | 否 | **复用**冻结码 `CONTENT_TOO_LARGE` |
+| `INVALID_FRAME_LIMITS` | 帧预算非法 | 否 | 本层新增码 |
+| `DUPLICATE_FRAGMENT` | 分片重复 | 否 | 本层新增码 |
+| `OUT_OF_ORDER_FRAGMENT` | 分片索引跳跃 | 否 | 本层新增码 |
+| `STALE_FRAME` | 旧帧迟到 | 否 | 本层新增码 |
+| `INCOMPLETE_FRAME` | 未收齐换帧/总长不一致 | 否 | 本层新增码 |
+| `INVALID_RETRY_POLICY` | 退避参数非法 | 否 | 本层新增码 |
+
+映射约定：本层错误一律不可自动重试；跨 FFI 暴露时冻结码可直接进入 `chat_protocol::map_error`，新增码在协议层登记前映射为 `INTERNAL_FAILURE` 并保留本层码做诊断。
+
+### 验证证据
+
+`cargo test --offline -p chat-transport`（2026-10-18）→ **33 passed / 0 failed**（lib 25 + `tests/transport_core.rs` 8），`cargo clippy --offline -p chat-transport --all-targets` 0 警告。
+
+- 状态机：`state::tests::transition_table_matches_the_full_matrix`（5×6 逐格）、`repeated_events_are_idempotent`、`closed_is_terminal_except_repeated_close`、`illegal_transitions_are_explicit`，以及 `transport_core::transition_matrix_is_complete_and_unique`。
+- 会话：`session::tests::opens_session_in_disconnected_state`、`rejects_invalid_session_inputs`、`session_limits_are_bounded`、`negotiated_frame_limit_cannot_be_enlarged`、`session_lifecycle_uses_the_state_machine`、`transport_core::sessions_cannot_connect_without_negotiation_or_enlarge_limits`。
+- 帧：`frame::tests::round_trip_single_and_multi_fragment`、`wire_format_round_trip_and_byte_vectors`、`frame_and_fragment_boundaries_are_enforced`、`malformed_wire_is_rejected_before_allocation`、`assembler_rejects_duplicate_out_of_order_stale_and_incomplete`、`random_wire_input_never_panics`、`transport_core::frame_*_rejects_*`。
+- 退避：`retry::tests::exponential_base_delay_is_capped`、`jitter_is_bounded_deterministic_and_capped`、`budget_exhaustion_stops_retrying`、`next_attempt_time_is_saturating`、`invalid_policies_are_rejected`、`transport_core::retry_sequence_is_deterministic_and_bounded`。
+- 端到端纯逻辑闭环：`transport_core::session_frame_retry_flow_is_closed_loop`（建立会话 → 连接 → 分片/重组 → 降级/恢复 → 退避预算 → 关闭）。
 
 <a id="transport-001"></a>
 
@@ -52,7 +137,7 @@ start_endpoint(config: TransportConfig, device_key: DeviceKeyRef) -> Result<Endp
 - [ ] 关闭公共服务后仍使用自托管。
 - [ ] 端口冲突无遗留任务。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（Rust 纯逻辑子集：`TransportSession::open`/`open_session` 校验端点/设备标识、协商结果、初始状态与会话预算，见上方章节；证据 `cargo test --offline -p chat-transport` → 33 passed，`session::tests::*`、`transport_core::sessions_cannot_connect_without_negotiation_or_enlarge_limits`）。iroh 端点启动、设备密钥装载、运行时/任务取消、有界入站队列与端口冲突清理未实现（`network.rs` 只有 P0 loopback 实验，不构成本函数验收），两项验收未勾选。
 
 <a id="transport-002"></a>
 
@@ -120,7 +205,7 @@ connect_peer(peer: VerifiedPeerAddress, budget: ConnectBudget) -> Result<Connect
 - [ ] 中继不可用明确错误。
 - [ ] 取消无后台重试泄漏。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（Rust 纯逻辑子集：连接状态机 `ConnectionStateMachine`/`next_state` 与确定性重试退避 `RetryPolicy`/`RetryTracker`，见上方章节；证据 `state::tests::transition_table_matches_the_full_matrix`、`retry::tests::budget_exhaustion_stops_retrying`、`transport_core::session_frame_retry_flow_is_closed_loop`）。局域网/穿透/中继路径、超时总预算、取消关闭竞赛连接与 `EndpointId` 验证未实现，三项验收未勾选。
 
 <a id="transport-004"></a>
 
@@ -153,7 +238,7 @@ send_peer_frame(connection: Connection, frame: ImmutableFrame) -> Result<Transpo
 - [ ] ACK 丢失后重发相同 bytes。
 - [ ] P2P 待确认消息不触发正式插件行为。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（Rust 纯逻辑子集：帧长度/分片/线格式编码与上限检查，见上方章节；证据 `frame::tests::wire_format_round_trip_and_byte_vectors`、`frame_and_fragment_boundaries_are_enforced`、`transport_core::frame_decode_rejects_oversize_without_allocation`）。连接关联校验、有限 ACK 等待、超时错误与同字节重发（重试策略已就绪）未实现，两项验收未勾选。
 
 <a id="transport-005"></a>
 
@@ -187,7 +272,7 @@ read_peer_frame(connection: Connection, limits: FrameLimits) -> Result<Unverifie
 - [ ] 超大长度声明不分配巨内存。
 - [ ] 伪造 EventId 不被提前去重。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（Rust 纯逻辑子集：有界解码 `FrameCodec::decode_wire` 与严格有序分片重组 `FragmentAssembler`，长度先检查后分配；证据 `frame::tests::malformed_wire_is_rejected_before_allocation`、`assembler_rejects_duplicate_out_of_order_stale_and_incomplete`、`random_wire_input_never_panics`）。连接读循环、入站队列投递与背压未实现；内层去重仍归 protocol/sync（伪造 EventId 不会被本层提前去重），两项验收未勾选。
 
 <a id="transport-006"></a>
 

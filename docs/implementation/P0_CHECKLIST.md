@@ -66,7 +66,13 @@ P0-03 局部实验已通过客户端单连接事务及独立节点接受事务�
 - [x] 附件记录落正式加密存储（0005），重开后记录仍在；**FileKey 未持久化 → 重启后导出/下载显式 `ATTACHMENT_KEY_UNAVAILABLE`**（诚实失败，不含伪造）。
 - [x] 上传/下载经可注入的 `BlobTransport` 端口完成（密文逐字节、同序号重试幂等、manifest 先校验）。
 
-未勾选（仍缺）：真实节点适配层（NODE-012~015 配额/回执验签）与断点续传位图、E2EE SecretDescriptor/CAPABILITY、下载写入本地加密缓存以便离线导出。
+2026-10-18 追加（R-47 落地后更新）：
+
+- [x] FileKey 持久化：附件密钥随记录存入正式加密库（`0007_attachment_secrets`，密封 + AAD 绑 attachment_id），**关闭重开后导出/下载真实可用**；篡改密钥 `STATE_CORRUPTED`；删除附件级联清密钥。
+- [x] 真实节点适配层已接线（`NodeBlobTransport`：NODE-012~015，块上限已与客户端 256 KiB 分块对齐），上传/下载端到端通过。
+- [x] E2EE SecretDescriptor 已实现（`crates/crypto/src/secret_descriptor.rs`，93 字节、摘要先校验）。
+
+仍未勾选（缺口）：断点续传位图（进度不落盘，重启从头重发）、下载写入本地加密缓存以便离线再导出、跨设备/跨实例的“对方可下载”（需要描述符随消息投递 + 群密钥通路）。
 
 下面仍为正式跨端/全场景退出条件，未因局部实验打勾：
 

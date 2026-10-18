@@ -1,6 +1,6 @@
 # SQLite、统一事务、数据表与崩溃恢复
 
-阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/008/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过；P1 身份/联系人持久化与邀请一次性消费（迁移 0003，无计划书编号）、P1 MLS 群状态/provider 记录持久化（迁移 0004，CRYPTO-004/010 的持久化切片）与 P1 设备凭据/撤销集合持久化（迁移 0006，IDENTITY-008~012 的存储侧）也已实测通过；STORAGE-004/005 的正式语义（与加密层同事务的 provider 写入）仍未接入。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
+阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/008/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过；P1 身份/联系人持久化与邀请一次性消费（迁移 0003，无计划书编号）、P1 MLS 群状态/provider 记录持久化（迁移 0004，CRYPTO-004/010 的持久化切片）与 P1 设备凭据/撤销集合持久化（迁移 0006，IDENTITY-008~012 的存储侧）、P1 附件 FileKey 持久化（迁移 0007，attachment_secrets + 外键级联）也已实测通过；STORAGE-004/005 的正式语义（与加密层同事务的 provider 写入）仍未接入。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
 
 状态补充（2026-10-18）：`store.rs` 已有独立的未加密 P0 事务试验表，覆盖 T1/C01 意图与准备任务和 T2 MLS/attempt/outbox 崩溃断点，局部证据见 [P0-03 报告](../P0_PERSISTENCE.md)。`crates/storage/src/formal/` 新增正式加密存储路径，实现 STORAGE-001/003/006/007/009/010/011 与 002 的迁移器，证据见下文“P0-04 正式存储路径实现记录”；其余 STORAGE-004/005/008 仍未实现，MLS 加密语义（CRYPTO-004 等）也未接入。
 
@@ -333,6 +333,34 @@ cargo test --offline -p chat-storage   # 5 lib + 2 formal_crash + 7 formal_entry
 4. **摘要占用 `protected_metadata`**：该列同时是会话元数据的正式位置，本函数独占其格式；遇到非本格式字节时显式 `STATE_CORRUPTED`，不覆盖、不猜测。
 5. **未关联本地草稿**：输入不携带 `draft_id`/`operation_id`，因此同一条本机消息可能短暂同时以“待发投影 + 正式消息”出现，直到 outbox 结果（STORAGE-014/015）把草稿置为 `accepted`。
 6. **未写日志/去重/游标/回执**：STORAGE-008 契约里属于群日志与同步的部分（`group_log_entries`、`inbox_dedup`、`sync_cursors`、`receipts`）不在本切片范围内，本函数不写它们，也不推进任何游标。
+
+## 附件 FileKey 持久化实现记录（2026-10-18，Windows x64）
+
+迁移 [0007_attachment_secrets.sql](../../crates/storage/migrations/0007_attachment_secrets.sql)（schema v7，
+不改写 0001~0006）新增 attachment_secrets 表：attachment_id 主键且 **外键到 attachments 并
+ON DELETE CASCADE**（删除附件记录时密钥记录一并清除），明文列只有 attachment_id、版本号与
+时间戳。实现位于 [crates/storage/src/formal/attachments.rs](../../crates/storage/src/formal/attachments.rs)。
+
+- 密封内容：version(1) || file_id(16) || FileKey(32) 的明文负载用用途
+  `SealPurpose::AttachmentSecret` 密封，AAD 绑定 attachment_id + 记录版本；文件标识必须与
+  FileKey 一起保存，否则重启后无法重建每块 AAD、也就无法解密已有密文块。
+- API（都在 `Store` 上，走 `WriteScope::attachments()` 短事务）：
+  `save_attachment_secret`（同 file_id + 同密钥幂等；换密钥/换 file_id → OPERATION_ID_CONFLICT；
+  附件记录不存在 → ATTACHMENT_NOT_FOUND；调用方传来的密钥缓冲立即接管为 Zeroizing 并在落盘前清零）、
+  `load_attachment_secret`（返回 Zeroizing 缓冲；篡改/错主密钥/挪行 → STATE_CORRUPTED）、
+  `delete_attachment_secret`。
+- 有界与隐私：密钥必须恰好 32 字节；条目数上限继承 MAX_ATTACHMENTS；磁盘扫描不含 FileKey 与
+  file_id 明文；错误主密钥在 open_store 阶段即拒绝。
+
+复现命令（全程离线）：
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-storage --test attachment_secrets   # 5 passed
+```
+
+已知限制：没有密钥轮换/重封（换主密钥需要整表重加密，属 PLATFORM 密钥槽设计）；没有按账户的
+密钥隔离（单账户本地库）；attachment_secrets 不做独立备份/导出。
 
 ## 函数导航
 

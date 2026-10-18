@@ -26,8 +26,10 @@ use chat_crypto::attachment::{
     chunk_context_for, chunk_count, chunk_plain_length, decrypt_attachment_chunk,
     encrypt_attachment_chunk,
 };
+use chat_crypto::secret_descriptor::{SecretDescriptor, seal_secret_descriptor};
 use chat_storage::formal::{
-    AttachmentRecordInput as PersistedAttachmentInput, StorageError, Store as FormalStore,
+    AttachmentRecordInput as PersistedAttachmentInput,
+    AttachmentSecretInput as PersistedAttachmentSecretInput, StorageError, Store as FormalStore,
 };
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -311,6 +313,44 @@ pub struct ExportReceipt {
     pub written_bytes: u64,
     /// 导出的明文 SHA-256（小写 hex）。
     pub content_digest: String,
+}
+
+/// 缓存的机密材料（file_id + FileKey 副本）。只在“写入受保护存储”的边界使用：
+/// 调用方必须立即交给加密存储并显式清零，不得写日志/DTO。
+pub struct AttachmentSecretMaterial {
+    /// 附件文件标识（进入每块 AAD）。
+    pub file_id: [u8; 16],
+    /// 文件内容密钥副本（用完显式清零）。
+    pub file_key: [u8; 32],
+}
+
+impl fmt::Debug for AttachmentSecretMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttachmentSecretMaterial")
+            .field("file_id", &hex(&self.file_id))
+            .field("file_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// 64 位小写 hex → 32 字节摘要（失败按损坏处理）。
+fn digest_from_hex(value: &str) -> AttachmentResult<[u8; 32]> {
+    if value.len() != 64 {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "stored digest is not 64 hex characters",
+        ));
+    }
+    let mut digest = [0u8; 32];
+    for (index, chunk) in value.as_bytes().chunks(2).enumerate() {
+        let text = core::str::from_utf8(chunk).map_err(|_| {
+            AttachmentError::AttachmentCorrupted("stored digest is not valid hex")
+        })?;
+        digest[index] = u8::from_str_radix(text, 16).map_err(|_| {
+            AttachmentError::AttachmentCorrupted("stored digest is not valid hex")
+        })?;
+    }
+    Ok(digest)
 }
 
 struct AttachmentRecord {
@@ -672,6 +712,74 @@ impl AttachmentStore {
         }
     }
 
+
+    /// 导出本进程内缓存的机密材料（file_id + FileKey），用于写入受保护存储。
+    ///
+    /// 返回值里的密钥是普通副本：调用方必须立即交给加密存储并显式清零，
+    /// 不得写日志/DTO；本类型不持有 Zeroizing（core 不直接依赖 zeroize）。
+    pub fn secret_material(
+        &self,
+        attachment_id: &str,
+    ) -> AttachmentResult<AttachmentSecretMaterial> {
+        let records = self.lock_records()?;
+        let record = records
+            .get(attachment_id)
+            .ok_or(AttachmentError::AttachmentNotFound)?;
+        let key = record.file_key.copy_bytes();
+        Ok(AttachmentSecretMaterial {
+            file_id: *record.file_id.as_bytes(),
+            file_key: *key,
+        })
+    }
+
+    /// 把“从正式存储恢复出来的”记录重新注入进程内缓存（重启后仍可导出/下载）。
+    ///
+    /// 只接受与 attachment_id 一致的描述符；已存在同 ID 记录时直接返回（幂等）。
+    /// ciphertext_bytes 由缓存里现有块文件长度求和，缺块不在这里报错（导出/下载会显式失败）。
+    pub fn restore_record(
+        &self,
+        descriptor: AttachmentDescriptor,
+        file_id: [u8; 16],
+        file_key: [u8; 32],
+        ciphertext_digest: [u8; 32],
+        state: AttachmentState,
+    ) -> AttachmentResult<()> {
+        let file_id = FileId::try_from_slice(&file_id)?;
+        if descriptor.attachment_id != format!("{ATTACHMENT_ID_PREFIX}{}", file_id.to_hex()) {
+            return Err(AttachmentError::AttachmentCorrupted(
+                "restored file id does not match the attachment id",
+            ));
+        }
+        let mut ciphertext_bytes = 0u64;
+        for index in 0..descriptor.chunk_count {
+            if let Ok(path) = self.chunk_path(&descriptor.attachment_id, index)
+                && let Ok(metadata) = fs::metadata(&path)
+            {
+                ciphertext_bytes = ciphertext_bytes.saturating_add(metadata.len());
+            }
+        }
+        let mut records = self.lock_records()?;
+        if records.contains_key(&descriptor.attachment_id) {
+            return Ok(());
+        }
+        let key = FileKey::try_from_slice(&file_key)?;
+        records.insert(
+            descriptor.attachment_id.clone(),
+            AttachmentRecord {
+                descriptor,
+                file_id,
+                file_key: key,
+                state,
+                transferred_chunks: 0,
+                cancel_requested: state == AttachmentState::Cancelled,
+                failure: None,
+                ciphertext_bytes,
+                ciphertext_digest,
+            },
+        );
+        Ok(())
+    }
+
     fn write_plaintext(
         &self,
         attachment_id: &str,
@@ -908,8 +1016,19 @@ impl PersistedAttachmentStore {
                 display_name: descriptor.display_name.clone(),
                 created_at_ms: now_ms(),
             };
+            let mut material = self.cache.secret_material(&descriptor.attachment_id)?;
             let mut store = self.lock_store()?;
             store.save_attachment(input)?;
+            // FileKey 与 file_id 一起封存：重启后没有进程内缓存也能导出/下载。
+            let secret = PersistedAttachmentSecretInput {
+                attachment_id: descriptor.attachment_id.clone(),
+                file_id: material.file_id,
+                file_key: material.file_key.to_vec(),
+                created_at_ms: now_ms(),
+            };
+            let saved = store.save_attachment_secret(secret);
+            material.file_key.fill(0);
+            saved?;
             Ok(())
         })();
         if let Err(error) = persisted {
@@ -987,9 +1106,56 @@ impl PersistedAttachmentStore {
         }
     }
 
+    /// 从受保护存储取回 FileKey（必要时把缓存记录重新注入进进程内缓存）。
+    ///
+    /// 重启后进程内没有缓存记录，但附件记录与密钥记录都在正式库里；这里用
+    /// storage 的 attachment_secrets 恢复 file_id + FileKey，使“关掉重开仍可导出”
+    /// 成为真实行为。密钥记录缺失（例如旧数据）时仍显式 ATTACHMENT_KEY_UNAVAILABLE。
+    fn ensure_cache_record(&self, record: &StoredAttachmentRecord) -> AttachmentResult<()> {
+        if self.cache.cached_descriptor(&record.attachment_id).is_some() {
+            return Ok(());
+        }
+        let secret = {
+            let store = self.lock_store()?;
+            store
+                .load_attachment_secret(&record.attachment_id)
+                .map_err(AttachmentError::from)?
+        };
+        let Some(secret) = secret else {
+            return Err(AttachmentError::KeyUnavailable(
+                "the file key is not persisted for this attachment; re-import the file before exporting",
+            ));
+        };
+        if secret.file_key.len() != 32 {
+            return Err(AttachmentError::AttachmentCorrupted(
+                "stored file key has an invalid length",
+            ));
+        }
+        let mut file_id = [0u8; 16];
+        file_id.copy_from_slice(&secret.file_id);
+        let mut file_key = [0u8; 32];
+        file_key.copy_from_slice(secret.file_key.as_slice());
+        let descriptor = AttachmentDescriptor {
+            attachment_id: record.attachment_id.clone(),
+            plain_size: record.plain_size,
+            chunk_size: record.chunk_size,
+            chunk_count: record.chunk_count,
+            content_digest: record.content_digest.clone(),
+            display_name: record.display_name.clone(),
+        };
+        let ciphertext_digest = digest_from_hex(&record.ciphertext_digest)?;
+        let state = AttachmentState::from_code(&record.state).unwrap_or(AttachmentState::Imported);
+        let result = self
+            .cache
+            .restore_record(descriptor, file_id, file_key, ciphertext_digest, state);
+        file_key.fill(0);
+        result
+    }
+
     /// 导出附件：先核对持久化记录与本地缓存一致，再逐块认证解密并复核完整摘要。
     ///
-    /// FileKey 只在进程内，所以重启后（缓存记录缺失）必须显式失败，不产生任何目标文件。
+    /// 重启后进程内没有缓存记录时，先用 attachment_secrets 里的 FileKey 恢复缓存记录，
+    /// 因此“关掉重开仍可导出”成立；密钥记录缺失时显式 ATTACHMENT_KEY_UNAVAILABLE。
     pub fn export_attachment(
         &self,
         attachment_id: &str,
@@ -999,9 +1165,10 @@ impl PersistedAttachmentStore {
         let record = self
             .attachment_record(attachment_id)?
             .ok_or(AttachmentError::AttachmentNotFound)?;
+        self.ensure_cache_record(&record)?;
         let Some(cached) = self.cache.cached_descriptor(attachment_id) else {
-            return Err(AttachmentError::KeyUnavailable(
-                "the file key is only held in memory; re-import the file before exporting",
+            return Err(AttachmentError::AttachmentCorrupted(
+                "restored attachment cache record is missing",
             ));
         };
         let manifest = self.cache.attachment_manifest(attachment_id)?;
@@ -1027,7 +1194,30 @@ impl PersistedAttachmentStore {
         self.cache.export_attachment(attachment_id, destination)
     }
 
-    /// 删除附件：先删持久化记录（权威），再清本地缓存；返回是否删掉了任意一项。
+    /// 把该附件的 FileKey 封装成 E2EE SecretDescriptor（用调用方给的包装密钥）。
+    ///
+    /// 包装密钥由上层从 MLS application secret 派生（本轮未接线），因此描述符可以被
+    /// 放进 E2EE 内层事件发给同群设备；接收方用同一包装密钥打开后即可解密/导出。
+    pub fn export_secret_descriptor(
+        &self,
+        attachment_id: &str,
+        wrapping_key: &[u8; 32],
+    ) -> AttachmentResult<SecretDescriptor> {
+        validate_attachment_id(attachment_id)?;
+        let record = self
+            .attachment_record(attachment_id)?
+            .ok_or(AttachmentError::AttachmentNotFound)?;
+        self.ensure_cache_record(&record)?;
+        let material = self.cache.secret_material(attachment_id)?;
+        let mut file_key = material.file_key;
+        let key = FileKey::try_from_slice(&file_key);
+        file_key.fill(0);
+        let key = key?;
+        let descriptor = seal_secret_descriptor(wrapping_key, attachment_id, &key)?;
+        Ok(descriptor)
+    }
+
+    /// 删除附件：先删持久化记录（权威，外键级联同时清掉 attachment_secrets），再清本地缓存。
     pub fn delete_attachment(&self, attachment_id: &str) -> AttachmentResult<bool> {
         validate_attachment_id(attachment_id)?;
         let record_existed = self.attachment_record(attachment_id)?.is_some();
@@ -1364,6 +1554,8 @@ impl PersistedAttachmentStore {
         let record = self
             .attachment_record(blob_id)?
             .ok_or(AttachmentError::AttachmentNotFound)?;
+        // 重启后进程内没有 FileKey：先从 attachment_secrets 恢复缓存记录。
+        self.ensure_cache_record(&record)?;
         let state = AttachmentState::from_code(&record.state).ok_or(
             AttachmentError::AttachmentCorrupted("stored attachment state is unknown"),
         )?;
@@ -1969,7 +2161,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_import_survives_restart_and_export_fails_honestly() {
+    fn persisted_export_works_after_restart_with_persisted_secret() {
         let dir = TempDir::new("persisted-restart");
         let db_path = dir.path("chat.db");
         let cache_root = dir.path("cache");
@@ -1978,6 +2170,8 @@ mod tests {
         source.extend(pattern(CHUNK_BYTES + 16, 4));
         let source_path = dir.source("persisted.bin", &source);
         let attachment_id;
+        let file_id_bytes;
+        let mut file_key_bytes;
         {
             let store = PersistedAttachmentStore::open(&cache_root, formal_store(&db_path))
                 .expect("open persisted store");
@@ -1986,6 +2180,12 @@ mod tests {
                 .expect("import");
             attachment_id = descriptor.attachment_id.clone();
             assert_eq!(descriptor.chunk_count, 2);
+            let material = store
+                .cache
+                .secret_material(&attachment_id)
+                .expect("secret material");
+            file_id_bytes = material.file_id;
+            file_key_bytes = material.file_key;
             let record = store
                 .attachment_record(&attachment_id)
                 .expect("record")
@@ -2011,7 +2211,8 @@ mod tests {
             assert_eq!(fs::read(&destination).expect("read export"), source);
         }
 
-        // 关闭后同主密钥重开：记录仍在（持久真相），但 FileKey 只在进程内。
+        // 关闭后同主密钥重开：进程内没有 FileKey，但 attachment_secrets 里有，
+        // 导出必须**真实成功**且逐字节一致（这是本轮修复的核心行为）。
         {
             let store = PersistedAttachmentStore::open(&cache_root, formal_store(&db_path))
                 .expect("reopen persisted store");
@@ -2025,8 +2226,31 @@ mod tests {
             let status = store.attachment_status(&attachment_id).expect("status");
             assert_eq!(status.state, AttachmentState::Imported);
             assert_eq!(status.available_chunks, 0, "no in-memory chunks after restart");
-            // 诚实失败：FileKey 未持久化 → 显式 ATTACHMENT_KEY_UNAVAILABLE，不产生目标文件。
             let destination = dir.path("after-restart.out");
+            let receipt = store
+                .export_attachment(&attachment_id, &FileToken::from_local_path(&destination))
+                .expect("export after restart must succeed");
+            assert_eq!(receipt.written_bytes, source.len() as u64);
+            assert_eq!(fs::read(&destination).expect("read export"), source);
+            // 恢复出来的缓存记录可以复用：再导出一次仍然一致（幂等）。
+            let again = dir.path("after-restart-again.out");
+            store
+                .export_attachment(&attachment_id, &FileToken::from_local_path(&again))
+                .expect("second export");
+            assert_eq!(fs::read(&again).expect("read second export"), source);
+        }
+
+        // 诚实路径仍然存在：显式删掉密钥记录后，新进程（无缓存）导出必须显式失败。
+        {
+            let store = PersistedAttachmentStore::open(&cache_root, formal_store(&db_path))
+                .expect("reopen persisted store");
+            {
+                let mut guard = store.store.lock().expect("formal store lock");
+                assert!(guard
+                    .delete_attachment_secret(&attachment_id)
+                    .expect("delete secret"));
+            }
+            let destination = dir.path("no-secret.out");
             let error = store
                 .export_attachment(&attachment_id, &FileToken::from_local_path(&destination))
                 .unwrap_err();
@@ -2036,7 +2260,7 @@ mod tests {
             let missing = store
                 .export_attachment(
                     "att-00000000000000000000000000000000",
-                    &FileToken::from_local_path(&destination),
+                    &FileToken::from_local_path(&dir.path("unknown.out")),
                 )
                 .unwrap_err();
             assert_eq!(missing.code(), "ATTACHMENT_NOT_FOUND");
@@ -2063,7 +2287,147 @@ mod tests {
                 "display name leaked into {}",
                 path.display()
             );
+            assert!(
+                !contains(&bytes, &file_key_bytes),
+                "file key leaked into {}",
+                path.display()
+            );
+            assert!(
+                !contains(&bytes, &file_id_bytes),
+                "file id leaked into {}",
+                path.display()
+            );
         }
+        file_key_bytes.fill(0);
+    }
+
+
+    #[test]
+    fn persisted_secret_tamper_is_state_corrupted() {
+        let dir = TempDir::new("secret-tamper");
+        let db_path = dir.path("chat.db");
+        let cache_root = dir.path("cache");
+        let source_path = dir.source("tamper.bin", &pattern(700, 6));
+        let attachment_id = {
+            let store = PersistedAttachmentStore::open(&cache_root, formal_store(&db_path))
+                .expect("open persisted store");
+            let descriptor = store
+                .import_file(&FileToken::from_local_path(&source_path), "tamper.bin")
+                .expect("import");
+            let id = descriptor.attachment_id.clone();
+            // 测试专用篡改：直接改写密封列（绕过存储 API），模拟磁盘被改写。
+            {
+                let guard = store.store.lock().expect("store lock");
+                guard
+                    .connection()
+                    .execute(
+                        "UPDATE attachment_secrets SET protected_secret = X'00ff' WHERE attachment_id = ?1",
+                        [&id],
+                    )
+                    .expect("tamper secret");
+            }
+            id
+        };
+        // 重启（进程内没有别的东西可依赖）：读取密封密钥必须显式 STATE_CORRUPTED。
+        let store = PersistedAttachmentStore::open(&cache_root, formal_store(&db_path))
+            .expect("reopen persisted store");
+        assert_eq!(
+            store
+                .attachment_record(&attachment_id)
+                .expect("record is still readable")
+                .expect("present")
+                .state,
+            "imported"
+        );
+        let destination = dir.path("tampered.out");
+        let error = store
+            .export_attachment(&attachment_id, &FileToken::from_local_path(&destination))
+            .unwrap_err();
+        assert_eq!(error.code(), "STATE_CORRUPTED");
+        assert!(!destination.exists(), "tampered secret must not produce a file");
+    }
+
+    #[test]
+    fn persisted_delete_removes_the_stored_secret() {
+        let dir = TempDir::new("secret-delete");
+        let source_path = dir.source("delete-secret.bin", &pattern(400, 7));
+        let store =
+            PersistedAttachmentStore::open(dir.path("cache"), formal_store(&dir.path("chat.db")))
+                .expect("open persisted store");
+        let descriptor = store
+            .import_file(&FileToken::from_local_path(&source_path), "delete-secret.bin")
+            .expect("import");
+        let attachment_id = descriptor.attachment_id.clone();
+        {
+            let guard = store.store.lock().expect("store lock");
+            assert!(guard
+                .load_attachment_secret(&attachment_id)
+                .expect("load secret")
+                .is_some());
+        }
+        assert!(store.delete_attachment(&attachment_id).expect("delete"));
+        let guard = store.store.lock().expect("store lock");
+        let count: i64 = guard
+            .connection()
+            .query_row("SELECT COUNT(*) FROM attachment_secrets", [], |row| row.get(0))
+            .expect("count secrets");
+        assert_eq!(count, 0, "deleting an attachment must clear its file key");
+        assert!(guard
+            .load_attachment_secret(&attachment_id)
+            .expect("load secret")
+            .is_none());
+    }
+
+    #[test]
+    fn persisted_export_secret_descriptor_roundtrip() {
+        let dir = TempDir::new("secret-descriptor");
+        let source_path = dir.source("descriptor.bin", &pattern(900, 8));
+        let store =
+            PersistedAttachmentStore::open(dir.path("cache"), formal_store(&dir.path("chat.db")))
+                .expect("open persisted store");
+        let descriptor = store
+            .import_file(&FileToken::from_local_path(&source_path), "descriptor.bin")
+            .expect("import");
+        let attachment_id = descriptor.attachment_id.clone();
+        let mut material = store
+            .cache
+            .secret_material(&attachment_id)
+            .expect("secret material");
+        let file_key = FileKey::try_from_slice(&material.file_key).expect("file key");
+        let wrapping_key = [0x5au8; 32];
+        let wrapped = store
+            .export_secret_descriptor(&attachment_id, &wrapping_key)
+            .expect("export descriptor");
+        assert!(!contains(wrapped.as_bytes(), &material.file_key));
+        let opened = chat_crypto::secret_descriptor::open_secret_descriptor(
+            &wrapping_key,
+            &attachment_id,
+            &wrapped,
+        )
+        .expect("open descriptor");
+        assert!(opened.equals(&file_key), "descriptor must wrap the same file key");
+        // 错包装密钥与错附件 ID 都显式拒绝。
+        assert_eq!(
+            chat_crypto::secret_descriptor::open_secret_descriptor(
+                &[0x5bu8; 32],
+                &attachment_id,
+                &wrapped
+            )
+            .unwrap_err()
+            .code(),
+            "ATTACHMENT_CORRUPTED"
+        );
+        assert_eq!(
+            chat_crypto::secret_descriptor::open_secret_descriptor(
+                &wrapping_key,
+                "att-00000000000000000000000000000000",
+                &wrapped
+            )
+            .unwrap_err()
+            .code(),
+            "ATTACHMENT_CORRUPTED"
+        );
+        material.file_key.fill(0);
     }
 
     #[test]
@@ -2587,9 +2951,9 @@ mod tests {
     }
 
     #[test]
-    fn download_rejects_unknown_blobs_and_missing_keys() {
+    fn download_works_after_restart_and_rejects_unknown_blobs() {
         let dir = TempDir::new("download-unknown");
-        let (source_path, _source) = upload_source(&dir, "unknown.bin");
+        let (source_path, source_bytes) = upload_source(&dir, "unknown.bin");
         let db_path = dir.path("chat.db");
         let cache_root = dir.path("cache");
         let (attachment_id, manifest) = {
@@ -2630,18 +2994,65 @@ mod tests {
             (descriptor.attachment_id, manifest)
         };
 
-        // “重启”：进程内 FileKey 消失，下载必须显式失败且不写文件。
+        // “重启”：进程内 FileKey 消失，但 attachment_secrets 里有，下载必须真实成功。
         let reopened =
             PersistedAttachmentStore::open(&cache_root, formal_store(&db_path)).expect("reopen");
+        // 节点侧仍有已发布密文（用缓存里的块播种一个假节点，模拟“同一 blob 还在”）。
         let mut transport = FakeBlobTransport::default();
-        let error = reopened
+        let session = transport
+            .begin_upload(UploadRequest {
+                attachment_id: attachment_id.clone(),
+                plain_size: manifest.plain_size,
+                chunk_size: manifest.chunk_size,
+                chunk_count: manifest.chunk_count,
+                ciphertext_bytes: manifest.ciphertext_bytes,
+                ciphertext_digest: manifest.ciphertext_digest.clone(),
+            })
+            .expect("seed begin");
+        for index in 0..manifest.chunk_count {
+            let chunk = reopened
+                .cache
+                .ciphertext_chunk(&attachment_id, index)
+                .expect("cached ciphertext chunk");
+            transport
+                .put_chunk(session.as_str(), index, &chunk)
+                .expect("seed chunk");
+        }
+        transport
+            .complete(session.as_str(), &manifest.ciphertext_digest)
+            .expect("seed complete");
+        let destination = dir.path("after-restart.out");
+        let receipt = reopened
+            .download_attachment(
+                &attachment_id,
+                &manifest,
+                &FileToken::from_local_path(&destination),
+                &mut transport,
+            )
+            .expect("download after restart must succeed");
+        assert_eq!(receipt.written_bytes, source_bytes.len() as u64);
+        assert_eq!(fs::read(&destination).expect("read download"), source_bytes);
+        assert_eq!(transport.reads as u32, manifest.chunk_count);
+
+        // 密钥记录被删掉后（新进程、无缓存）：显式 ATTACHMENT_KEY_UNAVAILABLE 且不读字节。
+        drop(reopened);
+        let reopened_again =
+            PersistedAttachmentStore::open(&cache_root, formal_store(&db_path)).expect("reopen again");
+        {
+            let mut guard = reopened_again.store.lock().expect("formal store lock");
+            assert!(guard
+                .delete_attachment_secret(&attachment_id)
+                .expect("delete secret"));
+        }
+        let mut transport = FakeBlobTransport::default();
+        let error = reopened_again
             .download_attachment(
                 &attachment_id,
                 &manifest,
                 &FileToken::from_local_path(&dir.path("no-key.out")),
                 &mut transport,
             )
-            .expect_err("the file key is only held in memory");
+            .expect_err("the file key must be gone");
         assert_eq!(error.code(), "ATTACHMENT_KEY_UNAVAILABLE");
         assert!(!dir.path("no-key.out").exists());
         assert_eq!(transport.reads, 0, "no bytes are read without the file key");

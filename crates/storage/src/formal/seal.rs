@@ -61,6 +61,8 @@ pub enum SealPurpose {
     MlsRecord,
     /// `attachments.protected_descriptor`：附件记录的敏感元数据（内容/密文摘要、展示名）。
     AttachmentRecord,
+    /// `attachment_secrets.protected_secret`：附件的 file_id 与 FileKey（内容密钥）。
+    AttachmentSecret,
 }
 
 impl SealPurpose {
@@ -79,6 +81,7 @@ impl SealPurpose {
             Self::MlsGroupState => b"mls-group-state",
             Self::MlsRecord => b"mls-record",
             Self::AttachmentRecord => b"attachment-record",
+            Self::AttachmentSecret => b"attachment-secret",
         }
     }
 }

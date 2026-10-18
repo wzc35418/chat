@@ -1,6 +1,6 @@
 # MLS、单群串行状态与附件密码学
 
-阶段：P0 → P3。状态：函数级设计；CRYPTO-005~009 群成员控制（pending 控制提交、对端条目处理、接受后合并、拒绝后回滚、Welcome 加入）、CRYPTO-011/012 附件分块 AEAD、P0-04 存储主密钥/敏感列加密基础、以及 CRYPTO-004/010 的**状态持久化切片**（已提交 MLS 群状态与 provider 秘密落到正式加密库、重启后可继续加解密）已实现（Windows x64 实测，见下文实现记录）。仍未实现：同事务 provider（TxnCryptoProvider）、PreparedWrite/外层候选签名与 T3 落库、正式群策略授权（DOMAIN-004）、控制 head 对账与分叉胜出合并。目标源码：[crates/crypto/src/engine.rs](../../crates/crypto/src/engine.rs)、[crates/crypto/src/control.rs](../../crates/crypto/src/control.rs)、[crates/crypto/src/attachment.rs](../../crates/crypto/src/attachment.rs) 与 [crates/crypto/src/key_store.rs](../../crates/crypto/src/key_store.rs)。
+阶段：P0 → P3。状态：函数级设计；CRYPTO-005~009 群成员控制（pending 控制提交、对端条目处理、接受后合并、拒绝后回滚、Welcome 加入）、CRYPTO-011/012 附件分块 AEAD、P0-04 存储主密钥/敏感列加密基础、CRYPTO-004/010 的**状态持久化切片**（已提交 MLS 群状态与 provider 秘密落到正式加密库、重启后可继续加解密）以及 **E2EE SecretDescriptor**（附件 FileKey 的封装格式与 seal/open）已实现（Windows x64 实测，见下文实现记录）。仍未实现：同事务 provider（TxnCryptoProvider）、PreparedWrite/外层候选签名与 T3 落库、正式群策略授权（DOMAIN-004）、控制 head 对账与分叉胜出合并。目标源码：[crates/crypto/src/engine.rs](../../crates/crypto/src/engine.rs)、[crates/crypto/src/control.rs](../../crates/crypto/src/control.rs)、[crates/crypto/src/attachment.rs](../../crates/crypto/src/attachment.rs)、[crates/crypto/src/secret_descriptor.rs](../../crates/crypto/src/secret_descriptor.rs) 与 [crates/crypto/src/key_store.rs](../../crates/crypto/src/key_store.rs)。
 
 必须使用成熟实现。TxnCryptoProvider 在同一 storage 事务中读写；如果 OpenMLS provider 不能安全接入，则先 ADR 决策并实现幂等日志恢复再继续。PreparedWrite 不是已正式发布的新内存状态。每群串行执行，网络等待不跨持有 SQLite 写事务。
 
@@ -41,6 +41,35 @@ cargo test --offline -p chat-crypto --test attachment_chunks   # 9 passed
 ```
 
 已知限制：未对照 RFC 8439 官方测试向量（实现来自 chacha20poly1305 =0.11.0）；nonce 随机生成而非冻结的计数器方案，唯一性靠 96-bit 随机 + 每附件 100 块量级的概率论证，尚无形式化证明；分块层不校验“块数覆盖”与整文件摘要，这两项由导出流程负责。
+
+## E2EE SecretDescriptor 实现记录（CRYPTO-013 候选，2026-10-18，Windows x64）
+
+目标：把附件 FileKey 封装成可放进 E2EE 内层事件的**不透明描述符**，为“另一实例/另一设备可
+下载同一附件”提供格式与密码学边界（ADR 决策第 2 步）。代码在
+[crates/crypto/src/secret_descriptor.rs](../../crates/crypto/src/secret_descriptor.rs)；本地持久化
+（ADR 第 1 步）在 [storage.md](storage.md)。
+
+- 格式（固定 93 字节）：version(1) || nonce(12) || ciphertext(48 = 32 密钥 + 16 标签) || digest(32)。
+  digest = SHA-256(域分隔 || 正文长度 || 正文)，在 AEAD 之前校验，用于快速发现损坏；机密性/完整性
+  仍由 ChaCha20-Poly1305 提供。
+- 包装密钥：调用方提供 32 字节（未来由 MLS application secret 派生；本轮未接线），因此描述符可以
+  随消息传递而不泄露 FileKey。
+- AAD：域分隔 + 长度前缀的 attachment_id；把描述符挪到另一个附件上会认证失败。
+- 有界与失败语义：长度不是 93 字节、版本不是 1、长度上限（256 字节）、attachment_id 为空或超长
+  都显式拒绝；解封失败统一 ATTACHMENT_CORRUPTED（不区分错密钥与篡改），不返回任何明文；
+  解出的 FileKey 用 Zeroizing 缓冲（Drop 清零），描述符 Debug 只打印版本与摘要。
+- 密钥外带：新增 `FileKey::copy_bytes()` 返回 Zeroizing 缓冲，只在“写入受保护存储/封装描述符”
+  的边界使用；core 侧拿到副本后必须立即交给加密存储并显式清零。
+
+复现命令（全程离线）：
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-crypto --test secret_descriptor   # 4 passed
+```
+
+已知限制：包装密钥的派生与生命周期（MLS application secret / 平台密钥槽）未接线，因此跨设备
+“描述符送达即可下载”仍未端到端验证；描述符没有独立的 KDF/版本迁移策略（首个版本固定 93 字节）。
 
 ## CRYPTO-004/010 MLS 状态持久化切片实现记录（2026-10-18，Windows x64）
 

@@ -101,6 +101,14 @@ impl FileKey {
         Ok(Self(key))
     }
 
+    /// 复制密钥字节，返回的缓冲在 Drop 时清零。
+    ///
+    /// 只在“把 FileKey 交给受保护存储/封装成 SecretDescriptor”的边界使用：
+    /// 调用方必须立即交给加密存储或密码函数，不得写入日志、DTO 或普通错误消息。
+    pub fn copy_bytes(&self) -> Zeroizing<[u8; FILE_KEY_BYTES]> {
+        Zeroizing::new(self.0)
+    }
+
     /// 常量时间比较（只用于测试与一致性校验）。
     pub fn equals(&self, other: &Self) -> bool {
         let mut diff = 0u8;

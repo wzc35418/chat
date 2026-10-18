@@ -351,9 +351,9 @@ fn upload_reaches_the_node_and_download_returns_the_original_bytes() {
         .expect("status after reopen");
     assert_eq!(status.state, "available");
 
-    // 诚实边界：FileKey 只在进程内，另一个实例无法解密（显式失败，不产出文件）。
+    // FileKey 现已随附件记录持久化（R-47）：重开后的实例能真实下载并解出原文。
     let second_target = dir.path("second-instance.bin");
-    let error = reopened
+    let second = reopened
         .download(
             uploaded.attachment_id.clone(),
             second_target.to_string_lossy().into_owned(),
@@ -363,9 +363,10 @@ fn upload_reaches_the_node_and_download_returns_the_original_bytes() {
             group_id,
             source_seq,
         )
-        .expect_err("a fresh instance has no file key");
-    assert_eq!(code(error), "ATTACHMENT_KEY_UNAVAILABLE");
-    assert!(!second_target.exists(), "no unverified output");
+        .expect("a reopened instance can decrypt with the persisted file key");
+    assert_eq!(second.written_bytes, source.len() as u64);
+    assert_eq!(second.content_digest, imported.content_digest);
+    assert_eq!(fs::read(&second_target).expect("read second target"), source);
 }
 
 #[test]

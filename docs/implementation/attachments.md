@@ -343,7 +343,7 @@ impl PersistedAttachmentStore {
 1. 只接受 `available` / `downloading`（可重试）记录；`expected_manifest` 必须与本地持久化记录一致（附件 ID、块数、块大小、明文大小、密文摘要），不一致在**任何网络读取之前** `ATTACHMENT_CORRUPTED`。
 2. 逐块 `read_chunk` → CRYPTO-012 分块 AAD 认证解密 → 同目录临时文件；全部块通过后再校验**密文整文件摘要 + 明文总长 + 明文 SHA-256**，三者都一致才 rename 成目标文件。
 3. 任何失败（块缺失/篡改/manifest 不符/IO）删除临时文件，绝不写出未验证成品；失败时记录停在 `downloading`（可重试）。
-4. 解密需要进程内的 FileKey（不持久化）：重启后（没有进程内记录）显式 `ATTACHMENT_KEY_UNAVAILABLE`，且在拿到密钥前不发起任何块读取。
+4. 解密需要 FileKey：本进程有缓存时直接用；重启后从正式库的 `attachment_secrets` 取回（见下文 ADR 记录），只有密钥记录真的缺失时才显式 `ATTACHMENT_KEY_UNAVAILABLE`，且在拿到密钥前不发起任何块读取。
 
 复现命令（全程离线，本轮实测）：
 
@@ -360,14 +360,14 @@ cargo test --offline -p chat-core                     # 70 passed（既有 64 �
 - `attachments::tests::download_roundtrip_matches_the_original_plaintext`：上传→下载的明文与原始正文逐字节一致，回执 `written_bytes`/`content_digest` 与描述符一致，块读取次数 = 块数。
 - `attachments::tests::download_rejects_tampered_chunks_and_leaves_no_partial_file`：替换第 2 块 → `ATTACHMENT_CORRUPTED`，目标文件不存在、`*.download-partial` 也不存在，记录停在 `downloading`（可重试）。
 - `attachments::tests::download_rejects_a_wrong_manifest_before_reading_any_chunk`：密文摘要被改 / manifest 属于另一个附件 → `ATTACHMENT_CORRUPTED` 且**零块读取**。
-- `attachments::tests::download_rejects_unknown_blobs_and_missing_keys`：节点缺块或未知附件 ID → `ATTACHMENT_NOT_FOUND`；“重启”后没有进程内 FileKey → `ATTACHMENT_KEY_UNAVAILABLE` 且零读取、不写文件。
+- `attachments::tests::download_works_after_restart_and_rejects_unknown_blobs`：节点缺块或未知附件 ID → `ATTACHMENT_NOT_FOUND`；重启后从 `attachment_secrets` 取回 FileKey，下载真实成功且字节一致；显式删除密钥记录后 → `ATTACHMENT_KEY_UNAVAILABLE` 且零读取、不写文件。
 
 已知限制（本切片不覆盖）：
 
 1. **节点适配在独立文件**：端口 `BlobTransport` 的节点实现是 [crates/core/src/attachment_transport.rs](../../crates/core/src/attachment_transport.rs) 的 `NodeBlobTransport`（NODE-012~015，含节点配额与回执验签），本文件（编排层）不含任何 HTTP/节点依赖；见下文“节点块传输适配实现记录”。
 2. **进度不落盘**：附件表没有进度列，`transferred_chunks` 只在进程内；重启后重试从头重发（同序号同字节，端口侧幂等）。验收项“重启从位图续传”因此未勾选。
 3. **下载不写本地加密缓存**：本轮直接认证解密写到目标路径（不重新加密入缓存），因此下载后不能离线 `export_attachment`；“只拉缺块”的位图也未实现。
-4. **FileKey 仍只在进程内**：下载与导出都要求“本进程导入过”，E2EE SecretDescriptor（含 FileKey 的受保护记录）与下载能力令牌/CAPABILITY_EXPIRED 仍未实现。
+4. **FileKey 已持久化（本轮）**：下载与导出在重启后可用（storage 的 `attachment_secrets`）；仍未实现的是**跨设备**派发（E2EE SecretDescriptor 的包装密钥派生/送达）与下载能力令牌/CAPABILITY_EXPIRED。
 5. **取消与传输的竞争**：`cancel_transfer` 会把状态置 cancelled；若此时上传/下载已在进行，端口调用不会被中断（没有网络流句柄），完成回写会因白名单拒绝而显式失败（cancelled 是终态）。
 6. **节点侧“同块只计一次配额”**属于 NODE-013 的记账，本层只保证重发同一字节。
 
@@ -430,7 +430,7 @@ cargo test --offline -p chat-core                                # 76 passed（�
 1. **节点块上限已对齐客户端分块（后续任务修正）**：节点 `BlobPolicy` 现在提供 `CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES`（256 KiB + 29 字节封装开销），默认 `max_chunk_bytes` 1 MiB、硬上限 4 MiB，且编译期断言 `DEFAULT_BLOB_CHUNK_BYTES >= CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES`。因此 256 KiB 分块的多块附件可以真正发布（用例 `multi_chunk_attachments_pass_the_node_chunk_policy_and_publish`）；本层的 `chunk_bytes` 换算不变，若节点策略再次收紧，该用例会立刻变红。
 2. **断链时无“部分进度>0”的真实场景**：单块附件在第一次块写入前就失败（transferred = 0）；真正的“已发 2 块后失败”由编排层单元测试（假端口）覆盖。多块场景受限制 1 阻断。
 3. **没有取消/超时的网络流句柄**：`cancel_transfer` 只改本地状态，进行中的 HTTP 请求不会被中断（与编排层记录的限制一致）。
-4. **下载仍要求进程内 FileKey**：跨进程/重启的下载需要 E2EE SecretDescriptor（未实现），因此“节点重启后下载”用例保持同一个客户端 store 句柄。
+4. **下载已可跨重启**（FileKey 从 `attachment_secrets` 取回）；仍未实现的是跨**设备**下载（需要把 E2EE SecretDescriptor 随消息送达）。
 5. **一个 transport 绑定一个群 + 一条 source 条目**：多附件（不同 source seq）需要按消息构造 transport 或多绑定表；本轮按“一消息一附件一组”的切片构造。
 6. **节点授权需先有本设备的已接受日志条目**：附件上传前必须已有一条本设备条目（测试用 append 真实写入），不存在“先传附件再发消息”的路径。
 
@@ -482,11 +482,77 @@ cargo test --offline -p chat-ffi -p chat-core             # 30 + 81 passed（既
 
 ### 已知限制
 
-1. **跨进程/跨实例下载**需要 E2EE SecretDescriptor（FileKey 不落盘），当前显式 `ATTACHMENT_KEY_UNAVAILABLE`；本轮用例因此用“导入同一实例下载”证明往返，并单独断言“另一实例诚实失败”。
+1. **跨设备下载**仍需要 E2EE SecretDescriptor 的包装密钥派生与送达（crypto 的封装格式已实现并可导出描述符；MLS application secret 接线未做），本机跨重启已通过 `attachment_secrets` 支持。
 2. **节点块上限已对齐客户端分块**：默认 1 MiB（硬上限 4 MiB）≥ 客户端 256 KiB 密文块，因此多块附件也能上传；见上文节点块传输适配记录与 `multi_chunk_attachments_pass_the_node_chunk_policy_and_publish`。
 3. `AttachmentFfi::open` 的库是**独占单写者**：与 `ConversationCore`/`LocalStoreFfi` 不能同时打开同一库，调用方需先关闭另一个对象。
 4. 上传/下载是同步阻塞调用（FFI `Mutex` 串行化），大文件不要在 UI 线程直接跑。
 5. `Cargo.lock` 变化：`chat-ffi` 新增 dev-dependencies（`chat-node-api`/`chat-node-client`/`chat-node-services`/`axum`/`tokio`/`ed25519-dalek`）供端到端用例起真节点；这些包在锁文件中已存在，无版本变动。
+
+## FileKey 持久化与 E2EE SecretDescriptor（ADR 摘要，R-36/X 包，2026-10-18，Windows x64）
+
+ADR 见 [docs/design/FILE_KEY_PERSISTENCE.md](../design/FILE_KEY_PERSISTENCE.md)（状态：第 1 步已落地、
+第 2 步格式已落地、第 3 步依赖 PLATFORM）。本轮把 FileKey 真正持久化，使“关掉重开仍可导出/下载”
+成为可验证行为，而不是靠进程内缓存。
+
+### 决策摘要
+
+1. **本地持久化**：新增迁移 `0007_attachment_secrets`（storage），`attachment_secrets` 表以
+   attachment_id 为主键、外键到 attachments 并 `ON DELETE CASCADE`；密封内容 =
+   version(1) || file_id(16) || FileKey(32)，用主密钥派生的用途子密钥（`attachment-secret`）
+   密封，AAD 绑定 attachment_id + 记录版本。**file_id 必须与 FileKey 一起存**：它是每块 AAD 的
+   一部分，缺了它重启后无法解密已有密文块。
+2. **描述符化**：crypto 增加 [SecretDescriptor](../implementation/crypto.md)（93 字节固定格式：
+   版本 + nonce + 密文 + 摘要），用调用方给的包装密钥（未来由 MLS application secret 派生）
+   把 FileKey 封装成可随 E2EE 消息传递的不透明载荷；core 的
+   `PersistedAttachmentStore::export_secret_descriptor` 已能导出。
+3. **平台密钥槽**（未做）：主密钥进入系统凭据库/TPM 后，调用方不再传 master_key_hex。
+
+### 落地行为
+
+- `import_file`：先写缓存与附件记录，再把 file_id + FileKey 写入 `attachment_secrets`；
+  任一步失败都会清掉刚写入的缓存与记录，不留半成品。
+- `export_attachment` / `download_attachment`：本进程有缓存时直接用；没有缓存时
+  `ensure_cache_record` 从 `attachment_secrets` 取回 file_id + FileKey 并重建缓存记录，
+  然后照常逐块认证解密 + 整文件摘要复核。密钥记录缺失（旧数据或被删除）仍显式
+  `ATTACHMENT_KEY_UNAVAILABLE`，不伪造成功。
+- 解封失败（错主密钥、挪行、篡改密文列）→ `STATE_CORRUPTED`，不降级成“没有密钥”。
+- `delete_attachment`：删除附件记录时外键级联删除 `attachment_secrets`（同一次事务提交）。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-storage --test attachment_secrets   # 5 passed
+cargo test --offline -p chat-crypto --test secret_descriptor     # 4 passed
+cargo test --offline -p chat-core --lib                          # 29 passed
+~~~
+
+### 证据
+
+- `attachments::tests::persisted_export_works_after_restart_with_persisted_secret`：导入 → 关闭 →
+  同主密钥重开 → 导出**真实成功**且逐字节一致（并可重复导出）；显式删掉密钥记录后新进程导出
+  → `ATTACHMENT_KEY_UNAVAILABLE` 且不产生文件；未知附件仍 `ATTACHMENT_NOT_FOUND`；
+  缓存与全库文件里没有明文、展示名、FileKey、file_id。
+- `attachments::tests::persisted_secret_tamper_is_state_corrupted`：篡改密封列后重启读取
+  → `STATE_CORRUPTED`，不产生目标文件。
+- `attachments::tests::persisted_delete_removes_the_stored_secret`：删除附件后
+  `attachment_secrets` 计数为 0 且 load 返回 None。
+- `attachments::tests::persisted_export_secret_descriptor_roundtrip`：导出的描述符用同一包装密钥
+  可以解出同一个 FileKey，错包装密钥/错 attachment_id 都 `ATTACHMENT_CORRUPTED`，描述符不含明文密钥。
+- `attachments::tests::download_works_after_restart_and_rejects_unknown_blobs`：重启后从节点下载
+  真实成功（FileKey 来自库），删掉密钥记录后 `ATTACHMENT_KEY_UNAVAILABLE` 且零读取。
+- storage：`attachment_secrets` 用例 5 个（幂等/换钥冲突/缺记录拒绝/密封与篡改/级联删除/有界）。
+- crypto：`secret_descriptor` 用例 4 个（往返、错密钥与错附件、篡改/截断/版本、无明文密钥）。
+
+### 已知限制
+
+1. 描述符的包装密钥（MLS application secret → 设备/群绑定派生）尚未接线，因此**跨设备**“描述符
+   送达即可下载”仍未端到端验证；本机跨重启已通。
+2. 未做密钥轮换/重封（换主密钥需要整表重加密，属 PLATFORM 密钥槽设计）。
+3. `crates/ffi/tests/attachment_node.rs` 里“另一实例下载 → `ATTACHMENT_KEY_UNAVAILABLE`”的断言
+   反映的是本轮之前的边界；现在同一库同一主密钥的第二实例可以真实下载，该断言需由 FFI 任务同步更新
+   （本轮不在 crates/ffi 写范围）。
+
 
 
 
