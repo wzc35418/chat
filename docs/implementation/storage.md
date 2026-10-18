@@ -949,3 +949,29 @@ mark_outbox_result(lease: LeasedJob, result: JobResult) -> Result<JobState>
 
 **实现状态**：已实现（Windows x64 实测）。`mark_outbox_result(lease, result)` 与注入时钟的 `mark_outbox_result_at(..., now_unix_ms)`，见 [outbox_lease.rs](../../crates/storage/src/formal/outbox_lease.rs)。三态语义：success → 任务 `complete`；可重试失败 → `pending` + 指数退避（5 秒起、上限 5 分钟）；终态失败 → `failed` + attempt `rejected`；`unknown` → 保持 `leased`、延长 6 小时对账窗口、attempt `unknown`，绝不当作成功删除投递任务。attempt 只允许前进（`accepted`/`rejected` 不回退）。限制：诊断不落盘（P0 schema 无诊断列且本轮不新增迁移，只随 `JobState` 返回）；`unknown` 的真实对账（按 SubmissionId 查询节点状态）属于同步/节点模块，未实现；重试退避策略是本地取值，正式策略待 DOMAIN-010 `classify_retry` 接入后对齐。
 
+## 群状态键列表（STORAGE-清单，2026-10-18，Windows x64）
+
+~~~text
+pub fn list_mls_group_state_keys(prefix: &str, limit: usize) -> Result<Vec<MlsGroupStateKey>>
+pub struct MlsGroupStateKey { group_id, state_version, updated_at_ms }
+pub const MAX_GROUP_STATE_LIST: usize = 256;
+~~~
+
+- **只回键与时间**：不打开密封正文，列表页零解密成本；
+- **有界**：`limit` 必须 `1..=256`，越界返回 `INVALID_INPUT`（不夹取）；
+- **前缀用 @substr` 比较**（不走 `LIKE`，避免通配符语义）；前缀长度上限 256 字节；
+- **倒序**：`ORDER BY updated_at DESC, group_id ASC`（同毫秒时按 key 稳定排序）；
+- 负数 `state_version`/`updated_at` 视为状态损坏（`STATE_CORRUPTED`）。
+
+复现：
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-storage   # 94 passed
+~~~
+
+证据：`crates/core/tests/groups_list.rs` 的 `storage_list_bounds_are_enforced`（`limit=0/257` 拒绝、
+`limit=2` 截断、其它前缀为空、全量倒序）；`corrupted_entries_are_skipped_and_reported` 用非群快照正文
+验证"列表只回键、正文由 core 解析并计入 skipped"。
+
+

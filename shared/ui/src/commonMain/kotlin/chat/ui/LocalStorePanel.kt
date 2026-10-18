@@ -55,6 +55,7 @@ data class StoreHandlers(
     val syncRefresh: () -> Unit = {},
     val loadMessageAttachments: () -> Unit = {},
     val exportCard: (String) -> Unit = {},
+    val downloadCard: (String) -> Unit = {},
 ) {
     companion object {
         val None = StoreHandlers()
@@ -357,6 +358,13 @@ fun LocalStorePanel(
                                                 if (card.downloadable) "" else " · 不可下载",
                                             style = MaterialTheme.typography.bodySmall,
                                         )
+                                        TextButton(
+                                            onClick = { handlers.downloadCard(card.attachmentId) },
+                                            enabled = state.ready && !state.busy && !card.downloadable,
+                                            modifier = Modifier.semantics {
+                                                contentDescription = "从节点下载附件 " + card.displayName
+                                            },
+                                        ) { Text("从节点下载", style = MaterialTheme.typography.labelSmall) }
                                         TextButton(
                                             onClick = { handlers.exportCard(card.attachmentId) },
                                             enabled = state.ready && !state.busy,

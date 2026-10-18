@@ -31,6 +31,11 @@
 - **规范编码**：`"CPC" major:u8 minor:u8 body`。body tag：0x01 u64（8 字节大端）、0x02 bytes（u32 大端长度）、0x03 text（u32 大端 UTF-8 长度）、0x04 none、0x05 some、0x06 list（u32 大端数量）、0x07 struct（u16 大端字段数 + 每项 u16 字段号 + 值，字段号严格升序）。编码期按字段号重排，重复/未知字段号显式拒绝。预算：总长 64 KiB、深度 8、集合 512、文本 8 KiB。
 - **字段号**：1 schema_version、2/3 协议主/次版本、4 submission_id、5 group_id、6 author_device_id、7 kind、8 control_head、9 policy_version、10 mls_epoch、11 payload_digest、12/13 control 操作与目标摘要、14 receipt seq、15 previous_log_hash、16 candidate_digest、17–26 cursor（account/device/conversation/resource/sort_version/sort_key/seq/tie/issued_at/expires_at）、27–32 extension（namespace/schema_version/operation/object/payload/fallback）、33 节点回执签名、34 日志条目哈希、35 event_id、36 author_account_id、37 内容种类、38 文本、39 扩展内容、40 附件 file_id、41/42 回复会话/消息、43 origin、44 事件会话、45 展示时间、46–50 策略操作（account/role/muted/devices/name_digest）、51–54 会话能力（features/max_frame/max_message/max_ciphertext）、55/56 控制候选可选领域操作声明（domain_operation / domain_target_digest）。字段号只增不改，33–56 为 P1 补充。
 - **签名原文**：`域字符串 || 规范编码`。候选作者域 `chat/p1/candidate-author-signature/v1`；节点回执域 `chat/p1/coordinator-receipt-signature/v1`。候选原文编码 kind（消息类别）、协议主/次版本与全部路由/控制字段，排除 `author_signature` 自身；回执原文绑定 group/seq/previous_log_hash/candidate_digest。
+- **通用提案值（NODECAP，PROTOCOL-004）**：`ControlOperation` 在 1..=8 之后新增 9..=13 五个**提案**取值
+  （`9 proposal:membership`、`10 proposal:role_policy`、`11 proposal:settings`、`12 proposal:key_rotation`、
+  `13 proposal:custom`），提案类型编码在操作值本身（不新增字段、不改 1..=8 的数值），因此既有固定向量逐字节不变。
+  提案必须**不**附领域声明（语义来源唯一）；节点可用 `decode_proposal_kind` 从候选规范编码解出 `ProposalKind` 做
+  按类型的审计/分类。字段 42 仍是控制操作。
 - **控制候选领域操作声明（可选，PROTOCOL-004）**：控制候选可携带字段 55/56（领域操作白名单 `1 set_role`、`2 transfer_ownership`、`3 leave_self`、`4 dissolve`；目标摘要恰 32 字节且非全零）。两字段必须成对出现；**旧候选不写这两个字段，签名原文字节与既有固定向量完全一致，解码为 `None`**。应用候选携带声明、未知枚举值、字段只出现一个、摘要长度错误/全零、或与公开控制操作组合不合法（如 `rename + transfer_ownership`）一律 `INVALID_CANDIDATE`。该字段让 `SelfUpdate` 类 MLS 提交能显式声明真正的领域语义（改角色/转让群主/退出/解散）。
 - **分页游标**：`cur1.<12 字节系统随机 nonce hex>.<ChaCha20-Poly1305 密文+16 字节 tag hex>`；AAD 固定 `chat/p1/page-cursor/v1`；明文是 scope/position/issued_at/expires_at 的规范编码；TTL 10 分钟，允许 60 秒时钟超前；token 上限 1024 字节。`encode_page_cursor`/`decode_page_cursor` 因过期检查必须有可信时间，契约签名上补了显式 `unix_ms` 参数。
 - **日志条目**：`AcceptedLogEntry = VerifiedCandidate + group_sequence + previous_log_hash + coordinator_signature`；条目哈希 `log_hash = SHA-256(chat/p1/log-entry-hash/v1 || 规范编码{group, seq, previous_log_hash, candidate_digest, coordinator_signature})`。回执签名原文沿用 PROTOCOL-006。下一跳 `previous_log_hash` 必须等于上一条 `log_hash`；创世条目引用全零头。
@@ -166,6 +171,13 @@ candidate_signing_bytes(candidate: UnsignedCandidate) -> Result<CanonicalBytes>
 
 - [x] 替换目标群/epoch/控制元数据任一字段导致验签失败。
 - [x] 可选领域操作声明向后兼容（旧字节解码 `None`）且新字节通过白名单/长度/kind 组合校验。
+
+**NODECAP 补充（通用提案值）**：`ControlOperation` 新增 9..=13 五个提案取值与 `ProposalKind`（5 个分类，
+`as_u64/as_str/from_u64` 全部冻结），并提供 `is_proposal()`、`proposal_kind()`、`audit_label()` 与
+`decode_proposal_kind(body)`（只读公开字段，供节点按提案类型审计）。校验：提案值**不得**同时携带领域声明
+（`INVALID_CANDIDATE`），提案值参与签名原文（改提案值必然改签名）。证据：`proposal_values_round_trip_and_carry_a_stable_audit_label`、
+`proposal_kind_is_encoded_and_decodable_for_audit`、`proposals_must_not_carry_a_domain_declaration`，且
+`tests/vectors.rs` 的 12 个固定向量继续逐字节通过（新增取值只出现在新字节里）。
 
 **实现状态**：已实现 `candidate_signing_bytes` 与可选领域操作声明（`signing.rs`）。证据：`cargo test --offline -p chat-protocol`（2026-10-19，**78 passed**：lib 66 + tests/vectors 12；既有 73 全部继续通过）。`signing::tests::every_signed_field_change_breaks_verification`（group/device/submission/head/policy/epoch/payload/kind/控制操作/目标摘要共 10 类变异都用原候选签名验签失败）、`domain_declaration_is_signed_and_any_change_breaks_verification`（声明字段/目标摘要/移除声明都会让原签名失效）、`domain_declaration_requires_control_kind_and_compatible_operation`（应用候选携带声明、公开操作与领域操作不匹配、全零目标摘要都 → `INVALID_CANDIDATE`；5 组合法组合通过）、`domain_declaration_is_omitted_for_old_bytes_and_decoded_from_new_bytes`（旧字节无 55/56 字段且解码 `None`；新字节成对解码；单字段/未知枚举/31 字节摘要/全零/非结构体 → `INVALID_CANDIDATE`；55/56 已登记 `KNOWN_FIELD_IDS`）、`tests/vectors.rs::candidate_signing_bytes_match_frozen_vector`（既有固定 716 hex 向量不变）、`tests/vectors.rs::domain_declaration_vectors_are_frozen`（self_update+transfer_ownership / leave_self / dissolve 三条新固定向量）、`domain_declaration_round_trips_and_old_bytes_stay_none`、`ed25519_signature_is_deterministic_and_verifies`。注意：完整 `verify_candidate`（PROTOCOL-005）见下节；下游 core/group_node 与 node-services 的文本元数据尚未映射新声明（后续集成任务）。
 

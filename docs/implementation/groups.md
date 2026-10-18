@@ -998,3 +998,65 @@ cargo test --offline -p chat-core                                 # 173 passed�
 4. **投递不自动重试**：失败只返回稳定码，重试策略在上层（SYNC/发送队列）。
 5. **提案字节仍在本地快照里**（hex），用于重试投递；对端不需要它也能处理（只靠节点日志）。
 
+## 群列表查询（GROUPS-002 列表侧，2026-10-18，Windows x64）
+
+代码：[crates/storage/src/formal/mls_state.rs](../../crates/storage/src/formal/mls_state.rs)（`list_mls_group_state_keys`）、
+[crates/core/src/groups.rs](../../crates/core/src/groups.rs)（`group_list`）；测试：
+[crates/core/tests/groups_list.rs](../../crates/core/tests/groups_list.rs)（3 个，真 OpenMLS + 真临时库）、
+[crates/ffi/tests/groups_list_ffi.rs](../../crates/ffi/tests/groups_list_ffi.rs)（1 个，经 FFI）。
+
+~~~text
+// storage
+pub fn list_mls_group_state_keys(prefix, limit) -> Result<Vec<MlsGroupStateKey>>
+MlsGroupStateKey { group_id, state_version, updated_at_ms }
+pub const MAX_GROUP_STATE_LIST: usize = 256;
+
+// core
+pub fn group_list(store) -> GroupResult<GroupListView>
+GroupListView { groups: Vec<GroupSummaryView>, skipped: u32 }
+GroupSummaryView { group_id, name, epoch, role, policy_version, dissolved, left, pending }
+pub fn snapshot_key_for(group_id) -> String    // 诊断/测试用
+~~~
+
+### 关键语义
+
+1. **只扫本模块命名空间**（`grpmeta/`），`limit` 必须在 `1..=256`（越界显式拒绝，不夹取），
+   按 `updated_at` 倒序、同时间按 key 升序；列表**不解密**任何正文（只回键与时间）。
+2. **逐条读快照做本地投影**：`group_list` 对每个键读记录（JSON 解析），不导入 MLS 设备，
+   因此多群列表是纯本地轻量操作。
+3. **损坏条目不静默丢弃**：解析失败/不是本模块记录/不变量不成立 → 计入 `skipped`，
+   其余条目照常返回。
+4. **`pending` 是"待收口线索"**：`leaving_at_ms > 0`（已发起自移除提案）或
+   `pending_proposal.is_some()`（已收下待打包的提案）。**未决控制提交**的精确状态需要加载设备，
+   列表视图不读 MLS——精确值请用 `group_snapshot`。
+5. `epoch` 取快照记录里**写入时**的值（与 `group_snapshot` 的实时 epoch 可能相差一个未合并提交）。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test groups_list     # 3 passed
+cargo test --offline -p chat-ffi --test groups_list_ffi  # 1 passed
+cargo test --offline -p chat-storage -p chat-core -p chat-ffi  # 94 + 176 + 46 passed（既有 94/173/45 继续通过）
+~~~
+
+### 证据
+
+- `groups_list::list_reports_each_group_state_and_reflects_renames`：三个群（正常/已解散/已退出）→
+  摘要 `dissolved/left/role` 全部正确；改名后列表名字立即更新，且 `policy_version/epoch` 与
+  `group_snapshot` 一致。
+- `groups_list::corrupted_entries_are_skipped_and_reported`：在同一命名空间塞一条非法正文记录 →
+  列表只返回完好的那条、`skipped = 1`。
+- `groups_list::storage_list_bounds_are_enforced`：`limit=0/257` 显式拒绝；`limit=2` 截断；
+  非 `grpmeta/` 前缀为空；全量按 `updated_at` 倒序。
+- `groups_list_ffi::group_list_reports_states_and_skips_corrupted_entries`（经 FFI）：损坏条目
+  `skipped = 1`、两个群的名字/角色/改名正确；`shutdown` 后 `CORE_CLOSED`。
+
+### 已知限制
+
+1. **`pending` 不是"未决控制提交"的全集**（见语义第 4 条）；需要精确状态时按群调 `group_snapshot`。
+2. **一次最多 256 个群**：超过时列表会截断（无分页游标）；真要更多群需要另外的分页键。
+3. **列表不触发任何同步**：状态是最后一次本地写入的投影，未同步的对端变更不会出现。
+4. **不返回成员数**：成员列表需要读整条快照（记录里有），列表页刻意只投影摘要字段。
+
+

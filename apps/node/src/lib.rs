@@ -73,6 +73,8 @@ pub struct NodeConfig {
     pub init_seed: bool,
     /// 可选的固定公钥：与种子派生出的公钥不一致即拒绝启动。
     pub expect_public_key: Option<[u8; 32]>,
+    /// CAP 包：附件块端点是否强制能力令牌（默认关闭以保持旧客户端可用）。
+    pub require_capability: bool,
 }
 
 const DEFAULT_BIND: &'static str = "127.0.0.1:8080";
@@ -84,6 +86,8 @@ const ENV_NODE_ID: &'static str = "CHAT_NODE_ID";
 const ENV_ALLOW_PUBLIC_BIND: &'static str = "CHAT_NODE_ALLOW_PUBLIC_BIND";
 const ENV_INIT_SEED: &'static str = "CHAT_NODE_INIT_SEED";
 const ENV_EXPECT_PUBLIC_KEY: &'static str = "CHAT_NODE_EXPECT_PUBLIC_KEY";
+const ENV_REQUIRE_CAPABILITY: &'static str = "CHAT_NODE_CAPABILITY_REQUIRED";
+const ENV_CAPABILITY_MAX_TTL: &'static str = "CHAT_NODE_CAPABILITY_MAX_TTL_SECONDS";
 
 impl NodeConfig {
     /// 解析命令行参数与环境变量（命令行优先）。
@@ -100,6 +104,14 @@ impl NodeConfig {
         let mut allow_public_bind = env(ENV_ALLOW_PUBLIC_BIND).as_deref() == Some("1");
         let mut init_seed = env(ENV_INIT_SEED).as_deref() == Some("1");
         let mut expect_public_key = env(ENV_EXPECT_PUBLIC_KEY);
+        // CAP 包：能力令牌强制开关。环境变量只接受显式真/假文本，其它一律启动失败
+        // （不接受“拼写错误 = 关闭”，否则会以为已经强制而实际没开）。
+        let mut require_capability = match env(ENV_REQUIRE_CAPABILITY).as_deref() {
+            None => false,
+            Some(value) => parse_flag(value).ok_or(NodeStartError::Config(
+                "CHAT_NODE_CAPABILITY_REQUIRED must be one of 1/true/yes/on/0/false/no/off",
+            ))?,
+        };
 
         let mut arguments = args.into_iter();
         while let Some(argument) = arguments.next() {
@@ -117,8 +129,9 @@ impl NodeConfig {
                     expect_public_key = Some(take_value("--expect-public-key needs a value")?)
                 }
                 "--allow-public-bind" => allow_public_bind = true,
+                "--require-capability" => require_capability = true,
                 "--init-seed" => init_seed = true,
-                "--help" | "-h" => return Err(NodeStartError::Config("usage: chat-node --bind <addr> --data-dir <dir> --seed-file <file> [--node-id <id>] [--expect-public-key <hex>] [--allow-public-bind] [--init-seed]")),
+                "--help" | "-h" => return Err(NodeStartError::Config("usage: chat-node --bind <addr> --data-dir <dir> --seed-file <file> [--node-id <id>] [--expect-public-key <hex>] [--allow-public-bind] [--init-seed] [--require-capability]")),
                 other => {
                     let _ = other;
                     return Err(NodeStartError::Config("unknown command line argument"));
@@ -171,6 +184,7 @@ impl NodeConfig {
             allow_public_bind,
             init_seed,
             expect_public_key,
+            require_capability,
         })
     }
 
@@ -179,6 +193,17 @@ impl NodeConfig {
         Self::from_args_and_env(env::args().skip(1), |name| env::var(name).ok())
     }
 }
+/// 解析显式布尔开关文本（1/true/yes/on 与 0/false/no/off，大小写不敏感）。
+///
+/// 其它任何取值都返回 `None`，由调用方转成启动失败——绝不把拼写错误当成“关闭”。
+fn parse_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" | "" => Some(false),
+        _ => None,
+    }
+}
+
 /// 读取节点签名种子：32 字节原文，或允许尾部换行的 64 位小写十六进制。
 pub fn load_signing_seed(path: &Path, init_seed: bool) -> Result<[u8; 32], NodeStartError> {
     if !path.exists() {
@@ -221,6 +246,8 @@ pub struct RunningNode {
     pub node_public_key: [u8; 32],
     /// SQLite 库路径。
     pub database_path: PathBuf,
+    /// CAP 包：本进程是否强制附件块端点携带能力令牌。
+    pub require_capability: bool,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<Result<(), NodeStartError>>>,
 }
@@ -286,7 +313,7 @@ pub fn spawn_node(config: NodeConfig) -> Result<RunningNode, NodeStartError> {
     });
 
     // 3. 打开服务：迁移、节点身份固定、策略校验都在这里完成。
-    let policy = config.rate_limit_policy();
+    let policy = config.rate_limit_policy()?;
     let service = NodeService::open(
         &database_path,
         NodeServiceConfig {
@@ -336,15 +363,26 @@ pub fn spawn_node(config: NodeConfig) -> Result<RunningNode, NodeStartError> {
         node_id,
         node_public_key: public_key,
         database_path,
+        require_capability: config.require_capability,
         shutdown: Some(shutdown_tx),
         thread: Some(thread),
     })
 }
 
 impl NodeConfig {
-    /// 由配置构造节点策略：限流参数可用环境变量收紧/放宽，其余保持默认。
-    fn rate_limit_policy(&self) -> NodeAuthPolicy {
+    /// 由配置构造节点策略：限流参数可用环境变量收紧/放宽；能力令牌强制走显式开关。
+    fn rate_limit_policy(&self) -> Result<NodeAuthPolicy, NodeStartError> {
         let mut policy = NodeAuthPolicy::default();
+        // CAP 包：强制开关来自 CLI/环境变量，令牌有效期上限可选收紧。
+        policy.capability.required = self.require_capability;
+        if let Ok(ttl) = env::var(ENV_CAPABILITY_MAX_TTL) {
+            let ttl = ttl.trim().parse::<u64>().map_err(|_| {
+                NodeStartError::Config(
+                    "CHAT_NODE_CAPABILITY_MAX_TTL_SECONDS must be a positive integer",
+                )
+            })?;
+            policy.capability.max_ttl_seconds = ttl;
+        }
         if let Ok(window) = env::var("CHAT_NODE_RATE_LIMIT_WINDOW_SECONDS") {
             if let Ok(window) = window.trim().parse::<u64>() {
                 policy.rate_limit.window_seconds = window;
@@ -358,7 +396,7 @@ impl NodeConfig {
                     requests.saturating_mul(2).max(policy.rate_limit.max_requests_per_account);
             }
         }
-        policy
+        Ok(policy)
     }
 }
 
@@ -367,11 +405,13 @@ pub fn run_from_env() -> Result<(), NodeStartError> {
     let config = NodeConfig::from_process()?;
     let running = spawn_node(config)?;
     // 启动日志只输出节点 ID、监听地址与库路径（没有密钥、没有配置全文）。
+    // 启动日志同时说明能力令牌模式（运维需要一眼看出端点是否强制令牌）。
     println!(
-        "chat-node started node_id={} address={} database={}",
+        "chat-node started node_id={} address={} database={} capability={}",
         running.node_id,
         running.address,
-        running.database_path.display()
+        running.database_path.display(),
+        if running.require_capability { "required" } else { "off" }
     );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -425,6 +465,57 @@ mod tests {
         assert_eq!(config.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
         assert!(config.node_id.is_none());
         assert!(config.expect_public_key.is_none());
+    }
+
+    #[test]
+    fn capability_flag_comes_from_cli_or_env_and_bad_values_are_rejected() {
+        let env_with = |name: &'static str, value: &'static str| {
+            move |key: &str| {
+                if key == name {
+                    Some(value.to_owned())
+                } else {
+                    None
+                }
+            }
+        };
+        // 默认关闭（旧客户端零改动）。
+        let config = NodeConfig::from_args_and_env(args(&["--seed-file", "seed.bin"]), no_env)
+            .expect("minimal config");
+        assert!(!config.require_capability);
+        // CLI 开关。
+        let config = NodeConfig::from_args_and_env(
+            args(&["--seed-file", "seed.bin", "--require-capability"]),
+            no_env,
+        )
+        .expect("cli flag");
+        assert!(config.require_capability);
+        // 环境变量（多种真值写法）。
+        for value in ["1", "true", "YES", "on"] {
+            let config = NodeConfig::from_args_and_env(
+                args(&["--seed-file", "seed.bin"]),
+                env_with(ENV_REQUIRE_CAPABILITY, value),
+            )
+            .expect("env true");
+            assert!(config.require_capability, "value {value} must enable enforcement");
+        }
+        for value in ["0", "false", "no", "off", ""] {
+            let config = NodeConfig::from_args_and_env(
+                args(&["--seed-file", "seed.bin"]),
+                env_with(ENV_REQUIRE_CAPABILITY, value),
+            )
+            .expect("env false");
+            assert!(!config.require_capability, "value {value} must disable enforcement");
+        }
+        // 拼写错误/未知取值 → 显式启动失败（不是“当成关闭”）。
+        let error = NodeConfig::from_args_and_env(
+            args(&["--seed-file", "seed.bin"]),
+            env_with(ENV_REQUIRE_CAPABILITY, "maybe"),
+        )
+        .expect_err("bad flag value must fail startup");
+        assert!(matches!(error, NodeStartError::Config(_)));
+        assert_eq!(parse_flag("On"), Some(true));
+        assert_eq!(parse_flag("OFF"), Some(false));
+        assert_eq!(parse_flag("2"), None);
     }
 
     #[test]
@@ -532,6 +623,7 @@ mod tests {
             allow_public_bind: false,
             init_seed: false,
             expect_public_key: None,
+            require_capability: false,
         };
         let running = spawn_node(config.clone()).expect("node starts");
         assert!(running.node_id.starts_with("node-"));

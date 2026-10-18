@@ -44,9 +44,10 @@ pub use identity::{
     MAX_DEVICE_REVOCATIONS, MAX_IDENTITY_DISPLAY_NAME_BYTES, PUBLIC_KEY_BYTES, contact_id_for,
 };
 pub use mls_state::{
-    MAX_MLS_GROUP_ID_BYTES, MAX_MLS_GROUP_RECORD_BYTES, MAX_MLS_GROUP_STATE_BYTES,
-    MAX_MLS_RECORDS_PER_GROUP, MAX_MLS_RECORD_BYTES, MAX_MLS_RECORD_KEY_BYTES, MlsGroupStateInput,
-    MlsGroupStateRecord, MlsRecordInput, MlsRecordRecord, MlsWriteCheckpoint,
+    MAX_GROUP_STATE_LIST, MAX_MLS_GROUP_ID_BYTES, MAX_MLS_GROUP_RECORD_BYTES,
+    MAX_MLS_GROUP_STATE_BYTES, MAX_MLS_RECORDS_PER_GROUP, MAX_MLS_RECORD_BYTES,
+    MAX_MLS_RECORD_KEY_BYTES, MlsGroupStateInput, MlsGroupStateKey, MlsGroupStateRecord,
+    MlsRecordInput, MlsRecordRecord, MlsWriteCheckpoint,
 };
 pub use migrations::MigrationReport;
 pub use outbox_lease::{

@@ -72,6 +72,68 @@ pub enum ControlOperation {
     Leave = 7,
     /// 解散。
     Dissolve = 8,
+    // —— NODECAP 包：通用提案值（9..=13）——
+    //
+    // 提案是“正文自解释”的控制提交：上面 1..=8 是封闭的具体操作，而治理演进需要能表达
+    // “一次通用提案”，并让节点**按提案类型**做审计/分类。提案类型编码在操作值本身里
+    // （不新增候选字段），因此既有固定向量逐字节不变：旧值仍在 1..=8，新值只出现在新字节里。
+    /// 成员变更提案（加入/移除/角色调整的通用组合）。
+    ProposeMembership = 9,
+    /// 角色与策略提案（转让、禁言策略、治理规则）。
+    ProposeRolePolicy = 10,
+    /// 群设置提案（名称、保留期、配额等公开设置）。
+    ProposeSettings = 11,
+    /// 密钥轮换提案（epoch 前进但公开成员不变）。
+    ProposeKeyRotation = 12,
+    /// 其它提案（具体语义在密文正文里，公开层只留摘要）。
+    ProposeCustom = 13,
+}
+
+/// 通用提案类型（NODECAP）：把 `ControlOperation::Propose*` 的数值空间映射成稳定的审计分类。
+///
+/// 节点审计只需要“这是哪一类提案”，不需要也不能看到正文；因此分类是公开、冻结的。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProposalKind {
+    /// 成员变更提案。
+    Membership = 1,
+    /// 角色与策略提案。
+    RolePolicy = 2,
+    /// 群设置提案。
+    Settings = 3,
+    /// 密钥轮换提案。
+    KeyRotation = 4,
+    /// 其它（自定义）提案。
+    Custom = 5,
+}
+
+impl ProposalKind {
+    /// 冻结数值。
+    pub const fn as_u64(self) -> u64 {
+        self as u64
+    }
+
+    /// 稳定审计文本（写入节点日志投影/审计输出；不含正文）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Membership => "membership",
+            Self::RolePolicy => "role_policy",
+            Self::Settings => "settings",
+            Self::KeyRotation => "key_rotation",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// 由冻结数值还原；未知值显式失败。
+    pub const fn from_u64(value: u64) -> Option<Self> {
+        match value {
+            1 => Some(Self::Membership),
+            2 => Some(Self::RolePolicy),
+            3 => Some(Self::Settings),
+            4 => Some(Self::KeyRotation),
+            5 => Some(Self::Custom),
+            _ => None,
+        }
+    }
 }
 
 impl ControlOperation {
@@ -91,7 +153,55 @@ impl ControlOperation {
             6 => Some(ControlOperation::TransferOwnership),
             7 => Some(ControlOperation::Leave),
             8 => Some(ControlOperation::Dissolve),
+            9 => Some(ControlOperation::ProposeMembership),
+            10 => Some(ControlOperation::ProposeRolePolicy),
+            11 => Some(ControlOperation::ProposeSettings),
+            12 => Some(ControlOperation::ProposeKeyRotation),
+            13 => Some(ControlOperation::ProposeCustom),
             _ => None,
+        }
+    }
+
+    /// 是否是通用提案值（NODECAP，9..=13）。
+    pub const fn is_proposal(self) -> bool {
+        matches!(
+            self,
+            Self::ProposeMembership
+                | Self::ProposeRolePolicy
+                | Self::ProposeSettings
+                | Self::ProposeKeyRotation
+                | Self::ProposeCustom
+        )
+    }
+
+    /// 提案分类；具体操作（1..=8）返回 `None`。
+    pub const fn proposal_kind(self) -> Option<ProposalKind> {
+        match self {
+            Self::ProposeMembership => Some(ProposalKind::Membership),
+            Self::ProposeRolePolicy => Some(ProposalKind::RolePolicy),
+            Self::ProposeSettings => Some(ProposalKind::Settings),
+            Self::ProposeKeyRotation => Some(ProposalKind::KeyRotation),
+            Self::ProposeCustom => Some(ProposalKind::Custom),
+            _ => None,
+        }
+    }
+
+    /// 节点审计用文本：提案返回分类名（membership/…），具体操作返回操作名。
+    pub const fn audit_label(self) -> &'static str {
+        match self {
+            Self::Invite => "invite",
+            Self::Remove => "remove",
+            Self::SetRole => "set_role",
+            Self::SetMuted => "set_muted",
+            Self::Rename => "rename",
+            Self::TransferOwnership => "transfer_ownership",
+            Self::Leave => "leave",
+            Self::Dissolve => "dissolve",
+            Self::ProposeMembership => "proposal:membership",
+            Self::ProposeRolePolicy => "proposal:role_policy",
+            Self::ProposeSettings => "proposal:settings",
+            Self::ProposeKeyRotation => "proposal:key_rotation",
+            Self::ProposeCustom => "proposal:custom",
         }
     }
 }
@@ -165,7 +275,17 @@ impl ControlMetadata {
     }
 }
 
+/// NODECAP：提案值自证语义（分类在操作值里），因此**不得**再附领域声明——
+/// 两个来源同时表达语义会让审计出现两种解读。
+fn validate_proposal(metadata: &ControlMetadata) -> Result<()> {
+    if metadata.operation.is_proposal() && metadata.domain_operation.is_some() {
+        return Err(ProtocolError::InvalidCandidate);
+    }
+    Ok(())
+}
+
 fn validate_domain_declaration(kind: CandidateKind, metadata: &ControlMetadata) -> Result<()> {
+    validate_proposal(metadata)?;
     let Some(declaration) = metadata.domain_operation else {
         return Ok(());
     };
@@ -328,6 +448,28 @@ pub fn candidate_signing_bytes(candidate: &UnsignedCandidate) -> Result<Canonica
     bytes.extend_from_slice(CANDIDATE_SIGNING_DOMAIN);
     bytes.extend_from_slice(body.as_bytes());
     Ok(CanonicalBytes::from_raw(bytes))
+}
+
+/// NODECAP：从候选规范编码里解出**提案分类**，供节点按提案类型审计。
+///
+/// 返回 `None` = 不是提案（具体操作或无控制元数据）；未知操作值 → `InvalidCandidate`。
+/// 只读公开字段，不触碰正文/密文。
+pub fn decode_proposal_kind(body: &WireValue) -> Result<Option<ProposalKind>> {
+    let WireValue::Struct(fields) = body else {
+        return Err(ProtocolError::InvalidCandidate);
+    };
+    let Some(candidate) = fields.iter().find(|candidate| candidate.id == field::CONTROL_OPERATION)
+    else {
+        return Ok(None);
+    };
+    let WireValue::Some(inner) = &candidate.value else {
+        return Ok(None);
+    };
+    let WireValue::U64(raw) = inner.as_ref() else {
+        return Err(ProtocolError::InvalidCandidate);
+    };
+    let operation = ControlOperation::from_u64(*raw).ok_or(ProtocolError::InvalidCandidate)?;
+    Ok(operation.proposal_kind())
 }
 
 /// 从候选规范结构解码可选领域操作声明。
@@ -799,5 +941,125 @@ mod tests {
             DomainOperation::from_u64(DomainOperation::LeaveSelf.as_u64()),
             Some(DomainOperation::LeaveSelf)
         );
+    }
+
+    // ------------------------------------------------------------ NODECAP：通用提案值
+
+    /// 提案分类：9..=13 与 ProposalKind 一一对应，且审计文本冻结。
+    #[test]
+    fn proposal_values_round_trip_and_carry_a_stable_audit_label() {
+        let cases = [
+            (9_u64, ControlOperation::ProposeMembership, ProposalKind::Membership),
+            (10, ControlOperation::ProposeRolePolicy, ProposalKind::RolePolicy),
+            (11, ControlOperation::ProposeSettings, ProposalKind::Settings),
+            (12, ControlOperation::ProposeKeyRotation, ProposalKind::KeyRotation),
+            (13, ControlOperation::ProposeCustom, ProposalKind::Custom),
+        ];
+        for (raw, operation, kind) in cases {
+            assert_eq!(operation.as_u64(), raw, "frozen numeric for {operation:?}");
+            assert_eq!(ControlOperation::from_u64(raw), Some(operation));
+            assert!(operation.is_proposal());
+            assert_eq!(operation.proposal_kind(), Some(kind));
+            assert_eq!(kind.as_u64(), (raw - 8));
+            assert_eq!(ProposalKind::from_u64(kind.as_u64()), Some(kind));
+            assert!(operation.audit_label().starts_with("proposal:"), "audit label is a proposal");
+            assert_eq!(kind.as_str(), &operation.audit_label()["proposal:".len()..]);
+        }
+        // 具体操作（1..=8）不因为新增提案值而改变数值，也不是提案。
+        for (raw, operation, label) in [
+            (1_u64, ControlOperation::Invite, "invite"),
+            (5, ControlOperation::Rename, "rename"),
+            (8, ControlOperation::Dissolve, "dissolve"),
+        ] {
+            assert_eq!(operation.as_u64(), raw, "old numeric values must not move");
+            assert_eq!(ControlOperation::from_u64(raw), Some(operation));
+            assert!(!operation.is_proposal());
+            assert_eq!(operation.proposal_kind(), None);
+            assert_eq!(operation.audit_label(), label);
+        }
+        // 未登记值显式失败（不是“尽力解析”）。
+        assert_eq!(ControlOperation::from_u64(14), None);
+        assert_eq!(ControlOperation::from_u64(0), None);
+        assert_eq!(ProposalKind::from_u64(6), None);
+    }
+
+    /// 提案值进入规范编码的 CONTROL_OPERATION 字段，节点可解出分类；旧候选解不出提案。
+    #[test]
+    fn proposal_kind_is_encoded_and_decodable_for_audit() {
+        let mut proposal = candidate();
+        proposal.control_metadata = Some(ControlMetadata::new(
+            ControlOperation::ProposeRolePolicy,
+            Digest::from_bytes([0x55; 32]),
+        ));
+        let body = candidate_body_fields(&proposal);
+        assert_eq!(
+            decode_proposal_kind(&body).expect("proposal decodes"),
+            Some(ProposalKind::RolePolicy)
+        );
+        // 旧候选（invite）不是提案。
+        let old_body = candidate_body_fields(&candidate());
+        assert_eq!(decode_proposal_kind(&old_body).expect("old decodes"), None);
+        // 无控制元数据（应用候选）也不是提案。
+        let mut application = candidate();
+        application.kind = CandidateKind::Application;
+        application.control_metadata = None;
+        assert_eq!(
+            decode_proposal_kind(&candidate_body_fields(&application)).expect("application decodes"),
+            None
+        );
+        // 未知操作值、畸形字段 → 显式失败。
+        assert_eq!(
+            decode_proposal_kind(&WireValue::Struct(vec![WireField::new(
+                field::CONTROL_OPERATION,
+                WireValue::Some(Box::new(WireValue::U64(14))),
+            )]))
+            .unwrap_err(),
+            ProtocolError::InvalidCandidate
+        );
+        assert_eq!(
+            decode_proposal_kind(&WireValue::Struct(vec![WireField::new(
+                field::CONTROL_OPERATION,
+                WireValue::Some(Box::new(WireValue::Text("proposal".into()))),
+            )]))
+            .unwrap_err(),
+            ProtocolError::InvalidCandidate
+        );
+        assert_eq!(
+            decode_proposal_kind(&WireValue::U64(1)).unwrap_err(),
+            ProtocolError::InvalidCandidate
+        );
+    }
+
+    /// 提案值不得再附领域声明（两个来源同时表达语义会让审计出现两种解读）。
+    #[test]
+    fn proposals_must_not_carry_a_domain_declaration() {
+        let mut proposal = candidate();
+        proposal.control_metadata = Some(
+            ControlMetadata::new(
+                ControlOperation::ProposeMembership,
+                Digest::from_bytes([0x55; 32]),
+            )
+            .with_domain_operation(DomainOperationDeclaration {
+                operation: DomainOperation::SetRole,
+                target_digest: Digest::from_bytes([0x66; 32]),
+            }),
+        );
+        assert_eq!(
+            candidate_signing_bytes(&proposal).unwrap_err(),
+            ProtocolError::InvalidCandidate
+        );
+        // 不附声明就是合法提案，且签名原文覆盖提案值本身。
+        proposal.control_metadata = Some(ControlMetadata::new(
+            ControlOperation::ProposeMembership,
+            Digest::from_bytes([0x55; 32]),
+        ));
+        let bytes = candidate_signing_bytes(&proposal).expect("bare proposal encodes");
+        let mut other = proposal.clone();
+        other.control_metadata = Some(ControlMetadata::new(
+            ControlOperation::ProposeSettings,
+            Digest::from_bytes([0x55; 32]),
+        ));
+        let other_bytes = candidate_signing_bytes(&other).expect("other proposal encodes");
+        assert_ne!(bytes.as_bytes(), other_bytes.as_bytes(), "提案值参与签名原文");
     }
 }

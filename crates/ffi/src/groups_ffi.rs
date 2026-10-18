@@ -466,6 +466,49 @@ fn proposal_view_ffi(view: &chat_core::groups::ProposalOutcomeView) -> ProposalV
     }
 }
 
+/// 群列表摘要（纯数据：不含密钥/正文）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupSummaryFfi {
+    /// 协议群 ID。
+    pub group_id: String,
+    /// 群名。
+    pub name: String,
+    /// 快照里记录的 MLS epoch（精确值用 group_snapshot）。
+    pub epoch: u64,
+    /// 本机角色：`owner` / `admin` / `member`。
+    pub role: String,
+    /// 群策略版本。
+    pub policy_version: u64,
+    /// 已解散。
+    pub dissolved: bool,
+    /// 本机已退出（本地策略层）。
+    pub left: bool,
+    /// 本机有待收口线索（已发起自移除提案或已收下待打包提案）。
+    pub pending: bool,
+}
+
+/// 群列表结果：`skipped` 是被跳过的损坏条目数（绝不静默丢弃）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupListFfi {
+    /// 摘要（按最近写入时间倒序）。
+    pub groups: Vec<GroupSummaryFfi>,
+    /// 读不出来的条目数。
+    pub skipped: u32,
+}
+
+fn summary_ffi(view: &chat_core::groups::GroupSummaryView) -> GroupSummaryFfi {
+    GroupSummaryFfi {
+        group_id: view.group_id.clone(),
+        name: view.name.clone(),
+        epoch: view.epoch,
+        role: group_role_code(view.role).to_owned(),
+        policy_version: view.policy_version,
+        dissolved: view.dissolved,
+        left: view.left,
+        pending: view.pending,
+    }
+}
+
 /// 群治理 FFI 门面。
 #[derive(uniffi::Object)]
 pub struct GroupFfi {
@@ -717,6 +760,18 @@ impl GroupFfi {
             .group_process_proposal(&input)
             .map_err(|error| failure!(error))?;
         Ok(proposal_view_ffi(&view))
+    }
+
+    /// GROUPS-002（列表侧）：列出本机所有群的摘要（不解密 MLS 状态，按最近写入倒序）。
+    ///
+    /// 读不出来的条目不抛出也不静默丢弃：计入返回的 `skipped`。
+    pub fn group_list(&self) -> Result<GroupListFfi, FfiError> {
+        let mut core = self.lock()?;
+        let view = core.group_list().map_err(|error| failure!(error))?;
+        Ok(GroupListFfi {
+            groups: view.groups.iter().map(summary_ffi).collect(),
+            skipped: view.skipped,
+        })
     }
 
     /// GROUPS-013（提交侧）：把本地待提交提案打包成 pending 控制提交（epoch 不推进）。

@@ -111,6 +111,20 @@ impl MlsGroupStateInput {
     }
 }
 
+/// 群状态键列表的单次上限（有界查询，防止一次拉出整库）。
+pub const MAX_GROUP_STATE_LIST: usize = 256;
+
+/// 群状态键的读回投影（**只含键与时间**，不含密封正文）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MlsGroupStateKey {
+    /// 群 ID（本模块里是命名空间 + 摘要，例如 `grpmeta/<hex>`）。
+    pub group_id: String,
+    /// 状态版本（每次成功写入 +1）。
+    pub state_version: u64,
+    /// 最近写入时间（Unix 毫秒）。
+    pub updated_at_ms: i64,
+}
+
 /// 已提交群状态的读回投影（`state` 是**已解密**的明文，只在可信核心路径内使用）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MlsGroupStateRecord {
@@ -342,6 +356,69 @@ impl Store {
                 Err(error)
             }
         }
+    }
+
+
+    /// 列出前缀匹配的群状态键（按更新时间倒序、同时间按 key 升序），最多 `limit` 条。
+    ///
+    /// - `limit` 必须 `1..=MAX_GROUP_STATE_LIST`（越界显式拒绝，不夹取）；
+    /// - 只返回 `group_id/state_version/updated_at_ms`，**不解密**任何正文（列表页零成本）；
+    /// - `prefix` 用 `substr` 比较（不走 LIKE，避免通配符注入）。
+    pub fn list_mls_group_state_keys(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<MlsGroupStateKey>> {
+        self.ensure_ready()?;
+        if !(1..=MAX_GROUP_STATE_LIST).contains(&limit) {
+            return Err(StorageError::InvalidInput(format!(
+                "group state list limit must be 1..={MAX_GROUP_STATE_LIST}"
+            )));
+        }
+        if prefix.len() > 256 {
+            return Err(StorageError::InvalidInput(
+                "group state list prefix is too long".to_owned(),
+            ));
+        }
+        let limit_sql = i64::try_from(limit)
+            .map_err(|_| StorageError::InvalidInput("limit is out of range".to_owned()))?;
+        let prefix_len = i64::try_from(prefix.len())
+            .map_err(|_| StorageError::InvalidInput("prefix is out of range".to_owned()))?;
+        let connection = self.connection();
+        let mut statement = connection
+            .prepare(
+                "SELECT group_id, state_version, updated_at
+                   FROM mls_group_state
+                  WHERE substr(group_id, 1, ?2) = ?1
+                  ORDER BY updated_at DESC, group_id ASC
+                  LIMIT ?3",
+            )
+            .map_err(StorageError::from)?;
+        let rows = statement
+            .query_map(params![prefix, prefix_len, limit_sql], |row| {
+                Ok((
+                    row.get::<usize, String>(0)?,
+                    row.get::<usize, i64>(1)?,
+                    row.get::<usize, i64>(2)?,
+                ))
+            })
+            .map_err(StorageError::from)?;
+        let mut keys = Vec::new();
+        for row in rows {
+            let (group_id, state_version, updated_at) = row.map_err(StorageError::from)?;
+            if state_version < 0 || updated_at < 0 {
+                return Err(StorageError::StateCorrupted(
+                    "stored group state key has a negative counter or timestamp".to_owned(),
+                ));
+            }
+            keys.push(MlsGroupStateKey {
+                group_id,
+                state_version: u64::try_from(state_version)
+                    .map_err(|_| StorageError::StateCorrupted("state version overflow".to_owned()))?,
+                updated_at_ms: updated_at,
+            });
+        }
+        Ok(keys)
     }
 
     /// 读取一个群的已提交状态；不存在返回 `None`。

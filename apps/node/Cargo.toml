@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[dev-dependencies]
+# 冒烟测试需要真实签名客户端（设备注册/建群/追加/上传会话/能力令牌）。
+chat-node-client = { path = "../../crates/node-client" }
+chat-protocol = { workspace = true }
+
 [dependencies]
 chat-node-api.workspace = true
 chat-node-services.workspace = true

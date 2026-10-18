@@ -1607,6 +1607,15 @@ impl ConversationCore {
         .map_err(anyhow::Error::new)
     }
 
+    /// GROUPS-002（列表侧）：本机所有群的摘要（不解密 MLS 状态，按最近写入倒序）。
+    ///
+    /// 读不出来的条目计入返回的 `skipped`，绝不静默丢弃。
+    pub fn group_list(&mut self) -> anyhow::Result<crate::groups::GroupListView> {
+        let guard = self.store_guard()?;
+        let store = guard.as_ref().ok_or_else(closed)?;
+        crate::groups::group_list(store).map_err(anyhow::Error::new)
+    }
+
     // ------------------------------------------------ 自移除提案编排（GROUPS-013）
 
     /// GROUPS-013：本机发起自移除提案（离开群的第一步；不推进 epoch、无 pending 控制提交）。

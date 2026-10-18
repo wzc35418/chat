@@ -938,6 +938,21 @@ cargo test --offline -p chat-ffi --test groups_proposal_ffi   # 3 passed
 cargo test --offline -p chat-core -p chat-ffi                  # 170 + 45 passed
 ~~~
 
+## 群列表 FFI（GroupFfi.group_list，2026-10-18）
+
+~~~text
+group_list() -> GroupListFfi
+GroupListFfi   { groups: Vec<GroupSummaryFfi>, skipped: u32 }
+GroupSummaryFfi{ group_id, name, epoch, role, policy_version, dissolved, left, pending }
+~~~
+
+- 纯数据（角色是 `owner`/`admin`/`member` 文本），不含密钥或正文；
+- 按最近写入时间倒序（storage 保证），一次最多 256 个群；
+- 读不出来的条目会计入 `skipped`，不抛出也不静默丢弃；
+- 已关闭 → `CORE_CLOSED`。
+- 测试：[crates/ffi/tests/groups_list_ffi.rs](../../crates/ffi/tests/groups_list_ffi.rs)（1 个，真库经 FFI）。
+
+
 
 
 

@@ -825,3 +825,23 @@ expire_node_data(now: Time, budget: GcBudget) -> Result<CleanupReport>
 
 已知限制：没有“标回收（collecting）→ 受控路径删除”的两阶段（块内容都在 SQLite 单库单事务里，删除本身是原子的，因此不需要文件系统删除日志）；没有后台定时器（由运维/上层按节奏调用 `collect_expired`）；已 ACK 条目被回收后，迟到的重复 ACK 会得到 `PERMISSION_DENIED` 而不是 `already_consumed`；控制日志/回执/群状态**永不**按 TTL 回收。通过本函数用例不自动代表整个模块完成。
 
+**NODECAP 包补充（apps/node 接线能力令牌开关）**：`run_node` 的配置新增 `require_capability: bool`，
+来源优先级 CLI > 环境变量 > 默认（默认 **关闭**）：
+
+- CLI：`--require-capability`（无值开关）；
+- 环境变量：`CHAT_NODE_CAPABILITY_REQUIRED` 只接受显式真/假文本（`1/true/yes/on` 与 `0/false/no/off/空`，
+  大小写不敏感），**其它任何取值（含拼写错误）都让进程以 `INVALID_CONFIG` 退出**——不会把 “maybe” 静默当成关闭；
+- 令牌有效期上限：`CHAT_NODE_CAPABILITY_MAX_TTL_SECONDS`（非正整数同样启动失败；超过协议硬上限由节点策略校验拒绝）。
+
+接线方式：配置值直接写进 `NodeAuthPolicy.capability.required`，`NodeService::open` 校验后由 node-api 的
+`AppState::capability_required()`（策略 **或** 环境变量）执行强制；启动日志带 `capability=required|off` 一眼可见。
+`RunningNode` 也暴露 `require_capability` 供上层核对实际生效模式。
+
+验证证据（`cargo test --offline -p chat-node`）：`tests::capability_flag_comes_from_cli_or_env_and_bad_values_are_rejected`
+（默认关、CLI 开、环境变量真/假两种文本、`maybe` 显式失败、`parse_flag` 边界）、
+`smoke::capability_required_mode_serves_401_without_token_and_200_with_one`（**真进程**：`spawn_node(require_capability=true)`
+→ 真设备注册/建群/追加/上传会话 → 用 `send_with_challenge` 发**不带令牌**的已认证 `PUT` 得到
+`AUTH_REQUIRED@（401）→ 申请能力令牌后 `put_blob_chunk` 得到 200 → 优雅关闭）。
+
+已知限制：强制模式只覆盖附件块 `PUT/GET`；`--require-capability` 不能“只对某群/某设备”生效；运行时不能热切换
+（要改只能重启进程）。

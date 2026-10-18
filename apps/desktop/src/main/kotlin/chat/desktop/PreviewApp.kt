@@ -539,6 +539,38 @@ fun main() = application {
                     }
             }
         },
+        downloadCard = { attachmentId ->
+            scope.launch {
+                val attachmentService = attachmentServiceHolder.value ?: return@launch
+                val endpoint = storeState.sendNodeUrl.trim()
+                val nodeId = storeState.sendNodeId.trim()
+                val groupId = groupState.snapshot?.groupId ?: demoConversation
+                if (endpoint.isBlank() || nodeId.isBlank()) {
+                    storeState = storeState.withError("INVALID_INPUT", "请先在发送区填写节点地址与节点 ID")
+                    return@launch
+                }
+                val target = storeState.exportTarget.trim()
+                if (target.isBlank()) {
+                    storeState = storeState.withError("INVALID_INPUT", "请先填写下载目标路径（附件面板可用来选择）")
+                    return@launch
+                }
+                storeState = storeState.beginBusy()
+                val pubkey = storeState.sendNodePublicKey.trim().ifEmpty { null }
+                runCatching {
+                    attachmentService.download(attachmentId, target, endpoint, nodeId, pubkey, groupId, 1L)
+                }.onSuccess { written ->
+                    storeState = storeState.copy(
+                        busy = false,
+                        notice = "已从节点下载 " + written + " 字节并校验解密，目标 " + target,
+                    )
+                }.onFailure { error ->
+                    storeState = storeState.withError(
+                        (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                        error.message,
+                    )
+                }
+            }
+        },
         exportCard = { attachmentId ->
             scope.launch {
                 val attachmentService = attachmentServiceHolder.value ?: return@launch

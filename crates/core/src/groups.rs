@@ -522,6 +522,13 @@ fn validate_credential(credential: &str) -> GroupResult<()> {
     Ok(())
 }
 
+/// 快照记录在 storage 里的键（独立命名空间 + 协议群 ID 的摘要）。
+///
+/// 对外开放只用于**诊断/测试**：正常读写请走本模块的函数。
+pub fn snapshot_key_for(group_id: &str) -> String {
+    snapshot_group_id(group_id)
+}
+
 /// 快照记录的 storage group_id（独立命名空间 + 协议群 ID 的摘要）。
 fn snapshot_group_id(group_id: &str) -> String {
     let mut hasher = Sha256::new();
@@ -2348,6 +2355,95 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
         bytes.push((high as u8) << 4 | low as u8);
     }
     Some(bytes)
+}
+/// 群列表上限（与 storage 的 `MAX_GROUP_STATE_LIST` 保持一致）。
+fn storage_max_group_list() -> usize {
+    chat_storage::formal::MAX_GROUP_STATE_LIST
+}
+
+/// 群列表里的一条摘要（列表页只读快照记录，不解密 MLS 状态）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupSummaryView {
+    /// 协议群 ID。
+    pub group_id: String,
+    /// 群名（改名后立即反映）。
+    pub name: String,
+    /// 快照里记录的 MLS epoch（**写入时的值**；精确值请用 `group_snapshot`）。
+    pub epoch: u64,
+    /// 本机在群里的角色（本机已不是成员时是 `Member`）。
+    pub role: MemberRole,
+    /// 群策略版本。
+    pub policy_version: u64,
+    /// 已解散。
+    pub dissolved: bool,
+    /// 本机已退出（本地策略层）。
+    pub left: bool,
+    /// 本机有待收口的线索：已发起自移除提案（`leaving_at_ms`）或已收下待打包的提案。
+    pub pending: bool,
+}
+
+/// 群列表结果（`skipped` 是被跳过的损坏条目数，绝不静默丢弃）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupListView {
+    /// 摘要（按最近写入时间倒序）。
+    pub groups: Vec<GroupSummaryView>,
+    /// 读不出来的条目数（快照损坏/不是本模块记录/越界）。
+    pub skipped: u32,
+}
+
+/// GROUPS-002（列表侧）：列出本机所有群的摘要，不解密 MLS 状态。
+///
+/// - 只扫 `grpmeta/` 命名空间（本模块独占），最多 `MAX_GROUP_STATE_LIST`(256) 条；
+/// - 每条读快照记录并**只做本地投影**（不导入设备、不解密），因此很快；
+/// - 损坏/不认识的条目不抛出、也不静默吞掉：计入 `skipped` 并在返回里报告；
+/// - 排序由 storage 给出（最近写入时间倒序）。
+pub fn group_list(store: &Store) -> GroupResult<GroupListView> {
+    let keys = store
+        .list_mls_group_state_keys(SNAPSHOT_GROUP_PREFIX, storage_max_group_list())
+        .map_err(GroupError::from)?;
+    let mut groups = Vec::with_capacity(keys.len());
+    let mut skipped = 0_u32;
+    for key in keys {
+        match summary_from_key(store, &key) {
+            Ok(Some(summary)) => groups.push(summary),
+            // 读不出来 / 不是本模块记录：计数跳过，绝不静默丢弃。
+            Ok(None) | Err(_) => skipped = skipped.saturating_add(1),
+        }
+    }
+    Ok(GroupListView { groups, skipped })
+}
+
+fn summary_from_key(
+    store: &Store,
+    key: &chat_storage::formal::MlsGroupStateKey,
+) -> GroupResult<Option<GroupSummaryView>> {
+    let Some(stored) = store.load_mls_group_state(&key.group_id).map_err(GroupError::from)? else {
+        return Ok(None);
+    };
+    let Ok(record) = serde_json::from_slice::<GroupRecord>(&stored.state) else {
+        return Ok(None);
+    };
+    // 记录必须自洽且真的属于本命名空间（防止别的模块写进同名空间）。
+    record.validate()?;
+    if record.group_id.is_empty() {
+        return Ok(None);
+    }
+    let role = record
+        .members
+        .iter()
+        .find(|member| member.is_local)
+        .map(|member| role_of(member.role))
+        .unwrap_or(MemberRole::Member);
+    Ok(Some(GroupSummaryView {
+        group_id: record.group_id.clone(),
+        name: record.name.clone(),
+        epoch: record.mls_epoch,
+        role,
+        policy_version: record.policy_version,
+        dissolved: record.dissolved,
+        left: record.left_at_ms > 0,
+        pending: record.leaving_at_ms > 0 || record.pending_proposal.is_some(),
+    }))
 }
 
 
