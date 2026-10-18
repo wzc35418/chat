@@ -175,3 +175,183 @@ fn public_key_hex(key: &[u8; 32]) -> String {
 fn signature_hex(signature: &[u8; 64]) -> String {
     signature.iter().map(|byte| format!("{byte:02x}")).collect()
 }
+
+// ---------------------------------------------------------------- U 包新增向量
+
+const APPLICATION_EVENT_VECTOR: &str = "435043010007001000010100000000000000010002010000000000000001000301000000000000000000050200000020777777777777777777777777777777777777777777777777777777777777777700060200000020b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b200230200000020e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e100240200000020a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a10025010000000000000001002605030000000568656c6c6f002704002804002904002a04002b010000000000000001002c0200000020c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1002d010000018bcfe56800";
+
+const EVENT_DIGEST_VECTOR: &str =
+    "7503ce5f884c6df8cba51b25080f38b91c1873b04ce744b21d67007c9e5133eb";
+
+const CANDIDATE_DIGEST_VECTOR: &str =
+    "1d7c8fc3eb80fc79540587fc8da4aeb04b308b6ded456998e469e3b29d730624";
+
+const LOG_ENTRY_HASH_VECTOR: &str =
+    "0af01d62b8dd46518257859d109991cacd34721c365f231566d6c7dff4564f0d";
+
+const RECEIPT_SIGNATURE_VECTOR: &str = "18219f668a618ea8398e85d1bf69123c84feed9cf402c4065c16aaa0665b660d8ceb13dfca0aade8b7bab301e56076b56f39830884b7f9faaf484a5776753502";
+
+const SESSION_FINGERPRINT_VECTOR: &str =
+    "6b46e70602d4b07a512c1c1d16365923e92e305114521324457ce65b5610dc84";
+
+fn u_package_event() -> PlainApplicationEvent {
+    PlainApplicationEvent {
+        protocol_version: ProtocolVersion::V1,
+        conversation_id: ConversationId::from_bytes([0xc1; 32]),
+        group_id: GroupId::from_bytes([0x77; 32]),
+        event_id: EventId::from_bytes([0xe1; 32]),
+        account_id: AccountId::from_bytes([0xa1; 32]),
+        device_id: DeviceId::from_bytes([0xb2; 32]),
+        content: ApplicationContent::Text {
+            text: "hello".to_owned(),
+        },
+        reply: None,
+        origin: MessageOrigin::UserInitiated,
+        sent_at_unix_ms: 1_700_000_000_000,
+    }
+}
+
+fn session_input() -> (Capabilities, Capabilities) {
+    let local = Capabilities::new(
+        vec![ProtocolVersion::V1],
+        vec![
+            "e2ee.v1".to_owned(),
+            "mls.v1".to_owned(),
+            "log.v1".to_owned(),
+            "attachments.v1".to_owned(),
+            "receipts.v1".to_owned(),
+        ],
+        CapabilityLimits::new(64 * 1024, 64 * 1024, 64 * 1024),
+    );
+    let remote = Capabilities::new(
+        vec![ProtocolVersion::V1],
+        vec![
+            "mls.v1".to_owned(),
+            "e2ee.v1".to_owned(),
+            "extensions.v1".to_owned(),
+        ],
+        CapabilityLimits::new(32 * 1024, 16 * 1024, 8 * 1024),
+    );
+    (local, remote)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(char::from(HEX[(byte >> 4) as usize]));
+        text.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    text
+}
+
+#[test]
+fn application_event_matches_frozen_vector() {
+    let bytes = encode_application_event(u_package_event()).expect("encode");
+    assert_eq!(hex(bytes.as_bytes()), APPLICATION_EVENT_VECTOR);
+    assert_eq!(bytes.as_bytes().len() * 2, APPLICATION_EVENT_VECTOR.len());
+    // 解码回同一事件，且重复编码字节一致。
+    let decoded =
+        decode_application_event(bytes.as_bytes(), DecodeLimits::DEFAULT).expect("decode");
+    assert_eq!(decoded, u_package_event());
+    let again = encode_application_event(decoded).expect("re-encode");
+    assert_eq!(again.as_bytes(), bytes.as_bytes());
+    // 事件摘要带域分隔，且与裸字节摘要不同。
+    let mut preimage = EVENT_DIGEST_DOMAIN.to_vec();
+    preimage.extend_from_slice(bytes.as_bytes());
+    let digest = Digest::sha256(&preimage);
+    assert_eq!(digest.to_hex(), EVENT_DIGEST_VECTOR);
+    assert_ne!(digest, Digest::sha256(bytes.as_bytes()));
+}
+
+#[test]
+fn candidate_digest_matches_signing_vector() {
+    let signing = candidate_signing_bytes(&candidate()).expect("candidate");
+    assert_eq!(
+        Digest::sha256(signing.as_bytes()).to_hex(),
+        CANDIDATE_DIGEST_VECTOR
+    );
+    // 通过 PROTOCOL-005 得到的候选摘要必须与签名原文摘要一致。
+    let device_key = signing_key_from_seed(&[0x42; 32]);
+    let signed = SignedCandidate {
+        unsigned: candidate(),
+        author_signature: sign_bytes(&device_key, signing.as_bytes()),
+    };
+    let credential = VerifiedCredential {
+        account_id: AccountId::from_bytes([0x99; 32]),
+        device_id: DeviceId::from_bytes([0x33; 32]),
+        device_public_key: device_key.verifying_key().to_bytes(),
+        credential_version: 1,
+        revoked: false,
+    };
+    let context = GroupContext {
+        group_id: GroupId::from_bytes([0x22; 32]),
+        control_head: ControlHead::from_bytes([0x44; 32]),
+        policy_version: 7,
+        mls_epoch: 9,
+    };
+    let verified = verify_candidate(signed, credential, context).expect("verify");
+    assert_eq!(
+        verified.candidate_digest().to_hex(),
+        CANDIDATE_DIGEST_VECTOR
+    );
+    assert_eq!(verified.author_account(), AccountId::from_bytes([0x99; 32]));
+}
+
+#[test]
+fn log_entry_hash_and_receipt_signature_match_frozen_vectors() {
+    let group = GroupId::from_bytes([0x22; 32]);
+    let candidate_digest = Digest::from_bytes(
+        hex_decode(CANDIDATE_DIGEST_VECTOR)
+            .try_into()
+            .expect("32 bytes"),
+    );
+    let log_hash =
+        log_entry_hash(group, 1, Digest::ZERO, candidate_digest, &[0x5c; 64]).expect("log hash");
+    assert_eq!(log_hash.to_hex(), LOG_ENTRY_HASH_VECTOR);
+    // 节点回执签名是确定性的 Ed25519：固定种子必须得到固定签名。
+    let receipt = receipt_signing_bytes(candidate_digest, 1, Digest::ZERO, group).expect("receipt");
+    let node_key = signing_key_from_seed(&[0x33; 32]);
+    let signature = sign_bytes(&node_key, receipt.as_bytes());
+    assert_eq!(hex(&signature), RECEIPT_SIGNATURE_VECTOR);
+    verify_ed25519(
+        &node_key.verifying_key().to_bytes(),
+        receipt.as_bytes(),
+        &signature,
+    )
+    .expect("receipt verifies");
+    // 改变序号/前序摘要即改变日志哈希。
+    assert_ne!(
+        log_entry_hash(group, 2, Digest::ZERO, candidate_digest, &[0x5c; 64])
+            .expect("hash")
+            .to_hex(),
+        LOG_ENTRY_HASH_VECTOR
+    );
+    assert_ne!(
+        log_entry_hash(
+            group,
+            1,
+            Digest::from_bytes([9; 32]),
+            candidate_digest,
+            &[0x5c; 64]
+        )
+        .expect("hash")
+        .to_hex(),
+        LOG_ENTRY_HASH_VECTOR
+    );
+}
+
+#[test]
+fn session_fingerprint_matches_frozen_vector() {
+    let (local, remote) = session_input();
+    let session = negotiate_capabilities(local, remote).expect("session");
+    assert_eq!(session.protocol_version(), ProtocolVersion::V1);
+    assert_eq!(session.fingerprint().to_hex(), SESSION_FINGERPRINT_VECTOR);
+    // 限额取较小值，未知能力忽略。
+    assert_eq!(session.limits().max_message_bytes, 16 * 1024);
+    assert!(!session.supports("extensions.v1"), "远端声明但本地未声明");
+    let (local, mut remote) = session_input();
+    remote.limits.max_frame_bytes = 1;
+    let changed = negotiate_capabilities(local, remote).expect("session");
+    assert_ne!(changed.fingerprint().to_hex(), SESSION_FINGERPRINT_VECTOR);
+}

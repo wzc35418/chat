@@ -9,7 +9,8 @@
 //! 任何被签字段（群、设备、kind、head/policy/epoch、密文摘要、控制元数据）变化都会
 //! 改变原文，因此验签失败。
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+pub use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, Signer, VerifyingKey};
 
 use crate::canonical::{
     CanonicalBytes, ProtocolVersion, WireField, WireValue, encode_canonical, field,

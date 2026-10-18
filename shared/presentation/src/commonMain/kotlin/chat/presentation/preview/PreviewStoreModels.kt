@@ -11,6 +11,7 @@ import chat.presentation.display.MessageDisplayView
 import chat.presentation.display.presentDraft
 import chat.presentation.display.toConversationDisplayPage
 import chat.presentation.display.toDraftEvidence
+import chat.presentation.display.toDraftUiState
 import chat.presentation.display.toMessageDisplayPage
 
 /**
@@ -107,3 +108,18 @@ fun PreviewStoreState.contactless(accountId: String?): PreviewStoreState = copy(
     notice = if (accountId == null) "本机属性化身份未就绪；本机存储面板只展示数据库内容。" else null,
     busy = false,
 )
+
+/** 用 CORE-010 真实状态刷新草稿条目（按钮态以底层 canRetry/canCancel 为准）。 */
+fun PreviewStoreState.withDraftStatus(status: chat.api.StoredDraftStatus): PreviewStoreState {
+    val ui = status.toDraftUiState()
+    val merged = LinkedHashMap<String, DraftUiState>()
+    drafts.forEach { merged[it.draftId] = it }
+    merged[status.draftId] = ui
+    return copy(
+        drafts = merged.values.toList(),
+        busy = false,
+        notice = "草稿状态：" + status.status +
+            "（尝试 " + status.attempts + " 次，序号 " + (status.attemptIndex ?: 0) + "）",
+        lastErrorCode = null,
+    )
+}

@@ -38,6 +38,14 @@ pub enum DomainError {
     HistoryNotAuthorized { detail: &'static str },
     /// 快照本身违反不变量（例如群主不唯一），必须停止该群分支。
     InvalidSnapshot { detail: &'static str },
+    /// 候选/操作基于的控制状态已陈旧。
+    StaleControlHead { detail: &'static str },
+    /// 策略迁移不合法或操作与授权结果不一致。
+    InvalidPolicyTransition { detail: &'static str },
+    /// 控制结果（MLS 实际增删/epoch）与业务预期不一致。
+    InvalidControlResult { detail: &'static str },
+    /// 日志冲突：群/epoch/序号与本地已验证状态矛盾。
+    LogConflict { detail: &'static str },
 }
 
 impl DomainError {
@@ -58,12 +66,19 @@ impl DomainError {
             DomainError::MessageNotVisible => ErrorCode::MessageNotVisible,
             DomainError::HistoryNotAuthorized { .. } => ErrorCode::HistoryNotAuthorized,
             DomainError::InvalidSnapshot { .. } => ErrorCode::StateCorrupted,
+            DomainError::StaleControlHead { .. } => ErrorCode::StaleControlHead,
+            DomainError::InvalidPolicyTransition { .. } => ErrorCode::InvalidPolicyTransition,
+            DomainError::InvalidControlResult { .. } => ErrorCode::InvalidControlResult,
+            DomainError::LogConflict { .. } => ErrorCode::LogConflict,
         }
     }
 
-    /// 领域层错误一律不可自动重试（需要先改变正式状态）。
+    /// 是否允许自动重试：完全遵循冻结码表。
+    ///
+    /// 只有 `STALE_CONTROL_HEAD` 这类「先同步再重试」的条件可重试；权限、验证、
+    /// 损坏与策略迁移失败都不可重试。
     pub const fn retryable(&self) -> bool {
-        false
+        self.code().retryable()
     }
 }
 
@@ -102,6 +117,16 @@ impl fmt::Display for DomainError {
             DomainError::InvalidSnapshot { detail } => {
                 write!(formatter, "invalid group snapshot: {detail}")
             }
+            DomainError::StaleControlHead { detail } => {
+                write!(formatter, "stale control head: {detail}")
+            }
+            DomainError::InvalidPolicyTransition { detail } => {
+                write!(formatter, "invalid policy transition: {detail}")
+            }
+            DomainError::InvalidControlResult { detail } => {
+                write!(formatter, "invalid control result: {detail}")
+            }
+            DomainError::LogConflict { detail } => write!(formatter, "log conflict: {detail}"),
         }
     }
 }
@@ -117,7 +142,30 @@ impl From<DomainError> for InternalError {
             ErrorCode::DeviceRevoked => InternalError::DeviceRevoked,
             ErrorCode::ContentTooLarge => InternalError::ContentTooLarge,
             ErrorCode::StateCorrupted => InternalError::StateCorrupted,
+            ErrorCode::StaleControlHead => InternalError::StaleControlHead,
+            ErrorCode::LogConflict => InternalError::LogConflict,
             code => InternalError::Classified(code),
+        }
+    }
+}
+
+/// 协议层错误（规范编码/版本）只能以策略迁移失败的形式进入领域层。
+impl From<chat_protocol::ProtocolError> for DomainError {
+    fn from(error: chat_protocol::ProtocolError) -> Self {
+        match error {
+            chat_protocol::ProtocolError::UnsupportedProtocolVersion => {
+                DomainError::InvalidPolicyTransition {
+                    detail: "unsupported protocol version for policy encoding",
+                }
+            }
+            chat_protocol::ProtocolError::ContentTooLarge { .. } => {
+                DomainError::InvalidPolicyTransition {
+                    detail: "policy encoding exceeds protocol limits",
+                }
+            }
+            _ => DomainError::InvalidPolicyTransition {
+                detail: "policy canonical encoding failed",
+            },
         }
     }
 }

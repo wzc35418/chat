@@ -17,6 +17,21 @@ data class StoredDraft(
     val submissionId: String?,
 )
 
+/** 草稿真实状态（CORE-010）；不含正文。 */
+data class StoredDraftStatus(
+    val draftId: String,
+    val conversationId: String,
+    val operationId: String,
+    /** queued / prepared / submitted / accepted / rejected / unknown / cancelled / failed */
+    val status: String,
+    val submissionId: String?,
+    val attemptIndex: Int?,
+    val attempts: Int,
+    val updatedAtMillis: Long,
+    val canRetry: Boolean,
+    val canCancel: Boolean,
+)
+
 data class StoredConversation(
     val conversationId: String,
     val title: String,
@@ -68,6 +83,9 @@ interface LocalStore {
     suspend fun createDraft(conversationId: String, operationId: String, body: String): StoredDraft
 
     suspend fun draftStatus(draftId: String): StoredDraft?
+
+    /** 真实状态查询（CORE-010）：不含正文，未知草稿返回 null。 */
+    suspend fun draftStatusView(draftId: String): StoredDraftStatus?
 
     suspend fun applyVerifiedMessage(input: VerifiedMessageInput): StoredMessage
 

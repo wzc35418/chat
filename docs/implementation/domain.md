@@ -1,6 +1,6 @@
 # 领域规则、群权限与状态机
 
-阶段：P1 → P3。状态：DOMAIN-001/002/003/006/007/008/009/010/011/012 已实现并通过自动化用例；DOMAIN-004/005 仍为设计（需要 MLS Commit 阶段结果，P1-01 范围不含）。源码：[crates/domain/src/rules.rs](../../crates/domain/src/rules.rs)（占位保留）+ 新模块 [model.rs](../../crates/domain/src/model.rs)、[group.rs](../../crates/domain/src/group.rs)、[delivery.rs](../../crates/domain/src/delivery.rs)、[visibility.rs](../../crates/domain/src/visibility.rs)、[error.rs](../../crates/domain/src/error.rs)。
+阶段：P1 → P3。状态：DOMAIN-001~012 全部 12 个函数已实现并通过自动化用例。源码：[crates/domain/src/rules.rs](../../crates/domain/src/rules.rs)（占位保留）+ 模块 [model.rs](../../crates/domain/src/model.rs)、[group.rs](../../crates/domain/src/group.rs)、[control.rs](../../crates/domain/src/control.rs)、[delivery.rs](../../crates/domain/src/delivery.rs)、[visibility.rs](../../crates/domain/src/visibility.rs)、[error.rs](../../crates/domain/src/error.rs)。
 
 本层为可独立验证的纯规则。GroupSnapshot 必须来自已验证正式日志；作者时间不能参与权限排序。私聊也采用同样的节点确认模型；会话类别另行限制成员治理入口。
 
@@ -26,7 +26,9 @@
 - **快照不变量**：所有入口先校验「群主唯一且与 owner 字段一致、群主为有效成员、账户唯一、单账户设备唯一、设备不跨账户共享、加入窗口合法」；违反返回 `STATE_CORRUPTED` 并停止该群分支，不推断授权。
 - **基线限额**：`GroupLimits::BASELINE` = 20 账户 / 40 设备 / 每账户 2 设备。`authorize_group_operation` 的邀请按基线校验；节点若配置更低限额，必须在节点侧再调用 `validate_capacity`（该函数签名不含 limits）。
 - **治理入口**：只有 `ConversationKind::Group` 允许群治理；`Direct`/`SelfSync` 只允许 `Leave`/`Dissolve`。管理员只能治理普通成员（不能踢/降级/禁言管理员或群主、不能改角色、不能邀请管理员）；任何人不能修改自己的角色，群主降级必须走转让；任命群主只能通过 `TransferOwnership`。
-- **错误码**：领域错误复用 `chat_protocol::ErrorCode`（PERMISSION_DENIED / DEVICE_REVOKED / INVALID_TARGET / GROUP_LIMIT_EXCEEDED / DEVICE_LIMIT_EXCEEDED / OWNER_TRANSFER_REQUIRED / NOT_MEMBER / INVALID_STATE_TRANSITION / INVALID_RECEIPT_SCOPE / INVALID_REPLY / MESSAGE_NOT_VISIBLE / HISTORY_NOT_AUTHORIZED / STATE_CORRUPTED），一律不可自动重试；经 `chat_protocol::map_error` 输出时通过 `InternalError::Classified` 保留具体码。
+- **策略迁移（DOMAIN-004）**：`apply_policy_operation` 先要求 `op.snapshot_head/policy_version` 等于当前快照（否则 `STALE_CONTROL_HEAD`），再按当前快照重新授权同一操作并与传入的授权结果逐项比对（角色迁移/owner_after/操作必须一致，否则 `INVALID_POLICY_TRANSITION`），随后只应用该单一操作、校验唯一群主不变量，最后 `policy_version + 1` 并派生新控制头；MLS epoch 不在策略层推进。冻结派生公式：`policy_operation_digest = SHA-256(chat/p1/policy-operation/v1 || 规范编码{操作种类, 目标账户/角色/禁言/设备/名称摘要})`；`control_head_after = SHA-256(chat/p1/control-head/v1 || 规范编码{前一控制头, 新策略版本, 操作种类, 操作摘要})`。候选快照 `ProposedPolicy` 不是正式快照。
+- **控制结果（DOMAIN-005）**：`verify_control_result` 要求 `StagedCommit` 的 group 与本地一致、`epoch_before == before.mls_epoch`（否则 `LOG_CONFLICT`）、`epoch_after > epoch_before`（否则 `INVALID_CONTROL_RESULT`，不猜测固定 +1）；公开 `ControlMetadata` 的操作种类与目标摘要必须等于已授权操作的 `policy_operation_digest`；随后重新授权并应用出预期业务结果，实际 `added/removed` 凭据叶子集合必须与预期完全一致（移除账户必须覆盖其全部设备，纯角色操作不得夹带成员变化），否则 `INVALID_CONTROL_RESULT`。
+- **错误码**：领域错误复用 `chat_protocol::ErrorCode`（PERMISSION_DENIED / DEVICE_REVOKED / INVALID_TARGET / GROUP_LIMIT_EXCEEDED / DEVICE_LIMIT_EXCEEDED / OWNER_TRANSFER_REQUIRED / NOT_MEMBER / INVALID_STATE_TRANSITION / INVALID_POLICY_TRANSITION / INVALID_CONTROL_RESULT / INVALID_RECEIPT_SCOPE / INVALID_REPLY / MESSAGE_NOT_VISIBLE / HISTORY_NOT_AUTHORIZED / STALE_CONTROL_HEAD / LOG_CONFLICT / STATE_CORRUPTED）；重试性完全遵循冻结码表（只有 `STALE_CONTROL_HEAD` 这类「先同步再重试」可重试，权限/验证/损坏/迁移失败不可重试）；经 `chat_protocol::map_error` 输出时通过 `InternalError::Classified` 保留具体码。
 - **发送状态表**：`QUEUED + VerifiedAcceptedReceipt -> ACCEPTED`；`ACCEPTED + AuthenticatedReceipt -> DELIVERED`；`VerifiedRejection(终止错误) -> FAILED`；transport/mailbox ACK、本机超时、可重试错误一律 `INVALID_STATE_TRANSITION`；`ACCEPTED/DELIVERED` 不得回退；重复证据幂等。
 - **重试分类**：`AcceptanceUnknown`/`UNKNOWN_RESULT -> QueryExisting`（保留 SubmissionId，禁止重新加密）；网络/节点/限流/存储忙 -> `ResendSameBytes`；陈旧 head/epoch/缺日志/日志冲突 -> `SyncThenRebuild`；权限/禁言/设备撤销/配额/限额 -> `WaitForUser`（不自动重试）；签名/损坏/不支持 -> `PermanentFailure`。
 - **送达聚合**：只统计消息时点的 `RecipientSnapshot`；按 (账户, 设备) 去重、按账户 OR 聚合、排除发件人账户；发件人自己其他设备的回执不计入对方；超出快照的回执显式 `INVALID_RECEIPT_SCOPE`。
@@ -158,10 +160,10 @@ apply_policy_operation(before: GroupSnapshot, op: AuthorizedGroupOperation) -> R
 
 **完成验收**：
 
-- [ ] 加人操作夹带管理员角色拒绝。
-- [ ] 移除账户覆盖其全部设备。
+- [x] 加人操作夹带管理员角色拒绝。
+- [x] 移除账户覆盖其全部设备。
 
-**实现状态**：未实现（设计保留；P1-01 实现范围不含该函数，未开始）。
+**实现状态**：已实现（`control.rs::apply_policy_operation`）。证据：`cargo test --offline -p chat-protocol -p chat-domain`（2026-10-18，chat-protocol 73 passed、chat-domain 43 passed）中的 `control_rules.rs::owner_authorized_admin_invite_is_allowed_but_smuggled_authorization_is_not`（群主邀请管理员通过；管理员/普通成员伪造「邀请管理员」授权 → 重新授权 `PERMISSION_DENIED`）、`invite_application_updates_snapshot_and_device_diff`（policy_version+1、epoch 不变、控制头更新、设备增删差集、加入序号 = verified_sequence+1）、`removal_covers_every_device_and_keeps_single_owner`（移除账户差集包含其全部设备、唯一群主保持）、`tampered_authorization_is_rejected`（篡改角色迁移/owner_after → `INVALID_POLICY_TRANSITION`）、`stale_head_or_policy_is_rejected_before_any_mutation`（`STALE_CONTROL_HEAD`）、`role_mute_rename_and_transfer_apply_exactly`（转让后唯一群主、原群主降级且不退出）、`leave_and_dissolve_apply_exactly`（群主伪造 Leave → `OWNER_TRANSFER_REQUIRED`；解散置 dissolved）、`frozen_policy_digest_and_control_head_vectors`（固定 hex 向量）。
 
 <a id="domain-005"></a>
 
@@ -191,10 +193,10 @@ verify_control_result(before: GroupSnapshot, metadata: ControlMetadata, mls: Sta
 
 **完成验收**：
 
-- [ ] 管理员 Invite 夹带 Remove Owner 拒绝。
-- [ ] 账户所有设备移除才通过。
+- [x] 管理员 Invite 夹带 Remove Owner 拒绝。
+- [x] 账户所有设备移除才通过。
 
-**实现状态**：未实现（设计保留；P1-01 实现范围不含该函数，未开始）。
+**实现状态**：已实现（`control.rs::verify_control_result`）。证据：`control_rules.rs::invite_commit_matches_business_change`（epoch/head/操作摘要一致时通过，added 叶子与邀请设备一致）、`commit_cannot_smuggle_extra_member_changes`（Invite 的 Commit 夹带移除群主设备 → `INVALID_CONTROL_RESULT`；纯禁言操作夹带新增叶子同样拒绝；空变化通过）、`account_removal_requires_every_device`（只移除一台设备拒绝，移除账户全部设备通过）、`metadata_must_match_operation`（操作种类或目标摘要不符 → `INVALID_CONTROL_RESULT`）、`wrong_group_or_epoch_is_a_log_conflict`（跨群/epoch_before 不符 → `LOG_CONFLICT`；epoch 不前进 → `INVALID_CONTROL_RESULT`）、`stale_authorization_and_bad_actor_are_rejected`（陈旧 head → `STALE_CONTROL_HEAD`；设备撤销 → `DEVICE_REVOKED`）、`control_failures_map_to_frozen_codes_without_retry`（码表映射与重试性）。实现说明：`StagedCommit` 携带 MLS 的 `epoch_before/epoch_after`、已授权操作与实际 added/removed 凭据叶子（账户+设备）；本层只核对，不合并 MLS 状态，也不断言 epoch 固定 +1。
 
 <a id="domain-006"></a>
 

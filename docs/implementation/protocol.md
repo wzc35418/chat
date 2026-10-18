@@ -1,6 +1,6 @@
 # 标识符、线协议、编码与验证
 
-阶段：P0 → P1。状态：PROTOCOL-001/002/003/004/006/010/012/013/014 已实现并通过自动化用例；PROTOCOL-005/007/008/009/011 仍为设计（P1-01 范围不含）。源码：[crates/protocol/src/wire.rs](../../crates/protocol/src/wire.rs)（P0 帧，公开 API 未改动）+ 新模块 [ids.rs](../../crates/protocol/src/ids.rs)、[canonical.rs](../../crates/protocol/src/canonical.rs)、[decode.rs](../../crates/protocol/src/decode.rs)、[signing.rs](../../crates/protocol/src/signing.rs)、[extension.rs](../../crates/protocol/src/extension.rs)、[cursor.rs](../../crates/protocol/src/cursor.rs)、[error.rs](../../crates/protocol/src/error.rs)。
+阶段：P0 → P1。状态：PROTOCOL-001~014 全部 14 个函数已实现并通过自动化用例。源码：[crates/protocol/src/wire.rs](../../crates/protocol/src/wire.rs)（P0 帧，公开 API 未改动）+ 模块 [ids.rs](../../crates/protocol/src/ids.rs)、[canonical.rs](../../crates/protocol/src/canonical.rs)、[decode.rs](../../crates/protocol/src/decode.rs)、[signing.rs](../../crates/protocol/src/signing.rs)、[verify.rs](../../crates/protocol/src/verify.rs)、[event.rs](../../crates/protocol/src/event.rs)、[extension.rs](../../crates/protocol/src/extension.rs)、[capability.rs](../../crates/protocol/src/capability.rs)、[cursor.rs](../../crates/protocol/src/cursor.rs)、[digest.rs](../../crates/protocol/src/digest.rs)、[error.rs](../../crates/protocol/src/error.rs)。
 
 本层只处理有界字节、规范编码和验签输入，不查询 UI。所有公钥、摘要、签名算法和线编码由 P0 决策锁定；下列签名是设计契约，不是可编译 Rust。Result 的错误包含稳定 code、retryable 与 operationId。签名前的域分隔必须覆盖协议主版本、消息类别和用途。
 
@@ -29,10 +29,13 @@
 
 - **ID 文本**：`<prefix>:1:<32 字节小写 hex>`；前缀 acc/dev/grp/conv/sub/evt/msg/draft/op/obj/node；文本上限 96 字节。大写 hex、前导零版本、空白、非 ASCII、长度不符一律 `INVALID_ID`；类型前缀不符同样拒绝（AccountId 不能代作 DeviceId）。
 - **规范编码**：`"CPC" major:u8 minor:u8 body`。body tag：0x01 u64（8 字节大端）、0x02 bytes（u32 大端长度）、0x03 text（u32 大端 UTF-8 长度）、0x04 none、0x05 some、0x06 list（u32 大端数量）、0x07 struct（u16 大端字段数 + 每项 u16 字段号 + 值，字段号严格升序）。编码期按字段号重排，重复/未知字段号显式拒绝。预算：总长 64 KiB、深度 8、集合 512、文本 8 KiB。
-- **字段号**：1 schema_version、2/3 协议主/次版本、4 submission_id、5 group_id、6 author_device_id、7 kind、8 control_head、9 policy_version、10 mls_epoch、11 payload_digest、12/13 control 操作与目标摘要、14 receipt seq、15 previous_log_hash、16 candidate_digest、17–26 cursor（account/device/conversation/resource/sort_version/sort_key/seq/tie/issued_at/expires_at）、27–32 extension（namespace/schema_version/operation/object/payload/fallback）。
+- **字段号**：1 schema_version、2/3 协议主/次版本、4 submission_id、5 group_id、6 author_device_id、7 kind、8 control_head、9 policy_version、10 mls_epoch、11 payload_digest、12/13 control 操作与目标摘要、14 receipt seq、15 previous_log_hash、16 candidate_digest、17–26 cursor（account/device/conversation/resource/sort_version/sort_key/seq/tie/issued_at/expires_at）、27–32 extension（namespace/schema_version/operation/object/payload/fallback）、33 节点回执签名、34 日志条目哈希、35 event_id、36 author_account_id、37 内容种类、38 文本、39 扩展内容、40 附件 file_id、41/42 回复会话/消息、43 origin、44 事件会话、45 展示时间、46–50 策略操作（account/role/muted/devices/name_digest）、51–54 会话能力（features/max_frame/max_message/max_ciphertext）。字段号只增不改，33–54 为本轮补充。
 - **签名原文**：`域字符串 || 规范编码`。候选作者域 `chat/p1/candidate-author-signature/v1`；节点回执域 `chat/p1/coordinator-receipt-signature/v1`。候选原文编码 kind（消息类别）、协议主/次版本与全部路由/控制字段，排除 `author_signature` 自身；回执原文绑定 group/seq/previous_log_hash/candidate_digest。
 - **分页游标**：`cur1.<12 字节系统随机 nonce hex>.<ChaCha20-Poly1305 密文+16 字节 tag hex>`；AAD 固定 `chat/p1/page-cursor/v1`；明文是 scope/position/issued_at/expires_at 的规范编码；TTL 10 分钟，允许 60 秒时钟超前；token 上限 1024 字节。`encode_page_cursor`/`decode_page_cursor` 因过期检查必须有可信时间，契约签名上补了显式 `unix_ms` 参数。
-- **错误码**：`chat_protocol::ErrorCode` 共 41 个冻结 ASCII 码；`PublicError` 只含 code、retryable、限幅后的 retry_after_ms（≤300000）、operationId 与静态 detail_key。只有网络/节点/限流/存储忙/需同步补齐类可自动重试；未知错误映射 `INTERNAL_FAILURE` 且不可重试；内部诊断绝不进入公共错误。
+- **日志条目**：`AcceptedLogEntry = VerifiedCandidate + group_sequence + previous_log_hash + coordinator_signature`；条目哈希 `log_hash = SHA-256(chat/p1/log-entry-hash/v1 || 规范编码{group, seq, previous_log_hash, candidate_digest, coordinator_signature})`。回执签名原文沿用 PROTOCOL-006。下一跳 `previous_log_hash` 必须等于上一条 `log_hash`；创世条目引用全零头。
+- **应用内层事件**：16 个冻结字段（schema、协议主/次、会话、群、event_id、account、device、内容种类、文本/附件/扩展三种可选内容、回复会话/消息、origin、展示时间）；内容种类 1=文本、2=附件、3=扩展；文本按 UTF-8 字节 ≤8 KiB，完整事件 ≤64 KiB；扩展走 PROTOCOL-010；`SecretBytes` 析构清零。去重键 `event_digest = SHA-256(chat/p1/application-event/v1 || 事件字节)`，与外层候选摘要无关。
+- **能力协商**：schema=1；双方各声明协议版本（≤8）、能力名（≤32 个，每个 ≤64 字节规范名）、三项限额（≥1 且 ≤64 KiB）。必需能力 `e2ee.v1`/`mls.v1` 缺失即拒绝；未知能力被忽略但不参与会话；版本取双方共同支持的最高版本；限额逐项取较小值。会话指纹 `SHA-256(chat/p1/capability-session/v1 || 规范编码{version, features, limits})`。
+- **错误码**：`chat_protocol::ErrorCode` 共 43 个冻结 ASCII 码（本轮按计划文档补入 `INVALID_POLICY_TRANSITION`、`INVALID_CONTROL_RESULT`，未发明新码）；`PublicError` 只含 code、retryable、限幅后的 retry_after_ms（≤300000）、operationId 与静态 detail_key。只有网络/节点/限流/存储忙/需同步补齐类可自动重试；未知错误映射 `INTERNAL_FAILURE` 且不可重试；内部诊断绝不进入公共错误。
 
 <a id="protocol-001"></a>
 
@@ -192,11 +195,11 @@ verify_candidate(candidate: SignedCandidate, credential: VerifiedCredential, con
 
 **完成验收**：
 
-- [ ] 伪造 author_device。
-- [ ] 重放到其他群。
-- [ ] 内层伪造仍需后续拒绝。
+- [x] 伪造 author_device。
+- [x] 重放到其他群。
+- [x] 内层伪造仍需后续拒绝。
 
-**实现状态**：未实现（设计保留；P1-01 实现范围不含该函数，未开始）。
+**实现状态**：已实现（`verify.rs::verify_candidate`，输出 `VerifiedCandidate`；构造入口只有本函数）。证据：`cargo test --offline -p chat-protocol -p chat-domain`（2026-10-18，chat-protocol 73 passed、chat-domain 43 passed）中的 `verify::tests::valid_candidate_verifies_with_bindings`、`revoked_device_and_wrong_device_are_rejected`（伪造/借用设备 → `INVALID_SIGNATURE`；撤销 → `DEVICE_REVOKED`）、`signature_from_another_key_or_tampered_fields_is_rejected`（换钥与篡改密文/提交/群/设备）、`cross_group_and_stale_context_are_rejected`（跨群 → `INVALID_SIGNATURE`；head/policy 陈旧 → `STALE_CONTROL_HEAD`；epoch 陈旧 → `STALE_EPOCH`；不支持版本 → `PROTOCOL_UNSUPPORTED`）、`application_candidate_cannot_smuggle_control_metadata`（`INVALID_CANDIDATE`）；内层伪造由 PROTOCOL-009 用例 `event::tests::inner_event_binds_sender_and_outer_candidate`、`cross_group_inner_event_is_rejected` 拒绝。契约偏差：head/policy/epoch 陈旧使用冻结的 `STALE_CONTROL_HEAD`/`STALE_EPOCH`（契约失败表只列三个码），因为陈旧不是伪造，调用方应先同步；凭据/设备的账户绑定由上层 `VerifiedCredential` 保证，本层检查撤销、设备一致与群/状态绑定。
 
 <a id="protocol-006"></a>
 
@@ -258,11 +261,11 @@ verify_log_entry(entry: AcceptedLogEntry, expected: VerifiedHead, node_key: Pinn
 
 **完成验收**：
 
-- [ ] 跳号触发补齐。
-- [ ] 相同 seq 不同摘要暂停。
-- [ ] 换节点公钥不得静默信任。
+- [x] 跳号触发补齐。
+- [x] 相同 seq 不同摘要暂停。
+- [x] 换节点公钥不得静默信任。
 
-**实现状态**：未实现（设计保留；P1-01 实现范围不含该函数，未开始）。
+**实现状态**：已实现（`verify.rs::verify_log_entry` + `log_entry_hash`）。证据：`verify::tests::log_chain_accepts_contiguous_entries_only`（创世 seq=1 接受、第二条引用首条链尾接受、跳号 → `MISSING_LOG_ENTRIES`、重复序号/错误前序 → `LOG_CONFLICT`）、`wrong_node_key_and_tampered_receipt_are_rejected`（换节点公钥或篡改回执/候选摘要 → `INVALID_SIGNATURE`）、`cross_group_and_stale_log_heads_are_rejected`（跨群 → `INVALID_SIGNATURE`；head/epoch 陈旧 → `STALE_*`；创世非零前序 → `LOG_CONFLICT`）、`log_entry_hash_is_deterministic_and_field_sensitive`、固定向量 `tests/vectors.rs::log_entry_hash_and_receipt_signature_match_frozen_vectors`。实现说明：`AcceptedLogEntry.candidate` 是 `VerifiedCandidate`（PROTOCOL-005 输出），作者验签是类型前置条件；本函数只验证节点回执、序号与前序哈希链，并返回新 `log_hash`，不推断 control_head/epoch 的更新规则。
 
 <a id="protocol-008"></a>
 
@@ -292,10 +295,10 @@ encode_application_event(event: PlainApplicationEvent) -> Result<SecretBytes>
 
 **完成验收**：
 
-- [ ] 64 KiB 边界按 UTF-8 完整字节计算。
-- [ ] 跨会话引用拒绝。
+- [x] 64 KiB 边界按 UTF-8 完整字节计算。
+- [x] 跨会话引用拒绝。
 
-**实现状态**：未实现（设计保留；P1-01 实现范围不含该函数，未开始）。
+**实现状态**：已实现（`event.rs::encode_application_event`，返回析构清零的 `SecretBytes`）。证据：`event::tests::text_event_round_trips_deterministically`、`extension_and_attachment_content_round_trip`、`reply_must_stay_in_the_same_conversation`（跨会话/零消息 ID → `INVALID_REPLY`）、`malformed_or_oversized_events_are_bounded`（文本 >8 KiB 与完整事件 >64 KiB → `CONTENT_TOO_LARGE`；恰好 8 KiB 接受；空文本/零 ID → `INVALID_EVENT_BINDING`）、固定向量 `tests/vectors.rs::application_event_matches_frozen_vector`。字节边界按 UTF-8 完整字节计算（`String::len`）。
 
 <a id="protocol-009"></a>
 
@@ -325,10 +328,10 @@ verify_inner_event(event: DecryptedEvent, sender: MlsSender, outer: VerifiedCand
 
 **完成验收**：
 
-- [ ] 伪造外层 ID 不吞掉真消息。
-- [ ] MLS sender 与外层设备不一致拒绝。
+- [x] 伪造外层 ID 不吞掉真消息。
+- [x] MLS sender 与外层设备不一致拒绝。
 
-**实现状态**：未实现（设计保留；P1-01 实现范围不含该函数，未开始）。
+**实现状态**：已实现（`event.rs::verify_inner_event`，另有解码步骤 `decode_application_event`）。证据：`event::tests::inner_event_binds_sender_and_outer_candidate`（sender 与外层作者不一致 → `INVALID_CREDENTIAL`；控制候选冒充应用候选 → `INVALID_EVENT_BINDING`；去重键为内层域分隔摘要）、`forged_outer_candidate_does_not_change_inner_dedupe_key`（换外层候选摘要不改变内层去重键，伪造外层 ID 不会吞掉真消息）、`cross_group_inner_event_is_rejected`、`tampered_or_non_canonical_decrypted_bytes_are_rejected`（魔数/尾随字节/截断 → `INVALID_EVENT_BINDING`）。契约偏差：完整事件超过 64 KiB 时返回 `CONTENT_TOO_LARGE`（冻结码），其余绑定/结构失败统一 `INVALID_EVENT_BINDING`。
 
 <a id="protocol-010"></a>
 
@@ -392,10 +395,10 @@ negotiate_capabilities(local: Capabilities, remote: Capabilities) -> Result<Sess
 
 **完成验收**：
 
-- [ ] 远端不支持 E2EE 必须失败。
-- [ ] 限额更低时严格采用较低值。
+- [x] 远端不支持 E2EE 必须失败。
+- [x] 限额更低时严格采用较低值。
 
-**实现状态**：未实现（设计保留；P1-01 实现范围不含该函数，未开始）。
+**实现状态**：已实现（`capability.rs::negotiate_capabilities`）。证据：`capability::tests::negotiates_required_features_and_smaller_limits`（限额逐项取较小值、未声明能力不进入会话）、`remote_missing_e2ee_is_rejected`（远端缺 `e2ee.v1` → `REQUIRED_CAPABILITY_MISSING`；本机缺必需能力 → `PROTOCOL_UNSUPPORTED`）、`no_common_version_is_rejected`（无共同版本 → `PROTOCOL_UNSUPPORTED`；未知版本被忽略而非放大）、`unknown_features_are_ignored_but_bounded`（未知能力忽略并计数；>32 个、>64 字节、大写、重复都拒绝）、`malformed_declarations_are_rejected`（schemaVersion≠1、空/重复/超量版本、主版本 0、0 或超过 64 KiB 的限额）、`session_fingerprint_is_deterministic_and_limit_sensitive`、固定向量 `tests/vectors.rs::session_fingerprint_matches_frozen_vector`。
 
 <a id="protocol-012"></a>
 

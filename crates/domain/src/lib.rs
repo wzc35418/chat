@@ -1,9 +1,10 @@
-//! 领域规则：群权限、发送状态机、送达聚合与可见性（DOMAIN-001..012 中的纯规则部分）。
+//! 领域规则：群权限、策略迁移、控制结果、发送状态机、送达聚合与可见性。
 //!
 //! 模块边界：
 //!
-//! - [`model`]：正式群快照、成员、操作与授权结果；
+//! - [`model`]：正式群快照、成员、操作、容量与授权/策略结果；
 //! - [`group`]：DOMAIN-001/002/003/006/007；
+//! - [`control`]：DOMAIN-004/005 策略操作应用与控制结果核对；
 //! - [`delivery`]：DOMAIN-008/009/010；
 //! - [`visibility`]：DOMAIN-011/012；
 //! - [`error`]：复用协议层冻结错误码的领域错误。
@@ -13,12 +14,17 @@
 #![forbid(unsafe_code)]
 pub mod rules;
 
+pub mod control;
 pub mod delivery;
 pub mod error;
 pub mod group;
 pub mod model;
 pub mod visibility;
 
+pub use control::{
+    CONTROL_HEAD_DOMAIN, POLICY_OPERATION_DOMAIN, apply_policy_operation, control_head_after,
+    control_operation_of, policy_operation_digest, verify_control_result,
+};
 pub use delivery::{
     AccountDelivery, DeliveryEvidence, DeliverySummary, DeviceDelivery, MessageIdentity,
     OperationState, RecipientAccount, RecipientSnapshot, RetryDecision, SendState, VerifiedReceipt,
@@ -30,9 +36,10 @@ pub use group::{
     validate_ownership_transfer, validate_send_permission, validate_snapshot_capacity,
 };
 pub use model::{
-    Actor, AuthorizedGroupOperation, AuthorizedSend, Capacity, ConversationKind, GroupLimits,
-    GroupMember, GroupOperation, GroupSnapshot, MAX_MESSAGE_BYTES, MemberRole, MembershipWindow,
-    PauseReason, RoleChange,
+    Actor, AuthorizedGroupOperation, AuthorizedSend, Capacity, ConversationKind, CredentialLeaf,
+    DeviceSetDiff, GroupLimits, GroupMember, GroupOperation, GroupSnapshot, MAX_MESSAGE_BYTES,
+    MemberRole, MembershipWindow, PauseReason, ProposedPolicy, RoleChange, StagedCommit,
+    VerifiedControlResult,
 };
 pub use visibility::{
     MessageAvailability, MessageRef, ReplyReference, SequenceRange, enforce_join_visibility,

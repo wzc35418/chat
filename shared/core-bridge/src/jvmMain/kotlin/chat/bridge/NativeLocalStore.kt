@@ -4,6 +4,7 @@ import chat.api.LocalStore
 import chat.api.LocalStoreException
 import chat.api.StoredConversation
 import chat.api.StoredDraft
+import chat.api.StoredDraftStatus
 import chat.api.StoredMessage
 import chat.api.StoredPage
 import chat.api.VerifiedMessageInput
@@ -45,6 +46,23 @@ class NativeLocalStore : LocalStore {
 
     override suspend fun draftStatus(draftId: String): StoredDraft? = withStore { store ->
         store.draftStatus(draftId)?.toStoredDraft()
+    }
+
+    override suspend fun draftStatusView(draftId: String): StoredDraftStatus? = withStore { store ->
+        store.draftStatusView(draftId)?.let { view ->
+            StoredDraftStatus(
+                draftId = view.draftId,
+                conversationId = view.conversationId,
+                operationId = view.operationId,
+                status = view.status,
+                submissionId = view.submissionId,
+                attemptIndex = view.attemptIndex?.toInt(),
+                attempts = view.attempts.toInt(),
+                updatedAtMillis = view.updatedAtMs.toLong(),
+                canRetry = view.canRetry,
+                canCancel = view.canCancel,
+            )
+        }
     }
 
     override suspend fun applyVerifiedMessage(input: VerifiedMessageInput): StoredMessage = withStore { store ->

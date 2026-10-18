@@ -1,6 +1,6 @@
 # MLS、单群串行状态与附件密码学
 
-阶段：P0 → P3。状态：函数级设计；CRYPTO-011/012 附件分块 AEAD、P0-04 存储主密钥/敏感列加密基础、以及 CRYPTO-004/010 的**状态持久化切片**（已提交 MLS 群状态与 provider 秘密落到正式加密库、重启后可继续加解密）已实现（Windows x64 实测，见下文实现记录）；CRYPTO-001..010 的完整 MLS 语义（同事务 provider、pending Commit、正式群操作、回执应用）仍未实现。目标源码：[crates/crypto/src/engine.rs](../../crates/crypto/src/engine.rs)、[crates/crypto/src/attachment.rs](../../crates/crypto/src/attachment.rs) 与 [crates/crypto/src/key_store.rs](../../crates/crypto/src/key_store.rs)。
+阶段：P0 → P3。状态：函数级设计；CRYPTO-005~009 群成员控制（pending 控制提交、对端条目处理、接受后合并、拒绝后回滚、Welcome 加入）、CRYPTO-011/012 附件分块 AEAD、P0-04 存储主密钥/敏感列加密基础、以及 CRYPTO-004/010 的**状态持久化切片**（已提交 MLS 群状态与 provider 秘密落到正式加密库、重启后可继续加解密）已实现（Windows x64 实测，见下文实现记录）。仍未实现：同事务 provider（TxnCryptoProvider）、PreparedWrite/外层候选签名与 T3 落库、正式群策略授权（DOMAIN-004）、控制 head 对账与分叉胜出合并。目标源码：[crates/crypto/src/engine.rs](../../crates/crypto/src/engine.rs)、[crates/crypto/src/control.rs](../../crates/crypto/src/control.rs)、[crates/crypto/src/attachment.rs](../../crates/crypto/src/attachment.rs) 与 [crates/crypto/src/key_store.rs](../../crates/crypto/src/key_store.rs)。
 
 必须使用成熟实现。TxnCryptoProvider 在同一 storage 事务中读写；如果 OpenMLS provider 不能安全接入，则先 ADR 决策并实现幂等日志恢复再继续。PreparedWrite 不是已正式发布的新内存状态。每群串行执行，网络等待不跨持有 SQLite 写事务。
 
@@ -95,14 +95,55 @@ cargo test --offline -p chat-storage -p chat-crypto           # 全绿（28 + 65
 1. **不是同事务 provider**：本切片在 `export_to_store` 时一次性写库；CRYPTO-004 要求的
    “在调用方 T2 事务内由 provider 直接读写”仍未实现，因此应用消息的加密与其状态
    更新目前是两个动作（调用方必须在提交失败时回滚内存状态）。
-2. **pending Commit / 正式群操作未实现**（CRYPTO-005/006/007）：epoch 前进只支持本地
-   自更新 commit，不能建/删成员、不能把 Commit 投递给成员并由对端处理。
+2. **epoch 前进的持久化只覆盖已提交快照**：CRYPTO-005~009 的 pending Commit 与正式群
+   操作已在 `control.rs` 实现（见下文实现记录），但本切片的 `export_to_store` 仍是全量
+   快照替换，未与 T3 日志/游标同事务。
 3. **provider 记录全量快照**：每次导出写全部记录（2 人群规模很小）；大群需要增量
    差异方案与写入预算。
 4. 群级头里的名字/签名公钥来自本机 credential，未与 account/device 身份表交叉校验
    （身份绑定由 IDENTITY 与 CRYPTO-001/002 负责）。
 5. 旧 `persistence.rs`（P0-03 未加密 SQLite 实验）与 `p0-crash-worker` 保持原样，
    正式路径不复用它们。
+
+## CRYPTO-005~009 群成员控制实现记录（2026-10-18，Windows x64）
+
+代码在 [crates/crypto/src/control.rs](../../crates/crypto/src/control.rs)（`impl MlsDevice` 的 CRYPTO-005~009 方法），复用
+[engine.rs](../../crates/crypto/src/engine.rs) 的真实 OpenMLS provider/群句柄与
+`export_to_store`/`import_from_store` 的正式加密持久化（mls_group_state/mls_record）。
+
+- **pending 显式且不提前合并**：`prepare_control` 让 OpenMLS 进入 PendingCommit，本地
+  epoch 不变；返回 `PendingControl { group_id, base_epoch, target_epoch = base+1,
+  operation, added, removed, commit, welcome?, commit_digest }`。pending 元数据随群状态
+  快照（群级头版本 2，兼容读取版本 1）密封写入正式库；打开时与 OpenMLS 的
+  PendingCommit 状态交叉校验，不一致即 STATE_CORRUPTED。
+- **合并需要接受证据**：`merge_accepted_pending(acceptance, store)` 核对
+  group/base_epoch/target_epoch/提交摘要后才 `merge_pending_commit`，合并后 epoch 必须
+  等于 target_epoch；成功才清 pending 并写已提交快照。证据不符 → PENDING_MISMATCH
+  （epoch 不变、pending 保留）；合并失败或 epoch 不符 → 设备 fail-closed。
+- **拒绝后回滚**：`discard_rejected_pending(rejection, store)` 只在拒绝证据绑定同一候选、
+  且正式库里的 pending 分支仍停在 base_epoch 时 `clear_pending_commit`，随后写回已提交
+  快照。旧 epoch 密钥不受影响，可继续加解密。
+- **对端条目**：`process_verified_entry(entry)` 先校验 group_id、epoch（落后
+  STALE_EPOCH、超前 MISSING_LOG_ENTRIES）与 MLS 消息 epoch，再认证解密/stage；作者凭据
+  与条目声称身份不符 → INVALID_CIPHERTEXT；对端 Commit 用 `CommitExpectation` 比对实际
+  增删，不一致 → INVALID_CONTROL_RESULT 并停止该群分支；本机有 pending 时收到竞争
+  Commit → PENDING_MISMATCH（必须先显式解决本分支）。
+- **Welcome 加入**：`join_from_welcome(welcome, acceptance, store)` 用 `StagedWelcome`
+  建群，核对群 ID/epoch/成员集合/本机身份后立即持久化；拒绝时删除刚写入 provider 的
+  群状态；重复加入 → INVALID_STATE_TRANSITION。
+
+复现命令（全程离线）：
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-crypto --test mls_control   # 12 passed
+cargo test --offline -p chat-crypto                      # 40 passed（既有 28 个继续全绿）
+```
+
+已知限制：控制操作没有账户/角色授权与 control-head 对账（DOMAIN-004 与日志层未接入）；
+接受/拒绝证据由调用方构造，未做节点回执验签；合并/回滚未与 T3 日志/游标同事务（属
+STORAGE-008）；提案（ProposalMessage）只入 proposal store，未实现提案式控制流；外部加入
+提案与分叉胜出合并不支持。
 
 ## 函数导航
 
@@ -282,10 +323,10 @@ prepare_control(operation: AuthorizedGroupOperation, tx: CryptoTransaction) -> R
 
 **完成验收**：
 
-- [ ] 两个并发 Commit 只串行准备。
-- [ ] 夹带移除成员拒绝。
+- [x] 两个并发 Commit 只串行准备：`mls_control::pending_commit_does_not_advance_epoch_and_new_epoch_messages_are_rejected`（已有 pending 时第二个 prepare 返回 INVALID_STATE_TRANSITION / PendingCommitExists）、`mls_control::key_package_and_member_inputs_are_validated`。
+- [x] 夹带移除成员拒绝：发送侧在 staging 后比对 pending StagedCommit 的实际 add/remove 数量与请求（不一致即 clear pending 并返回 INVALID_CONTROL_RESULT，见 control.rs 步骤 3）；接收侧由 `mls_control::control_result_mismatch_stops_the_group_branch` 证明“提交实际成员变化与已验证业务不一致”会被拒绝。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（Windows x64 实测），代码在 [crates/crypto/src/control.rs](../../crates/crypto/src/control.rs) 的 `prepare_control`。Add/Remove/SelfUpdate 三种控制提交由 OpenMLS 真实生成 Commit（Add 另产生 Welcome）；staging 后**不推进本地 epoch**（base_epoch/target_epoch 显式），pending 元数据（Commit/Welcome/摘要/操作/增删数）随群状态快照写入正式加密库。Add 的 KeyPackage 会重新做 MLS 验签、去重与“已是成员/本机”拒绝。证据：`cargo test --offline -p chat-crypto --test mls_control`（12 passed）。限制：未接入 DOMAIN-004 的账户/角色授权与 STALE_CONTROL_HEAD 对账（外层日志不存在），只做 MLS 层与结构校验。
 
 <a id="crypto-006"></a>
 
@@ -315,10 +356,10 @@ process_verified_entry(entry: VerifiedLogEntry, tx: CryptoTransaction) -> Result
 
 **完成验收**：
 
-- [ ] 畸形 Commit 不推进任何游标。
-- [ ] 本人已发消息不重复消费发送状态。
+- [x] 畸形 Commit 不推进任何游标：`mls_control::entry_validation_rejects_wrong_group_epoch_sender_and_tampering`（群不符/epoch 落后/epoch 超前/条目与密文 epoch 不符/篡改字节/重复提交全部显式拒绝，epoch 不变）、`mls_control::entry_commit_is_rejected_while_a_local_control_commit_is_pending`。
+- [x] 本人已发消息不重复消费发送状态：同一用例（本机 pending 提交被回显 → PENDING_MISMATCH，pending 与 epoch 都不变；自己的应用消息回显 → OwnPrivateMessage 被拒绝，不合并、不推进）。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（Windows x64 实测）。`process_verified_entry` 先校验群 ID、条目 epoch 与 MLS 消息 epoch、作者凭据，再交给 OpenMLS 认证解密/stage；应用消息返回明文，提案入 proposal store，对端 Commit 在校验预期增删（CommitExpectation）后才合并并核对 epoch 恰好 +1。认证失败：握手失败会让该群分支 fail-closed（该代密钥已消耗、不能假设无副作用），应用消息失败只拒绝该条。证据：`--test mls_control` 12 passed。限制：不做 T3 落库（消息/去重/游标/回执 outbox 一事务属 STORAGE-008）、不做外部队列与 log 连续性（MISSING_LOG_ENTRIES 只按 epoch 判定）、不做提案式授权（直接 Add/Remove 提交）。
 
 <a id="crypto-007"></a>
 
@@ -348,10 +389,10 @@ merge_accepted_pending(pending: PendingCommit, entry: VerifiedLogEntry, tx: Cryp
 
 **完成验收**：
 
-- [ ] 节点回执丢失后拉取同事件成功合并一次。
-- [ ] 不同摘要必须暂停。
+- [x] 节点回执丢失后拉取同事件成功合并一次：`mls_control::add_member_welcome_join_and_bidirectional_roundtrip`（同一接受证据只合并一次；再次合并返回 PENDING_MISMATCH 且 epoch 保持 2）、`mls_control::pending_and_committed_states_survive_close_and_reopen`（回执丢失后重开仍能用同证据合并）。
+- [x] 不同摘要必须暂停：同一用例（摘要/target_epoch 不符的接受证据 → PENDING_MISMATCH，pending 保留、epoch 不变，必须用正确证据）。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（Windows x64 实测）。`merge_accepted_pending` 先核对接受证据（group_id/base_epoch/target_epoch/提交摘要）与本地 epoch，再 `merge_pending_commit` 消费该提交密钥；合并后 epoch 必须等于 target_epoch，随后写已提交快照。合并失败或 epoch 不符时设备 fail-closed（丢弃内存群句柄，必须从已提交存储重新 import）。证据：`--test mls_control` 12 passed。限制：接受证据由调用方从节点回执构造，未实现回执验签（T4/NODE 侧）；合并未与 T3 日志/游标同事务。
 
 <a id="crypto-008"></a>
 
@@ -381,10 +422,10 @@ discard_rejected_pending(pending: PendingCommit, rejection: AuthenticatedRejecti
 
 **完成验收**：
 
-- [ ] 未知结果先查询旧 SubmissionId。
-- [ ] 清理后不复用发送代数。
+- [ ] 未知结果先查询旧 SubmissionId。（未实现：节点回执对账属 NODE/SYNC 侧；本实现在“没有明确拒绝证据”时拒绝丢弃，绝不把未知当拒绝）
+- [x] 清理后不复用发送代数：`mls_control::rejected_pending_discards_and_old_epoch_still_works`（丢弃后 epoch 仍为 1，重新准备的控制提交字节与摘要都与被拒候选不同，不复用同一代材料）。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（Windows x64 实测，仅本地回滚语义）。`discard_rejected_pending` 要求拒绝证据绑定同一 group/base_epoch/提交摘要，且正式库里的 pending 分支仍停在 base_epoch（否则 STALE_EPOCH，不用旧快照覆盖新状态）；随后 `clear_pending_commit` 回到 Operational 并写回已提交快照。旧 epoch 的密钥状态不变，丢弃后可继续用旧 epoch 加解密（用例覆盖）。证据：`--test mls_control` 12 passed。限制：不记录“被拒尝试”历史表、不返回 RebuildIntent 的业务字段（草稿/意图重建属 DOMAIN-010）。
 
 <a id="crypto-009"></a>
 
@@ -415,11 +456,11 @@ join_from_welcome(welcome: AuthorizedWelcome, tx: CryptoTransaction) -> Result<J
 
 **完成验收**：
 
-- [ ] 为另一设备的 Welcome 拒绝。
-- [ ] 重启不产生重复群。
-- [ ] 无旧历史能力。
+- [x] 为另一设备的 Welcome 拒绝：`mls_control::welcome_join_rejects_unauthorized_bindings_and_replays`（外来设备的 Welcome 无法 stage → WELCOME_NOT_AUTHORIZED；群 ID/epoch/成员集合绑定不符同样拒绝并清理半加入的群状态）。
+- [x] 重启不产生重复群：`mls_control::pending_add_with_welcome_survives_reopen`（重开后仍只有一个 mls_group_state 行）、同一用例的重复加入返回 INVALID_STATE_TRANSITION。
+- [x] 无旧历史能力：`mls_control::add_member_welcome_join_and_bidirectional_roundtrip`（Carol 加入 epoch 2 后无法解密 Alice 在 epoch 1 发的消息）。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（Windows x64 实测）。`join_from_welcome` 用 OpenMLS `StagedWelcome` 建群，核对 group_id、epoch、成员凭据集合与本机身份后立即 `export_to_store`；拒绝时删除刚写入 provider 的群状态，不留半加入的群。证据：`--test mls_control` 12 passed。限制：邀请能力/账户设备授权（IDENTITY-003、DOMAIN-005）未接入，只做 MLS 结构绑定；被拒 Welcome 会消耗本机 KeyPackage 私有材料，必须换新 KeyPackage 与邀请（用例注释已说明）。
 
 <a id="crypto-010"></a>
 

@@ -49,6 +49,25 @@ impl MemberRole {
     pub const fn is_governor(self) -> bool {
         matches!(self, MemberRole::Owner | MemberRole::Admin)
     }
+
+    /// 冻结数值（用于规范编码与策略摘要）。
+    pub const fn as_u64(self) -> u64 {
+        match self {
+            MemberRole::Owner => 1,
+            MemberRole::Admin => 2,
+            MemberRole::Member => 3,
+        }
+    }
+
+    /// 由冻结数值还原；未知值显式返回 `None`。
+    pub const fn from_u64(value: u64) -> Option<Self> {
+        match value {
+            1 => Some(MemberRole::Owner),
+            2 => Some(MemberRole::Admin),
+            3 => Some(MemberRole::Member),
+            _ => None,
+        }
+    }
 }
 
 /// 正式状态暂停原因。
@@ -428,4 +447,77 @@ pub struct AuthorizedGroupOperation {
     pub owner_after: AccountId,
     /// 操作生效后的规模。
     pub capacity_after: Capacity,
+}
+
+/// 设备凭据叶子（账户 + 设备）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CredentialLeaf {
+    /// 账户。
+    pub account_id: AccountId,
+    /// 设备。
+    pub device_id: DeviceId,
+}
+
+impl CredentialLeaf {
+    /// 构造叶子。
+    pub const fn new(account_id: AccountId, device_id: DeviceId) -> Self {
+        Self {
+            account_id,
+            device_id,
+        }
+    }
+}
+
+/// 一次策略操作带来的设备集合变化。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DeviceSetDiff {
+    /// 新增叶子。
+    pub added: Vec<CredentialLeaf>,
+    /// 移除叶子。
+    pub removed: Vec<CredentialLeaf>,
+}
+
+/// 策略操作产生的候选快照与预期差异。它不是正式快照。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposedPolicy {
+    /// 候选快照（policy_version 已递增；MLS epoch 未变）。
+    pub policy: GroupSnapshot,
+    /// 该操作应有的设备增删。
+    pub device_changes: DeviceSetDiff,
+    /// 明确的角色迁移。
+    pub role_changes: Vec<RoleChange>,
+    /// 操作生效后的唯一群主。
+    pub owner_after: AccountId,
+}
+
+/// 已验证但尚未合并的 MLS Commit 设备成员变化（领域层视图）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedCommit {
+    /// 群。
+    pub group_id: GroupId,
+    /// 合并前 epoch。
+    pub epoch_before: u64,
+    /// 合并后 epoch。
+    pub epoch_after: u64,
+    /// 该 Commit 对应的已授权操作。
+    pub operation: AuthorizedGroupOperation,
+    /// 实际新增的凭据叶子。
+    pub added: Vec<CredentialLeaf>,
+    /// 实际移除的凭据叶子。
+    pub removed: Vec<CredentialLeaf>,
+}
+
+/// 控制结果核对通过的结论。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedControlResult {
+    /// 核对后的候选策略快照。
+    pub policy: ProposedPolicy,
+    /// 实际新增设备。
+    pub added_devices: Vec<DeviceId>,
+    /// 实际移除设备。
+    pub removed_devices: Vec<DeviceId>,
+    /// 合并前 epoch。
+    pub epoch_before: u64,
+    /// 合并后 epoch。
+    pub epoch_after: u64,
 }

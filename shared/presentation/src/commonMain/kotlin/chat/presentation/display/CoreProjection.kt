@@ -63,3 +63,76 @@ fun StoredPage<StoredMessage>.toMessageDisplayPage(): DisplayPage<MessageDisplay
         items = items.map { it.toDisplayView() },
         nextCursor = nextCursor,
     )
+
+/** 存储层状态码（CORE-010 有效状态集合）。 */
+object StoredDraftStatusKind {
+    const val QUEUED = "queued"
+    const val PREPARED = "prepared"
+    const val SUBMITTED = "submitted"
+    const val ACCEPTED = "accepted"
+    const val REJECTED = "rejected"
+    const val UNKNOWN = "unknown"
+    const val CANCELLED = "cancelled"
+    const val FAILED = "failed"
+}
+
+/**
+ * CORE-010 状态 → 展示状态。
+ *
+ * 映射原则：只有 accepted 显示“已接受”；unknown 只给对账；rejected 且可重试才给重试；
+ * cancelled/failed 不提供动作；按钮可用性最终以底层 canRetry/canCancel 为准（双保险）。
+ */
+fun chat.api.StoredDraftStatus.toDraftUiState(): DraftUiState {
+    val evidence = when (status) {
+        StoredDraftStatusKind.ACCEPTED -> DraftEvidence(
+            draftId = draftId,
+            queuedLocally = true,
+            nodeAcceptedReceiptId = submissionId,
+        )
+
+        StoredDraftStatusKind.UNKNOWN -> DraftEvidence(
+            draftId = draftId,
+            queuedLocally = true,
+            submissionId = submissionId,
+            acceptanceUnknown = true,
+        )
+
+        StoredDraftStatusKind.REJECTED, StoredDraftStatusKind.FAILED -> DraftEvidence(
+            draftId = draftId,
+            queuedLocally = true,
+            submissionId = submissionId,
+            failure = chat.api.CoreFailure(
+                code = "INVALID_STATE_TRANSITION",
+                retryable = canRetry,
+                retryAfterMillis = null,
+                operationId = operationId,
+            ),
+        )
+
+        StoredDraftStatusKind.CANCELLED -> DraftEvidence(
+            draftId = draftId,
+            queuedLocally = true,
+            submissionId = submissionId,
+            cancelRequested = true,
+        )
+
+        StoredDraftStatusKind.PREPARED, StoredDraftStatusKind.SUBMITTED -> DraftEvidence(
+            draftId = draftId,
+            queuedLocally = true,
+            submissionId = submissionId,
+        )
+
+        else -> DraftEvidence(draftId = draftId, queuedLocally = true)
+    }
+    val base = presentDraft(evidence)
+    // 底层动作可用性是最终裁决：can_retry=false 时不提供重试，can_cancel=false 时不提供取消。
+    val actions = base.actions.filter { action ->
+        when (action) {
+            DraftAction.RETRY -> canRetry
+            DraftAction.CANCEL -> canCancel
+            DraftAction.RECONCILE -> status == StoredDraftStatusKind.UNKNOWN
+            DraftAction.VIEW_DETAILS -> true
+        }
+    }
+    return base.copy(actions = actions)
+}

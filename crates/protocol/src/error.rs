@@ -50,6 +50,8 @@ pub enum ErrorCode {
     OwnerTransferRequired,
     NotMember,
     InvalidStateTransition,
+    InvalidPolicyTransition,
+    InvalidControlResult,
     InvalidReceiptScope,
     InvalidReply,
     MessageNotVisible,
@@ -97,6 +99,8 @@ impl ErrorCode {
             ErrorCode::OwnerTransferRequired => "OWNER_TRANSFER_REQUIRED",
             ErrorCode::NotMember => "NOT_MEMBER",
             ErrorCode::InvalidStateTransition => "INVALID_STATE_TRANSITION",
+            ErrorCode::InvalidPolicyTransition => "INVALID_POLICY_TRANSITION",
+            ErrorCode::InvalidControlResult => "INVALID_CONTROL_RESULT",
             ErrorCode::InvalidReceiptScope => "INVALID_RECEIPT_SCOPE",
             ErrorCode::InvalidReply => "INVALID_REPLY",
             ErrorCode::MessageNotVisible => "MESSAGE_NOT_VISIBLE",
@@ -109,7 +113,7 @@ impl ErrorCode {
     }
 
     /// 码表全量，供唯一性测试与对外文档使用。
-    pub const ALL: [ErrorCode; 41] = [
+    pub const ALL: [ErrorCode; 43] = [
         ErrorCode::NetworkUnavailable,
         ErrorCode::NodeUnavailable,
         ErrorCode::RateLimited,
@@ -143,6 +147,8 @@ impl ErrorCode {
         ErrorCode::OwnerTransferRequired,
         ErrorCode::NotMember,
         ErrorCode::InvalidStateTransition,
+        ErrorCode::InvalidPolicyTransition,
+        ErrorCode::InvalidControlResult,
         ErrorCode::InvalidReceiptScope,
         ErrorCode::InvalidReply,
         ErrorCode::MessageNotVisible,
@@ -258,6 +264,26 @@ pub enum ProtocolError {
     CursorExpired,
     /// PROTOCOL-012/013：跨范围复用。
     InvalidCursorScope,
+    /// PROTOCOL-005：设备已撤销。
+    DeviceRevoked,
+    /// PROTOCOL-005/007：候选期望的控制状态已陈旧。
+    StaleControlHead,
+    /// PROTOCOL-005/007：候选期望的 epoch 已陈旧。
+    StaleEpoch,
+    /// PROTOCOL-007：日志跳号，需要补齐。
+    MissingLogEntries,
+    /// PROTOCOL-007：日志冲突（重复序号/哈希链不一致）。
+    LogConflict,
+    /// PROTOCOL-009：MLS 发送者与外层凭据不一致。
+    InvalidCredential,
+    /// PROTOCOL-008/009：内层事件与绑定不一致。
+    InvalidEventBinding,
+    /// PROTOCOL-008：跨会话回复引用。
+    InvalidReply,
+    /// PROTOCOL-011：必需能力缺失。
+    RequiredCapabilityMissing,
+    /// PROTOCOL-011：远端能力声明不合法。
+    InvalidCapabilities(crate::capability::CapabilityError),
     /// 验签失败（helper）。
     InvalidSignature,
     /// 系统随机源失败，调用方必须显式失败而不是退化为可预测值。
@@ -284,6 +310,16 @@ impl ProtocolError {
             ProtocolError::CursorExpired => ErrorCode::CursorExpired,
             ProtocolError::InvalidCursorScope => ErrorCode::InvalidCursorScope,
             ProtocolError::InvalidSignature => ErrorCode::InvalidSignature,
+            ProtocolError::DeviceRevoked => ErrorCode::DeviceRevoked,
+            ProtocolError::StaleControlHead => ErrorCode::StaleControlHead,
+            ProtocolError::StaleEpoch => ErrorCode::StaleEpoch,
+            ProtocolError::MissingLogEntries => ErrorCode::MissingLogEntries,
+            ProtocolError::LogConflict => ErrorCode::LogConflict,
+            ProtocolError::InvalidCredential => ErrorCode::InvalidCredential,
+            ProtocolError::InvalidEventBinding => ErrorCode::InvalidEventBinding,
+            ProtocolError::InvalidReply => ErrorCode::InvalidReply,
+            ProtocolError::RequiredCapabilityMissing => ErrorCode::RequiredCapabilityMissing,
+            ProtocolError::InvalidCapabilities(_) => ErrorCode::ProtocolUnsupported,
             ProtocolError::RandomUnavailable => ErrorCode::InternalFailure,
         }
     }
@@ -321,6 +357,20 @@ impl fmt::Display for ProtocolError {
             ProtocolError::CursorExpired => formatter.write_str("cursor expired"),
             ProtocolError::InvalidCursorScope => formatter.write_str("cursor scope mismatch"),
             ProtocolError::InvalidSignature => formatter.write_str("invalid signature"),
+            ProtocolError::DeviceRevoked => formatter.write_str("device revoked"),
+            ProtocolError::StaleControlHead => formatter.write_str("stale control head"),
+            ProtocolError::StaleEpoch => formatter.write_str("stale mls epoch"),
+            ProtocolError::MissingLogEntries => formatter.write_str("missing log entries"),
+            ProtocolError::LogConflict => formatter.write_str("log conflict"),
+            ProtocolError::InvalidCredential => formatter.write_str("invalid credential"),
+            ProtocolError::InvalidEventBinding => formatter.write_str("invalid event binding"),
+            ProtocolError::InvalidReply => formatter.write_str("invalid reply target"),
+            ProtocolError::RequiredCapabilityMissing => {
+                formatter.write_str("required capability missing")
+            }
+            ProtocolError::InvalidCapabilities(reason) => {
+                write!(formatter, "invalid capability declaration: {reason}")
+            }
             ProtocolError::RandomUnavailable => {
                 formatter.write_str("secure randomness unavailable")
             }
@@ -451,6 +501,12 @@ impl From<ProtocolError> for InternalError {
             ErrorCode::ContentTooLarge => InternalError::ContentTooLarge,
             ErrorCode::InvalidSignature => InternalError::SignatureInvalid,
             ErrorCode::ProtocolUnsupported => InternalError::ProtocolUnsupported,
+            ErrorCode::DeviceRevoked => InternalError::DeviceRevoked,
+            ErrorCode::StaleControlHead => InternalError::StaleControlHead,
+            ErrorCode::StaleEpoch => InternalError::StaleEpoch,
+            ErrorCode::MissingLogEntries => InternalError::MissingLogEntries,
+            ErrorCode::LogConflict => InternalError::LogConflict,
+            ErrorCode::InvalidCredential => InternalError::InvalidCredential,
             // 协议层每个失败都有冻结码，直接保留具体码，避免降级成 MALFORMED_FRAME。
             code => InternalError::Classified(code),
         }

@@ -63,6 +63,31 @@ pub struct DraftView {
     pub submission_id: Option<String>,
 }
 
+/// 草稿真实状态投影（CORE-010；**不含正文**）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DraftStatusView {
+    /// 本地草稿 ID。
+    pub draft_id: String,
+    /// 会话 ID。
+    pub conversation_id: String,
+    /// 用户操作幂等键。
+    pub operation_id: String,
+    /// 有效状态：queued / prepared / submitted / accepted / rejected / unknown / cancelled / failed。
+    pub status: String,
+    /// 最新尝试的 SubmissionId（尚无尝试时为空）。
+    pub submission_id: Option<String>,
+    /// 最新尝试的重建序号（0 表示首次尝试）。
+    pub attempt_index: Option<u32>,
+    /// 已尝试次数。
+    pub attempts: u32,
+    /// 可观测的最后活动时间（Unix 毫秒）。
+    pub updated_at_ms: u64,
+    /// 现在调用 retry 是否会真正推进。
+    pub can_retry: bool,
+    /// 现在调用 cancel 是否还有意义。
+    pub can_cancel: bool,
+}
+
 /// 会话列表条目。
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct ConversationView {
@@ -155,6 +180,26 @@ impl LocalStoreFfi {
     }
 
     /// 查询草稿状态；未知草稿返回 null。
+    /// 草稿真实状态（CORE-010）：不含正文，供列表/按钮态使用。
+    pub fn draft_status_view(&self, draft_id: String) -> Result<Option<DraftStatusView>, FfiError> {
+        let core = self.lock()?;
+        let status = core
+            .get_draft_status(&draft_id)
+            .map_err(|error| failure!(error))?;
+        Ok(status.map(|view| DraftStatusView {
+            draft_id: view.draft_id,
+            conversation_id: view.conversation_id,
+            operation_id: view.operation_id,
+            status: view.status,
+            submission_id: view.submission_id,
+            attempt_index: view.attempt_index,
+            attempts: view.attempts,
+            updated_at_ms: view.updated_at_ms,
+            can_retry: view.can_retry,
+            can_cancel: view.can_cancel,
+        }))
+    }
+
     pub fn draft_status(&self, draft_id: String) -> Result<Option<DraftView>, FfiError> {
         let core = self.lock()?;
         let status = core.draft_status(&draft_id).map_err(|error| failure!(error))?;

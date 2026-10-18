@@ -5,7 +5,11 @@
 //!   [`MlsDevice::import_from_store`] 把已提交群状态与 provider 秘密写入正式加密库
 //!   （chat-storage 的 mls_group_state / mls_record 表），重启后可继续加解密；
 //! - [`MlsDevice::advance_epoch_with_self_update`] 是“推进 epoch”的最小操作
-//!   （本地自更新 commit）；对端处理该 commit 属于 CRYPTO-007，本轮未实现。
+//!   （本地自更新 commit 并立即合并）；
+//! - CRYPTO-005~009 的群成员控制（prepare_control / process_verified_entry /
+//!   merge_accepted_pending / discard_rejected_pending / join_from_welcome）
+//!   在 [`crate::control`] 里实现；本文件只提供它们需要的 provider/signer/群句柄
+//!   访问与“pending 控制元数据”的持久化编码（随群状态快照一起写入正式库）。
 use anyhow::{Context, Result, bail, ensure};
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
@@ -23,6 +27,8 @@ pub struct MlsDevice {
     signer: SignatureKeyPair,
     credential: CredentialWithKey,
     group: Option<MlsGroup>,
+    /// 已准备但尚未被接受的控制提交元数据（与 OpenMLS 的 PendingCommit 状态同步）。
+    pending: Option<crate::control::PendingControl>,
 }
 
 impl MlsDevice {
@@ -42,6 +48,7 @@ impl MlsDevice {
             signer,
             credential,
             group: None,
+            pending: None,
         })
     }
 
@@ -127,6 +134,57 @@ impl MlsDevice {
     fn group(&self) -> Result<&MlsGroup> {
         self.group.as_ref().context("MLS group is not initialized")
     }
+
+    // ---- CRYPTO-005~009（crate::control）使用的内部访问 ----
+
+    /// 一次性取得控制操作需要的 provider/signer/群句柄（字段拆分借用，避免冲突）。
+    pub(crate) fn control_parts_mut(
+        &mut self,
+    ) -> Result<(&OpenMlsRustCrypto, &SignatureKeyPair, &mut MlsGroup)> {
+        let provider = &self.provider;
+        let signer = &self.signer;
+        let group = self
+            .group
+            .as_mut()
+            .context("MLS group is not initialized")?;
+        Ok((provider, signer, group))
+    }
+
+    pub(crate) fn provider(&self) -> &OpenMlsRustCrypto {
+        &self.provider
+    }
+
+    pub(crate) fn credential_handle(&self) -> &CredentialWithKey {
+        &self.credential
+    }
+
+    pub(crate) fn group_ref(&self) -> Result<&MlsGroup> {
+        self.group()
+    }
+
+    pub(crate) fn pending_record(&self) -> Option<&crate::control::PendingControl> {
+        self.pending.as_ref()
+    }
+
+    pub(crate) fn set_pending_record(
+        &mut self,
+        record: Option<crate::control::PendingControl>,
+    ) {
+        self.pending = record;
+    }
+
+    /// 由 Welcome 建好群后装配设备（provider/signer/身份沿用本设备）。
+    pub(crate) fn set_group(&mut self, group: MlsGroup) {
+        self.group = Some(group);
+        self.pending = None;
+    }
+
+    /// 无法确认的状态（例如 merge 失败/控制结果不一致）时让设备 fail-closed：
+    /// 丢弃内存群句柄，调用方必须从已提交的正式存储重新 import。
+    pub(crate) fn abandon_group(&mut self) {
+        self.group = None;
+        self.pending = None;
+    }
     pub fn epoch(&self) -> Result<u64> {
         Ok(self.group()?.epoch().as_u64())
     }
@@ -193,11 +251,21 @@ impl MlsDevice {
         let group = self.group.as_ref().context("MLS group is not initialized")?;
         let epoch = group.epoch().as_u64();
         let group_id = group.group_id().as_slice().to_vec();
+        // pending 元数据必须与 OpenMLS 的 PendingCommit 状态一致，否则拒绝写出半状态。
+        ensure!(
+            group.pending_commit().is_some() == self.pending.is_some(),
+            "in-memory pending control metadata does not match the MLS group state"
+        );
+        let pending_block = match &self.pending {
+            Some(record) => Some(crate::control::encode_pending_record(record)?),
+            None => None,
+        };
         let header = GroupHeader {
             name: self.credential.credential.serialized_content().to_vec(),
             signer_public: self.signer.public().to_vec(),
             group_id: group_id.clone(),
             epoch,
+            pending: pending_block,
         };
         let state = encode_group_header(&header)?;
         let records = snapshot_provider_records(self)?;
@@ -272,11 +340,30 @@ impl MlsDevice {
             signer.public() == header.signer_public.as_slice(),
             "persisted MLS signer does not match its public key"
         );
+        let pending = match header.pending {
+            Some(block) => Some(crate::control::decode_pending_record(&block)?),
+            None => None,
+        };
+        ensure!(
+            group.pending_commit().is_some() == pending.is_some(),
+            "persisted MLS pending-commit state does not match the provider snapshot"
+        );
+        if let Some(record) = &pending {
+            ensure!(
+                record.group_id == group_key,
+                "persisted pending control record belongs to another group"
+            );
+            ensure!(
+                record.base_epoch == header.epoch,
+                "persisted pending control commit is bound to the wrong epoch"
+            );
+        }
         Ok(Self {
             provider,
             signer,
             credential,
             group: Some(group),
+            pending,
         })
     }
 
@@ -317,8 +404,13 @@ pub struct MlsExportSummary {
     pub records: usize,
 }
 
-/// 导出格式版本（进入群状态明文）。
-const EXPORT_FORMAT_VERSION: u8 = 1;
+/// 导出格式版本（进入群状态明文）。版本 2 在 epoch 之后增加 pending 控制元数据块；
+/// 版本 1 的快照仍可读入（视为没有 pending）。
+const EXPORT_FORMAT_VERSION: u8 = 2;
+/// 兼容读取的旧导出格式版本。
+const EXPORT_FORMAT_VERSION_V1: u8 = 1;
+/// pending 控制元数据块上限（commit + welcome + 头部字段）。
+const MAX_PENDING_BLOCK_BYTES: usize = 256 * 1024;
 /// 显示名上限（字节），与 identity 的显示名上限一致。
 const MAX_EXPORT_NAME_BYTES: usize = 256;
 /// 签名公钥上限（字节）。
@@ -332,6 +424,8 @@ struct GroupHeader {
     signer_public: Vec<u8>,
     group_id: Vec<u8>,
     epoch: u64,
+    /// 已编码的 pending 控制元数据块；None 表示该快照没有未决控制提交。
+    pending: Option<Vec<u8>>,
 }
 
 fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8], limit: usize, label: &str) -> Result<()> {
@@ -361,12 +455,25 @@ fn encode_group_header(header: &GroupHeader) -> Result<Vec<u8>> {
         "MLS group ID",
     )?;
     out.extend_from_slice(&header.epoch.to_be_bytes());
+    match &header.pending {
+        Some(block) => {
+            ensure!(
+                !block.is_empty() && block.len() <= MAX_PENDING_BLOCK_BYTES,
+                "MLS pending control block exceeds {MAX_PENDING_BLOCK_BYTES} bytes"
+            );
+            out.extend_from_slice(&(block.len() as u32).to_be_bytes());
+            out.extend_from_slice(block);
+        }
+        None => out.extend_from_slice(&0u32.to_be_bytes()),
+    }
     Ok(out)
 }
 
 fn decode_group_header(bytes: &[u8]) -> Result<GroupHeader> {
+    ensure!(!bytes.is_empty(), "persisted MLS header is empty");
+    let version = bytes[0];
     ensure!(
-        !bytes.is_empty() && bytes[0] == EXPORT_FORMAT_VERSION,
+        version == EXPORT_FORMAT_VERSION || version == EXPORT_FORMAT_VERSION_V1,
         "unsupported MLS export format version"
     );
     let mut cursor = 1usize;
@@ -390,19 +497,53 @@ fn decode_group_header(bytes: &[u8]) -> Result<GroupHeader> {
     let signer_public = take(&mut cursor, MAX_EXPORT_KEY_BYTES, "signature key")?;
     let group_id = take(&mut cursor, MAX_EXPORT_GROUP_ID_BYTES, "group ID")?;
     ensure!(
-        bytes.len() == cursor + 8,
+        bytes.len() >= cursor + 8,
         "persisted MLS header has an invalid length"
     );
     let mut epoch_bytes = [0u8; 8];
     epoch_bytes.copy_from_slice(&bytes[cursor..cursor + 8]);
+    cursor += 8;
     ensure!(!name.is_empty(), "persisted MLS name is empty");
     ensure!(!signer_public.is_empty(), "persisted MLS key is empty");
     ensure!(!group_id.is_empty(), "persisted MLS group ID is empty");
+    let pending = if version == EXPORT_FORMAT_VERSION_V1 {
+        ensure!(
+            bytes.len() == cursor,
+            "persisted MLS header has an invalid length"
+        );
+        None
+    } else {
+        ensure!(
+            bytes.len() >= cursor + 4,
+            "persisted MLS header is truncated (pending block)"
+        );
+        let length =
+            u32::from_be_bytes(bytes[cursor..cursor + 4].try_into()?) as usize;
+        cursor += 4;
+        if length == 0 {
+            ensure!(
+                bytes.len() == cursor,
+                "persisted MLS header has an invalid length"
+            );
+            None
+        } else {
+            ensure!(
+                length <= MAX_PENDING_BLOCK_BYTES,
+                "persisted MLS pending control block exceeds {MAX_PENDING_BLOCK_BYTES} bytes"
+            );
+            ensure!(
+                bytes.len() == cursor + length,
+                "persisted MLS header has an invalid pending block length"
+            );
+            Some(bytes[cursor..cursor + length].to_vec())
+        }
+    };
     Ok(GroupHeader {
         name,
         signer_public,
         group_id,
         epoch: u64::from_be_bytes(epoch_bytes),
+        pending,
     })
 }
 

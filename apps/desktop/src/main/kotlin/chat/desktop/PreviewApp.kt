@@ -27,6 +27,7 @@ import chat.presentation.preview.updatePastedToken
 import chat.presentation.preview.withContacts
 import chat.presentation.preview.withConversations
 import chat.presentation.preview.withDraft
+import chat.presentation.preview.withDraftStatus
 import chat.presentation.preview.withError
 import chat.presentation.preview.withInvite
 import chat.presentation.preview.withMessages
@@ -216,6 +217,11 @@ fun main() = application {
                     .onSuccess { draft ->
                         storeState = storeState.withDraft(draft)
                         storeDraftText = ""
+                        // 立刻用 CORE-010 查一次真实状态（不含正文，展示按钮态）
+                        runCatching { store.draftStatusView(draft.draftId) }
+                            .onSuccess { status ->
+                                if (status != null) storeState = storeState.withDraftStatus(status)
+                            }
                     }
                     .onFailure { error ->
                         storeState = storeState.withError(

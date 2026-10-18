@@ -96,6 +96,29 @@ pub mod field {
     pub const EXTENSION_OBJECT_ID: u16 = 30;
     pub const EXTENSION_PAYLOAD: u16 = 31;
     pub const EXTENSION_FALLBACK: u16 = 32;
+    // U 包新增（P1-01 补充，字段号只增不改）：日志条目、应用事件、策略操作与会话能力。
+    pub const LOG_COORDINATOR_SIGNATURE: u16 = 33;
+    pub const LOG_ENTRY_HASH: u16 = 34;
+    pub const EVENT_ID: u16 = 35;
+    pub const AUTHOR_ACCOUNT_ID: u16 = 36;
+    pub const CONTENT_KIND: u16 = 37;
+    pub const CONTENT_TEXT: u16 = 38;
+    pub const CONTENT_EXTENSION: u16 = 39;
+    pub const CONTENT_ATTACHMENT_FILE_ID: u16 = 40;
+    pub const REPLY_CONVERSATION_ID: u16 = 41;
+    pub const REPLY_MESSAGE_ID: u16 = 42;
+    pub const MESSAGE_ORIGIN: u16 = 43;
+    pub const EVENT_CONVERSATION_ID: u16 = 44;
+    pub const EVENT_SENT_AT: u16 = 45;
+    pub const POLICY_OPERATION_ACCOUNT: u16 = 46;
+    pub const POLICY_OPERATION_ROLE: u16 = 47;
+    pub const POLICY_OPERATION_MUTED: u16 = 48;
+    pub const POLICY_OPERATION_DEVICES: u16 = 49;
+    pub const POLICY_OPERATION_NAME_DIGEST: u16 = 50;
+    pub const SESSION_FEATURES: u16 = 51;
+    pub const SESSION_MAX_FRAME_BYTES: u16 = 52;
+    pub const SESSION_MAX_MESSAGE_BYTES: u16 = 53;
+    pub const SESSION_MAX_CIPHERTEXT_BYTES: u16 = 54;
 }
 
 /// 已知安全字段号表。编码/解码都拒绝表外字段号。
@@ -132,6 +155,28 @@ pub const KNOWN_FIELD_IDS: &[u16] = &[
     field::EXTENSION_OBJECT_ID,
     field::EXTENSION_PAYLOAD,
     field::EXTENSION_FALLBACK,
+    field::LOG_COORDINATOR_SIGNATURE,
+    field::LOG_ENTRY_HASH,
+    field::EVENT_ID,
+    field::AUTHOR_ACCOUNT_ID,
+    field::CONTENT_KIND,
+    field::CONTENT_TEXT,
+    field::CONTENT_EXTENSION,
+    field::CONTENT_ATTACHMENT_FILE_ID,
+    field::REPLY_CONVERSATION_ID,
+    field::REPLY_MESSAGE_ID,
+    field::MESSAGE_ORIGIN,
+    field::EVENT_CONVERSATION_ID,
+    field::EVENT_SENT_AT,
+    field::POLICY_OPERATION_ACCOUNT,
+    field::POLICY_OPERATION_ROLE,
+    field::POLICY_OPERATION_MUTED,
+    field::POLICY_OPERATION_DEVICES,
+    field::POLICY_OPERATION_NAME_DIGEST,
+    field::SESSION_FEATURES,
+    field::SESSION_MAX_FRAME_BYTES,
+    field::SESSION_MAX_MESSAGE_BYTES,
+    field::SESSION_MAX_CIPHERTEXT_BYTES,
 ];
 
 /// 判断字段号是否属于冻结安全字段集合。

@@ -10,6 +10,7 @@ import chat.api.IdentityContact
 import chat.api.IdentityInviteSummary
 import chat.api.StoredConversation
 import chat.api.StoredDraft
+import chat.api.StoredDraftStatus
 import chat.api.StoredMessage
 import chat.api.StoredPage
 import chat.presentation.P0Presenter
@@ -21,6 +22,8 @@ import chat.presentation.display.ConversationListDisplayState
 import chat.presentation.display.ConversationMessagesDisplayState
 import chat.presentation.display.ConversationSummaryView
 import chat.presentation.display.StoredDraftState
+import chat.presentation.display.StoredDraftStatusKind
+import chat.presentation.display.toDraftUiState
 import chat.presentation.display.toConversationDisplayPage
 import chat.presentation.display.toDraftEvidence
 import chat.presentation.display.toMessageDisplayPage
@@ -88,6 +91,7 @@ import chat.presentation.preview.opened
 import chat.presentation.preview.selecting
 import chat.presentation.preview.withConversations
 import chat.presentation.preview.withDraft
+import chat.presentation.preview.withDraftStatus
 import chat.presentation.preview.withError
 import chat.presentation.preview.withMessages
 import chat.presentation.preview.addSampleMessage
@@ -136,6 +140,7 @@ fun main() = runBlocking {
     checkCoreProjection()
     checkIdentityPresentation()
     checkStorePanelState()
+    checkDraftStatusProjection()
     checkPreviewStates()
     checkPreviewInviteValidation()
     checkConversationDisplayMerger()
@@ -387,6 +392,60 @@ private fun checkErrorPresentation() {
     val nonRetryableStorage = presentError(CoreFailure("STORAGE_FAILURE", false, null, null))
     check(nonRetryableStorage.action == ErrorAction.NONE)
     println("PASS DS-04 known/unknown/non-retryable error mapping")
+}
+
+private fun checkDraftStatusProjection() {
+    fun status(
+        state: String,
+        canRetry: Boolean,
+        canCancel: Boolean,
+        submissionId: String? = "sub-1",
+        attempts: Int = 1,
+    ) = StoredDraftStatus(
+        draftId = "draft-" + "ab".repeat(16),
+        conversationId = "conv:1:" + "aa".repeat(32),
+        operationId = "op:1:" + "cd".repeat(32),
+        status = state,
+        submissionId = submissionId,
+        attemptIndex = 0,
+        attempts = attempts,
+        updatedAtMillis = 1_700_000_000_000,
+        canRetry = canRetry,
+        canCancel = canCancel,
+    )
+
+    val accepted = status(StoredDraftStatusKind.ACCEPTED, canRetry = false, canCancel = false).toDraftUiState()
+    check(accepted.phase == DraftPhase.ACCEPTED)
+    check(accepted.label == "已接受")
+    check(!accepted.canRetry && !accepted.canCancel) { "已接受不得提供重试或取消" }
+
+    val unknown = status(StoredDraftStatusKind.UNKNOWN, canRetry = false, canCancel = true).toDraftUiState()
+    check(unknown.phase == DraftPhase.ACCEPTANCE_UNKNOWN)
+    check(unknown.actions == listOf(DraftAction.RECONCILE)) { "未知结果只能对账（取消不是重发）" }
+    check(!unknown.canRetry)
+
+    val rejectedRetryable = status(StoredDraftStatusKind.REJECTED, canRetry = true, canCancel = true).toDraftUiState()
+    check(rejectedRetryable.phase == DraftPhase.FAILED_RETRYABLE)
+    check(rejectedRetryable.canRetry) { "可重试的拒绝才给重试" }
+
+    val rejectedBlocked = status(StoredDraftStatusKind.REJECTED, canRetry = false, canCancel = true).toDraftUiState()
+    check(!rejectedBlocked.canRetry) { "底层 canRetry=false 时不得提供重试" }
+
+    val cancelled = status(StoredDraftStatusKind.CANCELLED, canRetry = false, canCancel = false).toDraftUiState()
+    check(cancelled.phase == DraftPhase.CANCEL_PENDING)
+    check(cancelled.actions.isEmpty())
+
+    val prepared = status(StoredDraftStatusKind.PREPARED, canRetry = true, canCancel = true).toDraftUiState()
+    check(prepared.phase == DraftPhase.QUEUED) { "prepared/submitted 只是本机已加密待发，不能显示已接受" }
+
+    // 状态直接喂进预览面板状态
+    var store = PreviewStoreState().opened("/tmp/demo.db", "opened")
+    store = store.withDraftStatus(status(StoredDraftStatusKind.ACCEPTED, false, false))
+    check(store.drafts.size == 1)
+    check(store.drafts.first().phase == DraftPhase.ACCEPTED)
+    check(store.notice?.contains("accepted") == true)
+
+    println("PASS CORE-010 projection: accepted/unknown/rejected/cancelled map to actions, canRetry/canCancel are authoritative")
 }
 
 private fun checkStorePanelState() {
