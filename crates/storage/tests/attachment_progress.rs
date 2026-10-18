@@ -417,3 +417,91 @@ fn deleting_an_attachment_clears_its_progress() {
         "ON DELETE CASCADE must clear both directions"
     );
 }
+
+#[test]
+fn purge_stale_transfer_progress_removes_only_expired_entries() {
+    let fixture = Fixture::new("purge");
+    let mut store = fixture.open();
+    store
+        .save_attachment(attachment("att-old", 3))
+        .expect("old attachment");
+    store
+        .save_attachment(attachment("att-new", 3))
+        .expect("new attachment");
+    store
+        .save_attachment_progress(progress("att-old", "upload", &[true, false, false]))
+        .expect("old progress");
+    store
+        .save_attachment_progress(progress("att-new", "upload", &[true, true, false]))
+        .expect("new progress");
+    store
+        .save_attachment_progress(progress("att-new", "download", &[true, false, false]))
+        .expect("new download progress");
+
+    // 把 att-old 的进度改成 10 分钟前（其余保持刚写入）。
+    let stale = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64
+        - 600_000;
+    store
+        .connection()
+        .execute(
+            "UPDATE attachment_transfer_progress SET updated_at = ?1
+              WHERE attachment_id = 'att-old'",
+            [stale],
+        )
+        .expect("backdate progress");
+
+    // max_age 必须为正。
+    assert_eq!(
+        store.purge_stale_transfer_progress(0).unwrap_err().code(),
+        "INVALID_INPUT"
+    );
+    assert_eq!(
+        store
+            .purge_stale_transfer_progress(60_000)
+            .expect("purge stale"),
+        1,
+        "only the stale entry is removed"
+    );
+    assert!(store
+        .load_attachment_progress("att-old", "upload")
+        .expect("load old")
+        .is_none());
+    assert!(store
+        .load_attachment_progress("att-new", "upload")
+        .expect("load new")
+        .is_some());
+    assert!(store
+        .load_attachment_progress("att-new", "download")
+        .expect("load new download")
+        .is_some());
+
+    // max_age 大于当前时间意味着“没有条目足够旧”：一条都不清（不是“清全部”）。
+    assert_eq!(
+        store
+            .purge_stale_transfer_progress(10 * 365 * 24 * 3600 * 1000)
+            .expect("nothing is older than that"),
+        0
+    );
+    // 把剩余两条也改成过期后，一次清掉。
+    store
+        .connection()
+        .execute(
+            "UPDATE attachment_transfer_progress SET updated_at = ?1",
+            [stale],
+        )
+        .expect("backdate the rest");
+    assert_eq!(
+        store.purge_stale_transfer_progress(60_000).expect("purge all"),
+        2
+    );
+    assert_eq!(rows(&store, "attachment_transfer_progress"), 0);
+    // 空表上再次清理是幂等的。
+    assert_eq!(
+        store.purge_stale_transfer_progress(1_000).expect("purge empty"),
+        0
+    );
+}
+

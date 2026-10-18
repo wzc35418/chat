@@ -105,6 +105,44 @@ class PassphraseKeySlot(
         }
     }
 
+    override suspend fun unwrapByAlias(alias: String): SecretBuffer {
+        requireAlias(alias)
+        val envelope = readEnvelope(alias)
+        val attempts = readAttempts(alias)
+        if (attempts >= MAX_ATTEMPTS) {
+            throw KeyProtectionException(
+                KeyProtectionCodes.UNAVAILABLE,
+                "尝试次数过多，已锁定；需要重新设置本机口令后才能恢复。",
+            )
+        }
+        val key = deriveKey(envelope.salt)
+        return try {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(key, "AES"),
+                GCMParameterSpec(128, envelope.nonce),
+            )
+            cipher.updateAAD(alias.toByteArray(Charsets.UTF_8))
+            val plaintext = cipher.doFinal(envelope.ciphertext)
+            if (plaintext.size != 32) {
+                throw KeyProtectionException(KeyProtectionCodes.KEY_INVALIDATED, "解出的主密钥长度不符")
+            }
+            writeAttempts(alias, 0)
+            SecretBuffer(plaintext)
+        } catch (error: KeyProtectionException) {
+            throw error
+        } catch (error: Exception) {
+            writeAttempts(alias, attempts + 1)
+            throw KeyProtectionException(
+                KeyProtectionCodes.KEY_INVALIDATED,
+                "口令不正确或密钥包已损坏（失败 " + (attempts + 1) + "/" + MAX_ATTEMPTS + "）",
+            )
+        } finally {
+            clear(key)
+        }
+    }
+
     override suspend fun delete(alias: String) {
         requireAlias(alias)
         envelopeFile(alias).delete()

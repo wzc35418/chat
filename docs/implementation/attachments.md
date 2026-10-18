@@ -203,7 +203,7 @@ download_attachment(id: AttachmentId) -> Result<TransferTicket>
 - [x] 重排/替换/缺最后块失败：`attachments::tests::download_rejects_tampered_chunks_and_leaves_no_partial_file`（替换第 2 块 → 分块 AAD 认证失败 → ATTACHMENT_CORRUPTED，删除半成品、不产生目标文件与临时文件）、`download_works_after_restart_and_rejects_unknown_blobs`（节点缺块/未知 blob → ATTACHMENT_NOT_FOUND）、`download_rejects_a_wrong_manifest_before_reading_any_chunk`（与本地记录不一致的 manifest 在任何网络读取前被拒）。
 - [x] 断点续传（重启后只拉缺块）：`attachments::tests::download_resumes_after_restart_and_reads_only_missing_chunks`（第 3 块读取失败 → 前 2 块已解密写出并持久化前缀摘要 → 重开 store → 只读剩余 1 块、输出与原文字节一致、进度与半成品清理；半成品被篡改时拒绝续传并从头重下）。取消下载仍没有单独入口（取消走 ATTACHMENTS-007）。
 
-**实现状态**：已实现（编排 + 状态机 + 断点续传，Windows x64 实测）。`PersistedAttachmentStore::download_attachment(blob_id, expected_manifest, destination, &mut transport)`：只接受 available/downloading 记录；先用 expected_manifest 与本地持久化记录（块数/块大小/明文大小/密文摘要）比对，不一致在任何网络读取前 `ATTACHMENT_CORRUPTED`；按迁移 0008 的进度位图续传：跳过已确认块、追加写同目录半成品、每块成功后持久化“已确认位图 + 已写前缀的明文摘要”，续传前重新读取本地前缀并核对摘要（不符则丢弃进度从头重下）；全部块认证通过后校验**明文大小 + 明文 SHA-256**（从头开始的完整下载额外校验密文整文件摘要）再 rename；损坏类错误删除半成品与进度，传输类错误保留两者供续传；解密用进程内 FileKey，缺失时先从 `attachment_secrets` 恢复（重启后仍可下载），密钥记录确实缺失才 `ATTACHMENT_KEY_UNAVAILABLE`。证据：`download_roundtrip_matches_the_original_plaintext`、`download_works_after_restart_and_rejects_unknown_blobs`、`download_resumes_after_restart_and_reads_only_missing_chunks`、上面三条拒绝用例。限制：不写本地加密缓存（本轮直接写出目标路径）；下载进度与半成品绑定同一目标路径（换目标目录视为新下载）；无 CAPABILITY_EXPIRED（下载能力令牌属 E2EE SecretDescriptor）；节点读取授权由 `NodeBlobTransport` 适配层承载（NODE-015：上传设备本人恒可读）。
+**实现状态**：已实现（编排 + 状态机 + 断点续传，Windows x64 实测）。`PersistedAttachmentStore::download_attachment(blob_id, expected_manifest, destination, &mut transport)`：只接受 available/downloading 记录；先用 expected_manifest 与本地持久化记录（块数/块大小/明文大小/密文摘要）比对，不一致在任何网络读取前 `ATTACHMENT_CORRUPTED`；按迁移 0008 的进度位图续传：跳过已确认块、追加写同目录半成品、每块成功后持久化“已确认位图 + 已写前缀的明文摘要”，续传前重新读取本地前缀并核对摘要（不符则丢弃进度从头重下）；全部块认证通过后校验**明文大小 + 明文 SHA-256**（从头开始的完整下载额外校验密文整文件摘要）再 rename；损坏类错误删除半成品与进度，传输类错误保留两者供续传；解密用进程内 FileKey，缺失时先从 `attachment_secrets` 恢复（重启后仍可下载），密钥记录确实缺失才 `ATTACHMENT_KEY_UNAVAILABLE`。下载成功后把**收到的分块密文原样**写入本地加密缓存（复用 import 的缓存目录/文件名与同一 FileKey，不重新生成密钥），并按缓存块重算密文摘要校验后才把记录标 available；此后 `attachment_status` 的 available_chunks 为满、`export_attachment` 不联网也能导出（见"下载写入本地缓存与终态进度清理"）。证据：`download_roundtrip_matches_the_original_plaintext`、`download_works_after_restart_and_rejects_unknown_blobs`、`download_resumes_after_restart_and_reads_only_missing_chunks`、`download_fills_the_local_cache_for_offline_export`、`failed_download_rolls_back_new_cache_chunks`、上面三条拒绝用例。限制：**续传完成的下载不写缓存**（前缀密文已不在内存，见"下载写入本地缓存与终态进度清理"的限制）；下载进度与半成品绑定同一目标路径（换目标目录视为新下载）；无 CAPABILITY_EXPIRED（下载能力令牌属 E2EE SecretDescriptor）；节点读取授权由 `NodeBlobTransport` 适配层承载（NODE-015：上传设备本人恒可读）。
 
 <a id="attachments-006"></a>
 
@@ -613,7 +613,62 @@ cargo test --offline -p chat-storage -p chat-core                # 89 + 100 全�
 3. 续传路径不重复校验整段密文摘要（本地已无前缀密文），安全性由每块 AEAD + 明文整文件摘要
    + 本地前缀摘要重算保证；从头下载仍校验密文摘要。
 4. 进度没有 TTL/后台清理：完成时 core 清除、删除附件时外键级联清除，异常中断的残留进度
-   会在下次续传时被覆盖或清除。
+   会在下次续传时被覆盖或清除；需要主动清理时用 `purge_stale_transfer_progress`。
+
+## 下载写入本地缓存与终态进度清理（R-42，2026-10-18，Windows x64）
+
+目标：下载完成后附件在**本地**可用（离线 export/status），不再只有目标文件那一份。
+
+### 落地行为
+
+- 下载成功后把收到的**分块密文原样**写进本地缓存（`<cache>/att-<hex>/chunk-<index>.bin`，
+  与 import 完全同一格式；复用同一 FileKey 解密，不重新生成密钥）。之所以原样保存而不是
+  重新加密：密文字节与节点清单一致，缓存里的 `ciphertext_digest/bytes` 仍然有效，
+  重新加密会产生新 nonce、使清单摘要与缓存不一致（上传/清单校验会随之失真）。
+- 写完按缓存块重算密文摘要并与记录比对，一致才把进程内记录标成 `available`；
+  不一致则回滚本次新写的块并返回 `ATTACHMENT_CORRUPTED`。
+- 同进程已导入过的附件本来就有缓存块：下载时只补缺块（`has_cached_chunk`），
+  失败也只回滚**本次新写**的块，不动既有缓存。
+- 终态清理：完成时清进度；**终态失败**（损坏、缺密钥、IO 等非可重试错误）清进度 +
+  半成品 + 本次新写缓存块；可重试传输错误（`NODE_UNAVAILABLE`/`NETWORK_UNAVAILABLE`/
+  `UPLOAD_EXPIRED`）保留进度与半成品供续传（与 task-38 的续传语义一致）。
+- storage 新增 `purge_stale_transfer_progress(max_age_ms)`：按 `updated_at` 清理过期进度，
+  返回删除条数；用于异常中断残留进度的终端清理。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --lib                          # 34 passed
+cargo test --offline -p chat-storage --test attachment_progress   # 6 passed
+cargo test --offline -p chat-storage -p chat-core                # 90 + 109 全绿
+~~~
+
+### 证据
+
+- `attachments::tests::download_fills_the_local_cache_for_offline_export`：导入 → 上传 →
+  **清空本地缓存目录**（模拟只有记录与 FileKey 的进程）→ 下载 → 缓存块与节点密文逐字节一致、
+  `status.available_chunks == chunk_count`、`transferred_chunks == chunk_count`、
+  随后**不接任何块传输端口**也能 `export_attachment` 且字节与原文一致、回执摘要与记录一致。
+- `attachments::tests::failed_download_rolls_back_new_cache_chunks`：篡改第 2 块 → 下载
+  `ATTACHMENT_CORRUPTED`、不产生目标文件、**不残留本次新写缓存块**（available_chunks = 0）、
+  终态失败清掉进度、半成品被删除。
+- `attachment_progress::purge_stale_transfer_progress_removes_only_expired_entries`：只删
+  `updated_at` 早于 `now - max_age` 的条目（1 条过期 + 2 条新进度 → 删 1 留 2）；
+  max_age = 0 → `INVALID_INPUT`；max_age 大于当前时间 → 0（不是“清空”）；空表重复清理 0。
+
+### 已知限制
+
+1. **续传完成的下载不写缓存**：前缀块的密文在上一轮没有保留（任务 38 只保留明文半成品），
+   当前实现只在 `skip == 0` 的完整下载里写缓存；续传成功后缓存仍为空，要离线 export 需要
+   重新完整下载一次（或等后续把半成品改成密文形态）。
+2. 缓存保存的是**节点密文**而非本地重新加密：换节点/换上传者的密文布局时，缓存仍可用
+   （解密只依赖 FileKey 与分块 AAD），但本地缓存与节点对象字节一一对应。
+3. 没有缓存 TTL/配额回收（ATTACHMENTS-008 未实现）；`purge_stale_transfer_progress` 只清进度，
+   不清缓存块。
+4. 下载成功且目标文件写出后，缓存写入失败会整体报错（不会留下“目标在、缓存半份”的假成功）；
+   此时目标文件已 rename 完成，属于可重试的本地 IO 失败。
+
 
 
 

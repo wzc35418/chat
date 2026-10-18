@@ -482,23 +482,29 @@ fn domain_snapshot(record: &GroupRecord) -> GroupResult<GroupSnapshot> {
     Ok(snapshot)
 }
 
-/// DOMAIN-004 的候选策略 → 持久记录（角色/禁言/版本/控制头/epoch 全部来自候选快照）。
+/// DOMAIN-004 的候选策略 → 持久记录（角色/禁言/增减成员/版本/控制头全部来自候选快照）。
+///
+/// 候选策略里没有的确认成员视为“已被移除”（GROUPS-005）；pending 成员不在候选快照里，
+/// 因此原样保留（它们还没被接受，不参与策略层）。
 fn apply_domain_policy(record: &mut GroupRecord, policy: &GroupSnapshot) -> GroupResult<()> {
     record.control_head = policy.control_head.to_hex();
     record.policy_version = policy.policy_version;
     record.mls_epoch = policy.mls_epoch;
     record.verified_sequence = policy.verified_sequence;
     record.verified_log_hash = policy.verified_log_hash.to_hex();
-    for member in &mut record.members {
+    let mut confirmed = Vec::with_capacity(record.members.len());
+    for member in &record.members {
         let account = account_id_for(&member.credential);
         let Some(updated) = policy.member(account) else {
-            return Err(GroupError::corrupted(
-                "candidate policy dropped a confirmed member",
-            ));
+            // 已被移除：从正式成员里去掉（唯一群主不变量由下面的 validate 再兜一次）。
+            continue;
         };
-        member.role = updated.role.as_u64();
-        member.muted = updated.muted;
+        let mut updated_member = member.clone();
+        updated_member.role = updated.role.as_u64();
+        updated_member.muted = updated.muted;
+        confirmed.push(updated_member);
     }
+    record.members = confirmed;
     record.validate()
 }
 
@@ -894,3 +900,112 @@ pub fn set_muted(
     let saved = persist_snapshot(store, &record, record.mls_epoch)?;
     Ok(project(&record, record.mls_epoch, None, saved))
 }
+
+/// GROUPS-005：移除一名确认成员（群主或管理员；不能移除群主、不能移除自己）。
+///
+/// 顺序（**非法操作在任何写入之前被拒**）：
+/// 1. 读持久快照 → DOMAIN-001 快照（不变量校验）；
+/// 2. 本机 MLS 设备必须是同一个群、同一 epoch（`INVALID_TARGET` / `STALE_EPOCH`）；
+/// 3. DOMAIN-002 授权（非群主/管理员 → `PERMISSION_DENIED`；移除自己 → `PERMISSION_DENIED`；
+///    移除群主 → `PERMISSION_DENIED`；目标不是确认成员 → `INVALID_TARGET`）；
+/// 4. DOMAIN-004 计算新 `policy_version`/`control_head`；
+/// 5. CRYPTO-005 `prepare_control(RemoveMembers)` 生成真实 MLS 移除提交并写 pending；
+/// 6. 快照写回（目标从正式成员里移除），返回真实投影。
+pub fn remove_member(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    group_id: &str,
+    actor_credential: &str,
+    target_credential: &str,
+) -> GroupResult<GroupView> {
+    let (mut record, _) = load_record(store, group_id)?;
+    let snapshot = domain_snapshot(&record)?;
+    let group_key = device
+        .group_key()
+        .map_err(|_| GroupError::invalid_target("the local device has no MLS group"))?;
+    if group_key != record.mls_group_key {
+        return Err(GroupError::invalid_target(
+            "the local device is not in this group",
+        ));
+    }
+    let epoch = device
+        .epoch()
+        .map_err(|_| GroupError::corrupted("MLS group epoch is unavailable"))?;
+    if epoch != snapshot.mls_epoch {
+        return Err(GroupError::new(
+            "STALE_EPOCH",
+            "the local MLS epoch does not match the persisted group",
+        ));
+    }
+    let actor_index = member_index(&record, actor_credential)?;
+    let target_index = member_index(&record, target_credential)?;
+    let actor = actor_of(&record, actor_index);
+    let target_account = account_id_for(&record.members[target_index].credential);
+    let operation = GroupOperation::RemoveMember {
+        account: target_account,
+    };
+    let authorized =
+        authorize_group_operation(&snapshot, actor, operation).map_err(GroupError::from)?;
+    let proposed: ProposedPolicy =
+        apply_policy_operation(&snapshot, &authorized).map_err(GroupError::from)?;
+    // 真实 MLS 移除提交：按凭据身份定位成员（crypto 内部会再校验唯一匹配/不能移除自己）。
+    let pending = device
+        .prepare_control(
+            ControlOperation::RemoveMembers {
+                members: vec![record.members[target_index].credential.clone()],
+            },
+            store,
+        )
+        .map_err(GroupError::from)?;
+    apply_domain_policy(&mut record, &proposed.policy)?;
+    let saved = persist_snapshot(store, &record, record.mls_epoch)?;
+    Ok(project(&record, record.mls_epoch, Some(&pending), saved))
+}
+
+/// GROUPS-006：修改群名（群主或管理员；纯策略层，无 MLS 成员变化）。
+///
+/// - 名称 1..=64 字节、无控制字符、首尾无空白（否则 `INVALID_INPUT`）；
+/// - **同名幂等无操作**：名称未变时直接返回当前快照，不写库、不推进策略版本；
+/// - 有未决控制提交时显式拒绝（避免策略头与提交顺序不一致）；
+/// - 否则 DOMAIN-002/004 计算新 `policy_version`/`control_head`，快照写回新名称。
+pub fn rename_group(
+    store: &mut Store,
+    group_id: &str,
+    actor_credential: &str,
+    new_name: &str,
+) -> GroupResult<GroupView> {
+    validate_name(new_name)?;
+    let (mut record, state_version) = load_record(store, group_id)?;
+    let snapshot = domain_snapshot(&record)?;
+    let device = MlsDevice::import_from_store(store, &record.mls_group_key).map_err(|_| {
+        GroupError::corrupted("the persisted MLS group state could not be restored")
+    })?;
+    if device
+        .pending_control()
+        .map_err(GroupError::from)?
+        .is_some()
+    {
+        return Err(GroupError::new(
+            "INVALID_STATE_TRANSITION",
+            "a control commit is pending; wait for its acceptance before policy writes",
+        ));
+    }
+    let actor_index = member_index(&record, actor_credential)?;
+    // 同名幂等：不写库、不推进策略版本（调用方重放不会产生额外版本）。
+    if record.name == new_name {
+        return Ok(project(&record, record.mls_epoch, None, state_version));
+    }
+    let actor = actor_of(&record, actor_index);
+    let operation = GroupOperation::Rename {
+        name_digest: Digest::sha256(new_name.as_bytes()),
+    };
+    let authorized =
+        authorize_group_operation(&snapshot, actor, operation).map_err(GroupError::from)?;
+    let proposed: ProposedPolicy =
+        apply_policy_operation(&snapshot, &authorized).map_err(GroupError::from)?;
+    apply_domain_policy(&mut record, &proposed.policy)?;
+    record.name = new_name.to_owned();
+    let saved = persist_snapshot(store, &record, record.mls_epoch)?;
+    Ok(project(&record, record.mls_epoch, None, saved))
+}
+

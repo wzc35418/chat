@@ -1,6 +1,6 @@
 # 小群创建、邀请与治理用例
 
-阶段：P3。状态：函数级设计；GROUPS-001 建群与 GROUPS-002 快照已实现（真实 OpenMLS + 正式加密库），成员治理的角色变更（`set_role`）与禁言（`set_muted`）也已实现（DOMAIN-002/004 策略层 + CRYPTO-005 控制提交）；其余治理函数未开始。目标源码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)。
+阶段：P3。状态：函数级设计；GROUPS-001 建群与 GROUPS-002 快照已实现（真实 OpenMLS + 正式加密库），成员治理的角色变更（`set_role`）与禁言（`set_muted`）也已实现（DOMAIN-002/004 策略层 + CRYPTO-005 控制提交）；移除成员（`remove_member`）与改名（`rename_group`）也已实现（同一条 DOMAIN-002/004 + CRYPTO-005 流程）；其余治理函数未开始。目标源码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)。
 
 本章对应 GroupService 的完整业务入口。所有管理操作都是待确认票据；UI 读取正式快照与 pending 列表分别显示。邀请加入分为业务接受、KeyPackage 获取、正式 Commit、Welcome 投递四步。重加入需要当前成员明确授权，不直接从节点读取群密钥。
 
@@ -299,7 +299,9 @@ remove_account_devices(group: GroupId, target: AccountId, expected: ControlHead)
 - [ ] 目标两台设备均失去后续解密。
 - [ ] 不能只踢当前在线设备。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：未开始（设备撤销语义）。**注意**：本轮实现的 `remove_member` 是“移除整个成员（账户）”，
+对应 GroupOperation::RemoveMember 的策略操作与 MLS RemoveMembers 提交，见文末“移除成员与改名实现记录”；
+按设备撤销（一台设备离开但账户仍在）仍属本函数，未实现。
 
 <a id="groups-009"></a>
 
@@ -329,10 +331,16 @@ rename_group(group: GroupId, name: String, expected: ControlHead) -> Result<Oper
 
 **完成验收**：
 
-- [ ] 节点存储搜索不到测试群名。
-- [ ] 未确认 UI 保留旧正式名。
+- [ ] 节点存储搜索不到测试群名。（未接节点：本轮不联网，群名只存在本地正式库的密封快照记录里，未写入任何节点公开元数据）
+- [ ] 未确认 UI 保留旧正式名。（未实现：还没有“未确认”态；本轮改名一经 DOMAIN-004 生效即刷新本地快照）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（本地策略层切片）。`groups::rename_group(store, group_id, actor_credential, new_name)`：
+名称 1..=64 字节/无控制字符/首尾无空白；群主或管理员（DOMAIN-002）；**同名幂等无操作**；
+未决控制提交期间显式拒绝；否则 DOMAIN-004 计算新 `policy_version`/`control_head` 并把新名写回密封快照。
+证据：`cargo test --offline -p chat-core --test groups_membership`（rename_group_succeeds_and_same_name_is_idempotent /
+invalid_names_and_non_governor_renames_are_rejected / membership_snapshot_survives_reopen）。
+限制：不联网（不写节点公开元数据、没有 operation 票据与 expected head CAS）、新名不做端到端加密（本地库密封，文档记录）；
+改名与成员治理共用“一次只有一个治理操作在飞”的约束。
 
 <a id="groups-010"></a>
 
@@ -614,7 +622,104 @@ cargo test --offline -p chat-core                            # 97 passed（既�
    并发 UI/多设备场景需要补 `expected_control_head` 入参（STALE_CONTROL_HEAD 已经在域层就绪）。
 3. **账户/设备标识是派生占位**（见上文第 5 条），接入真实账户目录后要替换；成员仍以凭据文本定位。
 4. **有未决控制提交时策略层整体冻结**：一次只有一个治理操作在飞；批量治理需要先接接受/合并。
-5. 待实现：移除成员、改名、转让群主、退出、解散（GROUPS-005~012）。
+5. 待实现：转让群主、退出、解散、按设备撤销（GROUPS-008/010/011/012）；移除成员与改名已在下一节实现。
+
+## 移除成员与改名实现记录（remove_member / rename_group，2026-10-18，Windows x64）
+
+代码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)（同一文件，无新依赖）；测试：
+[crates/core/tests/groups_membership.rs](../../crates/core/tests/groups_membership.rs)（7 个用例，真实 OpenMLS + 临时正式加密库）。
+
+> 编号说明：本轮任务的 GROUPS-005/006 指“移除成员 / 改名”；本文档 GROUPS-005 是 decline_group_invite、
+> GROUPS-008 是 remove_account_devices（按设备撤销）、GROUPS-009 是 rename_group。
+> `remove_member` 对应 GroupOperation::RemoveMember（策略层移除**整个成员**），`rename_group` 对应本文档 GROUPS-009。
+
+### 公开面
+
+~~~text
+pub fn remove_member(
+    device: &mut MlsDevice,      // 本机真实 MLS 设备（生成移除提交）
+    store: &mut Store,
+    group_id: &str,              // PROTOCOL-001 grp:1:<hex>
+    actor_credential: &str,      // 操作者（群主或管理员）
+    target_credential: &str,     // 被移除的确认成员
+) -> GroupResult<GroupView>
+
+pub fn rename_group(
+    store: &mut Store,
+    group_id: &str,
+    actor_credential: &str,      // 操作者（群主或管理员）
+    new_name: &str,              // 1..=64 字节、无控制字符、首尾无空白
+) -> GroupResult<GroupView>
+~~~
+
+### 关键语义
+
+1. **顺序 = 先判权限、再算策略、最后才写**（与 set_role 一致）：读持久快照 → DOMAIN-001 快照 →
+   本机 MLS 群键/epoch 一致（`INVALID_TARGET`/`STALE_EPOCH`）→ DOMAIN-002 授权 →
+   DOMAIN-004 计算 `policy_version`/`control_head` → （移除）CRYPTO-005
+   `prepare_control(RemoveMembers)` 生成真实 MLS 移除提交并写 pending → 快照写回。
+2. **移除权限**（DOMAIN-002）：只有群主或管理员；不能移除自己（必须走 Leave）；不能移除群主（只能转让或解散）；
+   管理员只能治理普通成员；目标必须是**确认成员**（pending 成员不参与策略层）。
+3. **改名**：群主或管理员；名称校验在建群同一套规则上（1..=64、无控制字符、首尾无空白）；
+   **同名幂等无操作**（不写库、不推进 `policy_version`、不改变记录版本）；
+   改名是纯策略层操作（不产生 MLS 成员变化提交），但有未决控制提交时显式拒绝。
+4. **移除是真实 MLS 提交**：`RemoveMembers` 按成员凭据身份定位（crypto 内部再校验唯一匹配、不能移除自己），
+   epoch 只在下一次接受合并时推进，因此快照 `epoch` 不变、`pending.operation == "remove_members"`、
+   `pending.removed == 1`。
+5. **快照反映结果**：被移除者从 `members` 消失（候选策略里没有的确认成员即视为已移除），
+   改名后 `name` 立即是新值；pending 成员与 pending 提交原样保留。
+
+### 错误码（全部既有冻结码）
+
+| 情形 | code |
+|---|---|
+| 非群主/管理员移除或改名 | `PERMISSION_DENIED` |
+| 移除自己 / 移除群主 | `PERMISSION_DENIED` |
+| 目标不是确认成员 / 未知群 / 本机不在该群 | `INVALID_TARGET` |
+| 非法群名（空/超长/控制字符/首尾空白） | `INVALID_INPUT` |
+| 群 ID 不是 PROTOCOL-001 文本 | `INVALID_ID` |
+| 未决控制提交期间的策略写入 | `INVALID_STATE_TRANSITION` |
+| 第二个控制提交（crypto PendingCommitExists） | `INVALID_STATE_TRANSITION` |
+| 本机 MLS epoch 与快照不一致 | `STALE_EPOCH` |
+| 快照/不变量损坏 | `STATE_CORRUPTED` |
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test groups_membership   # 7 passed
+cargo test --offline -p chat-core                            # 109 passed（既有 97 全部继续通过；lib 内另有并行任务的附件用例，共 34 个 lib 用例）
+~~~
+
+### 证据（测试名 → 覆盖点）
+
+- `groups_membership::remove_member_succeeds_and_policy_version_advances`：群主移除 bob →
+  `policy_version 1→2`、`control_head` 变化、`members` 只剩 alice、`epoch` 仍 1、
+  `pending.operation == "remove_members"` / `removed == 1` / base 1→target 2；设备侧 `pending_control()`
+  同为 remove_members；正式库快照与返回值一致。
+- `groups_membership::non_governor_cannot_remove_members`：普通成员移除别人 → `PERMISSION_DENIED`，
+  且 `policy_version`/`control_head`/pending/成员全部不变。
+- `groups_membership::cannot_remove_owner_self_or_unknown_member`：未知成员 `INVALID_TARGET`、移除自己
+  `PERMISSION_DENIED`；把 bob 升为 Admin 后 bob 仍不能移除群主（`PERMISSION_DENIED`，**授权先于 MLS 提交**）。
+- `groups_membership::rename_group_succeeds_and_same_name_is_idempotent`：改名成功（`policy_version 2`、
+  control_head 变化、无 pending、epoch 不变）；同名再次调用幂等（`policy_version` 与 `state_version` 都不变）。
+- `groups_membership::invalid_names_and_non_governor_renames_are_rejected`：5 种非法名 `INVALID_INPUT`、
+  普通成员改名 `PERMISSION_DENIED`、未知群 `INVALID_TARGET`，且全部没有写入（名称/版本/头都不变）。
+- `groups_membership::membership_snapshot_survives_reopen`：改名 + 移除后**关闭库重开**：
+  名称/`policy_version 3`/control_head/成员只剩 alice/pending remove_members/epoch 全部一致。
+- `groups_membership::pending_control_commit_blocks_further_governance`：移除后（pending remove_members）
+  改名被拒 `INVALID_STATE_TRANSITION`、再次移除已被移除的成员 `INVALID_TARGET`；第一次结果保持不变。
+
+### 已知限制
+
+1. **控制提交未接受/合并**：与 set_role 相同——`merge_accepted_pending` 与节点回执未接线，本轮把“策略快照
+   已写入”视为本地生效，pending 如实报告。
+2. **一次只有一个治理操作在飞**：有未决提交时策略层与第二个 MLS 提交都显式拒绝（批量治理要等接受/合并）。
+3. **只能移除确认成员**：建群时追加的成员在被协调者接受前是 pending，不能被 `remove_member` 处理。
+4. **账户/设备标识仍是派生占位**（见上一节第 5 条）；移除按 MLS 凭据文本定位，账户目录接入后要改用真实 ID。
+5. **不联网**：不改节点群日志、不投递 Commit/Welcome；改名也不写节点公开元数据（名字只在本地密封快照里）。
+6. 待实现：按设备撤销（GROUPS-008）、转让群主（010）、退出（011）、解散（012）。
+
 
 
 

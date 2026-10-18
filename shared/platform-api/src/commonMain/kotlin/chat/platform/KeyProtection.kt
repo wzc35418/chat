@@ -1,7 +1,7 @@
 package chat.platform
 
 /** 受控秘密缓冲：只能被平台封装层读取，不进入普通 DTO/日志。 */
-class SecretBuffer(bytes: ByteArray) {
+class SecretBuffer(bytes: ByteArray) : AutoCloseable {
     private val inner = bytes.copyOf()
 
     /** 仅平台封装边界可调用；调用方负责尽快用 [close]。 */
@@ -10,7 +10,7 @@ class SecretBuffer(bytes: ByteArray) {
     fun size(): Int = inner.size
 
     /** 尽力清零（JVM 不保证对象被复制前的内容一定被擦除，但不主动保留明文）。 */
-    fun close() {
+    override fun close() {
         inner.fill(0)
     }
 }
@@ -52,6 +52,9 @@ interface KeyProtection {
     suspend fun wrap(alias: String, secret: SecretBuffer): WrappedSecret
 
     suspend fun unwrap(alias: String, wrapped: WrappedSecret): SecretBuffer
+
+    /** 只按别名解包（读取平台本地槽）；别名不存在时抛 UNAVAILABLE。 */
+    suspend fun unwrapByAlias(alias: String): SecretBuffer
 
     suspend fun delete(alias: String)
 }

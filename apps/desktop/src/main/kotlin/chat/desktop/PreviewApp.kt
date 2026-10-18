@@ -74,19 +74,8 @@ fun main() = application {
         runCatching { File("build/preview-identity").apply { mkdirs() } }.getOrNull()
     }
     val identityDatabase = remember { identityDir?.let { File(it, "identity.db").absolutePath } }
-    val identityKey = remember {
-        identityDir?.let { dir ->
-            val keyFile = File(dir, "demo-master-key.hex")
-            if (keyFile.exists()) {
-                keyFile.readText().trim()
-            } else {
-                val bytes = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
-                val hex = bytes.joinToString("") { "%02x".format(it) }
-                keyFile.writeText(hex)
-                hex
-            }
-        }
-    }
+    var identityKey by remember { mutableStateOf<String?>(null) }
+    var keySlotSummary by remember { mutableStateOf("密钥槽未初始化") }
     val store = remember { runCatching { createLocalStore() }.getOrNull() }
     val storeDirectory = remember { runCatching { Files.createTempDirectory("chat-preview-store-").toFile() }.getOrNull() }
     val scope = rememberCoroutineScope()
@@ -128,11 +117,49 @@ fun main() = application {
             }
     }
 
+    // PLATFORM-001/002 接线：主密钥由桌面密钥槽封装（口令派生 AES-256-GCM），
+    // 磁盘只留盐与密文；启动时 unwrap，首次运行生成并 wrap。演示口令固定，
+    // 正式产品应改为用户输入或操作系统密钥链（未接线，如实标注）。
     LaunchedEffect(Unit) {
-        if (identity == null || identityDatabase == null || identityKey == null) {
+        if (identityDir == null) {
+            keySlotSummary = "密钥槽不可用（目录创建失败）"
+            return@LaunchedEffect
+        }
+        val slot = PassphraseKeySlot(
+            File(identityDir, "keyslot").apply { mkdirs() },
+            DEMO_KEY_PASSPHRASE.toCharArray(),
+        )
+        keySlotSummary = slot.protectionSummary()
+        val alias = "storage-main"
+        val restored = runCatching {
+            val buffer = slot.unwrapByAlias(alias)
+            try {
+                buffer.copyBytes().joinToString("") { byte -> "%02x".format(byte) }
+            } finally {
+                buffer.close()
+            }
+        }
+        if (restored.isSuccess) {
+            identityKey = restored.getOrThrow()
+        } else {
+            val fresh = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+            runCatching {
+                slot.wrap(alias, chat.platform.SecretBuffer(fresh))
+                fresh.joinToString("") { "%02x".format(it) }
+            }.getOrElse { error ->
+                keySlotSummary = "密钥封装失败：" + ((error as? chat.platform.KeyProtectionException)?.code ?: "UNKNOWN")
+                null
+            }
+        }
+    }
+
+    LaunchedEffect(identityKey) {
+        val database = identityDatabase
+        val opened = identityKey
+        if (identity == null || database == null || opened == null) {
             identityState = identityState.unavailable("原生身份服务未加载")
         } else {
-            runCatching { identity.openPersisted(identityDatabase, identityKey, node) }
+            runCatching { identity.openPersisted(database, opened, node) }
                 .onSuccess { account ->
                     identityState = identityState.openWith(account)
                     identityState = identityState.copy(
@@ -449,3 +476,6 @@ fun main() = application {
         )
     }
 }
+
+/** 演示口令：正式产品必须改为用户输入或操作系统密钥链（PLATFORM-001 未接线部分）。 */
+private const val DEMO_KEY_PASSPHRASE = "chat-preview-demo-passphrase"

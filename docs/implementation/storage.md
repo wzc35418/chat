@@ -377,7 +377,9 @@ cargo test --offline -p chat-storage --test attachment_secrets   # 5 passed
   （UPSERT，幂等覆盖；chunk_count 必须等于 attachments.chunk_count；位图长度必须等于
   chunk_count；方向白名单；会话/blob ≤256 字节；缺附件记录 → ATTACHMENT_NOT_FOUND）、
   `load_attachment_progress`（读取时再校验 chunk_count 与附件记录一致、位图填充位为 0）、
-  `clear_attachment_progress`。
+  `clear_attachment_progress`、`purge_stale_transfer_progress(max_age_ms)`（按 `updated_at`
+  清理过期进度并返回删除条数；max_age 必须为正；max_age 大于当前时间意味着“没有条目足够旧”，
+  返回 0 而不是清空——语义是“超过 max_age 未更新”）。
 - 错误语义：位图长度/填充位/记录版本/chunk_count 与附件记录不一致都返回 STATE_CORRUPTED，
   绝不接受“半截位图”继续传输；输入越界一律 INVALID_INPUT。
 

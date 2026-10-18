@@ -1262,6 +1262,42 @@ impl Store {
         load_progress_row(self.connection(), &self.key, attachment_id, direction)
     }
 
+    /// 清理“超过 max_age_ms 未更新”的传输进度；返回删除条数。
+    ///
+    /// 用于异常中断后残留进度的终端清理（完成时由 core 显式清除，删除附件时由外键级联清除）。
+    /// max_age_ms 必须为正；同一条附件按 (attachment_id, direction) 各自计数。
+    pub fn purge_stale_transfer_progress(&mut self, max_age_ms: i64) -> Result<u64> {
+        self.ensure_ready()?;
+        if max_age_ms <= 0 {
+            return Err(StorageError::InvalidInput(
+                "transfer progress max age must be positive".to_owned(),
+            ));
+        }
+        let cutoff = now_ms().saturating_sub(max_age_ms);
+        let mut transaction = self.begin_transaction(WriteScope::attachments())?;
+        let outcome = (|| -> Result<u64> {
+            let deleted = transaction.transaction.execute(
+                "DELETE FROM attachment_transfer_progress WHERE updated_at < ?1",
+                [cutoff],
+            )?;
+            if deleted > 0 {
+                transaction.note(deleted);
+            }
+            Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
+        })();
+        match outcome {
+            Ok(deleted) => {
+                commit_transaction(transaction)?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                Err(error)
+            }
+        }
+    }
+
     /// 清除某个方向的传输进度；返回是否真的删除了记录。
     pub fn clear_attachment_progress(
         &mut self,
