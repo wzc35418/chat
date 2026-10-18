@@ -247,3 +247,83 @@ impl BlobPolicy {
         Ok(())
     }
 }
+/// API-005 限流默认参数（固定窗口；窗口内请求数与字节数双限）。
+pub const DEFAULT_RATE_LIMIT_WINDOW_SECONDS: u64 = 60;
+pub const MAX_RATE_LIMIT_WINDOW_SECONDS: u64 = 3_600;
+/// 每设备每窗口请求数（默认保守：1 分钟 120 次）。
+pub const DEFAULT_RATE_LIMIT_REQUESTS_PER_DEVICE: u32 = 120;
+/// 每账户每窗口请求数（多设备账户的上限，默认是每设备的两倍）。
+pub const DEFAULT_RATE_LIMIT_REQUESTS_PER_ACCOUNT: u32 = 240;
+/// 匿名端点（挑战/注册）每窗口请求数；挑战本身另有未消费容量上限。
+pub const DEFAULT_RATE_LIMIT_REQUESTS_ANONYMOUS: u32 = 600;
+/// 任意预算的上限，防止配置成“实际上无限”。
+pub const MAX_RATE_LIMIT_REQUESTS: u32 = 1_000_000;
+/// 每设备每窗口请求正文字节上限（大上传按字节计，而不是只按次数）。
+pub const DEFAULT_RATE_LIMIT_BYTES_PER_DEVICE: u64 = 8 * 1024 * 1024;
+pub const MAX_RATE_LIMIT_BYTES_PER_DEVICE_LIMIT: u64 = 1024 * 1024 * 1024;
+/// 进程内桶表容量上限：达到上限时先清理过期窗口，仍满则拒绝新键（fail-closed）。
+pub const DEFAULT_RATE_LIMIT_BUCKETS: usize = 4_096;
+pub const MIN_RATE_LIMIT_BUCKETS: usize = 16;
+pub const MAX_RATE_LIMIT_BUCKETS: usize = 65_536;
+
+/// API-005 限流策略。只在 HTTP 层生效（服务层单测不经过限流）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RateLimitPolicy {
+    /// 是否启用。默认为 true；关闭必须显式配置（测试或受控环境）。
+    pub enabled: bool,
+    /// 固定窗口长度（秒）。
+    pub window_seconds: u64,
+    /// 每设备每窗口请求数上限。
+    pub max_requests_per_device: u32,
+    /// 每账户每窗口请求数上限（同一账户的多台设备共享）。
+    pub max_requests_per_account: u32,
+    /// 匿名端点每窗口请求数上限（本进程一个全局桶，见 api.md 的限制说明）。
+    pub max_requests_anonymous: u32,
+    /// 每设备每窗口请求正文字节上限。
+    pub max_bytes_per_device: u64,
+    /// 桶表容量上限。
+    pub max_buckets: usize,
+}
+
+impl Default for RateLimitPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_seconds: DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+            max_requests_per_device: DEFAULT_RATE_LIMIT_REQUESTS_PER_DEVICE,
+            max_requests_per_account: DEFAULT_RATE_LIMIT_REQUESTS_PER_ACCOUNT,
+            max_requests_anonymous: DEFAULT_RATE_LIMIT_REQUESTS_ANONYMOUS,
+            max_bytes_per_device: DEFAULT_RATE_LIMIT_BYTES_PER_DEVICE,
+            max_buckets: DEFAULT_RATE_LIMIT_BUCKETS,
+        }
+    }
+}
+
+impl RateLimitPolicy {
+    /// 校验策略本身可用；任何越界配置都显式拒绝启动。
+    pub fn validate(&self) -> NodeResult<()> {
+        if self.window_seconds == 0 || self.window_seconds > MAX_RATE_LIMIT_WINDOW_SECONDS {
+            return Err(NodeError::InvalidConfig("rate limit window"));
+        }
+        if self.max_requests_per_device == 0 || self.max_requests_per_device > MAX_RATE_LIMIT_REQUESTS {
+            return Err(NodeError::InvalidConfig("rate limit device requests"));
+        }
+        if self.max_requests_per_account == 0 || self.max_requests_per_account > MAX_RATE_LIMIT_REQUESTS {
+            return Err(NodeError::InvalidConfig("rate limit account requests"));
+        }
+        // 账户预算是多设备上限，不能比单设备还小（否则设备预算形同虚设）。
+        if self.max_requests_per_account < self.max_requests_per_device {
+            return Err(NodeError::InvalidConfig("rate limit account requests below device requests"));
+        }
+        if self.max_requests_anonymous == 0 || self.max_requests_anonymous > MAX_RATE_LIMIT_REQUESTS {
+            return Err(NodeError::InvalidConfig("rate limit anonymous requests"));
+        }
+        if self.max_bytes_per_device > MAX_RATE_LIMIT_BYTES_PER_DEVICE_LIMIT {
+            return Err(NodeError::InvalidConfig("rate limit device bytes"));
+        }
+        if self.max_buckets < MIN_RATE_LIMIT_BUCKETS || self.max_buckets > MAX_RATE_LIMIT_BUCKETS {
+            return Err(NodeError::InvalidConfig("rate limit buckets"));
+        }
+        Ok(())
+    }
+}

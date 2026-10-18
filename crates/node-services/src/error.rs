@@ -33,8 +33,11 @@ pub enum NodeError {
     PermissionDenied,
     /// 未消费挑战数量达到全局容量上限。
     ChallengeCapacityExceeded,
-    /// 限流拒绝（本阶段仅保留错误码，逐 IP 限流属 API-005）。
-    RateLimited,
+    /// 限流拒绝（API-005）；携带建议的等待时长（毫秒），供客户端退避。
+    RateLimited {
+        /// 建议的重试等待（毫秒），至少为 1。
+        retry_after_ms: u64,
+    },
     /// 群不存在或不属于本节点协调。
     GroupNotFound,
     /// 同一 GroupId 已用相异创建内容登记。
@@ -106,7 +109,7 @@ impl NodeError {
             Self::InvalidCapability => "INVALID_CAPABILITY",
             Self::PermissionDenied => "PERMISSION_DENIED",
             Self::ChallengeCapacityExceeded => "CHALLENGE_CAPACITY_EXCEEDED",
-            Self::RateLimited => "RATE_LIMITED",
+            Self::RateLimited { .. } => "RATE_LIMITED",
             Self::GroupNotFound => "GROUP_NOT_FOUND",
             Self::GroupIdConflict => "GROUP_ID_CONFLICT",
             Self::GroupCapacityExceeded => "GROUP_CAPACITY_EXCEEDED",
@@ -152,7 +155,7 @@ impl NodeError {
             Self::InvalidCapability => "registration capability is not valid",
             Self::PermissionDenied => "request is not authorized for this target",
             Self::ChallengeCapacityExceeded => "node challenge capacity is exhausted",
-            Self::RateLimited => "rate limited",
+            Self::RateLimited { .. } => "rate limited",
             Self::GroupNotFound => "group is unknown to this node",
             Self::GroupIdConflict => "group id was already registered with other content",
             Self::GroupCapacityExceeded => "group member capacity exceeded",

@@ -11,5 +11,6 @@ pub mod group;
 pub mod limits;
 pub mod mailbox;
 pub mod p0_accept;
+pub mod rate_limit;
 pub mod registration;
 pub mod services;

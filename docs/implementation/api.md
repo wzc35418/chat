@@ -1,6 +1,6 @@
 # 节点 HTTP、鉴权、限流与运行入口
 
-阶段：P1 → P5。状态：函数级设计。API-002 issue_auth_challenge 与 API-003 authenticate_request 已随 P1-03 在 [crates/node-api](../../crates/node-api) 与 [crates/node-services](../../crates/node-services) 落地（端点见“已实现端点（P1-03）”）。群日志与信箱的七个端点（NODE-005~011 的 HTTP 适配，对应 API-006 handle_append_http 与 API-007 handle_mailbox_http 的当前范围）已在同一轮落地；附件 blob 的四个端点（NODE-012~015 的 HTTP 适配，对应 API-008 handle_blob_http 的当前范围）在同表登记，见“已实现端点（群日志与信箱）”。客户端侧访问这些端点的实现见 [crates/node-client](../../crates/node-client)（见“客户端（crates/node-client）”）。其余函数仍未实现。目标源码：[crates/node-api/src/handlers.rs](../../crates/node-api/src/handlers.rs)。
+阶段：P1 → P5。状态：函数级设计。API-002 issue_auth_challenge 与 API-003 authenticate_request 已随 P1-03 在 [crates/node-api](../../crates/node-api) 与 [crates/node-services](../../crates/node-services) 落地（端点见“已实现端点（P1-03）”）。群日志与信箱的七个端点（NODE-005~011 的 HTTP 适配，对应 API-006 handle_append_http 与 API-007 handle_mailbox_http 的当前范围）已在同一轮落地；附件 blob 的四个端点（NODE-012~015 的 HTTP 适配，对应 API-008 handle_blob_http 的当前范围）在同表登记，见“已实现端点（群日志与信箱）”。客户端侧访问这些端点的实现见 [crates/node-client](../../crates/node-client)（见“客户端（crates/node-client）”）。**可部署节点入口**（API-010 run_node）与**基础限流**（API-005）也已落地：[apps/node](../../apps/node) 能真正监听并应答全部端点（含匿名的 `GET /v1/health`），超限请求返回 429 `RATE_LIMITED` 并带 `retry_after`；两者同表登记在“已实现端点（群日志与信箱）”。其余函数仍未实现。目标源码：[crates/node-api/src/handlers.rs](../../crates/node-api/src/handlers.rs)。
 
 所有 HTTP DTO 与错误结构单独版本化。公开 /capabilities 与 challenge 也限流。默认监听本地端口，通过明确的 TLS 部署入口提供 HTTPS/WSS；管理接口独立且默认关闭。每个 HTTP handler 只鉴权、解码、调用服务、映射结果，不重复实现领域规则。
 
@@ -28,7 +28,7 @@
 
 ## 已实现端点（群日志与信箱）
 
-路由同样由 `build_router` 构造；全部端点都走 API-003 已登记设备鉴权（挑战 + 设备签名），没有任何绕过鉴权的入口，也没有仅凭账户/设备 ID 的查询路径。
+路由同样由 `build_router` 构造；除 `GET /v1/health` 外全部端点都走 API-003 已登记设备鉴权（挑战 + 设备签名），没有任何绕过鉴权的入口，也没有仅凭账户/设备 ID 的查询路径。
 
 |方法/路径|作用|附加签名/约束|
 |---|---|---|
@@ -43,6 +43,9 @@
 |`PUT /v1/blobs/{upload_id}/chunks/{index}`|按序写入一块密文（NODE-013）|正文是**原始密文字节**（`application/octet-stream`）；顺序/边界/摘要严格校验|
 |`POST /v1/blobs/{upload_id}/complete`|校验清单并发布（NODE-014）|清单块数/总长/整体摘要必须与已上传内容一致；重复完成返回同一回执|
 |`GET /v1/blobs/{blob_id}/chunks/{index}`|取回一块密文（NODE-015）|成员窗口授权；未发布或越权一律拒绝；响应是原始密文字节|
+|`GET /v1/health`|健康检查（API-010）|**匿名、不鉴权、不限流**；只返回 `status/node_id/node_public_key/schema_version`，不含任何秘密与内部状态|
+
+健康检查的定位：运维/探活用，所以既不能要签名（探活方没有设备凭据），也不能被限流（否则过载时最先失去可观测性）。它不返回库路径、配置、队列长度等内部状态，避免成为信息泄露面。
 
 附件 blob 端点的两点特殊约定：
 
@@ -59,6 +62,7 @@
   - 403 `HISTORY_NOT_AUTHORIZED`（设备不在该群允许的历史/成员窗口内）。
   - 404 `GROUP_NOT_FOUND`（群不存在或不由本节点协调）。
   - 409 `GROUP_ID_CONFLICT`、`GROUP_CAPACITY_EXCEEDED`、`SUBMISSION_ID_CONFLICT`、`STALE_CONTROL_HEAD`、`STALE_EPOCH`、`QUOTA_EXCEEDED`、`ITEM_ID_CONFLICT`。
+  - 限流（API-005）：429 `RATE_LIMITED`，响应体带 `error.retry_after_ms`（毫秒，窗口剩余时间，至少 1），HTTP 头带 `retry-after`（秒，向上取整）。该码此前只是预留；现在真的会返回。错误体的 `retry_after_ms` 是**可选新增字段**（`skip_serializing_if`），其它错误不会出现，旧客户端可忽略。
   - 附件 blob（NODE-012~015）新增码：400 `CHUNK_OUT_OF_ORDER`（未按序）、404 `UPLOAD_NOT_FOUND`/`BLOB_NOT_FOUND`（会话或已发布对象不存在）、410 `UPLOAD_EXPIRED`（会话过期或已结束）、409 `BLOB_UPLOAD_CONFLICT`（同 operation 换描述或 blob_id 已占用）、`CHUNK_CONFLICT`（同序号相异摘要）、`MISSING_CHUNKS`（缺块，含缺末块）、`MANIFEST_MISMATCH`（块数/总长/整体摘要/单块边界不符）、413 `CONTENT_TOO_LARGE`（单块或声明总长超上限；与“正文超过 HTTP 上限”的 `PAYLOAD_TOO_LARGE` 区分）。
 - 复用既有码：401 `INVALID_CHALLENGE/NODE_ID_MISMATCH/AUTH_EXPIRED/AUTH_REPLAY/INVALID_SIGNATURE/INVALID_CREDENTIAL`，403 `DEVICE_REVOKED/INVALID_CAPABILITY/PERMISSION_DENIED`，400 `INVALID_REQUEST/UNSUPPORTED_SCHEMA_VERSION`，503 `STORAGE_FAILURE`。
 - 不泄漏语义：未知信箱条目、他人条目、越权目标都统一返回 403 `PERMISSION_DENIED`；日志读取的成员窗口失败返回 403 `HISTORY_NOT_AUTHORIZED`，不返回“该 seq 存在但你看不到”。
@@ -116,12 +120,13 @@
 
 ### 验证证据
 
-命令与结果：`cargo test --offline -p chat-node-client` → 38 个测试全部通过（13 个 lib 单元测试 + 11 个 `tests/client_limits.rs` + 9 个 `tests/http_flow.rs` + 5 个 `tests/blob_flow.rs`），0 警告；三 crate 合计 117 个测试（node-services 63 + node-api 16 + node-client 38）全绿。
+命令与结果：`cargo test --offline -p chat-node-client` → 38 个测试全部通过（13 个 lib 单元测试 + 11 个 `tests/client_limits.rs` + 9 个 `tests/http_flow.rs` + 5 个 `tests/blob_flow.rs`），0 警告；四 crate 合计 135 个测试（node-services 70 + node-api 19 + node-client 38 + chat-node 8）全绿。
 
 - 真 TCP 端到端（`tests/http_flow.rs`：在进程内用 `axum::serve` 起 [crates/node-api](../../crates/node-api) 的真实路由，服务端是真实 node-services）：`challenge_registration_and_signed_outputs_are_verified`（挑战由固定节点公钥验签、注册回执验签、重复注册幂等）、`group_log_head_and_idempotent_append_flow`（建群幂等、append 同 submission 同字节重试返回同 seq、fetch_log 分页、head 与页内 head 一致）、`mailbox_store_read_and_ack_flow`（投递幂等、读取分页与重复读、ACK 幂等与越权 403）、`wrong_device_key_is_rejected_without_retrying`、`replayed_and_expired_challenges_are_rejected`、`unknown_device_and_non_member_are_rejected`、`divergent_bytes_for_one_submission_are_a_conflict`、`wrong_node_identity_and_wrong_pinned_key_are_rejected`、`oversized_request_is_rejected_before_sending`。
 - 边界语义（`tests/client_limits.rs`：脚本化最小 HTTP/1.1 服务）：`auth_failure_is_retried_once_and_then_succeeds`（旧挑战失败后重取一次成功，挑战请求恰好 2 次）、`retry_budget_is_exactly_one_retry`、`single_attempt_budget_sends_one_request`、`oversized_response_with_content_length_is_rejected`、`oversized_chunked_response_is_rejected_by_incremental_budget`、`signed_request_timeout_is_retried_once_then_reported`、`anonymous_challenge_timeout_is_reported_without_retry`、`network_failure_is_reported_and_bounded`、`redirects_are_not_followed`（重定向不产生第二次请求）、`wrong_node_id_in_challenge_is_rejected`、`unknown_error_code_is_not_silently_treated_as_success`。
 
 - 附件 blob（`tests/blob_flow.rs` + node-api 的 `tests/group_mailbox_http.rs`）：`blob_upload_and_read_round_trip_over_http`（会话/分块/发布/读取往返；上传者与群内老成员都能读到逐字节一致的密文；群外设备 403 HISTORY_NOT_AUTHORIZED）、`duplicate_chunk_is_idempotent_and_size_violation_is_rejected`、`out_of_order_and_missing_chunks_are_rejected`、`digest_mismatch_is_rejected_and_unfinished_blob_is_not_readable`、`foreign_writer_and_non_canonical_ids_are_rejected`；HTTP 契约侧 `blob_http_error_statuses_are_stable`（409/410/413/400/404 逐项断言）与 `blob_endpoints_require_bound_authentication`（缺鉴权头 400、换方法/路径/正文 401、群外设备 403、方法/路由边界 405/404）。
+- 限流与运行入口（Z 包）：`cargo test --offline -p chat-node-services -p chat-node-api -p chat-node` 全绿 —— node-services 70（含 7 个 `rate_limit::tests` 单元用例）、node-api 19（含 `tests/rate_limit_http.rs` 的 3 个真 TCP 429 用例）、chat-node 8（6 个 lib 单测 + `tests/smoke.rs` 的进程内与真实二进制冒烟）。限流证据：`anonymous_endpoints_return_429_with_retry_after`、`device_endpoints_return_429_after_the_device_budget`、`health_is_never_rate_limited`；运行入口证据：`in_process_node_serves_health_and_shuts_down_cleanly`、`binary_starts_logs_only_public_identity_and_serves_health`（真实子进程 + 启动日志不含种子）。`cargo build --offline -p chat-node` 成功。
 ### 已知限制
 
 - 客户端不含 MLS/加密层的内容构造：候选密文、Welcome 等字节由上游加密层提供，本 crate 只负责传输、签名与错误映射（领域校验仍由节点与客户端加密层各自负责）。
@@ -172,9 +177,20 @@ load_node_config(path: ConfigPath, env: AllowedOverrides) -> Result<NodeConfig>
 **完成验收**：
 
 - [ ] 缺持久卷配置拒绝生产启动。
-- [ ] 非法负限额拒绝。
+- [x] 非法负限额拒绝。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（Z 包，run_node 轮次）：命令行/环境变量版本已落地，TOML 配置文件尚未实现。源码：[apps/node/src/lib.rs](../../apps/node/src/lib.rs) 的 `NodeConfig::from_args_and_env`。
+
+已实现：
+
+1. 只接受显式开关（`--bind`/`--data-dir`/`--seed-file`/`--node-id`/`--expect-public-key`/`--allow-public-bind`/`--init-seed`），未知参数直接拒绝；同名环境变量可覆盖默认值，命令行优先。
+2. `--bind` 必须能解析成 `ip:port`；非回环地址必须再给 `--allow-public-bind`（进程内没有 TLS 终止），否则拒绝启动。
+3. `--seed-file` 必填：缺失即拒绝启动（`--init-seed` 才允许生成新种子）；`--expect-public-key` 必须是 64 位十六进制，且与种子派生的公钥不一致时**在打开数据库之前**拒绝，避免把错误身份写进库。
+4. 限额全部是无符号类型且逐项范围校验（窗口 1..=3600 秒、请求数 1..=1_000_000、桶表 16..=65_536），负值在解析阶段就被拒绝（`INVALID_CONFIG`）；策略在 `NodeService::open` 时再次校验。
+
+证据：`cargo test --offline -p chat-node` 的 `config_requires_a_seed_file_and_valid_bind`、`public_bind_requires_an_explicit_opt_in`、`environment_is_used_and_command_line_wins`、`expected_public_key_must_be_canonical_hex`、`node_id_is_derived_from_the_public_key_when_absent`（含固定公钥不一致时拒绝且不建库）。
+
+已知限制：TOML 配置、目录权限检查（`INSECURE_STORAGE_PATH`）、外部 URL/TLS 模式声明与“限额乘法溢出”检查未实现，因此“缺持久卷配置拒绝生产启动”仍未勾选。通过本函数用例不自动代表整个模块完成。
 
 <a id="api-002"></a>
 
@@ -316,10 +332,27 @@ enforce_rate_limit(actor: Option<DeviceId>, route: RouteClass, cost: RequestCost
 
 **完成验收**：
 
-- [ ] 伪造 X-Forwarded-For 无效。
-- [ ] 大上传按字节计而非仅请求数。
+- [x] 伪造 X-Forwarded-For 无效。
+- [x] 大上传按字节计而非仅请求数。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（Z 包，run_node 轮次）。源码：[crates/node-services/src/rate_limit.rs](../../crates/node-services/src/rate_limit.rs)（策略与常量在 [limits.rs](../../crates/node-services/src/limits.rs)），HTTP 接线在 [crates/node-api/src/state.rs](../../crates/node-api/src/state.rs) 与 [handlers.rs](../../crates/node-api/src/handlers.rs)。
+
+位置：**只在 HTTP 层生效**。匿名端点在 handler 首行调用 `limit_anonymous`；已登记设备端点在 `authenticate` 助手内（鉴权成功后）调用 `limit_device`，因此新增端点不可能“忘记限流”，而服务层单测与节点内部调用完全不经过限流器。
+
+已实现行为：
+
+1. 固定窗口（默认 60 秒，可配）进程内计数；桶表有界（默认 4096，上限 65536）：满表时先清理上一窗口的桶，仍满则显式拒绝新键（fail-closed，绝不无界增长）。
+2. 三个维度：每设备请求数（默认 120/窗口）、每账户请求数（默认 240/窗口，同一账户多设备共享）、匿名全局请求数（默认 600/窗口）。设备桶额外计**请求正文字节**（默认 8 MiB/窗口），所以附件分块上传按字节计而不只是次数。
+3. 超限返回 429 `RATE_LIMITED`：响应体带 `error.retry_after_ms`（毫秒，等于窗口剩余时间，至少 1），HTTP 头额外带 `retry-after`（秒，向上取整）。客户端据此退避，不需要猜。
+4. **从不读取任何代理头**：`X-Forwarded-For`/`X-Real-IP` 完全不参与预算键，因此伪造它们不会得到额外配额；反过来也意味着没有逐 IP 维度（见限制）。
+5. `/v1/health` 豁免限流（否则监控探活会被自己拒绝）。
+
+验证证据（`cargo test --offline -p chat-node-services -p chat-node-api` 全绿）：
+
+- 单元（`rate_limit::tests`）：`device_budget_is_enforced_and_resets_with_the_window`（设备预算、retry_after 范围、下一窗口恢复）、`account_budget_is_shared_across_devices`（账户预算跨设备共享）、`request_bytes_are_counted_per_device`（字节预算，含大请求）、`anonymous_requests_share_one_global_budget`、`disabled_policy_allows_everything`、`bucket_table_stays_bounded_and_fails_closed`、`invalid_policy_is_rejected`。
+- 真 TCP（`crates/node-api/tests/rate_limit_http.rs`）：`anonymous_endpoints_return_429_with_retry_after`（挑战端点第 3 次 429，body 的 retry_after_ms 与 `retry-after` 头都体现）、`device_endpoints_return_429_after_the_device_budget`（设备预算 2，第 3 次鉴权请求 429，另一设备不受影响）、`health_is_never_rate_limited`。
+
+已知限制：没有逐 IP/子网维度（不读代理头，同一 NAT 后共享匿名预算）；计数在进程内，多实例部署时每个实例各自计数（重启会清零，因此重启是绕过窗口预算的方式——生产部署需要集中式计数或持久计数）；没有“可信代理头策略”配置项，也没有按路由类别的差异化预算（RouteClass 粒度未落地）；429 不关闭连接、不惩罚性延长窗口。通过本函数用例不自动代表整个模块完成。
 
 <a id="api-006"></a>
 
@@ -508,8 +541,29 @@ run_node(config: NodeConfig, shutdown: ShutdownSignal) -> Result<NodeExit>
 
 **完成验收**：
 
-- [ ] 节点在 append 返回后重启不丢日志。
-- [ ] 无私钥/正文诊断输出。
+- [x] 节点在 append 返回后重启不丢日志。
+- [x] 无私钥/正文诊断输出。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（Z 包，run_node 轮次）。源码：[apps/node/src/lib.rs](../../apps/node/src/lib.rs)（`spawn_node` / `RunningNode` / `run_from_env`，二进制约 [main.rs](../../apps/node/src/main.rs)），端点由 [crates/node-api](../../crates/node-api) 的 `build_router` 提供。
+
+启动顺序（先持久层、后监听）：
+
+1. 解析并校验配置（见 API-001 的当前范围）；
+2. 读取种子、派生公钥（`--expect-public-key` 不一致则**在任何持久化之前**退出）；
+3. 创建数据目录并 `NodeService::open`（执行 0001~0004 迁移并校验校验和、固定节点身份、校验策略）；
+4. `NodeConfig.bind` 同步绑定端口（失败立即退出，不留“看似已启动”的进程）；
+5. 在独立线程的 current-thread 运行时里 `axum::serve` 全部端点（挑战/注册/群日志/信箱/附件 blob/健康检查）；
+6. 日志只输出一行 `chat-node started node_id=... address=... database=...`；
+7. Ctrl+C → `with_graceful_shutdown` 停止接受新请求、等在途请求结束 → 服务线程退出、数据库连接随 `NodeService` 释放；最后打印 `chat-node stopped`。
+
+`spawn_node` 返回的 `RunningNode` 携带真实绑定地址（`--bind 127.0.0.1:0` 时是系统分配的端口）、`node_id`、公钥与库路径，测试与运维都从返回值/日志拿到地址，不需要猜端口。
+
+验证证据（`cargo test --offline -p chat-node` 全绿，8 个测试）：
+
+- 进程内（`tests/smoke.rs::in_process_node_serves_health_and_shuts_down_cleanly`）：真 TCP `GET /v1/health` 返回 200 且带 `status/node_id/schema_version`，关闭后端口不可连，`node.db` 在监听之前已落盘；同时确认健康检查正文不含 `signing`/`secret`/`seed` 字样。
+- 真实二进制（`tests/smoke.rs::binary_starts_logs_only_public_identity_and_serves_health`）：用 `CARGO_BIN_EXE_chat-node` 起子进程，解析启动日志里的 `address=`，做健康检查，并断言 stdout/stderr 都**不含种子的十六进制**。
+- 库内单测 `node_id_is_derived_from_the_public_key_when_absent` 走真实 `spawn_node` + `shutdown`，并证明固定公钥不一致时拒绝启动且不建库。
+- “append 返回后重启不丢日志”由既有 `crates/node-services` 的持久库用例（`tests/group_log.rs` 的崩溃/重开用例与 `p0_accept`）证明持久层语义，run_node 只是在该持久库上启动；本轮没有新增“整进程 kill -9 后重开”的脚本化实验。
+
+已知限制：没有后台 GC worker（NODE-016）、没有 TLS 终止（默认只允许回环监听，公开部署需要前置 TLS 反向代理并显式 `--allow-public-bind`）、没有管理接口/指标、没有多实例协调与租约；`SHUTDOWN_TIMEOUT` 没有实现（优雅关闭没有超时上限，靠 axum 的在途请求自然结束）；进程崩溃后没有“staged 物恢复”步骤（附件块与日志都在 SQLite，单库单事务，因此不需要文件系统恢复）。通过本函数用例不自动代表整个模块完成。
 

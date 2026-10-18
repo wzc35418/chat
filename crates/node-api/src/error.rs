@@ -22,6 +22,9 @@ pub struct ErrorResponseDto {
 pub struct ErrorDetailDto {
     pub code: &'static str,
     pub message: &'static str,
+    /// 建议的重试等待（毫秒）；只有限流等“稍后再来”的错误会带这个字段。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 /// HTTP 适配错误。
@@ -30,6 +33,7 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: &'static str,
+    retry_after_ms: Option<u64>,
 }
 
 impl ApiError {
@@ -39,7 +43,13 @@ impl ApiError {
             status,
             code,
             message,
+            retry_after_ms: None,
         }
+    }
+
+    /// 建议的重试等待（毫秒），只用于 429 之类的“稍后再来”错误。
+    pub fn retry_after_ms(&self) -> Option<u64> {
+        self.retry_after_ms
     }
 
     /// 请求形状不合法。
@@ -109,7 +119,7 @@ impl ApiError {
             | NodeError::ChunkOutOfOrder
             | NodeError::MissingChunks
             | NodeError::ManifestMismatch => StatusCode::CONFLICT,
-            NodeError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            NodeError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             NodeError::ChallengeCapacityExceeded
             | NodeError::StorageUnavailable
             | NodeError::Storage(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -118,10 +128,15 @@ impl ApiError {
             | NodeError::InvalidConfig(_)
             | NodeError::Encoding(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        let retry_after_ms = match &error {
+            NodeError::RateLimited { retry_after_ms } => Some(*retry_after_ms),
+            _ => None,
+        };
         Self {
             status,
             code: error.code(),
             message: error.safe_message(),
+            retry_after_ms,
         }
     }
 
@@ -143,8 +158,19 @@ impl IntoResponse for ApiError {
             error: ErrorDetailDto {
                 code: self.code,
                 message: self.message,
+                retry_after_ms: self.retry_after_ms,
             },
         };
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        // HTTP 语义里的 Retry-After 以秒为单位（向上取整，至少 1 秒）。
+        if let Some(retry_after_ms) = self.retry_after_ms {
+            let seconds = retry_after_ms.div_ceil(1000).max(1);
+            if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }

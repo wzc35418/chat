@@ -448,3 +448,25 @@ pub fn parse_chunk_index(raw: &str) -> Result<u32, ApiError> {
     raw.parse::<u32>()
         .map_err(|_| ApiError::invalid_request("chunk index must be an unsigned integer"))
 }
+/// GET /v1/health 响应：只含公开身份与 API schema 版本。
+#[derive(Clone, Debug, Serialize)]
+pub struct HealthResponseDto {
+    pub schema_version: u16,
+    /// 固定 `ok`：能返回该结构就说明服务进程可应答。
+    pub status: &'static str,
+    pub node_id: String,
+    /// 节点签名公钥（公开材料，客户端用它固定节点身份）。
+    pub node_public_key: String,
+}
+
+impl HealthResponseDto {
+    /// 包装节点公开身份。
+    pub fn new(node_id: String, node_public_key: String) -> Self {
+        Self {
+            schema_version: DTO_SCHEMA_VERSION,
+            status: "ok",
+            node_id,
+            node_public_key,
+        }
+    }
+}

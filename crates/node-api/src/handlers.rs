@@ -14,7 +14,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chat_node_services::auth::{ChallengePurpose, RequestMeta};
 use chat_node_services::services::AuthenticatedDevice;
-use chat_node_services::canonical::sha256;
+use chat_node_services::canonical::{hex_encode, sha256};
 use chat_node_services::limits::MAX_HTTP_BODY_BYTES;
 use serde::de::DeserializeOwned;
 
@@ -25,7 +25,8 @@ use crate::dto::{
     CompleteBlobUploadRequestDto, DeviceRegistrationResponseDto, GroupHeadResponseDto,
     GroupLogResponseDto, GroupRegistrationResponseDto, MailboxPageResponseDto,
     MailboxReceiptResponseDto, RegisterDeviceRequestDto, RegisterGroupRequestDto,
-    SignedAuthHeaders, StoreMailboxItemRequestDto, UploadSessionResponseDto, parse_chunk_index,
+    HealthResponseDto, SignedAuthHeaders, StoreMailboxItemRequestDto, UploadSessionResponseDto,
+    parse_chunk_index,
 };
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -41,6 +42,8 @@ const DEFAULT_MAILBOX_PAGE_LIMIT: u32 = 20;
 /// 逐 IP 限流（API-005）与事件套接字（API-009）尚未在本阶段实现。
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        // 健康检查：匿名、不鉴权、不限流，只返回公开身份（不含任何秘密）。
+        .route("/v1/health", get(health))
         .route("/v1/auth/challenge", post(issue_challenge))
         .route("/v1/devices", post(register_device))
         .route("/v1/groups", post(register_group))
@@ -77,10 +80,14 @@ fn parse_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
         .map_err(|_| ApiError::invalid_request("request body is not valid json for this endpoint"))
 }
 
-/// API-003：用请求头里的设备签名完成鉴权，返回已登记设备身份。
+/// API-003 鉴权 + API-005 限流：所有已登记设备端点都走这一条路径。
 ///
 /// 签名原文由服务层从 method/path/query/正文摘要重建，因此换方法、换路径、换查询、
 /// 换正文、换节点或重放同一挑战都会在鉴权阶段失败。
+///
+/// 鉴权成功后立刻按 (设备, 账户) 两个桶扣减预算：超限返回 429 RATE_LIMITED 并带
+/// retry_after。放在这里而不是逐个 handler 里，是为了让“新增端点忘记限流”不可能发生；
+/// 限流只在 HTTP 层生效，服务层单测不经过它。
 fn authenticate(
     state: &AppState,
     headers: &HeaderMap,
@@ -94,9 +101,11 @@ fn authenticate(
         .map_err(ApiError::from_node)?;
     let body_hash = sha256(body);
     let signed = auth_headers.to_signed_auth();
-    state.with_service(|service| {
+    let actor = state.with_service(|service| {
         service.authenticate_request(&meta, &body_hash, &signed, ChallengePurpose::RequestAuth, now)
-    })
+    })?;
+    state.limit_device(&actor.device_id, &actor.account_id, body.len() as u64)?;
+    Ok(actor)
 }
 
 /// 严格解析查询串：只接受 `key=value`、不重复、字符集受限。
@@ -152,6 +161,8 @@ pub async fn issue_challenge(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     ensure_body_bounded(&state, body.len())?;
+    // API-005：匿名端点先扣全局匿名预算（不读任何代理头）。
+    state.limit_anonymous(body.len() as u64)?;
     let request: ChallengeRequestDto = parse_body(&body)?;
     let purpose = request.purpose()?;
     let now = state.now();
@@ -169,6 +180,8 @@ pub async fn register_device(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     ensure_body_bounded(&state, body.len())?;
+    // API-005：注册同样是匿名端点，先扣全局匿名预算。
+    state.limit_anonymous(body.len() as u64)?;
     let request: RegisterDeviceRequestDto = parse_body(&body)?;
     let request = request.into_request()?;
     let auth_headers = SignedAuthHeaders::from_headers(&headers)?;
@@ -388,4 +401,11 @@ pub async fn read_blob_chunk(
         chunk.bytes,
     )
         .into_response())
+}
+/// GET /v1/health：最小健康检查（匿名、不鉴权、不限流）。
+///
+/// 只返回节点公开身份与 API schema 版本；不返回密钥、配置、库路径或任何内部状态。
+pub async fn health(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let (node_id, node_public_key) = state.node_identity()?;
+    Ok(Json(HealthResponseDto::new(node_id, hex_encode(&node_public_key))).into_response())
 }

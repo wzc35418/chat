@@ -7,3 +7,9 @@ publish.workspace = true
 [dependencies]
 chat-node-api.workspace = true
 chat-node-services.workspace = true
+# run_node 需要 bind/serve + Ctrl+C 信号 + 独立运行时的驱动能力（版本取自 workspace）。
+axum.workspace = true
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal", "time", "macros", "sync"] }
+# 启动时派生节点公钥、校验固定公钥；--init-seed 用安全随机生成种子（均为 workspace 依赖）。
+ed25519-dalek.workspace = true
+rand.workspace = true

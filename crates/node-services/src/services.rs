@@ -20,7 +20,7 @@ use crate::limits::{
     CHALLENGE_PURGE_BATCH, CHALLENGE_RETENTION_SECONDS, DEFAULT_CHALLENGE_TTL_SECONDS,
     DEFAULT_CLOCK_SKEW_SECONDS, DEFAULT_MAX_DEVICES_PER_ACCOUNT, DEFAULT_MAX_PENDING_CHALLENGES,
     BlobPolicy, GroupLogPolicy, MAX_ACCOUNT_ID_BYTES, MAX_DEVICE_ID_BYTES, MAX_HTTP_BODY_BYTES,
-    MAX_NODE_ID_BYTES, MailboxPolicy,
+    MAX_NODE_ID_BYTES, MailboxPolicy, RateLimitPolicy,
 };
 use crate::registration::{DeviceRegistration, RegisterDeviceRequest};
 
@@ -49,6 +49,8 @@ pub struct NodeAuthPolicy {
     pub mailbox: MailboxPolicy,
     /// 附件 blob 上传/读取上限。
     pub blob: BlobPolicy,
+    /// API-005 HTTP 层限流策略。
+    pub rate_limit: RateLimitPolicy,
 }
 
 impl Default for NodeAuthPolicy {
@@ -62,6 +64,7 @@ impl Default for NodeAuthPolicy {
             group_log: GroupLogPolicy::default(),
             mailbox: MailboxPolicy::default(),
             blob: BlobPolicy::default(),
+            rate_limit: RateLimitPolicy::default(),
         }
     }
 }
@@ -86,6 +89,7 @@ impl NodeAuthPolicy {
         self.group_log.validate()?;
         self.mailbox.validate()?;
         self.blob.validate()?;
+        self.rate_limit.validate()?;
         Ok(())
     }
 }

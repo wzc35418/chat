@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chat_node_services::error::{NodeError, NodeResult};
+use chat_node_services::limits::RateLimitPolicy;
+use chat_node_services::rate_limit::RateLimiter;
 use chat_node_services::services::NodeService;
 
 use crate::error::ApiError;
@@ -61,19 +63,43 @@ impl Clock for FixedClock {
     }
 }
 
-/// axum 共享状态：单连接节点服务 + 时钟。
+/// axum 共享状态：单连接节点服务 + 时钟 + HTTP 层限流器。
 #[derive(Clone)]
 pub struct AppState {
     service: Arc<Mutex<NodeService>>,
     clock: Arc<dyn Clock>,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl AppState {
-    /// 用显式时钟建立状态。
+    /// 用显式时钟建立状态；限流器取节点策略（策略在 NodeService::open 时已校验）。
     pub fn new(service: NodeService, clock: Arc<dyn Clock>) -> Self {
+        let policy = service.policy().rate_limit.clone();
+        // 防御式回退：策略不合法时退化为“关闭限流”，而不是 panic 或静默放行未知配置。
+        let rate_limiter = RateLimiter::new(policy).unwrap_or_else(|_| {
+            RateLimiter::new(RateLimitPolicy {
+                enabled: false,
+                ..RateLimitPolicy::default()
+            })
+            .expect("disabled rate limit policy is always valid")
+        });
         Self {
             service: Arc::new(Mutex::new(service)),
             clock,
+            rate_limiter: Arc::new(rate_limiter),
+        }
+    }
+
+    /// 用显式限流器建立状态（测试用固定窗口/紧预算）。
+    pub fn with_rate_limiter(
+        service: NodeService,
+        clock: Arc<dyn Clock>,
+        rate_limiter: RateLimiter,
+    ) -> Self {
+        Self {
+            service: Arc::new(Mutex::new(service)),
+            clock,
+            rate_limiter: Arc::new(rate_limiter),
         }
     }
 
@@ -93,6 +119,32 @@ impl AppState {
             .lock()
             .map(|service| service.policy().max_request_body_bytes)
             .unwrap_or(chat_node_services::limits::MAX_HTTP_BODY_BYTES)
+    }
+
+    /// 当前限流器（观测用）。
+    pub fn rate_limiter(&self) -> &RateLimiter {
+        &self.rate_limiter
+    }
+
+    /// API-005：匿名端点的一次请求（挑战签发/设备注册）。
+    ///
+    /// 只在 HTTP 层调用；超限返回 429 + RATE_LIMITED，并带 retry_after。
+    pub fn limit_anonymous(&self, bytes: u64) -> Result<(), ApiError> {
+        self.rate_limiter
+            .check_anonymous(bytes, self.now())
+            .map_err(ApiError::from_node)
+    }
+
+    /// API-005：已登记设备的一次请求（同时占设备桶与账户桶）。
+    pub fn limit_device(&self, device_id: &str, account_id: &str, bytes: u64) -> Result<(), ApiError> {
+        self.rate_limiter
+            .check_device(device_id, account_id, bytes, self.now())
+            .map_err(ApiError::from_node)
+    }
+
+    /// 节点公开身份（node_id + 签名公钥）；两者都不是秘密，供 /v1/health 使用。
+    pub fn node_identity(&self) -> Result<(String, [u8; 32]), ApiError> {
+        self.with_service(|service| Ok((service.node_id().to_owned(), service.node_public_key())))
     }
 
     /// 在锁内执行一次服务调用；锁中毒映射为 STORAGE_FAILURE，绝不当作成功。

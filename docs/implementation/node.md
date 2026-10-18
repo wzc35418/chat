@@ -83,11 +83,11 @@ register_device(request: RegisterDeviceRequest, invite: RegistrationCapability) 
 已知限制（未勾选的验收项之外仍需补齐的能力）：
 
 - 账户根信任：节点侧没有账户主管公钥的预注册，首次注册按 TOFU 固定；真正的账户根信任需要 IDENTITY 阶段提供可信锚点，当前实现只保证“后续设备必须由同一主管钥授权”。
-- 逐 IP / 逐设备限流（API-005）未实现；当前只有全局未消费挑战容量上限、单请求正文上限与单次清理批量上限。错误码 `RATE_LIMITED` 已预留，但本阶段没有任何路径返回它。
+- 逐设备/账户限流（API-005）已在 HTTP 层实现（[src/rate_limit.rs](../../crates/node-services/src/rate_limit.rs)，记录见 [api.md](api.md) 的 API-005）：固定窗口、进程内计数、设备/账户双桶、超限返回 429 `RATE_LIMITED` 并带 `retry_after`。**逐 IP 维度仍未实现**：节点从不读取 `X-Forwarded-For` 等代理头，伪造代理头因此无效，但同一 NAT 后的匿名请求共享一个全局匿名预算。此外仍有全局未消费挑战容量上限、单请求正文上限与单次清理批量上限。
 - 注册能力撤销只读取 0001 的 `capability_revocations`（按 issuer_id=account_id + capability_id 匹配版本）；本阶段没有对外撤销端点，撤销记录需由后续阶段或运维写入。
 - 挑战只持久化 nonce 的 SHA-256（沿用 0001 表结构），因此客户端必须回送 nonce；挑战不可跨重启重放，但节点重启后旧挑战仍会按过期时间被拒绝。
 - 已登记设备更换凭据（撤销后重新授权）在 P1-03 明确拒绝（`INVALID_CREDENTIAL` / `DEVICE_REVOKED`），设备撤销与重授权流程属后续阶段。
-- NODE-002 publish_discovery、NODE-003～NODE-004（密钥包）、NODE-016（TTL 回收）与 API-005～API-010（逐设备限流、事件套接字、`run_node` 与运行入口）仍未实现；[apps/node](../../apps/node) 仍是明确以 78 退出的骨架，不能被当作可部署节点。NODE-005~015 已有正式实现，但仍是“单进程、单 SQLite 连接串行”的形态，没有部署级运行入口。
+- NODE-002 publish_discovery、NODE-003～NODE-004（密钥包）、NODE-016（TTL 回收）与 API-009～API-010 的其余部分（事件套接字、后台 GC、TLS 终止、管理接口）仍未实现。[apps/node](../../apps/node) 现在**真的会启动**（`run_node`：配置 → 迁移 → 绑定 → axum 全部端点 → Ctrl+C 优雅关闭；实现记录见 [api.md](api.md) 的 API-010），但仍是“单进程、单 SQLite 连接串行、进程内限流”的形态：没有多实例协调、没有 TLS（默认只允许回环监听）、没有后台回收 worker，因此还不是生产级可部署节点。
 
 通过本函数用例不自动代表整个模块完成。
 
