@@ -1074,6 +1074,57 @@ impl Store {
         Ok(ids)
     }
 
+    /// 某条消息引用的附件 ID 列表（按 ID 升序，上限 MAX_MESSAGE_ATTACHMENT_LIST）。
+    ///
+    /// 供界面展示消息附件；只返回 ID，不解密任何记录。
+    pub fn message_attachment_refs_for_message(&self, message_id: &str) -> Result<Vec<String>> {
+        self.ensure_ready()?;
+        validate_message_id(message_id)?;
+        let mut statement = self.connection().prepare(
+            "SELECT attachment_id FROM message_attachments
+              WHERE message_id = ?1 ORDER BY attachment_id ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![message_id, i64::from(MAX_MESSAGE_ATTACHMENT_LIST)],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
+    }
+
+    /// 显式删除一条消息（引用随外键级联清除）；返回是否真的删除。
+    ///
+    /// 只删 messages 行本身：message_attempts/草稿等由各自的生命周期管理；
+    /// 附件引用（message_attachments）与回执（receipts）由外键级联删除。
+    pub fn delete_message(&mut self, message_id: &str) -> Result<bool> {
+        self.ensure_ready()?;
+        validate_message_id(message_id)?;
+        let mut transaction = self.begin_transaction(WriteScope::attachments())?;
+        let outcome = (|| -> Result<bool> {
+            let deleted = transaction
+                .transaction
+                .execute("DELETE FROM messages WHERE message_id = ?1", [message_id])?;
+            if deleted > 0 {
+                transaction.note(deleted);
+            }
+            Ok(deleted > 0)
+        })();
+        match outcome {
+            Ok(deleted) => {
+                commit_transaction(transaction)?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                Err(error)
+            }
+        }
+    }
+
     /// GC 用：状态为 state 且 created_at 早于 cutoff 的附件 ID（升序、有界）。
     pub fn attachment_ids_with_state_before(
         &self,

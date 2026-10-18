@@ -28,7 +28,10 @@
 //!   本切片把“已写入策略快照”视为本地生效，pending 提交仍会被如实报告；
 //! - 有未决控制提交时 GROUPS-004 显式拒绝，GROUPS-003 由 crypto 的 `prepare_control` 拒绝。
 
-use chat_crypto::control::{ControlError, ControlOperation, PendingControl};
+use chat_crypto::control::{
+    CommitExpectation, ControlError, ControlOperation, PendingControl, ProcessedEntry,
+    VerifiedGroupEntry, WelcomeAcceptance,
+};
 use chat_crypto::engine::MlsDevice;
 use chat_domain::{
     Actor, ConversationKind, DomainError, GroupMember, GroupOperation, GroupSnapshot, MemberRole,
@@ -721,12 +724,15 @@ fn persist_snapshot(store: &mut Store, record: &GroupRecord, epoch: u64) -> Grou
 /// 3. 有其余成员时用 CRYPTO-005 `prepare_control(AddMembers)` 生成真实 Commit/Welcome，**pending 落库**；
 /// 4. 快照（名称/成员/角色/禁言/策略头/版本）写入正式库的独立命名空间记录；
 /// 5. 返回真实 epoch 与 pending 的群投影。
-pub fn create_group(
+///
+/// 本变体额外返回**引导成员的 Welcome 字节**：投递给对方后由 [group_join_from_welcome] 加入
+/// （投递与重试属 NODE/SYNC 层，本切片只负责产出真实 Welcome）。
+pub fn create_group_with_welcome(
     device: &mut MlsDevice,
     bootstrap_peer: &GroupBootstrapPeer<'_>,
     store: &mut Store,
     request: &CreateGroupRequest,
-) -> GroupResult<GroupView> {
+) -> GroupResult<(GroupView, Vec<u8>)> {
     // ---- 1) 写入前的全部校验 -------------------------------------------------
     validate_name(&request.name)?;
     validate_credential(&request.local_credential)?;
@@ -786,7 +792,7 @@ pub fn create_group(
             "the bootstrap peer is also listed as an additional member",
         ));
     }
-    device
+    let welcome = device
         .create_and_invite(&peer_key_package, bootstrap_peer.device)
         .map_err(|_| {
             GroupError::invalid_candidate(
@@ -872,7 +878,17 @@ pub fn create_group(
     let _ = domain_snapshot(&record)?;
     let saved = persist_snapshot(store, &record, epoch)?;
 
-    Ok(project(&record, epoch, pending.as_ref(), saved))
+    Ok((project(&record, epoch, pending.as_ref(), saved), welcome))
+}
+
+/// GROUPS-001（无 Welcome 版本）：建群并丢弃引导 Welcome（投递由上层负责）。
+pub fn create_group(
+    device: &mut MlsDevice,
+    bootstrap_peer: &GroupBootstrapPeer<'_>,
+    store: &mut Store,
+    request: &CreateGroupRequest,
+) -> GroupResult<GroupView> {
+    create_group_with_welcome(device, bootstrap_peer, store, request).map(|(view, _)| view)
 }
 
 /// GROUPS-002：读取正式群快照（库离线也返回最后正式状态，不联网）。
@@ -1273,6 +1289,345 @@ pub fn discard_pending_control(
     });
     let saved = persist_snapshot(store, &record, record.mls_epoch)?;
     Ok(project(&record, discarded.epoch, None, saved))
+}
+/// 对端条目的输入（外层已验证的公开绑定字段；不含任何密钥）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerEntryInput {
+    /// 协议群 ID（PROTOCOL-001 `grp:1:<hex>`，与本机快照一致）。
+    pub group_id: String,
+    /// 外层已验证的条目 epoch（必须等于本机快照 epoch）。
+    pub epoch: u64,
+    /// 外层已验证的作者凭据身份（crypto 会与 MLS 认证作者比对）。
+    pub sender_identity: String,
+    /// 对端 Commit 的预期成员变化（应用消息为 `None`）。
+    pub expectation: Option<CommitExpectation>,
+    /// MLS 消息字节（应用消息或 Commit）。
+    pub payload: Vec<u8>,
+    /// 外层已验证控制元数据里的**新增成员身份**（数量必须等于真实 Commit 的新增数）。
+    pub added_members: Vec<String>,
+    /// 外层已验证控制元数据里的**移除成员身份**（数量必须等于真实 Commit 的移除数）。
+    pub removed_members: Vec<String>,
+}
+
+impl PeerEntryInput {
+    /// 只带绑定字段的构造（成员增删默认空）。
+    pub fn new(
+        group_id: impl Into<String>,
+        epoch: u64,
+        sender_identity: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            group_id: group_id.into(),
+            epoch,
+            sender_identity: sender_identity.into(),
+            expectation: None,
+            payload,
+            added_members: Vec::new(),
+            removed_members: Vec::new(),
+        }
+    }
+}
+
+/// 对端条目的处理结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerEntryOutcome {
+    /// 对端 Commit 已合并：epoch 恰好 +1，成员增删来自真实 StagedCommit 计数。
+    Commit {
+        /// 合并前 epoch。
+        old_epoch: u64,
+        /// 合并后 epoch。
+        new_epoch: u64,
+        /// 真实新增成员数。
+        added: u32,
+        /// 真实移除成员数。
+        removed: u32,
+        /// 真实更新数。
+        updated: u32,
+        /// 该 Commit 是否移除了本设备。
+        self_removed: bool,
+        /// 合并后的群投影。
+        view: GroupView,
+    },
+    /// 应用消息已认证解密（明文只交给可信核心路径，不进入普通 DTO）。
+    Application {
+        /// 已认证作者。
+        sender_identity: String,
+        /// 所属 epoch。
+        epoch: u64,
+        /// 明文。
+        plaintext: Vec<u8>,
+    },
+    /// 独立提案已暂存（等待后续 Commit）。
+    Proposal {
+        /// 已认证作者。
+        sender_identity: String,
+        /// 所属 epoch。
+        epoch: u64,
+        /// 当前群投影（未变化）。
+        view: GroupView,
+    },
+    /// 收到的是本机 pending 提交的回显：应改用 `accept_pending_control`。
+    OwnPendingCommit {
+        /// 该提交所属 epoch。
+        epoch: u64,
+    },
+}
+
+/// 把真实 MLS 成员身份写回持久记录（只用于加入/对端 Commit 的真实成员集合）。
+fn record_members_from_identities(
+    identities: &[String],
+    owner_credential: &str,
+    local_credential: &str,
+    joined_sequence: u64,
+) -> Vec<RecordMember> {
+    identities
+        .iter()
+        .map(|identity| RecordMember {
+            credential: identity.clone(),
+            role: if identity == owner_credential {
+                MemberRole::Owner.as_u64()
+            } else {
+                MemberRole::Member.as_u64()
+            },
+            muted: false,
+            is_local: identity == local_credential,
+            joined_sequence: joined_sequence.max(1),
+        })
+        .collect()
+}
+
+/// GROUPS-013：处理对端条目（CRYPTO-006 `process_verified_entry`）。
+///
+/// 语义：
+/// - 外层已验证的绑定字段（群 ID/epoch/作者/预期成员变化/成员身份）由调用方提供，
+///   crypto 会用独密的 MLS 认证复核**群、epoch、作者与真实成员变化计数**；
+/// - 本层额外要求「声明的成员身份数量 == 预期计数」，因此成员增删既是真实的（来自
+///   StagedCommit 计数）又可按身份写回快照；
+/// - 对端 Commit 合并后 epoch **恰好 +1**，随后把 MLS 状态导出到正式库并更新快照的
+///   epoch/成员（不臆造任何字段）；应用消息与提案不改变快照；
+/// - 任何失败（群不符/epoch 不符或乱序/作者不符/成员变化不符/认证失败）都显式返回冻结码，
+///   快照保持上一次完整状态（不留半状态）。
+pub fn group_process_peer_entry(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    input: &PeerEntryInput,
+) -> GroupResult<PeerEntryOutcome> {
+    let (mut record, state_version) = load_record(store, &input.group_id)?;
+    let group_key = device
+        .group_key()
+        .map_err(|_| GroupError::invalid_target("the local device has no MLS group"))?;
+    if group_key != record.mls_group_key {
+        return Err(GroupError::invalid_target(
+            "the local device is not in this group",
+        ));
+    }
+    validate_credential(&input.sender_identity)?;
+    if input.payload.is_empty() {
+        return Err(GroupError::invalid_candidate("entry payload must not be empty"));
+    }
+    if input.epoch != record.mls_epoch {
+        let code = if input.epoch < record.mls_epoch {
+            "STALE_EPOCH"
+        } else {
+            "MISSING_LOG_ENTRIES"
+        };
+        return Err(GroupError::new(code, "entry epoch does not match the local snapshot"));
+    }
+    // 预期计数与声明身份必须在合并之前一致（否则会在合并后才发现不一致 → 半状态）。
+    let (expected_added, expected_removed) = match input.expectation {
+        Some(expectation) => (expectation.added as usize, expectation.removed as usize),
+        None => (0, 0),
+    };
+    if expected_added != input.added_members.len() || expected_removed != input.removed_members.len() {
+        return Err(GroupError::new(
+            "INVALID_CONTROL_RESULT",
+            "declared member identities do not match the expected member changes",
+        ));
+    }
+    for credential in input.added_members.iter().chain(input.removed_members.iter()) {
+        validate_credential(credential)?;
+    }
+    let entry = VerifiedGroupEntry {
+        group_id: record.mls_group_key.clone(),
+        epoch: input.epoch,
+        sender_identity: input.sender_identity.clone(),
+        expectation: input.expectation,
+        payload: input.payload.clone(),
+    };
+    let processed = device
+        .process_verified_entry(&entry)
+        .map_err(GroupError::from)?;
+    match processed {
+        ProcessedEntry::Commit {
+            old_epoch,
+            new_epoch,
+            added,
+            removed,
+            updated,
+            self_removed,
+            ..
+        } => {
+            if new_epoch != old_epoch.saturating_add(1) {
+                return Err(GroupError::corrupted(
+                    "a merged peer commit must advance the epoch by exactly one",
+                ));
+            }
+            if added as usize != input.added_members.len()
+                || removed as usize != input.removed_members.len()
+            {
+                return Err(GroupError::new(
+                    "INVALID_CONTROL_RESULT",
+                    "the merged commit member changes do not match the declared identities",
+                ));
+            }
+            // MLS 状态已在内存合并：先导出到正式库，再更新快照（失败时快照保持旧值）。
+            device.export_to_store(store).map_err(|_| {
+                GroupError::new(
+                    "STORAGE_FAILURE",
+                    "the merged MLS group state could not be persisted",
+                )
+            })?;
+            for credential in &input.removed_members {
+                record.members.retain(|member| &member.credential != credential);
+            }
+            if self_removed {
+                record.members.retain(|member| !member.is_local);
+            }
+            let joined_sequence = new_epoch.max(1);
+            for credential in &input.added_members {
+                if record
+                    .members
+                    .iter()
+                    .any(|member| &member.credential == credential)
+                {
+                    return Err(GroupError::corrupted(
+                        "the merged commit adds a member that already exists locally",
+                    ));
+                }
+                record.members.push(RecordMember {
+                    credential: credential.clone(),
+                    role: MemberRole::Member.as_u64(),
+                    muted: false,
+                    is_local: false,
+                    joined_sequence,
+                });
+            }
+            record.mls_epoch = new_epoch;
+            record.validate()?;
+            let saved = persist_snapshot(store, &record, record.mls_epoch)?;
+            Ok(PeerEntryOutcome::Commit {
+                old_epoch,
+                new_epoch,
+                added,
+                removed,
+                updated,
+                self_removed,
+                view: project(&record, new_epoch, None, saved),
+            })
+        }
+        ProcessedEntry::Application {
+            sender_identity,
+            epoch,
+            plaintext,
+        } => Ok(PeerEntryOutcome::Application {
+            sender_identity,
+            epoch,
+            plaintext,
+        }),
+        ProcessedEntry::Proposal {
+            sender_identity,
+            epoch,
+        } => Ok(PeerEntryOutcome::Proposal {
+            sender_identity,
+            epoch,
+            view: project(&record, record.mls_epoch, None, state_version),
+        }),
+        ProcessedEntry::OwnPendingCommit { epoch } => {
+            Ok(PeerEntryOutcome::OwnPendingCommit { epoch })
+        }
+    }
+}
+
+/// GROUPS-004（加入侧）：用 Welcome 加入群并写入正式快照（CRYPTO-009 `join_from_welcome`）。
+///
+/// - `acceptance` 是外层已验证的邀请/日志绑定（群 ID/epoch/成员集合），crypto 会逐项复核；
+/// - 名称由调用方给（邀请里没有规范化群名），成员与 epoch 全部取**真实 MLS 值**；
+/// - `owner_credential` 来自已验证的邀请元数据（群主是谁），本层校验它确实在成员集合里；
+/// - 同一群重复加入显式 `INVALID_STATE_TRANSITION`；Welcome 绑定不符 → `WELCOME_NOT_AUTHORIZED`
+///   且不写入任何快照（不留半加入状态）。
+#[allow(clippy::too_many_arguments)]
+pub fn group_join_from_welcome(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    name: &str,
+    welcome: &[u8],
+    acceptance: &WelcomeAcceptance,
+    local_credential: &str,
+    owner_credential: &str,
+) -> GroupResult<GroupView> {
+    validate_name(name)?;
+    validate_credential(local_credential)?;
+    validate_credential(owner_credential)?;
+    let joined = device
+        .join_from_welcome(welcome, acceptance, store)
+        .map_err(GroupError::from)?;
+    let group_id = protocol_group_id_for(&joined.group_id)
+        .map_err(|_| GroupError::corrupted("protocol group id could not be derived"))?;
+    if load_record(store, &group_id).is_ok() {
+        return Err(GroupError::new(
+            "INVALID_STATE_TRANSITION",
+            "this device already joined the group",
+        ));
+    }
+    if joined.members.is_empty() {
+        return Err(GroupError::corrupted("joined MLS group reports no members"));
+    }
+    let local_present = joined
+        .members
+        .iter()
+        .any(|identity| identity == local_credential);
+    if !local_present {
+        return Err(GroupError::corrupted(
+            "the local credential is not an MLS member of the joined group",
+        ));
+    }
+    let owner_present = joined
+        .members
+        .iter()
+        .any(|identity| identity == owner_credential);
+    if !owner_present {
+        return Err(GroupError::new(
+            "INVALID_CONTROL_RESULT",
+            "the declared owner is not an MLS member of the joined group",
+        ));
+    }
+    let created_at_ms = now_ms();
+    let record = GroupRecord {
+        version: SNAPSHOT_VERSION,
+        group_id: group_id.clone(),
+        mls_group_key: joined.group_id.clone(),
+        name: name.to_owned(),
+        created_at_ms,
+        control_head: ControlHead::ZERO.to_hex(),
+        policy_version: 1,
+        mls_epoch: joined.epoch,
+        verified_sequence: 0,
+        verified_log_hash: Digest::ZERO.to_hex(),
+        members: record_members_from_identities(
+            &joined.members,
+            owner_credential,
+            local_credential,
+            joined.epoch,
+        ),
+        pending_members: Vec::new(),
+        pending_removed: Vec::new(),
+        last_control_cleared: None,
+    };
+    record.validate()?;
+    let _ = domain_snapshot(&record)?;
+    let saved = persist_snapshot(store, &record, record.mls_epoch)?;
+    Ok(project(&record, joined.epoch, None, saved))
 }
 
 

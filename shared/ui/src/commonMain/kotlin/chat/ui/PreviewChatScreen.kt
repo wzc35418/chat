@@ -73,6 +73,7 @@ import chat.presentation.preview.ComposerPresentation
 import chat.presentation.preview.PreviewChatState
 import chat.presentation.preview.PreviewContact
 import chat.presentation.preview.PreviewAttachmentState
+import chat.presentation.preview.PreviewGroupState
 import chat.presentation.preview.PreviewContactState
 import chat.presentation.preview.PreviewIdentityState
 import chat.presentation.preview.PreviewStoreState
@@ -129,12 +130,16 @@ fun PreviewChatScreen(
     attachmentState: PreviewAttachmentState = PreviewAttachmentState(),
     attachmentHandlers: AttachmentHandlers = AttachmentHandlers.None,
     initialAttachmentOpen: Boolean = false,
+    groupState: PreviewGroupState = PreviewGroupState(),
+    groupHandlers: GroupHandlers = GroupHandlers.None,
+    initialGroupOpen: Boolean = false,
 ) {
     var state by remember { mutableStateOf(initialState) }
     // 真实身份面板是独立浮层：默认关闭，由侧栏按钮打开；截图入口可指定初始打开。
     var showIdentity by remember { mutableStateOf(initialIdentityOpen) }
     var showStore by remember { mutableStateOf(initialStoreOpen) }
     var showAttachments by remember { mutableStateOf(initialAttachmentOpen) }
+    var showGroups by remember { mutableStateOf(initialGroupOpen) }
 
     MaterialTheme(
         colorScheme = lightColorScheme(
@@ -172,6 +177,7 @@ fun PreviewChatScreen(
                                     onOpenIdentity = { showIdentity = true },
                                     onOpenStore = { showStore = true },
                                     onOpenAttachments = { showAttachments = true },
+                                    onOpenGroups = { showGroups = true },
                                 )
                                 Box(Modifier.width(1.dp).fillMaxHeight().background(Color(0xFFE1E6E1)))
                                 ChatPane(
@@ -213,10 +219,26 @@ fun PreviewChatScreen(
                                     onOpenIdentity = { showIdentity = true },
                                     onOpenStore = { showStore = true },
                                     onOpenAttachments = { showAttachments = true },
+                                    onOpenGroups = { showGroups = true },
                                 )
                             }
                         }
                     }
+                }
+            }
+            if (showGroups) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color(0x66000000))
+                        .pointerInput(Unit) { detectTapGestures(onTap = { showGroups = false }) }
+                        .semantics { contentDescription = "群面板遮罩" },
+                ) {
+                    GroupPanel(
+                        state = groupState,
+                        handlers = groupHandlers,
+                        onClose = { showGroups = false },
+                    )
                 }
             }
             if (showAttachments) {
@@ -324,6 +346,7 @@ private fun Sidebar(
     onOpenIdentity: () -> Unit,
     onOpenStore: () -> Unit,
     onOpenAttachments: () -> Unit,
+    onOpenGroups: () -> Unit,
 ) {
     Surface(modifier, color = Color.White) {
         Column(
@@ -412,6 +435,15 @@ private fun Sidebar(
                     contentPadding = PaddingValues(vertical = 8.dp, horizontal = 6.dp),
                 ) {
                     Text("附件", style = MaterialTheme.typography.labelMedium)
+                }
+                OutlinedButton(
+                    onClick = onOpenGroups,
+                    modifier = Modifier.weight(1f).semantics {
+                        contentDescription = "打开群（真实 MLS）面板"
+                    },
+                    contentPadding = PaddingValues(vertical = 8.dp, horizontal = 6.dp),
+                ) {
+                    Text("群", style = MaterialTheme.typography.labelMedium)
                 }
             }
             Surface(color = PreviewCanvas, shape = RoundedCornerShape(10.dp)) {

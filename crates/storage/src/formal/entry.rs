@@ -30,6 +30,7 @@ use zeroize::Zeroizing;
 
 use super::error::StorageError;
 use super::seal::{ProtectedStorageKey, RecordSealer, SealPurpose};
+use super::now_ms;
 use super::{
     CoreTransaction, MessageContent, Result, Store, WriteScope, candidate_hash,
     commit_transaction, digest_parts, ensure_id, hex, rollback_transaction,
@@ -440,9 +441,62 @@ fn compare_existing_entry(
     }))
 }
 
+/// 单条消息最多引用的附件数（有界，防止一条消息把回收引用计数撑爆）。
+pub const MAX_ATTACHMENTS_PER_MESSAGE: usize = 32;
+
+/// 在消息落库的同一事务内登记附件引用（幂等；任一附件不存在则整体失败）。
+///
+/// 这是 ATTACHMENTS-008 引用计数的写入点：只有成功写入/确认消息的那一笔事务才会
+/// 留下引用；解析/校验失败时事务被 poison 并回滚，不会出现"消息没落库、引用却留下"
+/// 或"引用登记一半"的半状态。
+fn register_attachment_refs(
+    transaction: &mut CoreTransaction<'_>,
+    message_id: &str,
+    attachment_ids: &[String],
+) -> Result<()> {
+    if attachment_ids.is_empty() {
+        return Ok(());
+    }
+    if attachment_ids.len() > MAX_ATTACHMENTS_PER_MESSAGE {
+        return Err(StorageError::InvalidInput(format!(
+            "a message may reference at most {MAX_ATTACHMENTS_PER_MESSAGE} attachments"
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for attachment_id in attachment_ids {
+        ensure_id("attachment", attachment_id)?;
+        // 同一条消息内重复引用同一附件：只登记一次。
+        if !seen.insert(attachment_id.as_str()) {
+            continue;
+        }
+        let exists: Option<i64> = transaction
+            .transaction
+            .query_row(
+                "SELECT 1 FROM attachments WHERE attachment_id = ?1",
+                [attachment_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(StorageError::AttachmentNotFound(attachment_id.clone()));
+        }
+        let inserted = transaction.transaction.execute(
+            "INSERT OR IGNORE INTO message_attachments
+                 (message_id, attachment_id, created_at)
+             VALUES (?1, ?2, ?3)",
+            params![message_id, attachment_id, now_ms()],
+        )?;
+        if inserted > 0 {
+            transaction.note(inserted);
+        }
+    }
+    Ok(())
+}
+
 fn write_verified_entry(
     transaction: &mut CoreTransaction<'_>,
     input: VerifiedEntryInput,
+    attachment_ids: &[String],
 ) -> Result<AppliedEntry> {
     input.validate()?;
     if transaction.scope().kind() != super::WriteScopeKind::Inbound {
@@ -464,6 +518,8 @@ fn write_verified_entry(
     if let Some(applied) =
         compare_existing_entry(&transaction.transaction, transaction.key, &input, &content)?
     {
+        // 幂等重放：引用登记同样是幂等的（同消息同附件只留一行）。
+        register_attachment_refs(transaction, &input.message_id, attachment_ids)?;
         return Ok(applied);
     }
 
@@ -571,6 +627,9 @@ fn write_verified_entry(
         Err(error) => return Err(map_message_write_error(error, &input.message_id)),
     }
 
+    // 步骤 5：登记该消息引用的附件（同一事务；失败整体回滚）。
+    register_attachment_refs(transaction, &input.message_id, attachment_ids)?;
+
     Ok(AppliedEntry {
         message_id: input.message_id,
         conversation_id: input.conversation_id,
@@ -592,7 +651,16 @@ pub fn apply_verified_entry(
     transaction: &mut CoreTransaction<'_>,
     input: VerifiedEntryInput,
 ) -> Result<AppliedEntry> {
-    let outcome = write_verified_entry(transaction, input);
+    apply_verified_entry_with_attachments(transaction, input, &[])
+}
+
+/// STORAGE-008 + ATTACHMENTS-008：在调用方事务内写入条目并登记附件引用。
+pub fn apply_verified_entry_with_attachments(
+    transaction: &mut CoreTransaction<'_>,
+    input: VerifiedEntryInput,
+    attachment_ids: &[String],
+) -> Result<AppliedEntry> {
+    let outcome = write_verified_entry(transaction, input, attachment_ids);
     if outcome.is_err() {
         transaction.poison();
     }
@@ -621,6 +689,53 @@ impl Store {
                 Err(rollback) => Err(rollback),
             },
         }
+    }
+
+    /// STORAGE-008 + ATTACHMENTS-008：写入条目并在同一事务内登记附件引用。
+    ///
+    /// 引用登记幂等（同消息同附件只留一行）；任一附件记录不存在或 ID 非法时整笔回滚
+    /// （消息不会落库、引用也不会留一半）。重复调用（同内容重放）同样幂等。
+    pub fn apply_verified_entry_with_attachments(
+        &mut self,
+        input: VerifiedEntryInput,
+        attachment_ids: Vec<String>,
+    ) -> Result<AppliedEntry> {
+        self.ensure_ready()?;
+        input.validate()?;
+        if attachment_ids.len() > MAX_ATTACHMENTS_PER_MESSAGE {
+            return Err(StorageError::InvalidInput(format!(
+                "a message may reference at most {MAX_ATTACHMENTS_PER_MESSAGE} attachments"
+            )));
+        }
+        if attachment_ids.is_empty() {
+            return self.apply_verified_entry(input);
+        }
+        let mut transaction = self.begin_transaction(WriteScope::inbound(&input.conversation_id))?;
+        match apply_verified_entry_with_attachments(&mut transaction, input, &attachment_ids) {
+            Ok(applied) => {
+                commit_transaction(transaction)?;
+                Ok(applied)
+            }
+            Err(error) => match rollback_transaction(transaction) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(rollback),
+            },
+        }
+    }
+
+    /// 消息是否已经落库（有界存在性检查，供界面/测试确认引用登记的原子性）。
+    pub fn message_exists(&self, message_id: &str) -> Result<bool> {
+        self.ensure_ready()?;
+        ensure_id("message", message_id)?;
+        let row: Option<i64> = self
+            .connection()
+            .query_row(
+                "SELECT 1 FROM messages WHERE message_id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(row.is_some())
     }
 
     /// 读取本地会话摘要；会话行不存在返回 `None`。

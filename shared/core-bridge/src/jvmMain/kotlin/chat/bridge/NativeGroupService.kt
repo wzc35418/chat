@@ -32,6 +32,11 @@ class NativeGroupService(
     }
     private val mutex = Mutex()
 
+    override suspend fun createGroup(name: String): GroupSnapshot = call { native ->
+        // 演示用固定凭据：真实产品应由身份目录提供设备凭据（GROUP 与 IDENTITY 打通属后续任务）。
+        native.groupCreate(name, "local-device", "bootstrap-device", emptyList()).toSnapshot()
+    }
+
     override suspend fun snapshot(groupId: String): GroupSnapshot = call { it.groupSnapshot(groupId).toSnapshot() }
 
     override suspend fun rename(groupId: String, newName: String): GroupSnapshot =
@@ -77,7 +82,7 @@ class NativeGroupService(
         }
     }
 
-    suspend fun shutdown(): Unit = mutex.withLock {
+    override suspend fun shutdown(): Unit = mutex.withLock {
         withContext(Dispatchers.IO) { runCatching { native.shutdown() } }
         Unit
     }

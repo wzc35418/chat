@@ -128,6 +128,17 @@ tasks.register<JavaExec>("keySlotSmoke") {
     systemProperty("stdout.encoding", "UTF-8")
 }
 
+tasks.register<JavaExec>("groupSmoke") {
+    group = "verification"
+    description = "GROUP 竖直链路：Kotlin -> UniFFI -> core groups -> 真 OpenMLS（建群/改名/禁言/移除/接受）。"
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.GroupSmokeKt")
+    systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+}
+
 tasks.register<JavaExec>("previewApp") {
     group = "application"
     dependsOn("classes")

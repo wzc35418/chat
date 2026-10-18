@@ -40,6 +40,9 @@ data class GroupSnapshot(
  * 绝不把"本地接受"显示成"节点已确认"。
  */
 interface GroupService {
+    /** 建群（本机为 owner；引导成员由本进程临时设备承担）。 */
+    suspend fun createGroup(name: String): GroupSnapshot
+
     suspend fun snapshot(groupId: String): GroupSnapshot
 
     suspend fun rename(groupId: String, newName: String): GroupSnapshot
@@ -53,4 +56,7 @@ interface GroupService {
     suspend fun acceptPending(groupId: String): GroupSnapshot
 
     suspend fun discardPending(groupId: String, reason: String): GroupSnapshot
+
+    /** 释放独占写锁；之后所有调用返回 CORE_CLOSED。 */
+    suspend fun shutdown()
 }

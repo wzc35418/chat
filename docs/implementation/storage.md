@@ -407,13 +407,22 @@ message_id 外键到 messages、attachment_id 外键到 attachments，两者都 
   `detach_message_attachment`、`detach_message_attachments`（按消息清全部）。
 - 查询（ATTACHMENTS-008 引用计数）：`message_attachment_count`、`message_attachment_ids`
   （上限 512）、`message_referenced_attachment_ids`（去重、有界，回收一次性取用）、
+  `message_attachment_refs_for_message`（某消息引用的附件 ID，按 ID 升序、有界，供界面展示）、
   `attachment_ids_with_state_before(state, cutoff, limit)`（staging 过期候选）。
+- 消息落库自动登记（STORAGE-008 + ATTACHMENTS-008）：`Store::apply_verified_entry_with_attachments(input, attachment_ids)`
+  在**同一笔 inbound 事务**内写消息并登记引用（`register_attachment_refs`：单条消息最多
+  `MAX_ATTACHMENTS_PER_MESSAGE = 32` 个附件、同消息内重复附件只登记一次、附件记录必须存在）；
+  任一附件缺失/ID 非法 → `ATTACHMENT_NOT_FOUND` / `INVALID_INPUT` → 事务 poison+回滚
+  （消息不落库、引用不留一半）。幂等重放（同内容）同样只补幂等登记、不重复写行。
+- 显式删除消息：`Store::delete_message(message_id)` 只删 messages 行，`message_attachments`
+  与 receipts 随外键级联清除；另有 `Store::message_exists` 供确认原子性。
 
 复现命令（全程离线）：
 
 ```powershell
 . .\tools\activate.ps1
 cargo test --offline -p chat-storage --test message_attachments   # 4 passed
+cargo test --offline -p chat-core --test attachment_refs         # 4 passed（落库登记/幂等/回滚/级联）
 ```
 
 已知限制：没有“任务/上传队列”引用（只有消息引用）；消息引用只由应用层写入，STORAGE-008 的

@@ -28,9 +28,10 @@ use chat_crypto::attachment::{
 };
 use chat_crypto::secret_descriptor::{SecretDescriptor, seal_secret_descriptor};
 use chat_storage::formal::{
-    AttachmentProgress as StoredTransferProgress,
+    AppliedEntry, AttachmentProgress as StoredTransferProgress,
     AttachmentProgressInput as PersistedProgressInput, AttachmentRecordInput as PersistedAttachmentInput,
     AttachmentSecretInput as PersistedAttachmentSecretInput, StorageError, Store as FormalStore,
+    VerifiedEntryInput,
 };
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2090,6 +2091,41 @@ impl PersistedAttachmentStore {
         }
     }
 
+    /// 消息落库并在同一事务内登记该消息引用的附件（ATTACHMENTS-008 引用计数）。
+    ///
+    /// 事务语义由 storage 保证：任一附件记录不存在/ID 非法 → 整笔回滚，消息不落库、
+    /// 引用也不留一半；重复落库（同内容重放）幂等，引用同样幂等。
+    pub fn apply_verified_entry_with_attachments(
+        &self,
+        input: VerifiedEntryInput,
+        attachment_ids: Vec<String>,
+    ) -> AttachmentResult<AppliedEntry> {
+        let mut store = self.lock_store()?;
+        store
+            .apply_verified_entry_with_attachments(input, attachment_ids)
+            .map_err(AttachmentError::from)
+    }
+
+    /// 某条消息引用的附件 ID 列表（有界、按 ID 升序），供界面展示。
+    pub fn attachments_for_message(&self, message_id: &str) -> AttachmentResult<Vec<String>> {
+        let store = self.lock_store()?;
+        store
+            .message_attachment_refs_for_message(message_id)
+            .map_err(AttachmentError::from)
+    }
+
+    /// 消息是否已落库（确认“引用登记失败时没有半落库”）。
+    pub fn message_exists(&self, message_id: &str) -> AttachmentResult<bool> {
+        let store = self.lock_store()?;
+        store.message_exists(message_id).map_err(AttachmentError::from)
+    }
+
+    /// 显式删除一条消息；附件引用随外键级联清除（之后该附件可被回收）。
+    pub fn delete_message(&self, message_id: &str) -> AttachmentResult<bool> {
+        let mut store = self.lock_store()?;
+        store.delete_message(message_id).map_err(AttachmentError::from)
+    }
+
     /// ATTACHMENTS-008：回收没有被「附件记录 / 消息引用」引用的缓存，使用默认宽限期。
     ///
     /// 默认宽限期 [`DEFAULT_COLLECT_GRACE_MS`]（24 小时）：刚写入的缓存不会立刻被回收。
@@ -3615,6 +3651,73 @@ mod tests {
 
 
 
+
+
+    #[test]
+    fn deleting_a_message_makes_its_staging_attachment_collectible() {
+        let dir = TempDir::new("msg-gc-refs");
+        let cache_root = dir.path("cache");
+        let store =
+            PersistedAttachmentStore::open(&cache_root, formal_store(&dir.path("chat.db")))
+                .expect("open persisted store");
+        let staging_id = "att-00112233445566778899aabbccddeeff";
+        store
+            .store
+            .lock()
+            .expect("store lock")
+            .save_attachment(chat_storage::formal::AttachmentRecordInput {
+                attachment_id: staging_id.to_owned(),
+                state: "staging".to_owned(),
+                plain_size: 1024,
+                chunk_size: 262_144,
+                chunk_count: 1,
+                content_digest: "ab".repeat(32),
+                ciphertext_digest: "cd".repeat(32),
+                display_name: "staging.pdf".to_owned(),
+                created_at_ms: 1_000,
+            })
+            .expect("save staging record");
+        let staging_dir = cache_root.join(staging_id);
+        fs::create_dir_all(&staging_dir).expect("create staging cache");
+        fs::write(staging_dir.join("chunk-000000.bin"), vec![5u8; 11]).expect("write chunk");
+
+        // 一条消息引用这个 staging 附件（落库时自动登记）。
+        store
+            .apply_verified_entry_with_attachments(
+                VerifiedEntryInput {
+                    conversation_id: "conv-1".to_owned(),
+                    title: "引用回收".to_owned(),
+                    message_id: "msg-gc-ref".to_owned(),
+                    author_account: "acct-1".to_owned(),
+                    author_device: "dev-1".to_owned(),
+                    body: "带 staging 附件的消息".to_owned(),
+                    mine: false,
+                    created_at_ms: 2_000,
+                },
+                vec![staging_id.to_owned()],
+            )
+            .expect("apply entry with attachment");
+
+        // 被消息引用：即使 staging 且过期也不回收。
+        let report = store
+            .collect_unreferenced_attachments_with_grace(0)
+            .expect("collect with message ref");
+        assert_eq!(report.removed_records, 0);
+        assert!(staging_dir.is_dir(), "a message-referenced cache survives");
+
+        // 删除消息：引用级联清除，随后可回收。
+        assert!(store.delete_message("msg-gc-ref").expect("delete message"));
+        let report = store
+            .collect_unreferenced_attachments_with_grace(0)
+            .expect("collect after delete");
+        assert_eq!(report.removed_records, 1);
+        assert_eq!(report.freed_bytes, 11);
+        assert!(!staging_dir.exists());
+        assert!(store
+            .attachment_record(staging_id)
+            .expect("record")
+            .is_none());
+    }
 
     #[test]
     fn collect_keeps_message_referenced_staging_records_until_detached() {

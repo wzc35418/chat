@@ -1076,6 +1076,49 @@ impl ConversationCore {
         })
     }
 
+    /// 写入一条已验证条目并在同一事务内登记它引用的附件（ATTACHMENTS-008）。
+    ///
+    /// 与 `apply_verified_entry` 相同的 ID 校验；附件引用登记由 STORAGE-008 的事务保证
+    /// 原子性：任一附件缺失/非法则整笔回滚（消息不落库、引用不留一半），重复落库幂等。
+    pub fn apply_verified_entry_with_attachments(
+        &mut self,
+        input: VerifiedEntryInput,
+        attachment_ids: Vec<String>,
+    ) -> anyhow::Result<MessageRowView> {
+        parse_conversation(&input.conversation_id)?;
+        parse_message(&input.message_id)?;
+        parse_account(&input.author_account)?;
+        parse_device(&input.author_device)?;
+        if input.title.len() > MAX_SESSION_TITLE_BYTES {
+            return Err(invalid_input(format!(
+                "title must not exceed {MAX_SESSION_TITLE_BYTES} bytes"
+            )));
+        }
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        let applied = store
+            .apply_verified_entry_with_attachments(input, attachment_ids)
+            .map_err(anyhow::Error::new)?;
+        Ok(MessageRowView {
+            message_id: applied.message_id,
+            conversation_id: applied.conversation_id,
+            author: applied.author_account,
+            body: applied.body,
+            mine: applied.mine,
+            created_at_ms: u64::try_from(applied.created_at_ms).unwrap_or(0),
+        })
+    }
+
+    /// 某条消息引用的附件 ID 列表（有界、按 ID 升序），供界面展示消息附件。
+    pub fn attachments_for_message(&self, message_id: &str) -> anyhow::Result<Vec<String>> {
+        parse_message(message_id)?;
+        let guard = self.store_guard()?;
+        let store = guard.as_ref().ok_or_else(closed)?;
+        store
+            .message_attachment_refs_for_message(message_id)
+            .map_err(anyhow::Error::new)
+    }
+
     /// CORE-005 的本地切片：会话列表分页。
     pub fn list_conversations(
         &self,

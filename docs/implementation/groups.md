@@ -1,6 +1,6 @@
 # 小群创建、邀请与治理用例
 
-阶段：P3。状态：函数级设计；GROUPS-001 建群与 GROUPS-002 快照已实现（真实 OpenMLS + 正式加密库），成员治理的角色变更（`set_role`）与禁言（`set_muted`）也已实现（DOMAIN-002/004 策略层 + CRYPTO-005 控制提交）；移除成员（`remove_member`）与改名（`rename_group`）也已实现（同一条 DOMAIN-002/004 + CRYPTO-005 流程）；控制提交的**接受合并（`accept_pending_control`）与丢弃回滚（`discard_pending_control`）**也已接线（CRYPTO-007/008）；上述能力已通过 `GroupFfi` 暴露给 Kotlin（`group_create`/`snapshot`/`set_role`/`set_muted`/`remove_member`/`rename`/`accept_pending`/`discard_pending`）；其余治理函数未开始。目标源码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)。
+阶段：P3。状态：函数级设计；GROUPS-001 建群与 GROUPS-002 快照已实现（真实 OpenMLS + 正式加密库），成员治理的角色变更（`set_role`）与禁言（`set_muted`）也已实现（DOMAIN-002/004 策略层 + CRYPTO-005 控制提交）；移除成员（`remove_member`）与改名（`rename_group`）也已实现（同一条 DOMAIN-002/004 + CRYPTO-005 流程）；控制提交的**接受合并（`accept_pending_control`）与丢弃回滚（`discard_pending_control`）**也已接线（CRYPTO-007/008）；上述能力已通过 `GroupFfi` 暴露给 Kotlin（`group_create`/`snapshot`/`set_role`/`set_muted`/`remove_member`/`rename`/`accept_pending`/`discard_pending`）；对端条目处理（`group_process_peer_entry`，CRYPTO-006）与 Welcome 加入（`group_join_from_welcome`，CRYPTO-009）也已实现；其余治理函数未开始。目标源码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)。
 
 本章对应 GroupService 的完整业务入口。所有管理操作都是待确认票据；UI 读取正式快照与 pending 列表分别显示。邀请加入分为业务接受、KeyPackage 获取、正式 Commit、Welcome 投递四步。重加入需要当前成员明确授权，不直接从节点读取群密钥。
 
@@ -166,11 +166,15 @@ accept_group_invite(invite: InviteId) -> Result<GroupJoinTicket>
 
 **完成验收**：
 
-- [ ] 接受后断网恢复。
-- [ ] 重复接受同 ticket。
-- [ ] 无 Welcome 不假称可解密。
+- [ ] 接受后断网恢复。（未实现：没有 invitation ticket / 重试队列）
+- [x] 重复接受同 ticket。（本切片的对偶形态已覆盖：同一设备重复**加入**由 crypto 的“群已初始化”显式拒绝，快照不变——`groups_peer::duplicate_join_is_rejected_and_snapshot_is_unchanged`）
+- [x] 无 Welcome 不假称可解密。（`groups_peer::welcome_join_rejects_wrong_binding` / `join_rejects_declared_owner_outside_the_group`：绑定不符/群主不在成员里都显式拒绝且**不写快照**，绝不假装已加入）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（**Welcome 加入侧**已实现）。`groups::group_join_from_welcome(device, store, name, welcome,
+acceptance, local_credential, owner_credential)`：调 CRYPTO-009 `join_from_welcome` 校验外层绑定
+（群 ID/epoch/成员集合）→ 真实成员与 epoch 写快照（名称由调用方给，成员/epoch 取真实 MLS 值，群主来自已验证
+邀请元数据并核对确为成员）→ 同一群重复加入 `INVALID_STATE_TRANSITION`。证据：`cargo test --offline -p chat-core --test groups_peer`。
+待实现：邀请票据（accept/decline）、KeyPackage 生成与投递、节点正式加入回执（SYNC 侧）。
 
 <a id="groups-005"></a>
 
@@ -945,3 +949,141 @@ cargo test --offline -p chat-core                     # 128 passed（0 警告）
 设备统一用 `MlsDevice::import_from_store` 从持久库恢复（建群除外：群还不存在，设备是新建的）；
 禁用闭包 `with_group_device` 保证「先恢复、再执行、失败不留半状态」。
 为了让 FFI 拿到冻结码，`service::error_code` 增加了 `GroupError` 的 downcast 分支（方法体 3 行改动，
+不改任何既有语义）；角色 → 文本的映射以 `group_role_code` / `group_role_from_code` 暴露（FFI 不需要依赖 chat-domain）。
+
+### GroupFfi（Kotlin 可见）
+
+`open(database_path, master_key_hex, node)` + 上表 8 个方法，返回 `GroupViewFfi`（成员/角色/禁言/pending/
+pending_removed/last_control_cleared 全是纯数据，不含密钥）。`node` 只保存不联网。契约细节见
+[bridge.md 的“群治理 FFI 契约”](bridge.md)。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi --test groups_ffi   # 6 passed
+cargo test --offline -p chat-core -p chat-ffi        # 118 + 36 passed
+~~~
+
+### 证据
+
+- `groups_ffi::create_snapshot_rename_mute_and_remove_through_ffi`：建群 → 快照一致 → 改名（pv2，同名幂等）→
+  禁言（pv3）→ 移除（pv4，pending_removed=[bob]）→ 接受（epoch2、pending 清空、pv 不变）→ 快照一致。
+- `groups_ffi::role_change_accept_and_discard_through_ffi`：改角色（pending self_update）→ 丢弃（epoch 不变、
+  pv 不回退、审计 self_update/node_rejected）→ 改回并接受（epoch2）。
+- `groups_ffi::error_codes_are_frozen_and_failures_leave_no_state`：`INVALID_TARGET`/`INVALID_ID`/
+  `INVALID_INPUT`/`PERMISSION_DENIED`/`PENDING_MISMATCH` 逐条断言，失败后快照与建群结果完全一致。
+- `groups_ffi::empty_local_credential_uses_the_persisted_identity_device`：持久身份建立后，空凭据建群的本地成员
+  凭据 == 身份设备 ID。
+- `groups_ffi::create_without_identity_and_empty_credential_fails`：`INVALID_STATE_TRANSITION` / `INVALID_CANDIDATE`。
+- `groups_ffi::closed_object_reports_core_closed`：`shutdown` 后 `CORE_CLOSED`。
+
+### 已知限制
+
+1. **本地接受 ≠ 节点接受**（见上文节）：`group_accept_pending` 只收口本地状态。
+2. **引导成员设备由本进程临时创建**：真实邀请加入（GROUPS-004）仍未实现。
+3. **独占单写者**：`GroupFfi` 与 `LocalStoreFfi` / `AttachmentFfi` 互斥；需要身份数据时先关闭 `IdentityFfi`。
+4. **同步阻塞**：FFI 的 `Mutex` 串行执行（含 MLS 提交生成）。
+5. `node` 只保存；群治理当前不访问网络。
+
+## 对端条目处理与 Welcome 加入实现记录（2026-10-18，Windows x64）
+
+代码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)（同一文件，无新依赖）；测试：
+[crates/core/tests/groups_peer.rs](../../crates/core/tests/groups_peer.rs)（7 个用例，**真 OpenMLS 双设备 + 两个独立临时库**）。
+
+> 编号说明：本轮任务的“对端 Commit 处理”对应 CRYPTO-006 `process_verified_entry` 的群服务接线，
+> 在本文档没有独立函数号（属 SYNC 日志应用路径）；“Welcome 加入”对应 GROUPS-004 的**加入侧**。
+
+### 公开面
+
+~~~text
+pub fn group_process_peer_entry(device: &mut MlsDevice, store: &mut Store, input: &PeerEntryInput)
+    -> GroupResult<PeerEntryOutcome>
+
+pub struct PeerEntryInput {
+    group_id, epoch, sender_identity, expectation: Option<CommitExpectation>,
+    payload: Vec<u8>, added_members: Vec<String>, removed_members: Vec<String>,
+}
+pub enum PeerEntryOutcome {
+    Commit { old_epoch, new_epoch, added, removed, updated, self_removed, view },
+    Application { sender_identity, epoch, plaintext },
+    Proposal { sender_identity, epoch, view },
+    OwnPendingCommit { epoch },
+}
+
+pub fn group_join_from_welcome(
+    device: &mut MlsDevice, store: &mut Store, name: &str, welcome: &[u8],
+    acceptance: &WelcomeAcceptance, local_credential: &str, owner_credential: &str,
+) -> GroupResult<GroupView>
+
+pub fn create_group_with_welcome(...) -> GroupResult<(GroupView, Vec<u8>)>  // 额外返回引导成员的 Welcome 字节
+~~~
+
+### 关键语义
+
+1. **绑定与会话状态先校验**：快照必须存在（未知群 → `INVALID_TARGET`）、本机设备必须是该群（否则
+   `INVALID_TARGET`）、条目 epoch 必须等于快照 epoch（落后 → `STALE_EPOCH`，超前 → `MISSING_LOG_ENTRIES`）。
+2. **成员身份与真实计数双重绑定**：crypto 用 MLS 认证复核群/epoch/作者与**真实 StagedCommit 计数**；
+   本层在调用 crypto **之前**要求「声明的成员身份数量 == 预期计数」，因此合并成功后写回快照的成员增删
+   既来自真实 Commit 计数、又能按身份落库（数量不符 → `INVALID_CONTROL_RESULT`，**在任何合并之前**拒绝）。
+3. **epoch 恰 +1**：对端 Commit 合并后必须恰好前进一个 epoch（crypto 与本层各校验一次），随后
+   `export_to_store` 把真实 MLS 状态写库，再更新快照的 epoch 与成员；应用消息/提案不改变快照。
+4. **失败不留半状态**：所有拒绝都发生在合并之前；crypto 对致命错误会让该群分支 fail-closed，库内仍是上一次
+   完整状态（测试逐一断言 `GroupView` 不变）。
+5. **Welcome 加入**：crypto 复核外层绑定（群 ID/epoch/成员集合、本机身份必须在内）→ 真实成员与 epoch 写快照
+   （名称由调用方给、群主来自已验证邀请元数据并要求确为成员）；同一群重复加入 → `INVALID_STATE_TRANSITION`；
+   绑定不符 → `WELCOME_NOT_AUTHORIZED` 且**不写任何快照**。
+
+### 错误码（既有冻结码）
+
+| 情形 | code |
+|---|---|
+| 未知群 / 本机不在该群 | `INVALID_TARGET` |
+| 条目 epoch 落后 / 超前（乱序） | `STALE_EPOCH` / `MISSING_LOG_ENTRIES` |
+| 作者与 MLS 认证作者不符 / 认证解密失败 / epoch 不符 | `INVALID_CIPHERTEXT` |
+| 声明成员身份与预期或真实计数不符 | `INVALID_CONTROL_RESULT` |
+| 空 payload / 非法凭据 | `INVALID_CANDIDATE` / `INVALID_CREDENTIAL` |
+| 本机有未决控制提交时收到竞争 Commit | `PENDING_MISMATCH` |
+| Welcome 绑定不符 / 已被使用 | `WELCOME_NOT_AUTHORIZED` |
+| 重复加入 / 群已初始化 | `INVALID_STATE_TRANSITION` |
+| 合并后导出失败 | `STORAGE_FAILURE` |
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test groups_peer   # 7 passed
+cargo test --offline -p chat-core                      # 140 passed（既有 133 继续通过）
+~~~
+
+### 证据（测试名 → 覆盖点）
+
+- `groups_peer::welcome_join_then_peer_add_commit_advances_the_epoch`：A 建群（追加 carol → pending Add）→
+  B 用**真实 Welcome** 加入（成员 2、epoch 1、本机 role=member、群主=alice、无 pending）→ A 的快照里 carol 仍是
+  pending → B 处理 A 的真实 Add Commit（epoch 1、作者 alice、预期 added=1、声明成员 carol）→ outcome 断言
+  old 1 / **new 2** / added 1 / removed 0 / updated 0 / self_removed=false → B 的快照 epoch 2、成员
+  alice+bob+carol（carol 为 member）→ 快照一致且**关库重开**后仍一致。
+- `groups_peer::duplicate_and_out_of_order_entries_are_rejected`：重复处理同一条目 → `STALE_EPOCH`；
+  声称 epoch 3（乱序）→ `MISSING_LOG_ENTRIES`；epoch 声明与消息内 epoch 不符 → `INVALID_CIPHERTEXT`；
+  三次拒绝后快照与成功合并后完全一致。
+- `groups_peer::wrong_sender_and_declared_member_mismatch_are_rejected`：作者改成 mallory → `INVALID_CIPHERTEXT`；
+  声明成员数 0 与预期 1 不符 → `INVALID_CONTROL_RESULT`（**合并前**拒绝）；两次失败后快照仍为 epoch 1、成员 2。
+- `groups_peer::unknown_group_and_empty_payload_are_rejected`：未知群 `INVALID_TARGET`、空 payload `INVALID_CANDIDATE`。
+- `groups_peer::welcome_join_rejects_wrong_binding`：epoch 绑定错 → `WELCOME_NOT_AUTHORIZED` 且**没有快照记录**
+  （`INVALID_TARGET`）；被拒的 Welcome 已消耗 KeyPackage，换设备再用同一 Welcome 也被拒。
+- `groups_peer::duplicate_join_is_rejected_and_snapshot_is_unchanged`：同一设备重复加入 → `INVALID_STATE_TRANSITION`，
+  快照不变。
+- `groups_peer::join_rejects_declared_owner_outside_the_group`：声明的群主不在成员集合 → `INVALID_CONTROL_RESULT`
+  且不写快照（此时 MLS 状态已入群，因此第二次加入显式 `INVALID_STATE_TRANSITION`）。
+
+### 已知限制
+
+1. **成员身份来自外层已验证元数据**：MLS 只给出真实增删**计数**，身份集合必须由调用方（已验证控制日志）提供，
+   本层用「身份数量 == 真实计数」把两者绑定；没有控制日志时无法单独从 MLS 推导“新增的是谁”。
+2. **不接节点**：本条目不提交/不拉取；提交与回执属 group_node / NODE 侧，日志顺序与去重由 SYNC 负责。
+3. **应用消息不落库**：`PeerEntryOutcome::Application` 只把认证后的明文交给可信核心路径，消息表写入属消息模块。
+4. **自己的 pending 与对端 Commit 竞争**：crypto 要求先解决本机 pending（`PENDING_MISMATCH`），
+   本层不自动丢弃（避免丢失可重新投递的候选）。
+5. **Welcome 一次性**：被拒绝的 Welcome 已消耗 KeyPackage，必须重新获取邀请与 KeyPackage（GROUPS-004 票据未实现）。
+6. **self_removed 只更新快照**：本机被移除后快照会去掉本机成员，但重新加入需要新的 Welcome（未实现）。
+

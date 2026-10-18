@@ -301,10 +301,10 @@ collect_unreferenced_attachments(now: Time, budget: GcBudget) -> Result<GcReport
 **完成验收**：
 
 - [x] 有附件记录引用的缓存不删：`attachments::tests::collect_removes_only_unreferenced_cache_directories` 与 `collect_keeps_record_referenced_directories_even_without_grace`（有记录的缓存目录原样保留，含其分块文件）。
-- [x] 活跃上传/已接受消息引用不能删除（消息引用部分）：`attachments::tests::collect_keeps_message_referenced_staging_records_until_detached`（staging 记录 + 过期 + 被消息引用 → 记录与缓存都保留；解除引用后 → 记录与缓存一起回收）。任务/上传队列引用（outbox job 级）仍未接入。
+- [x] 活跃上传/已接受消息引用不能删除（消息引用部分）：`attachments::tests::collect_keeps_message_referenced_staging_records_until_detached`（staging 记录 + 过期 + 被消息引用 → 记录与缓存都保留；解除引用后 → 记录与缓存一起回收）与 `attachments::tests::deleting_a_message_makes_its_staging_attachment_collectible`（消息**落库时自动登记引用**；删消息 → 引用级联清除 → 可回收）。任务/上传队列引用（outbox job 级）仍未接入。
 - [ ] crash 后能继续回收。
 
-**实现状态**：本地缓存回收已实现（记录 + 消息引用计数 + 宽限期，Windows x64 实测）。`PersistedAttachmentStore::collect_unreferenced_attachments() -> CollectReport` 使用默认宽限期 `DEFAULT_COLLECT_GRACE_MS = 24h`，`collect_unreferenced_attachments_with_grace(grace_ms)` 可配置（负数 `INVALID_INPUT`）。流程：短事务读「有记录引用的附件 ID」与「被消息引用的附件 ID」（storage 迁移 0009 的 `message_referenced_attachment_ids`/`attachment_ids`），再：① 清 staging 残留（state=staging、created_at 早于 now-grace、无消息引用 → 删记录连带缓存，计入 `removed_records`）；② 扫缓存根目录，只删名字符合 `att-<32hex>`、无记录/消息引用、且目录 mtime 早于 now-grace 的目录，计入 `removed_directories/freed_bytes`；名字异常的目录与散落文件不动；扫描项数有界（`MAX_COLLECT_SCAN_ENTRIES = 10_000`）。返回 `{ removed_directories, removed_records, freed_bytes, scanned_entries }`；幂等（无孤儿时 0）。证据：`collect_removes_only_unreferenced_cache_directories`、`collect_keeps_message_referenced_staging_records_until_detached`、`collect_respects_the_grace_period_and_is_idempotent`、`collect_keeps_record_referenced_directories_even_without_grace`；storage `message_attachments` 4 个用例（幂等引用/级联删除/未知行拒绝/引用集合与 staging 候选）。限制：任务/上传队列（outbox job）级引用未接入；没有“两阶段 GC 标记”，文件系统与 DB 不是原子的（失败下次幂等重做）；staging 记录来源（导入中断）当前实现不会产生，用例用 storage API 直接构造。通过本函数用例不自动代表整个模块完成。
+**实现状态**：本地缓存回收已实现（记录 + 消息引用计数 + 宽限期，Windows x64 实测）。`PersistedAttachmentStore::collect_unreferenced_attachments() -> CollectReport` 使用默认宽限期 `DEFAULT_COLLECT_GRACE_MS = 24h`，`collect_unreferenced_attachments_with_grace(grace_ms)` 可配置（负数 `INVALID_INPUT`）。流程：短事务读「有记录引用的附件 ID」与「被消息引用的附件 ID」（storage 迁移 0009 的 `message_referenced_attachment_ids`/`attachment_ids`），再：① 清 staging 残留（state=staging、created_at 早于 now-grace、无消息引用 → 删记录连带缓存，计入 `removed_records`）；② 扫缓存根目录，只删名字符合 `att-<32hex>`、无记录/消息引用、且目录 mtime 早于 now-grace 的目录，计入 `removed_directories/freed_bytes`；名字异常的目录与散落文件不动；扫描项数有界（`MAX_COLLECT_SCAN_ENTRIES = 10_000`）。返回 `{ removed_directories, removed_records, freed_bytes, scanned_entries }`；幂等（无孤儿时 0）。证据：`collect_removes_only_unreferenced_cache_directories`、`collect_keeps_message_referenced_staging_records_until_detached`、`collect_respects_the_grace_period_and_is_idempotent`、`collect_keeps_record_referenced_directories_even_without_grace`；storage `message_attachments` 4 个用例（幂等引用/级联删除/未知行拒绝/引用集合与 staging 候选）。消息引用现在由**消息落库路径自动登记**（`apply_verified_entry_with_attachments`，同一笔事务）：见下文"消息落库自动登记附件引用（R-49）"。限制：任务/上传队列（outbox job）级引用未接入；没有“两阶段 GC 标记”，文件系统与 DB 不是原子的（失败下次幂等重做）；staging 记录来源（导入中断）当前实现不会产生，用例用 storage API 直接构造。通过本函数用例不自动代表整个模块完成。
 
 ## 上传/下载接块传输端口实现记录（ATTACHMENTS-003 / 005，2026-10-18，Windows x64）
 
@@ -720,6 +720,57 @@ cargo test --offline -p chat-storage -p chat-core                # 90 + 118 全�
    因此“活跃上传/已接受消息引用不能删除”尚未勾选。
 3. 回收不统计目录自身元数据开销，`freed_bytes` 只累计文件内容字节。
 4. 文件系统删除与 DB 不是同一事务：先删文件再更新计数，失败时下次幂等重做。
+
+## 消息落库自动登记附件引用（R-49，2026-10-18，Windows x64）
+
+目标：附件回收（ATTACHMENTS-008）不再依赖应用层手动 `attach`——消息落库时**自动**登记该消息
+引用的附件，且失败时不留下"消息没落库、引用却半登记"的中间态。
+
+### 落地行为
+
+- storage `Store::apply_verified_entry_with_attachments(input, attachment_ids)`：在**同一笔
+  inbound 事务**内写消息并调用 `register_attachment_refs`（单条消息最多
+  `MAX_ATTACHMENTS_PER_MESSAGE = 32` 个附件；同消息内重复附件只登记一次；每个附件记录必须
+  存在）。任一附件缺失/ID 非法 → `ATTACHMENT_NOT_FOUND` / `INVALID_INPUT` → 事务 poison
+  回滚：消息不落库、引用一行都不留。
+- 幂等：同内容重复落库走只读比对后仍补一次幂等登记（`INSERT OR IGNORE`），不重复写行。
+- core 入口：`PersistedAttachmentStore::apply_verified_entry_with_attachments` 与
+  `ConversationCore::apply_verified_entry_with_attachments`（协议 ID 校验后委托，同一事务）。
+- 查询：`attachments_for_message(message_id)`（`PersistedAttachmentStore` 与
+  `ConversationCore` 都有，按附件 ID 升序、上限 512），供界面展示消息附件。
+- 删除消息：`delete_message(message_id)` 只删 messages 行，`message_attachments`/
+  `receipts` 随外键级联清除；随后该附件（若无附件记录引用）可被 `collect_unreferenced_attachments`
+  回收。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test attachment_refs   # 4 passed
+cargo test --offline -p chat-core --lib                    # 42 passed
+~~~
+
+### 证据
+
+- `attachment_refs::message_persistence_registers_attachment_refs_idempotently`：一条消息落库
+  引用两个附件 → `attachments_for_message` 正好返回这两个；重复落库 `already_existed = true`
+  且引用数仍为 2（不重复登记）；未被引用的第三个附件不会出现。
+- `attachment_refs::invalid_attachment_reference_rolls_back_the_whole_entry`：附件列表里混入
+  不存在的附件 → `ATTACHMENT_NOT_FOUND`，`message_exists = false`（消息没落库）、
+  `attachments_for_message` 为空（引用没半登记）；修正后重试成功。
+- `attachment_refs::deleting_the_message_releases_the_reference`：删消息 → 引用级联清空；
+  重复删除幂等返回 false；附件记录本身保留（回收仍需记录/消息共同判断）。
+- `attachments::tests::deleting_a_message_makes_its_staging_attachment_collectible`：staging 附件
+  + 过期 + 被消息引用 → `collect(grace=0)` 不回收；删消息后同一次调用 → `removed_records = 1`、
+  释放 11 字节、缓存目录与记录都消失。
+
+### 已知限制
+
+1. 引用来自调用方给出的附件 ID 列表（正文是密文，core 不解析附件引用）；应用层必须把
+   消息内出现的附件 ID 传给 `apply_verified_entry_with_attachments`。
+2. 只有消息级引用；outbox job/上传队列引用未接入。
+3. `delete_message` 只删消息行，不清理 message_attempts/草稿（各自生命周期管理）。
+
 
 
 
