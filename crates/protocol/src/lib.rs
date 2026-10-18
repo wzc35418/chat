@@ -69,10 +69,10 @@ pub use ids::{
     SubmissionId, TypedId, parse_id,
 };
 pub use signing::{
-    CANDIDATE_SIGNING_DOMAIN, CandidateKind, ControlMetadata, ControlOperation,
-    MAX_CIPHERTEXT_BYTES, RECEIPT_SIGNING_DOMAIN, SigningKey, UnsignedCandidate,
-    candidate_signing_bytes, receipt_signing_bytes, sign_bytes, signing_key_from_seed,
-    verify_ed25519,
+    CANDIDATE_SIGNING_DOMAIN, CandidateKind, ControlMetadata, ControlOperation, DomainOperation,
+    DomainOperationDeclaration, MAX_CIPHERTEXT_BYTES, RECEIPT_SIGNING_DOMAIN, SigningKey,
+    UnsignedCandidate, candidate_signing_bytes, decode_domain_operation, receipt_signing_bytes,
+    sign_bytes, signing_key_from_seed, verify_ed25519,
 };
 pub use verify::{
     AcceptedLogEntry, GENESIS_SEQUENCE, GroupContext, LOG_ENTRY_HASH_DOMAIN, PinnedNodeKey,

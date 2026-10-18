@@ -456,6 +456,7 @@ pub(crate) mod test_support {
         unsigned.control_metadata = Some(ControlMetadata {
             operation: ControlOperation::Invite,
             target_digest: Digest::from_bytes([0x66; 32]),
+            domain_operation: None,
         });
         unsigned
     }
@@ -635,6 +636,7 @@ mod tests {
         unsigned.control_metadata = Some(crate::signing::ControlMetadata {
             operation: crate::signing::ControlOperation::Invite,
             target_digest: Digest::from_bytes([1; 32]),
+            domain_operation: None,
         });
         // 候选本身已不合法：规范编码阶段就拒绝，签名永远不会被检查。
         let candidate = SignedCandidate {

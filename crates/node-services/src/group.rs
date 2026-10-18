@@ -273,6 +273,8 @@ impl GroupCandidate {
                     "control target digest",
                     &metadata.target_digest,
                 )?),
+                // 节点接收路径暂不解析领域操作声明（PROTOCOL-004 的 55/56 由客户端声明）。
+                domain_operation: None,
             }),
             None => None,
         };

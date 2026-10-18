@@ -119,6 +119,9 @@ pub mod field {
     pub const SESSION_MAX_FRAME_BYTES: u16 = 52;
     pub const SESSION_MAX_MESSAGE_BYTES: u16 = 53;
     pub const SESSION_MAX_CIPHERTEXT_BYTES: u16 = 54;
+    // P1 补充（字段号只增不改）：控制候选的可选领域操作声明。
+    pub const CONTROL_DOMAIN_OPERATION: u16 = 55;
+    pub const CONTROL_DOMAIN_TARGET_DIGEST: u16 = 56;
 }
 
 /// 已知安全字段号表。编码/解码都拒绝表外字段号。
@@ -177,6 +180,8 @@ pub const KNOWN_FIELD_IDS: &[u16] = &[
     field::SESSION_MAX_FRAME_BYTES,
     field::SESSION_MAX_MESSAGE_BYTES,
     field::SESSION_MAX_CIPHERTEXT_BYTES,
+    field::CONTROL_DOMAIN_OPERATION,
+    field::CONTROL_DOMAIN_TARGET_DIGEST,
 ];
 
 /// 判断字段号是否属于冻结安全字段集合。

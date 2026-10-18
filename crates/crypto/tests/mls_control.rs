@@ -1268,6 +1268,261 @@ fn peer_commit_removing_the_local_device_blocks_send_and_decrypt() {
     assert!(!peer_message.is_empty());
 }
 
+fn proposal_entry(
+    group_id: &str,
+    epoch: u64,
+    sender: &str,
+    payload: Vec<u8>,
+) -> VerifiedGroupEntry {
+    VerifiedGroupEntry {
+        group_id: group_id.to_owned(),
+        epoch,
+        sender_identity: sender.to_owned(),
+        expectation: None,
+        payload,
+    }
+}
+
+#[test]
+fn peer_remove_proposal_is_staged_and_counted() {
+    let fixture = Fixture::new("proposal-stage");
+    let (mut alice, mut bob) = pair();
+    let group_key = alice.group_key().expect("group key");
+    let mut alice_store = fixture.open("alice");
+    let mut bob_store = fixture.open("bob");
+    alice.export_to_store(&mut alice_store).expect("export alice");
+    bob.export_to_store(&mut bob_store).expect("export bob");
+
+    let self_removal = alice
+        .prepare_self_removal(&mut alice_store)
+        .expect("prepare self removal proposal");
+    let outcome = bob
+        .process_proposal_entry(&proposal_entry(
+            &group_key,
+            1,
+            "Alice",
+            self_removal.proposal.clone(),
+        ))
+        .expect("bob processes the proposal");
+    assert_eq!(outcome.kind, chat_crypto::control::ProposalKind::Remove);
+    assert_eq!(outcome.by, "Alice");
+    assert_eq!(outcome.epoch, 1);
+    assert_eq!(outcome.targets, vec!["Alice".to_owned()]);
+    assert_eq!(outcome.proposals_pending, 1);
+    assert_eq!(bob.epoch().expect("bob epoch"), 1);
+    assert_eq!(bob.pending_proposal_count().expect("pending"), 1);
+    assert!(bob.pending_control().expect("pending control").is_none());
+}
+
+#[test]
+fn proposal_commit_flow_removes_the_self_removing_device_end_to_end() {
+    let fixture = Fixture::new("proposal-e2e");
+    let (mut alice, mut bob) = pair();
+    let group_key = alice.group_key().expect("group key");
+    let mut alice_store = fixture.open("alice");
+    let mut bob_store = fixture.open("bob");
+    alice.export_to_store(&mut alice_store).expect("export alice");
+    bob.export_to_store(&mut bob_store).expect("export bob");
+
+    let self_removal = alice
+        .prepare_self_removal(&mut alice_store)
+        .expect("prepare self removal proposal");
+    let outcome = bob
+        .process_proposal_entry(&proposal_entry(
+            &group_key,
+            1,
+            "Alice",
+            self_removal.proposal.clone(),
+        ))
+        .expect("bob stages the proposal");
+    assert_eq!(outcome.proposals_pending, 1);
+
+    let pending = bob
+        .commit_pending_proposals(&mut bob_store)
+        .expect("bob commits the pending proposals");
+    assert_eq!(pending.operation, ControlOperationKind::RemoveMembers);
+    assert_eq!(pending.base_epoch, 1);
+    assert_eq!(pending.target_epoch, 2);
+    assert_eq!(pending.added, 0);
+    assert_eq!(pending.removed, 1);
+    assert!(!pending.commit.is_empty());
+    assert!(pending.welcome.is_none());
+    assert_eq!(bob.epoch().expect("bob epoch"), 1);
+
+    bob.merge_accepted_pending(&pending.acceptance(), &mut bob_store)
+        .expect("bob merges his proposal commit");
+    assert_eq!(bob.epoch().expect("bob epoch"), 2);
+
+    let processed = alice
+        .process_verified_entry(&commit_entry(
+            &group_key,
+            1,
+            "Bob",
+            pending.commit.clone(),
+            CommitExpectation {
+                added: 0,
+                removed: 1,
+                updated: 0,
+            },
+        ))
+        .expect("alice processes the removal commit");
+    match processed {
+        ProcessedEntry::Commit {
+            new_epoch,
+            removed,
+            self_removed,
+            ..
+        } => {
+            assert_eq!(new_epoch, 2);
+            assert_eq!(removed, 1);
+            assert!(self_removed);
+        }
+        other => panic!("expected commit, got {other:?}"),
+    }
+    assert!(alice.encrypt("被移除后发言").is_err());
+    let peer_message = bob.encrypt("只剩 Bob 在群里").expect("bob encrypts");
+    assert!(alice.decrypt(&peer_message, "Bob").is_err());
+}
+
+#[test]
+fn duplicate_proposal_delivery_is_rejected_without_double_queueing() {
+    let fixture = Fixture::new("proposal-duplicate");
+    let (mut alice, mut bob) = pair();
+    let group_key = alice.group_key().expect("group key");
+    let mut alice_store = fixture.open("alice");
+    let mut bob_store = fixture.open("bob");
+    alice.export_to_store(&mut alice_store).expect("export alice");
+    bob.export_to_store(&mut bob_store).expect("export bob");
+    let self_removal = alice
+        .prepare_self_removal(&mut alice_store)
+        .expect("prepare proposal");
+    let entry = proposal_entry(&group_key, 1, "Alice", self_removal.proposal.clone());
+    bob.process_proposal_entry(&entry).expect("first delivery");
+    assert_eq!(bob.pending_proposal_count().expect("count"), 1);
+    // 同一条提案再次投递：MLS 的发送方 ratchet 拒绝重放（比提案去重更早失败），
+    // 显式报错且不重复入队、不改变 epoch。
+    let error = bob
+        .process_proposal_entry(&entry)
+        .expect_err("duplicate proposal must be rejected");
+    assert_eq!(error_code(&error), "INVALID_CIPHERTEXT");
+    assert_eq!(bob.pending_proposal_count().expect("count"), 1);
+    assert_eq!(bob.epoch().expect("epoch"), 1);
+    assert!(bob.pending_control().expect("pending").is_none());
+}
+
+#[test]
+fn proposal_entry_validation_rejects_wrong_group_epoch_sender_and_shape() {
+    let fixture = Fixture::new("proposal-validation");
+    let (mut alice, mut bob) = pair();
+    let group_key = alice.group_key().expect("group key");
+    let mut alice_store = fixture.open("alice");
+    let mut bob_store = fixture.open("bob");
+    alice.export_to_store(&mut alice_store).expect("export alice");
+    bob.export_to_store(&mut bob_store).expect("export bob");
+    let self_removal = alice
+        .prepare_self_removal(&mut alice_store)
+        .expect("prepare proposal");
+
+    let error = bob
+        .process_proposal_entry(&proposal_entry(
+            "deadbeef",
+            1,
+            "Alice",
+            self_removal.proposal.clone(),
+        ))
+        .expect_err("another group must be rejected");
+    assert_eq!(error_code(&error), "INVALID_CIPHERTEXT");
+    let error = bob
+        .process_proposal_entry(&proposal_entry(
+            &group_key,
+            0,
+            "Alice",
+            self_removal.proposal.clone(),
+        ))
+        .expect_err("a stale proposal must be rejected");
+    assert_eq!(error_code(&error), "STALE_EPOCH");
+    let error = bob
+        .process_proposal_entry(&proposal_entry(
+            &group_key,
+            3,
+            "Alice",
+            self_removal.proposal.clone(),
+        ))
+        .expect_err("a future proposal must be rejected");
+    assert_eq!(error_code(&error), "MISSING_LOG_ENTRIES");
+    let error = bob
+        .process_proposal_entry(&proposal_entry(
+            &group_key,
+            1,
+            "Bob",
+            self_removal.proposal.clone(),
+        ))
+        .expect_err("a forged sender must be rejected");
+    assert_eq!(error_code(&error), "INVALID_CIPHERTEXT");
+    let mut with_expectation = proposal_entry(&group_key, 1, "Alice", self_removal.proposal.clone());
+    with_expectation.expectation = Some(CommitExpectation {
+        added: 0,
+        removed: 1,
+        updated: 0,
+    });
+    let error = bob
+        .process_proposal_entry(&with_expectation)
+        .expect_err("a proposal with a commit expectation must be rejected");
+    assert_eq!(error_code(&error), "INVALID_STATE_TRANSITION");
+    assert_eq!(bob.pending_proposal_count().expect("count"), 0);
+    assert_eq!(bob.epoch().expect("epoch"), 1);
+    assert!(bob.pending_control().expect("pending").is_none());
+}
+
+#[test]
+fn commit_pending_proposals_requires_proposals_and_free_epoch() {
+    let fixture = Fixture::new("proposal-commit-guard");
+    let (mut alice, mut bob) = pair();
+    let group_key = alice.group_key().expect("group key");
+    let mut alice_store = fixture.open("alice");
+    let mut bob_store = fixture.open("bob");
+    alice.export_to_store(&mut alice_store).expect("export alice");
+    bob.export_to_store(&mut bob_store).expect("export bob");
+
+    let error = bob
+        .commit_pending_proposals(&mut bob_store)
+        .expect_err("no proposals to commit");
+    assert_eq!(error_code(&error), "NO_PENDING_PROPOSALS");
+    assert_eq!(bob.epoch().expect("epoch"), 1);
+    assert!(bob.pending_control().expect("pending").is_none());
+
+    let self_removal = alice
+        .prepare_self_removal(&mut alice_store)
+        .expect("prepare proposal");
+    bob.process_proposal_entry(&proposal_entry(
+        &group_key,
+        1,
+        "Alice",
+        self_removal.proposal.clone(),
+    ))
+    .expect("stage proposal");
+    let control_pending = bob
+        .prepare_control(
+            ControlOperation::RemoveMembers {
+                members: vec!["Alice".into()],
+            },
+            &mut bob_store,
+        )
+        .expect("bob prepares a control commit");
+    let error = bob
+        .commit_pending_proposals(&mut bob_store)
+        .expect_err("a pending control commit blocks packing");
+    assert_eq!(error_code(&error), "INVALID_STATE_TRANSITION");
+    assert_eq!(
+        bob.pending_control()
+            .expect("pending")
+            .expect("recorded")
+            .commit_digest,
+        control_pending.commit_digest
+    );
+    assert_eq!(bob.epoch().expect("epoch"), 1);
+}
+
 #[test]
 fn key_package_and_member_inputs_are_validated() {
     let fixture = Fixture::new("inputs");

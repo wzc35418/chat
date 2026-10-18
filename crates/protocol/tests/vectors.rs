@@ -21,6 +21,7 @@ fn candidate() -> UnsignedCandidate {
         control_metadata: Some(ControlMetadata {
             operation: ControlOperation::Invite,
             target_digest: Digest::from_bytes([0x55; 32]),
+            domain_operation: None,
         }),
     }
 }
@@ -354,4 +355,84 @@ fn session_fingerprint_matches_frozen_vector() {
     remote.limits.max_frame_bytes = 1;
     let changed = negotiate_capabilities(local, remote).expect("session");
     assert_ne!(changed.fingerprint().to_hex(), SESSION_FINGERPRINT_VECTOR);
+}
+/// 带领域操作声明的控制候选（其余字段与 candidate() 相同）。
+fn declared_candidate(operation: ControlOperation, domain: DomainOperation) -> UnsignedCandidate {
+    let mut candidate = candidate();
+    candidate.control_metadata = Some(
+        ControlMetadata::new(operation, Digest::from_bytes([0x55; 32])).with_domain_operation(
+            DomainOperationDeclaration {
+                operation: domain,
+                target_digest: Digest::from_bytes([0x66; 32]),
+            },
+        ),
+    );
+    candidate
+}
+
+const SELF_UPDATE_TRANSFER_VECTOR: &str = "636861742f70312f63616e6469646174652d617574686f722d7369676e61747572652f7631435043010007000f00010100000000000000010002010000000000000001000301000000000000000000040200000020111111111111111111111111111111111111111111111111111111111111111100050200000020222222222222222222222222222222222222222222222222222222222222222200060200000020333333333333333333333333333333333333333333333333333333333333333300070100000000000000020008020000002044444444444444444444444444444444444444444444444444444444444444440009010000000000000007000a010000000000000009000b0200000020305531dcc50ebca31cf1d5b31e9fc76ed51f66b3b6dd5a030c6539ae6532f979000c05010000000000000003000d05020000002055555555555555555555555555555555555555555555555555555555555555550037010000000000000002003802000000206666666666666666666666666666666666666666666666666666666666666666";
+const LEAVE_SELF_VECTOR: &str = "636861742f70312f63616e6469646174652d617574686f722d7369676e61747572652f7631435043010007000f00010100000000000000010002010000000000000001000301000000000000000000040200000020111111111111111111111111111111111111111111111111111111111111111100050200000020222222222222222222222222222222222222222222222222222222222222222200060200000020333333333333333333333333333333333333333333333333333333333333333300070100000000000000020008020000002044444444444444444444444444444444444444444444444444444444444444440009010000000000000007000a010000000000000009000b0200000020305531dcc50ebca31cf1d5b31e9fc76ed51f66b3b6dd5a030c6539ae6532f979000c05010000000000000007000d05020000002055555555555555555555555555555555555555555555555555555555555555550037010000000000000003003802000000206666666666666666666666666666666666666666666666666666666666666666";
+const DISSOLVE_VECTOR: &str = "636861742f70312f63616e6469646174652d617574686f722d7369676e61747572652f7631435043010007000f00010100000000000000010002010000000000000001000301000000000000000000040200000020111111111111111111111111111111111111111111111111111111111111111100050200000020222222222222222222222222222222222222222222222222222222222222222200060200000020333333333333333333333333333333333333333333333333333333333333333300070100000000000000020008020000002044444444444444444444444444444444444444444444444444444444444444440009010000000000000007000a010000000000000009000b0200000020305531dcc50ebca31cf1d5b31e9fc76ed51f66b3b6dd5a030c6539ae6532f979000c05010000000000000008000d05020000002055555555555555555555555555555555555555555555555555555555555555550037010000000000000004003802000000206666666666666666666666666666666666666666666666666666666666666666";
+
+#[test]
+fn domain_declaration_vectors_are_frozen() {
+    let cases = [
+        (
+            declared_candidate(
+                ControlOperation::SetRole,
+                DomainOperation::TransferOwnership,
+            ),
+            SELF_UPDATE_TRANSFER_VECTOR,
+        ),
+        (
+            declared_candidate(ControlOperation::Leave, DomainOperation::LeaveSelf),
+            LEAVE_SELF_VECTOR,
+        ),
+        (
+            declared_candidate(ControlOperation::Dissolve, DomainOperation::Dissolve),
+            DISSOLVE_VECTOR,
+        ),
+    ];
+    let mut actual = Vec::new();
+    let mut expected_all = Vec::new();
+    for (candidate, expected) in cases {
+        let bytes = candidate_signing_bytes(&candidate).expect("declared candidate must encode");
+        assert!(bytes.as_bytes().starts_with(CANDIDATE_SIGNING_DOMAIN));
+        actual.push(bytes.to_hex());
+        expected_all.push(expected.to_owned());
+    }
+    assert_eq!(actual, expected_all);
+}
+
+#[test]
+fn domain_declaration_round_trips_and_old_bytes_stay_none() {
+    // 旧固定向量（无声明）解码回 None，字节未漂移。
+    let old = candidate_signing_bytes(&candidate()).expect("old candidate");
+    let old_body = decode_bounded(
+        &old.as_bytes()[CANDIDATE_SIGNING_DOMAIN.len()..],
+        DecodeLimits::DEFAULT,
+    )
+    .expect("old body decodes");
+    assert_eq!(decode_domain_operation(old_body.value()).unwrap(), None);
+    // 新向量解码回同一声明。
+    let declared = declared_candidate(
+        ControlOperation::SetRole,
+        DomainOperation::TransferOwnership,
+    );
+    let new = candidate_signing_bytes(&declared).expect("declared candidate");
+    let new_body = decode_bounded(
+        &new.as_bytes()[CANDIDATE_SIGNING_DOMAIN.len()..],
+        DecodeLimits::DEFAULT,
+    )
+    .expect("new body decodes");
+    assert_eq!(
+        decode_domain_operation(new_body.value()).unwrap(),
+        Some(DomainOperationDeclaration {
+            operation: DomainOperation::TransferOwnership,
+            target_digest: Digest::from_bytes([0x66; 32]),
+        })
+    );
+    // 新字段号必须登记，否则旧解码器会拒绝这些字节。
+    assert!(is_known_field(field::CONTROL_DOMAIN_OPERATION));
+    assert!(is_known_field(field::CONTROL_DOMAIN_TARGET_DIGEST));
 }

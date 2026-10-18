@@ -165,8 +165,8 @@ cargo test --offline -p chat-storage -p chat-crypto           # 全绿（28 + 65
 
 ```powershell
 . .\tools\activate.ps1
-cargo test --offline -p chat-crypto --test mls_control   # 17 passed（含 5 个自移除用例）
-cargo test --offline -p chat-crypto                      # 49 passed（既有 44 继续全绿）
+cargo test --offline -p chat-crypto --test mls_control   # 22 passed（含自移除与提案式控制流用例）
+cargo test --offline -p chat-crypto                      # 54 passed（既有 49 继续全绿）
 ```
 
 已知限制：控制操作没有账户/角色授权与 control-head 对账（DOMAIN-004 与日志层未接入）；
@@ -396,6 +396,86 @@ cargo test --offline -p chat-crypto                      # 49 passed（既有 44
    提案实现；若将来切到 mixed/plaintext wire format，可改走 `leave_group_via_self_remove`。
 4. 提案在途期间本机不能发应用消息（MLS 规则），调用方（core 的 leave 流程）应把该状态视为
    "退出中"。
+
+
+## 提案式控制流（R-61，2026-10-18，Windows x64）
+
+背景：R-59 只能生成自移除**提案**（MLS 禁止成员提交移除自己的 Commit），但没有处理对端提案、
+也没有"把提案打包成 Commit"的入口，端到端不可达。本轮补齐这两步。
+
+### 落地行为
+
+- `MlsDevice::process_proposal_entry(entry) -> ProposalOutcome`：
+  - 只接受 MLS 内容类型为 **Proposal** 的条目（带 Commit 预期的条目显式拒绝
+    INVALID_STATE_TRANSITION）；
+  - 群 ID 必须一致（否则 INVALID_CIPHERTEXT）；epoch 必须等于本地 epoch
+    （落后 STALE_EPOCH、超前 MISSING_LOG_ENTRIES）；作者必须等于已认证 MLS 发送者
+    （伪造 INVALID_CIPHERTEXT）；
+  - 通过认证后才入 proposal store（`store_pending_proposal`），**epoch 不变**；
+  - 返回 `ProposalOutcome { kind, by, epoch, targets, proposals_pending }`：只含公开身份与计数，
+    不含密钥；P0 只支持 Remove 提案（自移除提案也是 Remove，目标是提案人本机）；
+  - 其它提案种类 → UNSUPPORTED_ENTRY（不入队、不留半状态）；
+  - 同一条提案再次投递：MLS 的发送方 ratchet 拒绝重放（INVALID_CIPHERTEXT），
+    提案数不变；另有"同发送者 + 同提案内容"的第二道去重（DUPLICATE_PROPOSAL）作为防御。
+- `MlsDevice::commit_pending_proposals(store) -> PendingControl`：
+  - 用 OpenMLS `commit_to_pending_proposals` 把本地 proposal store 里的提案打包成一条真实
+    Commit（`consume_proposal_store(true)`），**epoch 不推进**，写 pending 控制记录并随群状态
+    快照持久化（与 prepare_control 同一 T2 语义）；
+  - 种类按真实增删推导（added>0 → add_members；removed>0 → remove_members；否则 self_update），
+    `added/removed` 取 staged commit 的真实计数，Welcome 只在该提交真的新增成员时存在；
+  - 没有待提交提案 → NO_PENDING_PROPOSALS（不做空提交）；已有 pending 控制提交 →
+    PENDING_COMMIT_EXISTS（INVALID_STATE_TRANSITION）；
+  - 合并仍需 `merge_accepted_pending`（接受证据绑定 group/epochs/摘要）。
+- `MlsDevice::pending_proposal_count()`：本地待提交提案数（展示"等待被提交"状态用）。
+- 新增稳定错误码：`DUPLICATE_PROPOSAL`、`NO_PENDING_PROPOSALS`
+  （`ControlError` 新增 `DuplicateProposal`/`NoPendingProposals` 变体，未改既有码）。
+
+### 端到端（自移除）
+
+```text
+A.prepare_self_removal            → Remove 提案（epoch 1，A 的 proposal store 入队）
+B.process_proposal_entry(提案)     → ProposalOutcome{kind=remove, by=Alice, targets=[Alice],
+                                     proposals_pending=1}，B epoch 仍为 1
+B.commit_pending_proposals        → PendingControl{base=1, target=2, removed=1, commit 非空,
+                                     welcome=None}，B epoch 仍为 1
+B.merge_accepted_pending(acceptance)→ B epoch 2
+A.process_verified_entry(B 的 Commit) → Commit{new_epoch=2, removed=1, self_removed=true}
+A 此后 encrypt/decrypt 都失败；B 继续正常工作
+```
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-crypto --test mls_control   # 22 passed（新增 5 个提案流用例）
+cargo test --offline -p chat-crypto                      # 54 passed（既有 49 继续全绿）
+~~~
+
+### 证据（测试名 → 契约点）
+
+- `peer_remove_proposal_is_staged_and_counted`：对端 Remove 提案入队、epoch 不变、
+  `ProposalOutcome` 的 kind/by/epoch/targets/proposals_pending 全部正确，且没有 pending 控制提交。
+- `proposal_commit_flow_removes_the_self_removing_device_end_to_end`：完整链路（提案 → 打包
+  Commit → 合并 → 本机处理 self_removed=true → 本机不能加解密、对端正常），Commit 的
+  removed=1、welcome=None、epoch 不提前推进。
+- `duplicate_proposal_delivery_is_rejected_without_double_queueing`：重复投递被拒
+  （INVALID_CIPHERTEXT，MLS 重放保护）、提案数仍为 1、epoch 不变。
+- `proposal_entry_validation_rejects_wrong_group_epoch_sender_and_shape`：错群 / epoch 落后 /
+  epoch 超前 / 伪造作者 / 带 Commit 预期的条目全部显式拒绝，且拒绝后无提案入队、epoch 与
+  pending 状态不变（不留半状态）。
+- `commit_pending_proposals_requires_proposals_and_free_epoch`：无提案 → NO_PENDING_PROPOSALS；
+  已有 pending 控制提交时打包被拒（INVALID_STATE_TRANSITION）且原 pending 记录不变。
+
+### 已知限制
+
+1. 提案式控制流只支持 **Remove** 提案（P0 切片）；Add/Update/PSK 提案显式 UNSUPPORTED_ENTRY。
+2. `commit_pending_proposals` 打包的是**本地 proposal store 里的全部提案**：调用方必须先确保
+   只入队了本次业务允许的提案（与 DOMAIN-004 的授权/条目对账尚未接入）。
+3. 提案的传输（把 `proposal` 字节随 E2EE 消息送达对端）与 core/groups 的编排尚未接线；
+   本轮只提供 crypto 侧可用的处理与打包入口。
+4. 同发送者+同内容的第二道去重（DUPLICATE_PROPOSAL）在实际上难以触发（重放会先被 ratchet 拒绝），
+   作为防御保留。
+5. 仍未做：提案式控制流与 T3 日志/pending 胜出合并的联动、外部加入提案。
 
 ## CRYPTO-005 · prepare_control
 

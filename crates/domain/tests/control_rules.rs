@@ -79,6 +79,8 @@ fn metadata_of(operation: &GroupOperation) -> ControlMetadata {
     ControlMetadata {
         operation: control_operation_of(operation),
         target_digest: policy_operation_digest(operation).expect("digest"),
+        // 领域测试不涉及 PROTOCOL-004 的领域操作声明（55/56）。
+        domain_operation: None,
     }
 }
 

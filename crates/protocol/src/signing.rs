@@ -96,13 +96,99 @@ impl ControlOperation {
     }
 }
 
+/// 领域操作声明（可选）：当 MLS 提交只能表达 `SelfUpdate`/自移除/无成员变更时，
+/// 用它显式声明真正的领域语义（改角色 / 转让群主 / 本机退出 / 解散）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DomainOperation {
+    /// 常规改角色（MLS `SelfUpdate`）。
+    SetRole = 1,
+    /// 转让群主（MLS 侧通常也表达为 `SelfUpdate`，但领域语义是转让）。
+    TransferOwnership = 2,
+    /// 本机退出（`leave_self`）。
+    LeaveSelf = 3,
+    /// 解散群（无成员变更的领域操作）。
+    Dissolve = 4,
+}
+
+impl DomainOperation {
+    /// 冻结数值。
+    pub const fn as_u64(self) -> u64 {
+        self as u64
+    }
+
+    /// 由冻结数值还原；未知值显式失败（白名单）。
+    pub const fn from_u64(value: u64) -> Option<Self> {
+        match value {
+            1 => Some(DomainOperation::SetRole),
+            2 => Some(DomainOperation::TransferOwnership),
+            3 => Some(DomainOperation::LeaveSelf),
+            4 => Some(DomainOperation::Dissolve),
+            _ => None,
+        }
+    }
+}
+
+/// 领域操作声明：操作种类 + 目标摘要（目标账户/设备集合/群等）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DomainOperationDeclaration {
+    /// 领域操作。
+    pub operation: DomainOperation,
+    /// 目标摘要；必须是非零 32 字节摘要。
+    pub target_digest: Digest,
+}
+
 /// 单一控制操作的公开元数据。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ControlMetadata {
-    /// 操作种类。
+    /// 操作种类（公开层；转让在 MLS `SelfUpdate` 场景下通常是 `SetRole`）。
     pub operation: ControlOperation,
     /// 目标对象摘要（例如目标账户/设备集合的规范摘要）。
     pub target_digest: Digest,
+    /// 可选的领域操作声明；`None` 表示旧字节/未声明。
+    pub domain_operation: Option<DomainOperationDeclaration>,
+}
+
+impl ControlMetadata {
+    /// 无领域声明的公开元数据（兼容旧调用点）。
+    pub const fn new(operation: ControlOperation, target_digest: Digest) -> Self {
+        Self {
+            operation,
+            target_digest,
+            domain_operation: None,
+        }
+    }
+
+    /// 附带领域操作声明。
+    pub const fn with_domain_operation(mut self, declaration: DomainOperationDeclaration) -> Self {
+        self.domain_operation = Some(declaration);
+        self
+    }
+}
+
+fn validate_domain_declaration(kind: CandidateKind, metadata: &ControlMetadata) -> Result<()> {
+    let Some(declaration) = metadata.domain_operation else {
+        return Ok(());
+    };
+    if kind != CandidateKind::Control {
+        return Err(ProtocolError::InvalidCandidate);
+    }
+    let compatible = match declaration.operation {
+        DomainOperation::SetRole => metadata.operation == ControlOperation::SetRole,
+        // MLS 把转让表达为 SelfUpdate（公开层 set_role），直连中继/兼容路径也可能直接给 transfer。
+        DomainOperation::TransferOwnership => matches!(
+            metadata.operation,
+            ControlOperation::SetRole | ControlOperation::TransferOwnership
+        ),
+        DomainOperation::LeaveSelf => metadata.operation == ControlOperation::Leave,
+        DomainOperation::Dissolve => metadata.operation == ControlOperation::Dissolve,
+    };
+    if !compatible {
+        return Err(ProtocolError::InvalidCandidate);
+    }
+    if declaration.target_digest == Digest::ZERO {
+        return Err(ProtocolError::InvalidCandidate);
+    }
+    Ok(())
 }
 
 /// 未签名候选：签名原文覆盖的全部路由与控制字段。
@@ -142,7 +228,10 @@ impl UnsignedCandidate {
             });
         }
         match (self.kind, &self.control_metadata) {
-            (CandidateKind::Control, Some(_)) | (CandidateKind::Application, None) => Ok(()),
+            (CandidateKind::Control, Some(metadata)) => {
+                validate_domain_declaration(self.kind, metadata)
+            }
+            (CandidateKind::Application, None) => Ok(()),
             // 应用候选不得夹带控制元数据，控制候选不得缺少元数据。
             _ => Err(ProtocolError::InvalidCandidate),
         }
@@ -166,7 +255,7 @@ fn candidate_body(candidate: &UnsignedCandidate) -> WireValue {
     let control_target = candidate
         .control_metadata
         .map(|metadata| WireValue::digest(metadata.target_digest));
-    WireValue::structure([
+    let mut body_fields = vec![
         WireField::new(field::SCHEMA_VERSION, WireValue::U64(SCHEMA_VERSION)),
         WireField::new(
             field::PROTOCOL_MAJOR,
@@ -210,7 +299,22 @@ fn candidate_body(candidate: &UnsignedCandidate) -> WireValue {
             field::CONTROL_TARGET_DIGEST,
             WireValue::optional(control_target),
         ),
-    ])
+    ];
+    // 旧候选（无领域声明）不写新字段，保证既有固定向量字节不变。
+    if let Some(declaration) = candidate
+        .control_metadata
+        .and_then(|metadata| metadata.domain_operation)
+    {
+        body_fields.push(WireField::new(
+            field::CONTROL_DOMAIN_OPERATION,
+            WireValue::U64(declaration.operation.as_u64()),
+        ));
+        body_fields.push(WireField::new(
+            field::CONTROL_DOMAIN_TARGET_DIGEST,
+            WireValue::digest(declaration.target_digest),
+        ));
+    }
+    WireValue::Struct(body_fields)
 }
 
 /// PROTOCOL-004：候选作者签名原文。
@@ -224,6 +328,49 @@ pub fn candidate_signing_bytes(candidate: &UnsignedCandidate) -> Result<Canonica
     bytes.extend_from_slice(CANDIDATE_SIGNING_DOMAIN);
     bytes.extend_from_slice(body.as_bytes());
     Ok(CanonicalBytes::from_raw(bytes))
+}
+
+/// 从候选规范结构解码可选领域操作声明。
+///
+/// 旧字节（没有这两个字段）返回 `Ok(None)`；只出现一个字段、未知枚举值、
+/// 目标摘要长度不是 32 字节或全零都显式失败（`INVALID_CANDIDATE`）。
+pub fn decode_domain_operation(body: &WireValue) -> Result<Option<DomainOperationDeclaration>> {
+    let WireValue::Struct(fields) = body else {
+        return Err(ProtocolError::InvalidCandidate);
+    };
+    let operation = fields
+        .iter()
+        .find(|candidate| candidate.id == field::CONTROL_DOMAIN_OPERATION);
+    let target = fields
+        .iter()
+        .find(|candidate| candidate.id == field::CONTROL_DOMAIN_TARGET_DIGEST);
+    match (operation, target) {
+        (None, None) => Ok(None),
+        (Some(operation), Some(target)) => {
+            let WireValue::U64(raw) = operation.value else {
+                return Err(ProtocolError::InvalidCandidate);
+            };
+            let operation =
+                DomainOperation::from_u64(raw).ok_or(ProtocolError::InvalidCandidate)?;
+            let WireValue::Bytes(bytes) = &target.value else {
+                return Err(ProtocolError::InvalidCandidate);
+            };
+            let digest: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| ProtocolError::InvalidCandidate)?;
+            let target_digest = Digest::from_bytes(digest);
+            if target_digest == Digest::ZERO {
+                return Err(ProtocolError::InvalidCandidate);
+            }
+            Ok(Some(DomainOperationDeclaration {
+                operation,
+                target_digest,
+            }))
+        }
+        // 两个字段必须成对出现。
+        _ => Err(ProtocolError::InvalidCandidate),
+    }
 }
 
 /// PROTOCOL-006：节点回执签名原文。
@@ -291,6 +438,7 @@ mod tests {
             control_metadata: Some(ControlMetadata {
                 operation: ControlOperation::Invite,
                 target_digest: Digest::from_bytes([0x55; 32]),
+                domain_operation: None,
             }),
         }
     }
@@ -334,12 +482,14 @@ mod tests {
                 c.control_metadata = Some(ControlMetadata {
                     operation: ControlOperation::Remove,
                     target_digest: Digest::from_bytes([0x55; 32]),
+                    domain_operation: None,
                 })
             }),
             Box::new(|c| {
                 c.control_metadata = Some(ControlMetadata {
                     operation: ControlOperation::Invite,
                     target_digest: Digest::from_bytes([0x99; 32]),
+                    domain_operation: None,
                 })
             }),
         ];
@@ -439,6 +589,215 @@ mod tests {
         assert_eq!(
             verify_ed25519(&public_key, bytes.as_bytes(), &tampered).unwrap_err(),
             ProtocolError::InvalidSignature
+        );
+    }
+
+    fn declared_candidate() -> UnsignedCandidate {
+        let mut candidate = self::candidate();
+        candidate.control_metadata = Some(
+            ControlMetadata::new(ControlOperation::SetRole, Digest::from_bytes([0x55; 32]))
+                .with_domain_operation(DomainOperationDeclaration {
+                    operation: DomainOperation::TransferOwnership,
+                    target_digest: Digest::from_bytes([0x66; 32]),
+                }),
+        );
+        candidate
+    }
+
+    fn candidate_body_fields(candidate: &UnsignedCandidate) -> WireValue {
+        let bytes = candidate_signing_bytes(candidate).expect("candidate must encode");
+        let body = &bytes.as_bytes()[CANDIDATE_SIGNING_DOMAIN.len()..];
+        crate::decode::decode_bounded(body, crate::decode::DecodeLimits::DEFAULT)
+            .expect("body must decode")
+            .value()
+            .clone()
+    }
+
+    #[test]
+    fn domain_declaration_is_signed_and_any_change_breaks_verification() {
+        let key = signing_key_from_seed(&[0x42; 32]);
+        let public_key = key.verifying_key().to_bytes();
+        let bytes = candidate_signing_bytes(&declared_candidate()).expect("declared candidate");
+        let signature = sign_bytes(&key, bytes.as_bytes());
+        assert!(verify_ed25519(&public_key, bytes.as_bytes(), &signature).is_ok());
+        // 声明字段任一变化都必须让原签名失效。
+        let mut changed = declared_candidate();
+        if let Some(metadata) = changed.control_metadata.as_mut() {
+            metadata.domain_operation = Some(DomainOperationDeclaration {
+                operation: DomainOperation::SetRole,
+                target_digest: Digest::from_bytes([0x66; 32]),
+            });
+        }
+        assert!(!still_verifies(&changed, &public_key, &signature));
+        let mut changed = declared_candidate();
+        if let Some(metadata) = changed.control_metadata.as_mut() {
+            metadata.domain_operation = Some(DomainOperationDeclaration {
+                operation: DomainOperation::TransferOwnership,
+                target_digest: Digest::from_bytes([0x67; 32]),
+            });
+        }
+        assert!(!still_verifies(&changed, &public_key, &signature));
+        let mut changed = declared_candidate();
+        if let Some(metadata) = changed.control_metadata.as_mut() {
+            metadata.domain_operation = None;
+        }
+        assert!(!still_verifies(&changed, &public_key, &signature));
+    }
+
+    #[test]
+    fn domain_declaration_requires_control_kind_and_compatible_operation() {
+        // 应用候选携带声明 → 拒绝。
+        let mut application = declared_candidate();
+        application.kind = CandidateKind::Application;
+        assert_eq!(
+            candidate_signing_bytes(&application).unwrap_err(),
+            ProtocolError::InvalidCandidate
+        );
+        // 公开操作与领域声明不匹配 → 拒绝。
+        for (public, domain) in [
+            (ControlOperation::Rename, DomainOperation::TransferOwnership),
+            (ControlOperation::Remove, DomainOperation::LeaveSelf),
+            (ControlOperation::SetRole, DomainOperation::Dissolve),
+            (ControlOperation::Invite, DomainOperation::SetRole),
+        ] {
+            let mut candidate = self::candidate();
+            candidate.control_metadata = Some(
+                ControlMetadata::new(public, Digest::from_bytes([0x55; 32])).with_domain_operation(
+                    DomainOperationDeclaration {
+                        operation: domain,
+                        target_digest: Digest::from_bytes([0x66; 32]),
+                    },
+                ),
+            );
+            assert_eq!(
+                candidate_signing_bytes(&candidate).unwrap_err(),
+                ProtocolError::InvalidCandidate,
+                "public {public:?} + domain {domain:?} must be rejected"
+            );
+        }
+        // 合法组合。
+        for (public, domain) in [
+            (ControlOperation::SetRole, DomainOperation::SetRole),
+            (
+                ControlOperation::SetRole,
+                DomainOperation::TransferOwnership,
+            ),
+            (
+                ControlOperation::TransferOwnership,
+                DomainOperation::TransferOwnership,
+            ),
+            (ControlOperation::Leave, DomainOperation::LeaveSelf),
+            (ControlOperation::Dissolve, DomainOperation::Dissolve),
+        ] {
+            let mut candidate = self::candidate();
+            candidate.control_metadata = Some(
+                ControlMetadata::new(public, Digest::from_bytes([0x55; 32])).with_domain_operation(
+                    DomainOperationDeclaration {
+                        operation: domain,
+                        target_digest: Digest::from_bytes([0x66; 32]),
+                    },
+                ),
+            );
+            assert!(
+                candidate_signing_bytes(&candidate).is_ok(),
+                "public {public:?} + domain {domain:?} must be accepted"
+            );
+        }
+        // 全零目标摘要视为缺目标摘要。
+        let mut candidate = self::candidate();
+        candidate.control_metadata = Some(
+            ControlMetadata::new(ControlOperation::Leave, Digest::from_bytes([0x55; 32]))
+                .with_domain_operation(DomainOperationDeclaration {
+                    operation: DomainOperation::LeaveSelf,
+                    target_digest: Digest::ZERO,
+                }),
+        );
+        assert_eq!(
+            candidate_signing_bytes(&candidate).unwrap_err(),
+            ProtocolError::InvalidCandidate
+        );
+    }
+
+    #[test]
+    fn domain_declaration_is_omitted_for_old_bytes_and_decoded_from_new_bytes() {
+        // 旧候选：body 不含新字段号 → 解码为 None，且字节与既有向量一致。
+        let old_body = candidate_body_fields(&candidate());
+        let WireValue::Struct(fields) = &old_body else {
+            panic!("candidate body must be a struct");
+        };
+        assert!(
+            fields
+                .iter()
+                .all(|f| f.id != field::CONTROL_DOMAIN_OPERATION
+                    && f.id != field::CONTROL_DOMAIN_TARGET_DIGEST)
+        );
+        assert_eq!(decode_domain_operation(&old_body).unwrap(), None);
+        // 新候选：字段成对出现并解回同一声明。
+        let declared = declared_candidate();
+        let new_body = candidate_body_fields(&declared);
+        assert_eq!(
+            decode_domain_operation(&new_body).unwrap(),
+            declared
+                .control_metadata
+                .and_then(|metadata| metadata.domain_operation)
+        );
+        // 只出现一个字段 → 拒绝。
+        for partial in [
+            vec![WireField::new(
+                field::CONTROL_DOMAIN_OPERATION,
+                WireValue::U64(2),
+            )],
+            vec![WireField::new(
+                field::CONTROL_DOMAIN_TARGET_DIGEST,
+                WireValue::digest(Digest::from_bytes([7; 32])),
+            )],
+        ] {
+            assert_eq!(
+                decode_domain_operation(&WireValue::Struct(partial)).unwrap_err(),
+                ProtocolError::InvalidCandidate
+            );
+        }
+        // 未知枚举值、错误摘要长度、全零摘要、非结构体 → 全部拒绝。
+        for invalid in [
+            WireValue::Struct(vec![
+                WireField::new(field::CONTROL_DOMAIN_OPERATION, WireValue::U64(9)),
+                WireField::new(
+                    field::CONTROL_DOMAIN_TARGET_DIGEST,
+                    WireValue::digest(Digest::from_bytes([7; 32])),
+                ),
+            ]),
+            WireValue::Struct(vec![
+                WireField::new(field::CONTROL_DOMAIN_OPERATION, WireValue::U64(2)),
+                WireField::new(
+                    field::CONTROL_DOMAIN_TARGET_DIGEST,
+                    WireValue::Bytes(vec![7; 31]),
+                ),
+            ]),
+            WireValue::Struct(vec![
+                WireField::new(field::CONTROL_DOMAIN_OPERATION, WireValue::U64(2)),
+                WireField::new(
+                    field::CONTROL_DOMAIN_TARGET_DIGEST,
+                    WireValue::Bytes(vec![0; 32]),
+                ),
+            ]),
+            WireValue::U64(1),
+        ] {
+            assert_eq!(
+                decode_domain_operation(&invalid).unwrap_err(),
+                ProtocolError::InvalidCandidate
+            );
+        }
+        // 新字段号已登记为合法字段。
+        assert!(crate::canonical::is_known_field(
+            field::CONTROL_DOMAIN_OPERATION
+        ));
+        assert!(crate::canonical::is_known_field(
+            field::CONTROL_DOMAIN_TARGET_DIGEST
+        ));
+        assert_eq!(DomainOperation::from_u64(5), None);
+        assert_eq!(
+            DomainOperation::from_u64(DomainOperation::LeaveSelf.as_u64()),
+            Some(DomainOperation::LeaveSelf)
         );
     }
 }

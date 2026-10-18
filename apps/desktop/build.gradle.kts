@@ -15,6 +15,8 @@ dependencies {
     implementation(compose.desktop.currentOs)
     implementation(compose.material3)
     implementation(libs.coroutines.core)
+    // DPAPI 密钥槽需要直接调用 crypt32（与 core-bridge 使用同一 JNA 版本）
+    implementation(libs.jna)
 }
 compose.desktop {
     application {
@@ -135,6 +137,16 @@ tasks.register<JavaExec>("groupSmoke") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("chat.desktop.GroupSmokeKt")
     systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+}
+
+tasks.register<JavaExec>("dpapiSmoke") {
+    group = "verification"
+    description = "PLATFORM-001/002 Windows DPAPI 竖切：当前用户作用域封装/解封、无明文落盘、删除后不可解。"
+    dependsOn("classes")
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.DpapiSmokeKt")
     systemProperty("file.encoding", "UTF-8")
     systemProperty("stdout.encoding", "UTF-8")
 }

@@ -318,6 +318,38 @@ pub enum ProcessedEntry {
     },
 }
 
+
+/// 独立提案的种类（P0 控制切片只支持 Remove/自移除提案）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProposalKind {
+    /// 移除成员（含"本机自移除"提案：目标就是本机）。
+    Remove,
+}
+
+impl ProposalKind {
+    /// 稳定编码（进入 DTO/事件文本）。
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Remove => "remove",
+        }
+    }
+}
+
+/// 处理对端独立提案的结果（epoch 不变；提案进入本地 proposal store，等待 Commit 覆盖）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalOutcome {
+    /// 提案种类。
+    pub kind: ProposalKind,
+    /// 已认证的提案作者身份。
+    pub by: String,
+    /// 提案所属 epoch。
+    pub epoch: u64,
+    /// 提案的目标成员身份（Remove 提案的目标；自移除提案的目标就是作者本机）。
+    pub targets: Vec<String>,
+    /// 处理后本地 proposal store 里待提交的提案数。
+    pub proposals_pending: u32,
+}
+
 /// Welcome 加入的预期绑定（由已验证的邀请/控制日志提供）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WelcomeAcceptance {
@@ -374,6 +406,10 @@ pub enum ControlError {
     },
     /// KeyPackage 不合法/重复。
     InvalidKeyPackage(&'static str),
+    /// 重复的独立提案（同一提案引用已在 proposal store 里）。
+    DuplicateProposal,
+    /// 本地没有待提交的提案，无法打包成 Commit。
+    NoPendingProposals,
     /// 成员不在群里或身份不唯一。
     UnknownMember(&'static str),
     /// 控制操作本身不合法。
@@ -415,6 +451,8 @@ impl ControlError {
             Self::StaleEpoch { .. } => "STALE_EPOCH",
             Self::MissingLogEntries { .. } => "MISSING_LOG_ENTRIES",
             Self::InvalidKeyPackage(_) => "INVALID_KEY_PACKAGE",
+            Self::DuplicateProposal => "DUPLICATE_PROPOSAL",
+            Self::NoPendingProposals => "NO_PENDING_PROPOSALS",
             Self::UnknownMember(_) => "INVALID_STATE_TRANSITION",
             Self::InvalidControlOperation(_) => "INVALID_STATE_TRANSITION",
             Self::InvalidCiphertext(_) => "INVALID_CIPHERTEXT",
@@ -451,6 +489,12 @@ impl std::fmt::Display for ControlError {
                 "entry epoch {found} is ahead of the local epoch {expected}; entries are missing"
             ),
             Self::InvalidKeyPackage(detail) => write!(formatter, "invalid key package: {detail}"),
+            Self::DuplicateProposal => {
+                formatter.write_str("the proposal is already pending in the local proposal store")
+            }
+            Self::NoPendingProposals => {
+                formatter.write_str("there are no pending proposals to commit")
+            }
             Self::UnknownMember(detail) => write!(formatter, "unknown member: {detail}"),
             Self::InvalidControlOperation(detail) => {
                 write!(formatter, "invalid control operation: {detail}")
@@ -1099,6 +1143,129 @@ impl MlsDevice {
         })
     }
 
+    /// 把本地 proposal store 里的提案打包成一条 Commit（写 pending，epoch 不推进）。
+    ///
+    /// 用于"提案式控制流"：对端收到独立提案后，由某个成员把提案提交成 Commit。
+    /// - 没有待提交提案 → NO_PENDING_PROPOSALS（显式拒绝，不产生空提交）；
+    /// - 已有 pending 控制提交 → PENDING_COMMIT_EXISTS；
+    /// - 提交种类按实际增删推导（AddMembers/RemoveMembers/SelfUpdate），removed/added
+    ///   为 staged commit 的真实计数；Welcome 只在该提交真的新增成员时存在；
+    /// - 只有拿到接受证据并 merge 后 epoch 才推进；本调用不推进 epoch。
+    pub fn commit_pending_proposals(
+        &mut self,
+        store: &mut FormalStore,
+    ) -> Result<PendingControl, ControlError> {
+        if let Some(existing) = self.pending_record() {
+            return Err(ControlError::PendingCommitExists {
+                base_epoch: existing.base_epoch,
+            });
+        }
+        let base_epoch = self
+            .group_ref()
+            .map_err(|_| ControlError::GroupNotInitialized)?
+            .epoch()
+            .as_u64();
+        {
+            let group = self
+                .group_ref()
+                .map_err(|_| ControlError::GroupNotInitialized)?;
+            if group.pending_commit().is_some() {
+                return Err(ControlError::PendingMismatch(
+                    "the MLS group already holds an untracked pending commit",
+                ));
+            }
+            if group.proposal_store().proposals().next().is_none() {
+                return Err(ControlError::NoPendingProposals);
+            }
+        }
+        let (commit, welcome) = {
+            let (provider, signer, group) = self
+                .control_parts_mut()
+                .map_err(|_| ControlError::GroupNotInitialized)?;
+            let (commit, welcome, _) = group
+                .commit_to_pending_proposals(provider, signer)
+                .map_err(|error| crypto_error("commit pending proposals", error))?;
+            let commit_bytes = commit
+                .tls_serialize_detached()
+                .map_err(|error| crypto_error("serialize proposal commit", error))?;
+            let welcome_bytes = welcome
+                .map(|welcome| welcome.tls_serialize_detached())
+                .transpose()
+                .map_err(|error| crypto_error("serialize welcome", error))?;
+            (commit_bytes, welcome_bytes)
+        };
+        // 真实增删计数取自已 staged 的提交。
+        let (added, removed, updated) = {
+            let group = self
+                .group_ref()
+                .map_err(|_| ControlError::GroupNotInitialized)?;
+            let Some(staged) = group.pending_commit() else {
+                return Err(ControlError::PendingMismatch(
+                    "MLS did not stage a pending commit for the pending proposals",
+                ));
+            };
+            (
+                staged.add_proposals().count() as u32,
+                staged.remove_proposals().count() as u32,
+                staged.update_proposals().count() as u32,
+            )
+        };
+        // 关键不变量：打包提案不推进本地 epoch。
+        let epoch_after = self
+            .group_ref()
+            .map_err(|_| ControlError::GroupNotInitialized)?
+            .epoch()
+            .as_u64();
+        if epoch_after != base_epoch {
+            self.abandon_group();
+            return Err(ControlError::Crypto(
+                "staging a proposal commit changed the local epoch".to_owned(),
+            ));
+        }
+        if commit.is_empty() || commit.len() > MAX_COMMIT_BYTES {
+            self.abandon_group();
+            return Err(ControlError::Crypto(
+                "staged proposal commit length is outside the supported bounds".to_owned(),
+            ));
+        }
+        if let Some(welcome) = &welcome
+            && (welcome.is_empty() || welcome.len() > MAX_WELCOME_BYTES)
+        {
+            self.abandon_group();
+            return Err(ControlError::Crypto(
+                "staged welcome length is outside the supported bounds".to_owned(),
+            ));
+        }
+        let kind = if added > 0 {
+            ControlOperationKind::AddMembers
+        } else if removed > 0 {
+            ControlOperationKind::RemoveMembers
+        } else {
+            // 只有 update/PSK 类提案时按自更新记录（不新增枚举，避免破坏上层匹配）。
+            ControlOperationKind::SelfUpdate
+        };
+        let group_id = self
+            .group_key()
+            .map_err(|error| crypto_error("read MLS group id", error))?;
+        let target_epoch = base_epoch.saturating_add(1);
+        let commit_digest = control_digest(&group_id, base_epoch, target_epoch, &commit);
+        let pending = PendingControl {
+            group_id,
+            base_epoch,
+            target_epoch,
+            operation: kind,
+            added,
+            removed,
+            commit,
+            welcome,
+            commit_digest,
+        };
+        self.set_pending_record(Some(pending.clone()));
+        self.export_to_store(store).map_err(storage_error)?;
+        let _ = updated;
+        Ok(pending)
+    }
+
     /// CRYPTO-007：提交被接受后合并 pending，并消费该提交的密钥。
     ///
     /// 只有绑定同一 group/base_epoch/target_epoch/摘要的接受证据才允许合并；
@@ -1414,6 +1581,150 @@ impl MlsDevice {
                 "entry is an echo of an application message sent by this device",
             )),
         }
+    }
+
+    /// 本地 proposal store 里待提交的提案数（epoch 不变；用于展示"等待被提交"状态）。
+    pub fn pending_proposal_count(&self) -> Result<u32, ControlError> {
+        let group = self
+            .group_ref()
+            .map_err(|_| ControlError::GroupNotInitialized)?;
+        Ok(u32::try_from(group.proposal_store().proposals().count()).unwrap_or(u32::MAX))
+    }
+
+    /// 处理对端独立提案（P0 只支持 Remove 提案，含"自移除"提案）。
+    ///
+    /// 语义：
+    /// - 只接受 Proposal 内容类型的 MLS 消息（带 Commit 预期的条目显式拒绝）；
+    /// - 群 ID 必须一致、epoch 必须等于本地 epoch（落后 STALE_EPOCH、超前
+    ///   MISSING_LOG_ENTRIES）；作者身份必须等于已认证的 MLS 发送者；
+    /// - 提案通过认证后存进本地 proposal store，**epoch 不变**，等待后续 Commit 覆盖；
+    /// - 重复提案（同一提案引用已在 store 里）→ DUPLICATE_PROPOSAL，不重复入队；
+    /// - 其它种类（Add/Update/PSK/...）→ UNSUPPORTED_ENTRY，且不把该提案留在本地
+    ///   store（解析后立即撤销，保证不留半状态）。
+    pub fn process_proposal_entry(
+        &mut self,
+        entry: &VerifiedGroupEntry,
+    ) -> Result<ProposalOutcome, ControlError> {
+        let local_group_id = self
+            .group_key()
+            .map_err(|error| crypto_error("read MLS group id", error))?;
+        if entry.group_id != local_group_id {
+            return Err(ControlError::InvalidCiphertext(
+                "proposal entry belongs to another MLS group",
+            ));
+        }
+        if entry.expectation.is_some() {
+            return Err(ControlError::InvalidControlOperation(
+                "a proposal entry must not carry a commit expectation",
+            ));
+        }
+        let local_epoch = self
+            .group_ref()
+            .map_err(|_| ControlError::GroupNotInitialized)?
+            .epoch()
+            .as_u64();
+        if entry.epoch < local_epoch {
+            return Err(ControlError::StaleEpoch {
+                expected: local_epoch,
+                found: entry.epoch,
+            });
+        }
+        if entry.epoch > local_epoch {
+            return Err(ControlError::MissingLogEntries {
+                expected: local_epoch,
+                found: entry.epoch,
+            });
+        }
+        let protocol = MlsMessageIn::tls_deserialize_exact(entry.payload.as_slice())
+            .map_err(|_| ControlError::InvalidCiphertext("proposal is not a valid MLS message"))?
+            .try_into_protocol_message()
+            .map_err(|_| ControlError::InvalidCiphertext("expected an MLS protocol message"))?;
+        if protocol.content_type() != ContentType::Proposal {
+            return Err(ControlError::UnsupportedEntry(
+                "entry is not an MLS standalone proposal",
+            ));
+        }
+        // 现有提案（发送者 + 提案内容）：用于去重（重复提案不重复入队）。
+        // openmls 的 proposal_reference 是 crate 私有 API，这里用公开的 sender()/proposal() 比较。
+        let existing_proposals: Vec<(Sender, Proposal)> = self
+            .group_ref()
+            .map_err(|_| ControlError::GroupNotInitialized)?
+            .proposal_store()
+            .proposals()
+            .map(|stored| (stored.sender().clone(), stored.proposal().clone()))
+            .collect();
+        let processed = {
+            let (provider, _signer, group) = self
+                .control_parts_mut()
+                .map_err(|_| ControlError::GroupNotInitialized)?;
+            group.process_message(provider, protocol)
+        }
+        .map_err(|_| {
+            // 提案认证失败不改变 epoch，也不写入本地 store；不停止群分支。
+            ControlError::InvalidCiphertext("MLS proposal failed authentication or decryption")
+        })?;
+        if processed.epoch().as_u64() != entry.epoch {
+            return Err(ControlError::InvalidCiphertext(
+                "authenticated MLS epoch does not match the proposal entry epoch",
+            ));
+        }
+        if processed.credential().serialized_content() != entry.sender_identity.as_bytes() {
+            return Err(ControlError::InvalidCiphertext(
+                "entry sender does not match the authenticated MLS sender",
+            ));
+        }
+        let by = entry.sender_identity.clone();
+        let ProcessedMessageContent::ProposalMessage(proposal) = processed.into_content() else {
+            return Err(ControlError::UnsupportedEntry(
+                "entry is not a standalone proposal message",
+            ));
+        };
+        let duplicate = existing_proposals.iter().any(|(sender, stored)| {
+            *sender == *proposal.sender() && stored == proposal.proposal()
+        });
+        if duplicate {
+            return Err(ControlError::DuplicateProposal);
+        }
+        // 只支持 Remove 提案（自移除提案也是 Remove，目标是作者本机）。
+        let target_leaf = match proposal.proposal() {
+            Proposal::Remove(remove) => remove.removed(),
+            _ => {
+                return Err(ControlError::UnsupportedEntry(
+                    "only remove proposals are supported in the P0 control slice",
+                ));
+            }
+        };
+        let target = {
+            let group = self
+                .group_ref()
+                .map_err(|_| ControlError::GroupNotInitialized)?;
+            group
+                .members()
+                .find(|member| member.index == target_leaf)
+                .map(|member| {
+                    String::from_utf8_lossy(member.credential.serialized_content()).into_owned()
+                })
+        }
+        .ok_or(ControlError::StateCorrupted(
+            "remove proposal targets a leaf that is not a group member",
+        ))?;
+        // 入队（提案进 proposal store 与 provider storage；epoch 不变）。
+        {
+            let (provider, _signer, group) = self
+                .control_parts_mut()
+                .map_err(|_| ControlError::GroupNotInitialized)?;
+            group
+                .store_pending_proposal(provider.storage(), *proposal)
+                .map_err(|error| crypto_error("store pending proposal", error))?;
+        }
+        let proposals_pending = self.pending_proposal_count()?;
+        Ok(ProposalOutcome {
+            kind: ProposalKind::Remove,
+            by,
+            epoch: entry.epoch,
+            targets: vec![target],
+            proposals_pending,
+        })
     }
 
     /// CRYPTO-009：用 Welcome 加入群、核对绑定并立即持久化。
