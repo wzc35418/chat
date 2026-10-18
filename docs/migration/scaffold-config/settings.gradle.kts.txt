@@ -1,0 +1,13 @@
+rootProject.name = "chat"
+include(":apps:android")
+include(":apps:desktop")
+include(":shared:ui")
+include(":shared:presentation")
+include(":shared:core-api")
+include(":shared:core-bridge")
+include(":shared:platform-api")
+include(":desktop:plugin-sdk")
+include(":desktop:plugin-host")
+include(":desktop:platform")
+include(":plugins:examples:hello-command")
+include(":plugins:examples:message-formatter")

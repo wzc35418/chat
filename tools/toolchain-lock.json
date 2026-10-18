@@ -1,0 +1,23 @@
+{
+  "jdk": {
+    "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip",
+    "sha256": "f9d6e191ab098c0d416e7d588a24420a8621cd2f4720dab2459b8b7b2d2d8b4e",
+    "file": "OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip"
+  },
+  "rust": "1.99.1",
+  "gradle": {
+    "version": "8.14.3",
+    "sha256": "bd71102213493060956ec229d946beee57158dbd89d0e62b91bca0fa2c5f3531"
+  },
+  "androidCommandLine": {
+    "url": "https://dl.google.com/android/repository/commandlinetools-win-13114758_latest.zip",
+    "checksum": "54a582f3bf73e04253602f2d1c80bd5868aac115",
+    "checksumAlgorithm": "SHA1"
+  },
+  "androidPackages": [
+    "platform-tools",
+    "platforms;android-36",
+    "build-tools;36.0.0",
+    "ndk;28.2.13676358"
+  ]
+}

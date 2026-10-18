@@ -1,0 +1,25 @@
+[package]
+name = "chat-storage"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chat-protocol.workspace = true
+anyhow.workspace = true
+rusqlite.workspace = true
+openmls_sqlite_storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+chacha20poly1305.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+
+[[bin]]
+name = "storage-crash-worker"
+path = "src/formal_crash_worker.rs"

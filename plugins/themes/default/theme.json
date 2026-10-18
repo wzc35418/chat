@@ -1,0 +1,11 @@
+{
+  "id": "dev.example.default-theme",
+  "version": 1,
+  "colors": {
+    "background": "#F7F8FA",
+    "surface": "#FFFFFF",
+    "text": "#20242C",
+    "accent": "#2864DC"
+  },
+  "description": "声明式主题样例，尚未接入 UI"
+}

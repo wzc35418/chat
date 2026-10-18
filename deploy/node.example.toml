@@ -1,0 +1,17 @@
+# 配置草案；节点目前未实现，不可作为生产部署。
+[server]
+bind = "0.0.0.0:8080"
+external_url = "https://chat.example.invalid"
+[storage]
+database = "/data/node.db"
+blob_directory = "/data/blobs"
+[limits]
+message_bytes = 65536
+attachment_bytes = 26214400
+mailbox_ttl_days = 30
+accounts_per_group = 20
+devices_per_group = 40
+devices_per_account = 2
+[infrastructure]
+allow_public_fallback = false
+# relay_url 需 P0 自托管验证后显式填写。

@@ -1,0 +1,14 @@
+# 部署草案：P5 构建实际节点镜像后才可运行。
+# 镜像变量必须由操作者填写；当前骨架不会启动一个假节点。
+services:
+  node:
+    image: ${CHAT_NODE_IMAGE:?请先构建并设置经过验证的节点镜像}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - node-data:/data
+      - ./node.example.toml:/etc/chat/node.toml:ro
+    command: ["--config", "/etc/chat/node.toml"]
+volumes:
+  node-data:

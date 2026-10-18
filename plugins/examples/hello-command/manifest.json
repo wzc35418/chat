@@ -1,0 +1,19 @@
+{
+  "id": "dev.example.hello-command",
+  "name": "hello-command",
+  "version": "0.0.0",
+  "sdkVersion": "1",
+  "runtime": "trusted-jvm",
+  "entrypoint": "chat.examples.HelloPlugin",
+  "platforms": [
+    "windows-x64",
+    "linux-x64"
+  ],
+  "requestedCapabilities": [
+    "commands.register",
+    "messages.draft.propose"
+  ],
+  "contributions": [
+    "commands"
+  ]
+}

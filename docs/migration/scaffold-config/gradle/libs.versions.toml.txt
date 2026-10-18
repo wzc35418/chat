@@ -1,0 +1,6 @@
+[versions]
+# 待 P0 核实后填写精确版本，不使用 latest、+ 或虚构版本。
+
+[libraries]
+
+[plugins]

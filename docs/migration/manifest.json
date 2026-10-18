@@ -1,0 +1,1563 @@
+{
+  "date": "2026-10-18",
+  "source": "C:\\Users\\35828\\Documents\\Codex\\2026-10-18\\new-chat-2\\outputs\\chat",
+  "destination": "D:\\AgentProject\\chat",
+  "sourceFiles": 165,
+  "copied": 157,
+  "conflictsArchived": 7,
+  "protectedFiles": [
+    {
+      "path": ".gitignore",
+      "beforeSha256": "ea4384be7f229326b00d1194a442847f26d2ffe7a73e6039fc65a58f2c8cb65f",
+      "afterSha256": "ea4384be7f229326b00d1194a442847f26d2ffe7a73e6039fc65a58f2c8cb65f",
+      "sameDuringMigration": true,
+      "writtenByMigration": false
+    },
+    {
+      "path": "build.gradle.kts",
+      "beforeSha256": "db4c7c4ca3d0e6565418c151364aa466d4823ff804743c9b736403cdf6a9f12f",
+      "afterSha256": "db4c7c4ca3d0e6565418c151364aa466d4823ff804743c9b736403cdf6a9f12f",
+      "sameDuringMigration": true,
+      "writtenByMigration": false
+    },
+    {
+      "path": "Cargo.lock",
+      "beforeSha256": "70e0662266b760c208d73fba1faca5d76010db00c36da5cd4545871f0f298ef8",
+      "afterSha256": "70e0662266b760c208d73fba1faca5d76010db00c36da5cd4545871f0f298ef8",
+      "sameDuringMigration": true,
+      "writtenByMigration": false
+    },
+    {
+      "path": "Cargo.toml",
+      "beforeSha256": "1a2ed94909fd9909498efc55b2e92364134920863fc77ca46fae1c98cc5d15fa",
+      "afterSha256": "1a2ed94909fd9909498efc55b2e92364134920863fc77ca46fae1c98cc5d15fa",
+      "sameDuringMigration": true,
+      "writtenByMigration": false
+    },
+    {
+      "path": "gradle/libs.versions.toml",
+      "beforeSha256": "7f3ed6040b3971c4a28db189bdf2ffc51659427883b068e7d4656438cd1c5ede",
+      "afterSha256": "7f3ed6040b3971c4a28db189bdf2ffc51659427883b068e7d4656438cd1c5ede",
+      "sameDuringMigration": true,
+      "writtenByMigration": false
+    },
+    {
+      "path": "README.md",
+      "beforeSha256": "0d018ed2b888ad7071b1f161896797d22b36016209f7b3c8bafeeafeee89f53b",
+      "afterSha256": "0d018ed2b888ad7071b1f161896797d22b36016209f7b3c8bafeeafeee89f53b",
+      "sameDuringMigration": true,
+      "writtenByMigration": false
+    },
+    {
+      "path": "settings.gradle.kts",
+      "beforeSha256": "09f3fbbfe86228aee0029713f81ff164012e8cfcab299ae5b73d24c2306af90e",
+      "afterSha256": "09f3fbbfe86228aee0029713f81ff164012e8cfcab299ae5b73d24c2306af90e",
+      "sameDuringMigration": true,
+      "writtenByMigration": false
+    }
+  ],
+  "records": [
+    {
+      "relative": ".editorconfig",
+      "sourceHash": "3e0fe2d3addb6a62528d52458bd4a140e301bc28f0915a2557a8aead739c83b1",
+      "status": "new",
+      "destinationRelative": ".editorconfig",
+      "action": "already-identical",
+      "destinationSha256": "3e0fe2d3addb6a62528d52458bd4a140e301bc28f0915a2557a8aead739c83b1",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": ".gitignore",
+      "sourceHash": "199d966fe5acba6cadc9c18cae4e8cb1bac44b2129b52df6526b21861eb395ac",
+      "status": "conflict",
+      "destinationRelative": "docs/migration/scaffold-config/.gitignore.txt",
+      "action": "conflict-archived",
+      "destinationSha256": "199d966fe5acba6cadc9c18cae4e8cb1bac44b2129b52df6526b21861eb395ac",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "apps/android/build.gradle.kts",
+      "sourceHash": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "status": "new",
+      "destinationRelative": "apps/android/build.gradle.kts",
+      "action": "copied",
+      "destinationSha256": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "apps/android/README.md",
+      "sourceHash": "4fc566a7b8e60e4a772be17c047eeb47279051630e4a9ae985f2d505dcb0a5e6",
+      "status": "new",
+      "destinationRelative": "apps/android/README.md",
+      "action": "copied",
+      "destinationSha256": "4fc566a7b8e60e4a772be17c047eeb47279051630e4a9ae985f2d505dcb0a5e6",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "apps/android/src/main/AndroidManifest.xml",
+      "sourceHash": "1d8729b37a2b19f26aaacad045d36c0ab4d7b3f674a296c33499b70f02cfd636",
+      "status": "new",
+      "destinationRelative": "apps/android/src/main/AndroidManifest.xml",
+      "action": "copied",
+      "destinationSha256": "1d8729b37a2b19f26aaacad045d36c0ab4d7b3f674a296c33499b70f02cfd636",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "apps/android/src/main/kotlin/chat/Module.kt",
+      "sourceHash": "50323e82858f3972e8cd082f7bbf48a167bd80af6d8ef9fa3c55614be4b74db2",
+      "status": "new",
+      "destinationRelative": "apps/android/src/main/kotlin/chat/Module.kt",
+      "action": "copied",
+      "destinationSha256": "50323e82858f3972e8cd082f7bbf48a167bd80af6d8ef9fa3c55614be4b74db2",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "apps/desktop/build.gradle.kts",
+      "sourceHash": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "status": "new",
+      "destinationRelative": "apps/desktop/build.gradle.kts",
+      "action": "copied",
+      "destinationSha256": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "apps/desktop/README.md",
+      "sourceHash": "2f7b3bb010ccefec4f9f78811579f0a4285380134efc7fc3afd322b006280514",
+      "status": "new",
+      "destinationRelative": "apps/desktop/README.md",
+      "action": "copied",
+      "destinationSha256": "2f7b3bb010ccefec4f9f78811579f0a4285380134efc7fc3afd322b006280514",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "apps/desktop/src/main/kotlin/chat/Module.kt",
+      "sourceHash": "50323e82858f3972e8cd082f7bbf48a167bd80af6d8ef9fa3c55614be4b74db2",
+      "status": "new",
+      "destinationRelative": "apps/desktop/src/main/kotlin/chat/Module.kt",
+      "action": "copied",
+      "destinationSha256": "50323e82858f3972e8cd082f7bbf48a167bd80af6d8ef9fa3c55614be4b74db2",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "apps/node/Cargo.toml",
+      "sourceHash": "dae455ace69a3ae7fb5fe71907dca7154d1540937117b30a93dd41537c21060b",
+      "status": "new",
+      "destinationRelative": "apps/node/Cargo.toml",
+      "action": "copied",
+      "destinationSha256": "dae455ace69a3ae7fb5fe71907dca7154d1540937117b30a93dd41537c21060b",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "apps/node/README.md",
+      "sourceHash": "9248dd59911b3b8570680cf3e292ddf4d7010d0c15f7a1b0f63d3752061c936f",
+      "status": "new",
+      "destinationRelative": "apps/node/README.md",
+      "action": "copied",
+      "destinationSha256": "9248dd59911b3b8570680cf3e292ddf4d7010d0c15f7a1b0f63d3752061c936f",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "apps/node/src/main.rs",
+      "sourceHash": "c8f4af5ff86d54b92fcbd6311f58277aaf79e29f24992679b389819adf896665",
+      "status": "new",
+      "destinationRelative": "apps/node/src/main.rs",
+      "action": "copied",
+      "destinationSha256": "c8f4af5ff86d54b92fcbd6311f58277aaf79e29f24992679b389819adf896665",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "build.gradle.kts",
+      "sourceHash": "d39903f82cff1debbf993c23a96143876e162e9e097d53fe4d63625cf4cad21d",
+      "status": "conflict",
+      "destinationRelative": "docs/migration/scaffold-config/build.gradle.kts.txt",
+      "action": "conflict-archived",
+      "destinationSha256": "d39903f82cff1debbf993c23a96143876e162e9e097d53fe4d63625cf4cad21d",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "Cargo.lock",
+      "sourceHash": "09a9e5da01065c11b9c25da3c1e5d3c7d790de180cdbfa7b27e26a0319b57fcc",
+      "status": "conflict",
+      "destinationRelative": "docs/migration/scaffold-config/Cargo.lock.txt",
+      "action": "conflict-archived",
+      "destinationSha256": "09a9e5da01065c11b9c25da3c1e5d3c7d790de180cdbfa7b27e26a0319b57fcc",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "Cargo.toml",
+      "sourceHash": "4880bf0915ae0f9e8e036b1de1c0dd43995c32a3739556312b20bf56b2a47ae4",
+      "status": "conflict",
+      "destinationRelative": "docs/migration/scaffold-config/Cargo.toml.txt",
+      "action": "conflict-archived",
+      "destinationSha256": "4880bf0915ae0f9e8e036b1de1c0dd43995c32a3739556312b20bf56b2a47ae4",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/core/Cargo.toml",
+      "sourceHash": "3b4fe7aa4482a01ca4730f4987b192073c79ba644420f6a45d24925af755a7af",
+      "status": "new",
+      "destinationRelative": "crates/core/Cargo.toml",
+      "action": "copied",
+      "destinationSha256": "3b4fe7aa4482a01ca4730f4987b192073c79ba644420f6a45d24925af755a7af",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/core/README.md",
+      "sourceHash": "54e6ff245af09b43245d9d5d5f3b5516254962ad47425c6c4a7bdc4d64a825e2",
+      "status": "new",
+      "destinationRelative": "crates/core/README.md",
+      "action": "copied",
+      "destinationSha256": "54e6ff245af09b43245d9d5d5f3b5516254962ad47425c6c4a7bdc4d64a825e2",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/core/src/attachments.rs",
+      "sourceHash": "be0de9397d67614e5a1f5c04e7fee341f61dccb5f4333ae5fa948e7ceac6dc1d",
+      "status": "new",
+      "destinationRelative": "crates/core/src/attachments.rs",
+      "action": "copied",
+      "destinationSha256": "be0de9397d67614e5a1f5c04e7fee341f61dccb5f4333ae5fa948e7ceac6dc1d",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/core/src/groups.rs",
+      "sourceHash": "940df5b7194c086f0e82d123b2a1cac24307f6299032e773415f882bf888a95c",
+      "status": "new",
+      "destinationRelative": "crates/core/src/groups.rs",
+      "action": "copied",
+      "destinationSha256": "940df5b7194c086f0e82d123b2a1cac24307f6299032e773415f882bf888a95c",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/core/src/group_actions.rs",
+      "sourceHash": "0cde0c22da0cf458eebf094ebc4668fad76de416a10d04f349550ecea92ce9df",
+      "status": "new",
+      "destinationRelative": "crates/core/src/group_actions.rs",
+      "action": "copied",
+      "destinationSha256": "0cde0c22da0cf458eebf094ebc4668fad76de416a10d04f349550ecea92ce9df",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/core/src/lib.rs",
+      "sourceHash": "7a362b4ef9d2d76d19f7bd719e5782154fe1716823ad0a0e39c074cefcdea912",
+      "status": "new",
+      "destinationRelative": "crates/core/src/lib.rs",
+      "action": "copied",
+      "destinationSha256": "7a362b4ef9d2d76d19f7bd719e5782154fe1716823ad0a0e39c074cefcdea912",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/core/src/service.rs",
+      "sourceHash": "76a2ac31adc5b0f08128a3840d6beefb23c9084f008251849f4232f8b604df0f",
+      "status": "new",
+      "destinationRelative": "crates/core/src/service.rs",
+      "action": "copied",
+      "destinationSha256": "76a2ac31adc5b0f08128a3840d6beefb23c9084f008251849f4232f8b604df0f",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/crypto/Cargo.toml",
+      "sourceHash": "a36c37776cc0ef41288be4c321c0dc1607ed2d241444456cff6b79948c2cee4f",
+      "status": "new",
+      "destinationRelative": "crates/crypto/Cargo.toml",
+      "action": "copied",
+      "destinationSha256": "a36c37776cc0ef41288be4c321c0dc1607ed2d241444456cff6b79948c2cee4f",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/crypto/README.md",
+      "sourceHash": "49e535d649f1922b8799b5d2a3a39c776019f552168175ffcea20ba9d0c72d5c",
+      "status": "new",
+      "destinationRelative": "crates/crypto/README.md",
+      "action": "copied",
+      "destinationSha256": "49e535d649f1922b8799b5d2a3a39c776019f552168175ffcea20ba9d0c72d5c",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/crypto/src/engine.rs",
+      "sourceHash": "d577c892445053c91b716c344eed8a4081e238e96ec1b4b454ae9517522fd40f",
+      "status": "new",
+      "destinationRelative": "crates/crypto/src/engine.rs",
+      "action": "copied",
+      "destinationSha256": "d577c892445053c91b716c344eed8a4081e238e96ec1b4b454ae9517522fd40f",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/crypto/src/lib.rs",
+      "sourceHash": "dea1d9aed455af70959cfa89727bbbb3c9ec87b49d669fafef3c92c11415bbf9",
+      "status": "new",
+      "destinationRelative": "crates/crypto/src/lib.rs",
+      "action": "copied",
+      "destinationSha256": "dea1d9aed455af70959cfa89727bbbb3c9ec87b49d669fafef3c92c11415bbf9",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/domain/Cargo.toml",
+      "sourceHash": "beac1ccdde62cd9ef0478395377b268b29d5ee678998c57b3d3c81476a943060",
+      "status": "new",
+      "destinationRelative": "crates/domain/Cargo.toml",
+      "action": "copied",
+      "destinationSha256": "beac1ccdde62cd9ef0478395377b268b29d5ee678998c57b3d3c81476a943060",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/domain/README.md",
+      "sourceHash": "53a6c2fa45fa59ddb0c173df1f840d7953c503e1b856faa1c367742f90dcd102",
+      "status": "new",
+      "destinationRelative": "crates/domain/README.md",
+      "action": "copied",
+      "destinationSha256": "53a6c2fa45fa59ddb0c173df1f840d7953c503e1b856faa1c367742f90dcd102",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/domain/src/lib.rs",
+      "sourceHash": "25ab7c9811b7d4119339788309a4a8aa8d4adb74aeed5f52614ee67e88fbd0a8",
+      "status": "new",
+      "destinationRelative": "crates/domain/src/lib.rs",
+      "action": "copied",
+      "destinationSha256": "25ab7c9811b7d4119339788309a4a8aa8d4adb74aeed5f52614ee67e88fbd0a8",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/domain/src/rules.rs",
+      "sourceHash": "9a34b842f99cac1eaab82dc26de00fd25fc55aaae1d990569d275c94a5bb584f",
+      "status": "new",
+      "destinationRelative": "crates/domain/src/rules.rs",
+      "action": "copied",
+      "destinationSha256": "9a34b842f99cac1eaab82dc26de00fd25fc55aaae1d990569d275c94a5bb584f",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/ffi/Cargo.toml",
+      "sourceHash": "a0c567182ad98a19e90d753077dd5086e29ff462db686f0454fa119a6218aa52",
+      "status": "new",
+      "destinationRelative": "crates/ffi/Cargo.toml",
+      "action": "copied",
+      "destinationSha256": "a0c567182ad98a19e90d753077dd5086e29ff462db686f0454fa119a6218aa52",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/ffi/README.md",
+      "sourceHash": "28a930657d5d81f336e6aea797694f2fc9b6e99b9a5fc07e6a0d4e93baf7b3bd",
+      "status": "new",
+      "destinationRelative": "crates/ffi/README.md",
+      "action": "copied",
+      "destinationSha256": "28a930657d5d81f336e6aea797694f2fc9b6e99b9a5fc07e6a0d4e93baf7b3bd",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/ffi/src/bridge.rs",
+      "sourceHash": "f0468060dea28feb34f0614932cace26a3fbca81a85335ee907ddfc7c51f258d",
+      "status": "new",
+      "destinationRelative": "crates/ffi/src/bridge.rs",
+      "action": "copied",
+      "destinationSha256": "f0468060dea28feb34f0614932cace26a3fbca81a85335ee907ddfc7c51f258d",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/ffi/src/lib.rs",
+      "sourceHash": "6a0130bef2cd971d80acf173ca28e9a387827e001b29067ea6be9843f64d24a8",
+      "status": "new",
+      "destinationRelative": "crates/ffi/src/lib.rs",
+      "action": "copied",
+      "destinationSha256": "6a0130bef2cd971d80acf173ca28e9a387827e001b29067ea6be9843f64d24a8",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/identity/Cargo.toml",
+      "sourceHash": "c43a9bc3c379034ad9fa2ab5f2f4399d1db6b9421c5aa2f1c78ad44e4285c286",
+      "status": "new",
+      "destinationRelative": "crates/identity/Cargo.toml",
+      "action": "copied",
+      "destinationSha256": "c43a9bc3c379034ad9fa2ab5f2f4399d1db6b9421c5aa2f1c78ad44e4285c286",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/identity/README.md",
+      "sourceHash": "020b5bd3b75067b8b1e54e7f4e61dce2885b4ec39a25c8351940a3e20e049f0a",
+      "status": "new",
+      "destinationRelative": "crates/identity/README.md",
+      "action": "copied",
+      "destinationSha256": "020b5bd3b75067b8b1e54e7f4e61dce2885b4ec39a25c8351940a3e20e049f0a",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/identity/src/lib.rs",
+      "sourceHash": "6243568743c4796dce2cfd6bc242287852cb78573165c65985938b51594c0e6a",
+      "status": "new",
+      "destinationRelative": "crates/identity/src/lib.rs",
+      "action": "copied",
+      "destinationSha256": "6243568743c4796dce2cfd6bc242287852cb78573165c65985938b51594c0e6a",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/identity/src/service.rs",
+      "sourceHash": "be510cb08f590f0e9b8c8425360e751dace9cf9f7987480a67dbcd678afc9a42",
+      "status": "new",
+      "destinationRelative": "crates/identity/src/service.rs",
+      "action": "copied",
+      "destinationSha256": "be510cb08f590f0e9b8c8425360e751dace9cf9f7987480a67dbcd678afc9a42",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/node-api/Cargo.toml",
+      "sourceHash": "bb9a80822e1ab9338eab878ea39925e1c79f036c46123060e3646525a3c36fbf",
+      "status": "new",
+      "destinationRelative": "crates/node-api/Cargo.toml",
+      "action": "copied",
+      "destinationSha256": "bb9a80822e1ab9338eab878ea39925e1c79f036c46123060e3646525a3c36fbf",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/node-api/README.md",
+      "sourceHash": "07115d68bb1f412b7498da04dd00fa345453dd04cdf11500ecd012471032d701",
+      "status": "new",
+      "destinationRelative": "crates/node-api/README.md",
+      "action": "copied",
+      "destinationSha256": "07115d68bb1f412b7498da04dd00fa345453dd04cdf11500ecd012471032d701",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/node-api/src/handlers.rs",
+      "sourceHash": "c6a9a898f64f9cb5fc493222b856d5d00df00482032bd13d87f3dec4ff6c2a4f",
+      "status": "new",
+      "destinationRelative": "crates/node-api/src/handlers.rs",
+      "action": "copied",
+      "destinationSha256": "c6a9a898f64f9cb5fc493222b856d5d00df00482032bd13d87f3dec4ff6c2a4f",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/node-api/src/lib.rs",
+      "sourceHash": "b5c3edc48c6f4060f66e78562382f27d1ee65616e5cd8f16e6f8bb831344fe4c",
+      "status": "new",
+      "destinationRelative": "crates/node-api/src/lib.rs",
+      "action": "copied",
+      "destinationSha256": "b5c3edc48c6f4060f66e78562382f27d1ee65616e5cd8f16e6f8bb831344fe4c",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/node-services/Cargo.toml",
+      "sourceHash": "5baf4553d7387a872522c35213f77d45e995eda1e021e9bf3be4576efda2e841",
+      "status": "new",
+      "destinationRelative": "crates/node-services/Cargo.toml",
+      "action": "copied",
+      "destinationSha256": "5baf4553d7387a872522c35213f77d45e995eda1e021e9bf3be4576efda2e841",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/node-services/migrations/0001_initial.sql",
+      "sourceHash": "daa0bc897048198a266d3a1907add06f1f5a91111cc6cd7538c622fc859bb4f0",
+      "status": "new",
+      "destinationRelative": "crates/node-services/migrations/0001_initial.sql",
+      "action": "copied",
+      "destinationSha256": "daa0bc897048198a266d3a1907add06f1f5a91111cc6cd7538c622fc859bb4f0",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/node-services/README.md",
+      "sourceHash": "1be0bd7f97ea0cc657fd2d114bd3586cccc50af6a29cf3ebbff89f44445bf035",
+      "status": "new",
+      "destinationRelative": "crates/node-services/README.md",
+      "action": "copied",
+      "destinationSha256": "1be0bd7f97ea0cc657fd2d114bd3586cccc50af6a29cf3ebbff89f44445bf035",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/node-services/src/lib.rs",
+      "sourceHash": "b5277b569fa1de70e9deba995b69b35cc8c2c9997bcaae304b28e1c14ed9d520",
+      "status": "new",
+      "destinationRelative": "crates/node-services/src/lib.rs",
+      "action": "copied",
+      "destinationSha256": "b5277b569fa1de70e9deba995b69b35cc8c2c9997bcaae304b28e1c14ed9d520",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/node-services/src/services.rs",
+      "sourceHash": "e988be814fcb1ef0327490e3dc22f3ca757ca1969cb846d9fd73b2db43f1b56e",
+      "status": "new",
+      "destinationRelative": "crates/node-services/src/services.rs",
+      "action": "copied",
+      "destinationSha256": "e988be814fcb1ef0327490e3dc22f3ca757ca1969cb846d9fd73b2db43f1b56e",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/protocol/Cargo.toml",
+      "sourceHash": "18d0420687f74748c5334bf06483bb29d684aae7e14eb4ebe3baed094f1060b6",
+      "status": "new",
+      "destinationRelative": "crates/protocol/Cargo.toml",
+      "action": "copied",
+      "destinationSha256": "18d0420687f74748c5334bf06483bb29d684aae7e14eb4ebe3baed094f1060b6",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/protocol/README.md",
+      "sourceHash": "f91cb0e94ef8e55657f56f392d131384ba885cadd0e8c2530678e9894dbc432d",
+      "status": "new",
+      "destinationRelative": "crates/protocol/README.md",
+      "action": "copied",
+      "destinationSha256": "f91cb0e94ef8e55657f56f392d131384ba885cadd0e8c2530678e9894dbc432d",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/protocol/src/lib.rs",
+      "sourceHash": "238953407edee659c5db25f1cd56c995bf762846a3deba155a340caa0e9c83d6",
+      "status": "new",
+      "destinationRelative": "crates/protocol/src/lib.rs",
+      "action": "copied",
+      "destinationSha256": "238953407edee659c5db25f1cd56c995bf762846a3deba155a340caa0e9c83d6",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/protocol/src/wire.rs",
+      "sourceHash": "d32d18f05e4e17f8b180f7c80da1667de37e35fff9c690d67d7f9d9be7a07914",
+      "status": "new",
+      "destinationRelative": "crates/protocol/src/wire.rs",
+      "action": "copied",
+      "destinationSha256": "d32d18f05e4e17f8b180f7c80da1667de37e35fff9c690d67d7f9d9be7a07914",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/storage/Cargo.toml",
+      "sourceHash": "d3e2d3041cf470a048e47f2a5e43f6fd7ad61ee345db5f85db67df6a973df736",
+      "status": "new",
+      "destinationRelative": "crates/storage/Cargo.toml",
+      "action": "copied",
+      "destinationSha256": "d3e2d3041cf470a048e47f2a5e43f6fd7ad61ee345db5f85db67df6a973df736",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/storage/migrations/0001_initial.sql",
+      "sourceHash": "a620fdcbe6b6558e8bff464140a6ed1261f07d6e0b39a24ed6edb8b86e4272ce",
+      "status": "new",
+      "destinationRelative": "crates/storage/migrations/0001_initial.sql",
+      "action": "copied",
+      "destinationSha256": "a620fdcbe6b6558e8bff464140a6ed1261f07d6e0b39a24ed6edb8b86e4272ce",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/storage/README.md",
+      "sourceHash": "ccec40d59cb4ff2d6323400fffdae79391027fa57b1dfcf93ce6e4be8b97eae5",
+      "status": "new",
+      "destinationRelative": "crates/storage/README.md",
+      "action": "copied",
+      "destinationSha256": "ccec40d59cb4ff2d6323400fffdae79391027fa57b1dfcf93ce6e4be8b97eae5",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/storage/src/lib.rs",
+      "sourceHash": "1c2f3e521c4d0f5cd609c97f0e42cbee91923ce5329bcfee7df72c0a6160a139",
+      "status": "new",
+      "destinationRelative": "crates/storage/src/lib.rs",
+      "action": "copied",
+      "destinationSha256": "1c2f3e521c4d0f5cd609c97f0e42cbee91923ce5329bcfee7df72c0a6160a139",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/storage/src/store.rs",
+      "sourceHash": "9465d5372c20628ee460f6010caccd781119fd01e5f36f338f7fa949c78973d1",
+      "status": "new",
+      "destinationRelative": "crates/storage/src/store.rs",
+      "action": "copied",
+      "destinationSha256": "9465d5372c20628ee460f6010caccd781119fd01e5f36f338f7fa949c78973d1",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/sync/Cargo.toml",
+      "sourceHash": "978524fd8be12efa6708205670a049ccda86aba7a26bcb3592da07dfa383042f",
+      "status": "new",
+      "destinationRelative": "crates/sync/Cargo.toml",
+      "action": "copied",
+      "destinationSha256": "978524fd8be12efa6708205670a049ccda86aba7a26bcb3592da07dfa383042f",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/sync/README.md",
+      "sourceHash": "68889900fe8cb8b4174ff94defefccf98aafb67a1d1eae099b30079db010f1cd",
+      "status": "new",
+      "destinationRelative": "crates/sync/README.md",
+      "action": "copied",
+      "destinationSha256": "68889900fe8cb8b4174ff94defefccf98aafb67a1d1eae099b30079db010f1cd",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/sync/src/engine.rs",
+      "sourceHash": "558238474bc2d7dc5622bef99af461e544f4e7e9bc243a48f3a9851af89e48c8",
+      "status": "new",
+      "destinationRelative": "crates/sync/src/engine.rs",
+      "action": "copied",
+      "destinationSha256": "558238474bc2d7dc5622bef99af461e544f4e7e9bc243a48f3a9851af89e48c8",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/sync/src/lib.rs",
+      "sourceHash": "1dd15692783756f8b676fe5bc4b00b71c7d9313f90e4cd9810d2b85e1e436f69",
+      "status": "new",
+      "destinationRelative": "crates/sync/src/lib.rs",
+      "action": "copied",
+      "destinationSha256": "1dd15692783756f8b676fe5bc4b00b71c7d9313f90e4cd9810d2b85e1e436f69",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/transport/Cargo.toml",
+      "sourceHash": "e8afdeffd021dae91adecfd9c7eb2c23ca4f51837d7fecf5d042efadba18b50a",
+      "status": "new",
+      "destinationRelative": "crates/transport/Cargo.toml",
+      "action": "copied",
+      "destinationSha256": "e8afdeffd021dae91adecfd9c7eb2c23ca4f51837d7fecf5d042efadba18b50a",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/transport/README.md",
+      "sourceHash": "7f8086f34b6504e06511da807d16bca8c24033b7b7398e8c5c10fa267da6b26d",
+      "status": "new",
+      "destinationRelative": "crates/transport/README.md",
+      "action": "copied",
+      "destinationSha256": "7f8086f34b6504e06511da807d16bca8c24033b7b7398e8c5c10fa267da6b26d",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/transport/src/lib.rs",
+      "sourceHash": "0c02f3517e0550c8d33ecfea5d911e5761d2d6a5c3c67627599b704532d27596",
+      "status": "new",
+      "destinationRelative": "crates/transport/src/lib.rs",
+      "action": "copied",
+      "destinationSha256": "0c02f3517e0550c8d33ecfea5d911e5761d2d6a5c3c67627599b704532d27596",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "crates/transport/src/network.rs",
+      "sourceHash": "b9c1753ad8dbc9bd0c5892c3568b0d6b85e26f195c997c0eb6fd111e71475b9f",
+      "status": "new",
+      "destinationRelative": "crates/transport/src/network.rs",
+      "action": "copied",
+      "destinationSha256": "b9c1753ad8dbc9bd0c5892c3568b0d6b85e26f195c997c0eb6fd111e71475b9f",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "deploy/compose.yaml",
+      "sourceHash": "143deba3f7b4496ae347ed09bd32f3e115feb56535580c67b2ed20bb90f9939f",
+      "status": "new",
+      "destinationRelative": "deploy/compose.yaml",
+      "action": "copied",
+      "destinationSha256": "143deba3f7b4496ae347ed09bd32f3e115feb56535580c67b2ed20bb90f9939f",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "deploy/node.example.toml",
+      "sourceHash": "a6e18750877f46342563c94b745b16a6108eeec3dc008722bfafc2f59f48be8c",
+      "status": "new",
+      "destinationRelative": "deploy/node.example.toml",
+      "action": "copied",
+      "destinationSha256": "a6e18750877f46342563c94b745b16a6108eeec3dc008722bfafc2f59f48be8c",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "deploy/README.md",
+      "sourceHash": "ab2d3d187c3828063bf031ec5b6a4156c020fca2c9835dbeb78e2ffcff0e470d",
+      "status": "new",
+      "destinationRelative": "deploy/README.md",
+      "action": "copied",
+      "destinationSha256": "ab2d3d187c3828063bf031ec5b6a4156c020fca2c9835dbeb78e2ffcff0e470d",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "deploy/relay/README.md",
+      "sourceHash": "58b0348cda8f48a8a3109e6718b233a61b0dd34d8fc3415dfa4e03fb6e69a757",
+      "status": "new",
+      "destinationRelative": "deploy/relay/README.md",
+      "action": "copied",
+      "destinationSha256": "58b0348cda8f48a8a3109e6718b233a61b0dd34d8fc3415dfa4e03fb6e69a757",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "desktop/platform/build.gradle.kts",
+      "sourceHash": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "status": "new",
+      "destinationRelative": "desktop/platform/build.gradle.kts",
+      "action": "copied",
+      "destinationSha256": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "desktop/platform/README.md",
+      "sourceHash": "44af5f3687b4a54a6e9fef3d52bd9e60d370078a9ea7d75aedeaaa45530c8485",
+      "status": "new",
+      "destinationRelative": "desktop/platform/README.md",
+      "action": "copied",
+      "destinationSha256": "44af5f3687b4a54a6e9fef3d52bd9e60d370078a9ea7d75aedeaaa45530c8485",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "desktop/platform/src/main/kotlin/chat/Module.kt",
+      "sourceHash": "50323e82858f3972e8cd082f7bbf48a167bd80af6d8ef9fa3c55614be4b74db2",
+      "status": "new",
+      "destinationRelative": "desktop/platform/src/main/kotlin/chat/Module.kt",
+      "action": "copied",
+      "destinationSha256": "50323e82858f3972e8cd082f7bbf48a167bd80af6d8ef9fa3c55614be4b74db2",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "desktop/plugin-host/build.gradle.kts",
+      "sourceHash": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "status": "new",
+      "destinationRelative": "desktop/plugin-host/build.gradle.kts",
+      "action": "copied",
+      "destinationSha256": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "desktop/plugin-host/README.md",
+      "sourceHash": "212108c0d12197be300c0777172ae4c019deb7812ae5cada84f4d3ae67c81653",
+      "status": "new",
+      "destinationRelative": "desktop/plugin-host/README.md",
+      "action": "copied",
+      "destinationSha256": "212108c0d12197be300c0777172ae4c019deb7812ae5cada84f4d3ae67c81653",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "desktop/plugin-host/src/main/kotlin/chat/Module.kt",
+      "sourceHash": "50323e82858f3972e8cd082f7bbf48a167bd80af6d8ef9fa3c55614be4b74db2",
+      "status": "new",
+      "destinationRelative": "desktop/plugin-host/src/main/kotlin/chat/Module.kt",
+      "action": "copied",
+      "destinationSha256": "50323e82858f3972e8cd082f7bbf48a167bd80af6d8ef9fa3c55614be4b74db2",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "sourceHash": "9539fd1b2987bf1dea67547c09718da34160a8590f27dca3c1c29d5f6dc5c866",
+      "status": "new",
+      "destinationRelative": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "action": "copied",
+      "destinationSha256": "9539fd1b2987bf1dea67547c09718da34160a8590f27dca3c1c29d5f6dc5c866",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "desktop/plugin-sdk/build.gradle.kts",
+      "sourceHash": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "status": "new",
+      "destinationRelative": "desktop/plugin-sdk/build.gradle.kts",
+      "action": "copied",
+      "destinationSha256": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "desktop/plugin-sdk/README.md",
+      "sourceHash": "403ee9dbb3df12d3aeb970353aad6869af98b9d9fe51e74d8d9c2cc75f391478",
+      "status": "new",
+      "destinationRelative": "desktop/plugin-sdk/README.md",
+      "action": "copied",
+      "destinationSha256": "403ee9dbb3df12d3aeb970353aad6869af98b9d9fe51e74d8d9c2cc75f391478",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "desktop/plugin-sdk/src/main/kotlin/chat/plugin/DesktopPlugin.kt",
+      "sourceHash": "2d7e104632d7486a11d9a297bc80d111e20a9e3e6fa14fa09665b7e813cb3646",
+      "status": "new",
+      "destinationRelative": "desktop/plugin-sdk/src/main/kotlin/chat/plugin/DesktopPlugin.kt",
+      "action": "copied",
+      "destinationSha256": "2d7e104632d7486a11d9a297bc80d111e20a9e3e6fa14fa09665b7e813cb3646",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/adr/0001-bootstrap.md",
+      "sourceHash": "5b9ece4b22cf68f613a07dabda03dc8763fc68313324a9a4d1e99e9a859f5046",
+      "status": "new",
+      "destinationRelative": "docs/adr/0001-bootstrap.md",
+      "action": "copied",
+      "destinationSha256": "5b9ece4b22cf68f613a07dabda03dc8763fc68313324a9a4d1e99e9a859f5046",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/adr/0002-toolchain.md",
+      "sourceHash": "af6f49b1360f4af0c52a1b21d8aff0119fe734e797ff3506a9961598e6ec4c37",
+      "status": "new",
+      "destinationRelative": "docs/adr/0002-toolchain.md",
+      "action": "copied",
+      "destinationSha256": "af6f49b1360f4af0c52a1b21d8aff0119fe734e797ff3506a9961598e6ec4c37",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/adr/0003-crypto-storage.md",
+      "sourceHash": "e41e350fb38bdaea7c7301dcc89b0d18c828d0ef75f314342041c85ccef2b4a2",
+      "status": "new",
+      "destinationRelative": "docs/adr/0003-crypto-storage.md",
+      "action": "copied",
+      "destinationSha256": "e41e350fb38bdaea7c7301dcc89b0d18c828d0ef75f314342041c85ccef2b4a2",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/adr/0004-transport.md",
+      "sourceHash": "8f8f30edebcfe393cb51c68b0b51a467c71fc2ab73d315da5b71c34395da7f34",
+      "status": "new",
+      "destinationRelative": "docs/adr/0004-transport.md",
+      "action": "copied",
+      "destinationSha256": "8f8f30edebcfe393cb51c68b0b51a467c71fc2ab73d315da5b71c34395da7f34",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/design/ARCHITECTURE.md",
+      "sourceHash": "fe46ce4ad13eda548740da2bc0cae5bae7a854e927a04fe6954d9250070db241",
+      "status": "new",
+      "destinationRelative": "docs/design/ARCHITECTURE.md",
+      "action": "copied",
+      "destinationSha256": "fe46ce4ad13eda548740da2bc0cae5bae7a854e927a04fe6954d9250070db241",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/design/CONVERSATION_NOTES.md",
+      "sourceHash": "26d79d2ba2cf82cb3766c3cf15d86f66440460968c688b8ce83457a9bfef0f19",
+      "status": "new",
+      "destinationRelative": "docs/design/CONVERSATION_NOTES.md",
+      "action": "copied",
+      "destinationSha256": "26d79d2ba2cf82cb3766c3cf15d86f66440460968c688b8ce83457a9bfef0f19",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/design/CORE_INTERFACES.md",
+      "sourceHash": "f263c2352ea7e53ac92e63de9f17117951cae06ca3641cff723254128812f706",
+      "status": "new",
+      "destinationRelative": "docs/design/CORE_INTERFACES.md",
+      "action": "copied",
+      "destinationSha256": "f263c2352ea7e53ac92e63de9f17117951cae06ca3641cff723254128812f706",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/design/MVP.md",
+      "sourceHash": "d559b43474df6db4ac937f73c8d4f591c7ca75a0ff4925d5e134286accd7a976",
+      "status": "new",
+      "destinationRelative": "docs/design/MVP.md",
+      "action": "copied",
+      "destinationSha256": "d559b43474df6db4ac937f73c8d4f591c7ca75a0ff4925d5e134286accd7a976",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/design/README.md",
+      "sourceHash": "7b1c78be5233b95bb8139e4f71969999f4e3aa9d4acf51ac2f36d4d09bb64956",
+      "status": "new",
+      "destinationRelative": "docs/design/README.md",
+      "action": "copied",
+      "destinationSha256": "7b1c78be5233b95bb8139e4f71969999f4e3aa9d4acf51ac2f36d4d09bb64956",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/design/完整架构设计.md",
+      "sourceHash": "1029fc47d1141f7dae50a8afd2beb1a052cbae16528f89f8382ffc7f8a6b2494",
+      "status": "new",
+      "destinationRelative": "docs/design/完整架构设计.md",
+      "action": "copied",
+      "destinationSha256": "1029fc47d1141f7dae50a8afd2beb1a052cbae16528f89f8382ffc7f8a6b2494",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/api.md",
+      "sourceHash": "742149a28613feda385f19872979d859f8d80156747fe42b546ef87862182b17",
+      "status": "new",
+      "destinationRelative": "docs/implementation/api.md",
+      "action": "copied",
+      "destinationSha256": "742149a28613feda385f19872979d859f8d80156747fe42b546ef87862182b17",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/attachments.md",
+      "sourceHash": "bcbd0b5070ee8d1ab325ee61040f782d1c4b402c2bd1160fea6077252f20357d",
+      "status": "new",
+      "destinationRelative": "docs/implementation/attachments.md",
+      "action": "copied",
+      "destinationSha256": "bcbd0b5070ee8d1ab325ee61040f782d1c4b402c2bd1160fea6077252f20357d",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/bridge.md",
+      "sourceHash": "5f716719d93299597168e49ef6c653b475e0cbc6704d4a2bac443cf2faa37169",
+      "status": "new",
+      "destinationRelative": "docs/implementation/bridge.md",
+      "action": "copied",
+      "destinationSha256": "5f716719d93299597168e49ef6c653b475e0cbc6704d4a2bac443cf2faa37169",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/core.md",
+      "sourceHash": "69bd5c3b86b6b94c1ec3a33764457eb8260ae1a59792d4344a907b4c8d228c0e",
+      "status": "new",
+      "destinationRelative": "docs/implementation/core.md",
+      "action": "copied",
+      "destinationSha256": "69bd5c3b86b6b94c1ec3a33764457eb8260ae1a59792d4344a907b4c8d228c0e",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/COVERAGE.md",
+      "sourceHash": "d7008f05824fc461d391d230155ed7d6cf10888ba23e6e741cc11949e417f854",
+      "status": "new",
+      "destinationRelative": "docs/implementation/COVERAGE.md",
+      "action": "copied",
+      "destinationSha256": "d7008f05824fc461d391d230155ed7d6cf10888ba23e6e741cc11949e417f854",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/crypto.md",
+      "sourceHash": "610450ee0100a01de814054342e4c67c0bb1cdeb31fe8d80a47e84bb645c383a",
+      "status": "new",
+      "destinationRelative": "docs/implementation/crypto.md",
+      "action": "copied",
+      "destinationSha256": "610450ee0100a01de814054342e4c67c0bb1cdeb31fe8d80a47e84bb645c383a",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/DATA_MODEL.md",
+      "sourceHash": "88fd6f05caba20a63995bc7df00e8c22fe73e4b14ea7391f8112ea5976bbf159",
+      "status": "new",
+      "destinationRelative": "docs/implementation/DATA_MODEL.md",
+      "action": "copied",
+      "destinationSha256": "88fd6f05caba20a63995bc7df00e8c22fe73e4b14ea7391f8112ea5976bbf159",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/DEPENDENCIES.md",
+      "sourceHash": "fb2712f29e6bed9e2bee9a4208e711536fe424552f14c29b70ed8f31de46ed07",
+      "status": "new",
+      "destinationRelative": "docs/implementation/DEPENDENCIES.md",
+      "action": "copied",
+      "destinationSha256": "fb2712f29e6bed9e2bee9a4208e711536fe424552f14c29b70ed8f31de46ed07",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/domain.md",
+      "sourceHash": "db52a1857ba129d3ec74bf3ab32c89e8f0c47f3db572cffe471741e17be39db9",
+      "status": "new",
+      "destinationRelative": "docs/implementation/domain.md",
+      "action": "copied",
+      "destinationSha256": "db52a1857ba129d3ec74bf3ab32c89e8f0c47f3db572cffe471741e17be39db9",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/FLOWS.md",
+      "sourceHash": "7b1390d93b551a8f08d7dc629429182fe469de6fd3a820b1383a1f11e134337a",
+      "status": "new",
+      "destinationRelative": "docs/implementation/FLOWS.md",
+      "action": "copied",
+      "destinationSha256": "7b1390d93b551a8f08d7dc629429182fe469de6fd3a820b1383a1f11e134337a",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/function-catalog.json",
+      "sourceHash": "c6c90d3adc0bebbbb2bda40dd933789777791522da02170b471ffa3cf4332d0c",
+      "status": "new",
+      "destinationRelative": "docs/implementation/function-catalog.json",
+      "action": "copied",
+      "destinationSha256": "c6c90d3adc0bebbbb2bda40dd933789777791522da02170b471ffa3cf4332d0c",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/FUNCTION_INDEX.md",
+      "sourceHash": "524e1bc4f4f837630f00007e6162e04c202222b0a27dbdeb4c1a237ce437e44f",
+      "status": "new",
+      "destinationRelative": "docs/implementation/FUNCTION_INDEX.md",
+      "action": "copied",
+      "destinationSha256": "524e1bc4f4f837630f00007e6162e04c202222b0a27dbdeb4c1a237ce437e44f",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/group-actions.md",
+      "sourceHash": "8a637ae7e98bcc2c94a52c2f1ef3958c28f4dc5a2e24b4d91020ca321b30d827",
+      "status": "new",
+      "destinationRelative": "docs/implementation/group-actions.md",
+      "action": "copied",
+      "destinationSha256": "8a637ae7e98bcc2c94a52c2f1ef3958c28f4dc5a2e24b4d91020ca321b30d827",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/groups.md",
+      "sourceHash": "5372228c0f02ab9ff58ec911ff9cd2fa1afee53e0aa275e70399b6b2c1b00a13",
+      "status": "new",
+      "destinationRelative": "docs/implementation/groups.md",
+      "action": "copied",
+      "destinationSha256": "5372228c0f02ab9ff58ec911ff9cd2fa1afee53e0aa275e70399b6b2c1b00a13",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/identity.md",
+      "sourceHash": "3dc98831e096ac0c8902af2d27fa72efb0bd2ea451101472c642ee440222471e",
+      "status": "new",
+      "destinationRelative": "docs/implementation/identity.md",
+      "action": "copied",
+      "destinationSha256": "3dc98831e096ac0c8902af2d27fa72efb0bd2ea451101472c642ee440222471e",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/node.md",
+      "sourceHash": "e75bca7d58241894315444fa0c81633d367586fade6d48de883f0155e096fa73",
+      "status": "new",
+      "destinationRelative": "docs/implementation/node.md",
+      "action": "copied",
+      "destinationSha256": "e75bca7d58241894315444fa0c81633d367586fade6d48de883f0155e096fa73",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/P0_CHECKLIST.md",
+      "sourceHash": "51fab1918c0ec264f14cf85f09c73d07f7a06e010a1f52da6cff5b876783d1c8",
+      "status": "new",
+      "destinationRelative": "docs/implementation/P0_CHECKLIST.md",
+      "action": "copied",
+      "destinationSha256": "d319c6d33ac2eb09ee3db74205089e6f3322ca8e18feb71faab6839f3788d92a",
+      "expectedMigrationEdit": true
+    },
+    {
+      "relative": "docs/implementation/platform.md",
+      "sourceHash": "2e30ad2e26851ab1e07825433224cba7473b742682405cd908c575c937ae29d2",
+      "status": "new",
+      "destinationRelative": "docs/implementation/platform.md",
+      "action": "copied",
+      "destinationSha256": "2e30ad2e26851ab1e07825433224cba7473b742682405cd908c575c937ae29d2",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/plugins.md",
+      "sourceHash": "4250466177a9ae1566d3fff87ecb5fc3967c82204dc22944e2ebae97eca289e8",
+      "status": "new",
+      "destinationRelative": "docs/implementation/plugins.md",
+      "action": "copied",
+      "destinationSha256": "4250466177a9ae1566d3fff87ecb5fc3967c82204dc22944e2ebae97eca289e8",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/presentation.md",
+      "sourceHash": "a2f339a32f6d8a8f8e34dd5205b3de4f3c9b4a27346ce64c640d3996531f62e2",
+      "status": "new",
+      "destinationRelative": "docs/implementation/presentation.md",
+      "action": "copied",
+      "destinationSha256": "a2f339a32f6d8a8f8e34dd5205b3de4f3c9b4a27346ce64c640d3996531f62e2",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/protocol.md",
+      "sourceHash": "9123c064127c27b3b4948c0f2dbfa5e2ea55fde73ce176374eff8d4de2c9c3b9",
+      "status": "new",
+      "destinationRelative": "docs/implementation/protocol.md",
+      "action": "copied",
+      "destinationSha256": "9123c064127c27b3b4948c0f2dbfa5e2ea55fde73ce176374eff8d4de2c9c3b9",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/README.md",
+      "sourceHash": "d8e6fc10e2b2359ccff28de1dc5023b6faedca16b5260e690620081050e62541",
+      "status": "new",
+      "destinationRelative": "docs/implementation/README.md",
+      "action": "copied",
+      "destinationSha256": "71c0d4ff2d4a4afef8263c4ae59c15b269583531602405a987a7bc1036de96c0",
+      "expectedMigrationEdit": true
+    },
+    {
+      "relative": "docs/implementation/storage.md",
+      "sourceHash": "d5f803ebb8a783837a7518952642a440b10e5d163d47368c318a61f62a0ea51d",
+      "status": "new",
+      "destinationRelative": "docs/implementation/storage.md",
+      "action": "copied",
+      "destinationSha256": "d5f803ebb8a783837a7518952642a440b10e5d163d47368c318a61f62a0ea51d",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/sync.md",
+      "sourceHash": "4a47d12ac49db87f74004f3abe39e128ea2c51f6ceaf084b6ca0e1a425f2f28b",
+      "status": "new",
+      "destinationRelative": "docs/implementation/sync.md",
+      "action": "copied",
+      "destinationSha256": "4a47d12ac49db87f74004f3abe39e128ea2c51f6ceaf084b6ca0e1a425f2f28b",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/TASKS.md",
+      "sourceHash": "ad2bb4dda0e839937d615855fccbcebdf6952d905a84000ca87b94c08c108715",
+      "status": "new",
+      "destinationRelative": "docs/implementation/TASKS.md",
+      "action": "copied",
+      "destinationSha256": "ad2bb4dda0e839937d615855fccbcebdf6952d905a84000ca87b94c08c108715",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/TRANSACTIONS.md",
+      "sourceHash": "638d37267c45a4c5bc65d0bb20b4dd190f83f12f394c62ef5aaed2349683e6a9",
+      "status": "new",
+      "destinationRelative": "docs/implementation/TRANSACTIONS.md",
+      "action": "copied",
+      "destinationSha256": "638d37267c45a4c5bc65d0bb20b4dd190f83f12f394c62ef5aaed2349683e6a9",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/transport.md",
+      "sourceHash": "d5d1271071dc44951d01c4c9a6ab57b5f65eaaadb9e4fb92cefb50284c37d101",
+      "status": "new",
+      "destinationRelative": "docs/implementation/transport.md",
+      "action": "copied",
+      "destinationSha256": "d5d1271071dc44951d01c4c9a6ab57b5f65eaaadb9e4fb92cefb50284c37d101",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/implementation/TYPES.md",
+      "sourceHash": "c13cd0271aed43997e61e1cb775a5526768446a9e2736b3da34d4eef76c68cff",
+      "status": "new",
+      "destinationRelative": "docs/implementation/TYPES.md",
+      "action": "copied",
+      "destinationSha256": "c13cd0271aed43997e61e1cb775a5526768446a9e2736b3da34d4eef76c68cff",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/PROJECT_TREE.md",
+      "sourceHash": "78d07a799a4d22a2a5f1d421d07658904d3a10b8f733764486a7af84392a021d",
+      "status": "new",
+      "destinationRelative": "docs/PROJECT_TREE.md",
+      "action": "copied",
+      "destinationSha256": "68744a23b790141333da46be32279b3d05b9e50b7a71fde887d9182610c28bb5",
+      "expectedMigrationEdit": true
+    },
+    {
+      "relative": "docs/protocol/HTTP_API.md",
+      "sourceHash": "492ee2c794349ca4cd40b5a75cc9d5b9f6264eaab31b0bd73ad7331ffe18fee3",
+      "status": "new",
+      "destinationRelative": "docs/protocol/HTTP_API.md",
+      "action": "copied",
+      "destinationSha256": "492ee2c794349ca4cd40b5a75cc9d5b9f6264eaab31b0bd73ad7331ffe18fee3",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/protocol/WIRE_FORMAT.md",
+      "sourceHash": "2c1f6c20ee3d9ec45e34207f4ff48925d723c594dbd9f1955e42434669ce5dd6",
+      "status": "new",
+      "destinationRelative": "docs/protocol/WIRE_FORMAT.md",
+      "action": "copied",
+      "destinationSha256": "2c1f6c20ee3d9ec45e34207f4ff48925d723c594dbd9f1955e42434669ce5dd6",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "docs/validation-latest.json",
+      "sourceHash": "1ff1190f0b7c1722a4f3f8af8bdb100c3a8bed329bde8275bbc64724a0d56fdb",
+      "status": "new",
+      "destinationRelative": "docs/validation-latest.json",
+      "action": "copied",
+      "destinationSha256": "231e57e30eb2d88e1abcc9fedd321829b8ae482884145a642cc31ef0e1093460",
+      "expectedMigrationEdit": true
+    },
+    {
+      "relative": "docs/VALIDATION.md",
+      "sourceHash": "da95bbc80800a1c6848835232f85a03428b550db8276d3284f0f74871574352f",
+      "status": "new",
+      "destinationRelative": "docs/VALIDATION.md",
+      "action": "copied",
+      "destinationSha256": "cf7451094493fab84c0792f74a15801eee617defee5648efb62356c86261bb83",
+      "expectedMigrationEdit": true
+    },
+    {
+      "relative": "gradle/libs.versions.toml",
+      "sourceHash": "c51895aca88274243956c0f52dd06e36a7d03cf79273ced2ca8b99a82ebf1c8e",
+      "status": "conflict",
+      "destinationRelative": "docs/migration/scaffold-config/gradle/libs.versions.toml.txt",
+      "action": "conflict-archived",
+      "destinationSha256": "c51895aca88274243956c0f52dd06e36a7d03cf79273ced2ca8b99a82ebf1c8e",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "plugins/examples/hello-command/build.gradle.kts",
+      "sourceHash": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "status": "new",
+      "destinationRelative": "plugins/examples/hello-command/build.gradle.kts",
+      "action": "copied",
+      "destinationSha256": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "plugins/examples/hello-command/manifest.json",
+      "sourceHash": "342d728c0faccfbfd5a1d65a5a526e23923f1d2249e34d169df40b09fdbb41a3",
+      "status": "new",
+      "destinationRelative": "plugins/examples/hello-command/manifest.json",
+      "action": "copied",
+      "destinationSha256": "342d728c0faccfbfd5a1d65a5a526e23923f1d2249e34d169df40b09fdbb41a3",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "plugins/examples/hello-command/README.md",
+      "sourceHash": "4760484f95e860b01f1242494b6fd59d78ff9d7d910f6b2ec94e1f5fb2dc828a",
+      "status": "new",
+      "destinationRelative": "plugins/examples/hello-command/README.md",
+      "action": "copied",
+      "destinationSha256": "4760484f95e860b01f1242494b6fd59d78ff9d7d910f6b2ec94e1f5fb2dc828a",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "plugins/examples/hello-command/src/main/kotlin/chat/examples/HelloPlugin.kt",
+      "sourceHash": "eddc1da9201c6ff7312a0b5016773671ad94e32543b918de34dedf3287f5ec9a",
+      "status": "new",
+      "destinationRelative": "plugins/examples/hello-command/src/main/kotlin/chat/examples/HelloPlugin.kt",
+      "action": "copied",
+      "destinationSha256": "eddc1da9201c6ff7312a0b5016773671ad94e32543b918de34dedf3287f5ec9a",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "plugins/examples/message-formatter/build.gradle.kts",
+      "sourceHash": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "status": "new",
+      "destinationRelative": "plugins/examples/message-formatter/build.gradle.kts",
+      "action": "copied",
+      "destinationSha256": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "plugins/examples/message-formatter/manifest.json",
+      "sourceHash": "63d793d5cdd6deedfe68efdad93f80441dadbc22d24325ea2c2afe2d9f451cb5",
+      "status": "new",
+      "destinationRelative": "plugins/examples/message-formatter/manifest.json",
+      "action": "copied",
+      "destinationSha256": "63d793d5cdd6deedfe68efdad93f80441dadbc22d24325ea2c2afe2d9f451cb5",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "plugins/examples/message-formatter/README.md",
+      "sourceHash": "26ed04e4e7acc240b5cb76b262a049f9e19d47bcbc62ae17cd060a4547f393ae",
+      "status": "new",
+      "destinationRelative": "plugins/examples/message-formatter/README.md",
+      "action": "copied",
+      "destinationSha256": "26ed04e4e7acc240b5cb76b262a049f9e19d47bcbc62ae17cd060a4547f393ae",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "plugins/examples/message-formatter/src/main/kotlin/chat/examples/Formatter.kt",
+      "sourceHash": "22d5a4a7b7c81fac52a4c667f0c1dec40a6fe2c006a4b9fef557bdafc9939e1f",
+      "status": "new",
+      "destinationRelative": "plugins/examples/message-formatter/src/main/kotlin/chat/examples/Formatter.kt",
+      "action": "copied",
+      "destinationSha256": "22d5a4a7b7c81fac52a4c667f0c1dec40a6fe2c006a4b9fef557bdafc9939e1f",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "plugins/themes/default/README.md",
+      "sourceHash": "03ad42d1bcfb358822a37f7e2aa6aa89b1c04ba8d05daf29a017e080f7e91817",
+      "status": "new",
+      "destinationRelative": "plugins/themes/default/README.md",
+      "action": "copied",
+      "destinationSha256": "03ad42d1bcfb358822a37f7e2aa6aa89b1c04ba8d05daf29a017e080f7e91817",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "plugins/themes/default/theme.json",
+      "sourceHash": "5c5a0bda347ba07b0d6b7e84fc4fa2f8b375300e2a97030a05c40dfa1f85eef5",
+      "status": "new",
+      "destinationRelative": "plugins/themes/default/theme.json",
+      "action": "copied",
+      "destinationSha256": "5c5a0bda347ba07b0d6b7e84fc4fa2f8b375300e2a97030a05c40dfa1f85eef5",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "README.md",
+      "sourceHash": "271fbdfa2c5e17e3501cf7bc487774355cb01c20d32ef234c4f3d7f425a4fa4c",
+      "status": "conflict",
+      "destinationRelative": "docs/migration/scaffold-config/README.md.txt",
+      "action": "conflict-archived",
+      "destinationSha256": "271fbdfa2c5e17e3501cf7bc487774355cb01c20d32ef234c4f3d7f425a4fa4c",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "schemas/message-types/extension.schema.json",
+      "sourceHash": "dd42e0116f69aefe1e51bc345221501b5a45ea831621a8119cbfcd2013059d0a",
+      "status": "new",
+      "destinationRelative": "schemas/message-types/extension.schema.json",
+      "action": "copied",
+      "destinationSha256": "dd42e0116f69aefe1e51bc345221501b5a45ea831621a8119cbfcd2013059d0a",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "schemas/plugin-manifest.schema.json",
+      "sourceHash": "e440acf62fe309e4d5fbb05dd27e7ae61446820bfa6ab531c35143a5eb0909a7",
+      "status": "new",
+      "destinationRelative": "schemas/plugin-manifest.schema.json",
+      "action": "copied",
+      "destinationSha256": "e440acf62fe309e4d5fbb05dd27e7ae61446820bfa6ab531c35143a5eb0909a7",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "schemas/README.md",
+      "sourceHash": "1330614e451606d9163171f432fe7d3361d1e8171ef7695437e3b465d8e32add",
+      "status": "new",
+      "destinationRelative": "schemas/README.md",
+      "action": "copied",
+      "destinationSha256": "1330614e451606d9163171f432fe7d3361d1e8171ef7695437e3b465d8e32add",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "schemas/theme.schema.json",
+      "sourceHash": "d6013861abda15ff6cdff055d0eb0f776799909160504a1d787949644459cd84",
+      "status": "new",
+      "destinationRelative": "schemas/theme.schema.json",
+      "action": "copied",
+      "destinationSha256": "d6013861abda15ff6cdff055d0eb0f776799909160504a1d787949644459cd84",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "settings.gradle.kts",
+      "sourceHash": "7e212607d36b0fe7f258401fe33d123a820c6dc394a4c05065f2912a1add1a97",
+      "status": "conflict",
+      "destinationRelative": "docs/migration/scaffold-config/settings.gradle.kts.txt",
+      "action": "conflict-archived",
+      "destinationSha256": "7e212607d36b0fe7f258401fe33d123a820c6dc394a4c05065f2912a1add1a97",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/core-api/build.gradle.kts",
+      "sourceHash": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "status": "new",
+      "destinationRelative": "shared/core-api/build.gradle.kts",
+      "action": "copied",
+      "destinationSha256": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/core-api/README.md",
+      "sourceHash": "9f339ec00302cef4f34784ae3f22dae830a7fff4f94650c292c47605bb023500",
+      "status": "new",
+      "destinationRelative": "shared/core-api/README.md",
+      "action": "copied",
+      "destinationSha256": "9f339ec00302cef4f34784ae3f22dae830a7fff4f94650c292c47605bb023500",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/core-api/src/commonMain/kotlin/chat/api/ConversationService.kt",
+      "sourceHash": "4a8c3f652d6c05197d2178dccde938a83771c02da078cb4466e682d4141ea519",
+      "status": "new",
+      "destinationRelative": "shared/core-api/src/commonMain/kotlin/chat/api/ConversationService.kt",
+      "action": "copied",
+      "destinationSha256": "4a8c3f652d6c05197d2178dccde938a83771c02da078cb4466e682d4141ea519",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/core-api/src/commonMain/kotlin/chat/api/Models.kt",
+      "sourceHash": "10f328ac77636d8772515abc3e6f2e0daea2b8123066549fdaf544960d0ec01b",
+      "status": "new",
+      "destinationRelative": "shared/core-api/src/commonMain/kotlin/chat/api/Models.kt",
+      "action": "copied",
+      "destinationSha256": "10f328ac77636d8772515abc3e6f2e0daea2b8123066549fdaf544960d0ec01b",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/core-bridge/build.gradle.kts",
+      "sourceHash": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "status": "new",
+      "destinationRelative": "shared/core-bridge/build.gradle.kts",
+      "action": "copied",
+      "destinationSha256": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/core-bridge/README.md",
+      "sourceHash": "24006994cc893d0bc7649edf7c2369d7cff646df865e616eba3df27c125e4b4f",
+      "status": "new",
+      "destinationRelative": "shared/core-bridge/README.md",
+      "action": "copied",
+      "destinationSha256": "24006994cc893d0bc7649edf7c2369d7cff646df865e616eba3df27c125e4b4f",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/core-bridge/src/jvmMain/kotlin/chat/Module.kt",
+      "sourceHash": "50323e82858f3972e8cd082f7bbf48a167bd80af6d8ef9fa3c55614be4b74db2",
+      "status": "new",
+      "destinationRelative": "shared/core-bridge/src/jvmMain/kotlin/chat/Module.kt",
+      "action": "copied",
+      "destinationSha256": "50323e82858f3972e8cd082f7bbf48a167bd80af6d8ef9fa3c55614be4b74db2",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/platform-api/build.gradle.kts",
+      "sourceHash": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "status": "new",
+      "destinationRelative": "shared/platform-api/build.gradle.kts",
+      "action": "copied",
+      "destinationSha256": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/platform-api/README.md",
+      "sourceHash": "aa987e845a469b749cc4f6a4d1c5e15a7846baae476d1adcef5db481371af2b7",
+      "status": "new",
+      "destinationRelative": "shared/platform-api/README.md",
+      "action": "copied",
+      "destinationSha256": "aa987e845a469b749cc4f6a4d1c5e15a7846baae476d1adcef5db481371af2b7",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/platform-api/src/commonMain/kotlin/chat/platform/PlatformFiles.kt",
+      "sourceHash": "8c7a77a32e70a2e5b825987df664cc117ed99dc1ba8cbcd9f42754d10affdc98",
+      "status": "new",
+      "destinationRelative": "shared/platform-api/src/commonMain/kotlin/chat/platform/PlatformFiles.kt",
+      "action": "copied",
+      "destinationSha256": "8c7a77a32e70a2e5b825987df664cc117ed99dc1ba8cbcd9f42754d10affdc98",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/platform-api/src/commonMain/kotlin/chat/platform/Services.kt",
+      "sourceHash": "e3f6bc16bb6c8330c4ddabdcc11afcff9fd3fad389aebc9a9523592d5ecc889f",
+      "status": "new",
+      "destinationRelative": "shared/platform-api/src/commonMain/kotlin/chat/platform/Services.kt",
+      "action": "copied",
+      "destinationSha256": "e3f6bc16bb6c8330c4ddabdcc11afcff9fd3fad389aebc9a9523592d5ecc889f",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/presentation/build.gradle.kts",
+      "sourceHash": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "status": "new",
+      "destinationRelative": "shared/presentation/build.gradle.kts",
+      "action": "copied",
+      "destinationSha256": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/presentation/README.md",
+      "sourceHash": "a71abe3841220e0723b048d721c305b36ff18e9abc37f14db931667953f8cb17",
+      "status": "new",
+      "destinationRelative": "shared/presentation/README.md",
+      "action": "copied",
+      "destinationSha256": "a71abe3841220e0723b048d721c305b36ff18e9abc37f14db931667953f8cb17",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/presentation/src/commonMain/kotlin/chat/Module.kt",
+      "sourceHash": "50323e82858f3972e8cd082f7bbf48a167bd80af6d8ef9fa3c55614be4b74db2",
+      "status": "new",
+      "destinationRelative": "shared/presentation/src/commonMain/kotlin/chat/Module.kt",
+      "action": "copied",
+      "destinationSha256": "50323e82858f3972e8cd082f7bbf48a167bd80af6d8ef9fa3c55614be4b74db2",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/presentation/src/commonMain/kotlin/chat/presentation/UseCases.kt",
+      "sourceHash": "f90a55029a07b728bbc5ccbe1356b78ff1897a5e8a107fff2f32162c8a6cffe4",
+      "status": "new",
+      "destinationRelative": "shared/presentation/src/commonMain/kotlin/chat/presentation/UseCases.kt",
+      "action": "copied",
+      "destinationSha256": "f90a55029a07b728bbc5ccbe1356b78ff1897a5e8a107fff2f32162c8a6cffe4",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/ui/build.gradle.kts",
+      "sourceHash": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "status": "new",
+      "destinationRelative": "shared/ui/build.gradle.kts",
+      "action": "copied",
+      "destinationSha256": "24bb4440bfb24239b1c21a6774ec6586043f3225d91430eb456e662cb6ef8caa",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/ui/README.md",
+      "sourceHash": "0e842d8f56c0a438102413cff2035c7fb373cc80434c49e85bf0f20f656d830e",
+      "status": "new",
+      "destinationRelative": "shared/ui/README.md",
+      "action": "copied",
+      "destinationSha256": "0e842d8f56c0a438102413cff2035c7fb373cc80434c49e85bf0f20f656d830e",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "shared/ui/src/commonMain/kotlin/chat/Module.kt",
+      "sourceHash": "50323e82858f3972e8cd082f7bbf48a167bd80af6d8ef9fa3c55614be4b74db2",
+      "status": "new",
+      "destinationRelative": "shared/ui/src/commonMain/kotlin/chat/Module.kt",
+      "action": "copied",
+      "destinationSha256": "50323e82858f3972e8cd082f7bbf48a167bd80af6d8ef9fa3c55614be4b74db2",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "tests/fixtures/abstract-ordering.json",
+      "sourceHash": "fcf9e6d668ad79c214a7db52ad6ccaa9b68b328bf4472c85e934ec83f6a32cfd",
+      "status": "new",
+      "destinationRelative": "tests/fixtures/abstract-ordering.json",
+      "action": "copied",
+      "destinationSha256": "fcf9e6d668ad79c214a7db52ad6ccaa9b68b328bf4472c85e934ec83f6a32cfd",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "tests/fixtures/README.md",
+      "sourceHash": "84b7b7f10ba4e833c321c1f81b2b89a7b844f10437844bfe2933bd4a2648ab98",
+      "status": "new",
+      "destinationRelative": "tests/fixtures/README.md",
+      "action": "copied",
+      "destinationSha256": "84b7b7f10ba4e833c321c1f81b2b89a7b844f10437844bfe2933bd4a2648ab98",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "tests/integration/CASES.md",
+      "sourceHash": "784f4e3f4f5ab5fbbc9e78700685571bf6664019d1951f2693c67a4ebaa6e286",
+      "status": "new",
+      "destinationRelative": "tests/integration/CASES.md",
+      "action": "copied",
+      "destinationSha256": "784f4e3f4f5ab5fbbc9e78700685571bf6664019d1951f2693c67a4ebaa6e286",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "tests/protocol/CASES.md",
+      "sourceHash": "87bb32200b76b395983b6a34694ff232a8a461b5fac75d87df09324b2dde0769",
+      "status": "new",
+      "destinationRelative": "tests/protocol/CASES.md",
+      "action": "copied",
+      "destinationSha256": "87bb32200b76b395983b6a34694ff232a8a461b5fac75d87df09324b2dde0769",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "tests/README.md",
+      "sourceHash": "2aca27707094e6c1e19c628ca988205de2ec68c3b19937836688cda40fabb45d",
+      "status": "new",
+      "destinationRelative": "tests/README.md",
+      "action": "copied",
+      "destinationSha256": "2aca27707094e6c1e19c628ca988205de2ec68c3b19937836688cda40fabb45d",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "tests/recovery/CASES.md",
+      "sourceHash": "8bf37de14a705b60b93d51230e287149bd2ae2ee582c9bd194c05f4855d89324",
+      "status": "new",
+      "destinationRelative": "tests/recovery/CASES.md",
+      "action": "copied",
+      "destinationSha256": "8bf37de14a705b60b93d51230e287149bd2ae2ee582c9bd194c05f4855d89324",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "tools/bindings/README.md",
+      "sourceHash": "ce0b015268ebb0c61bdc61f6f877868fdfb65f9d8e277a778c9f9c6a9935d2eb",
+      "status": "new",
+      "destinationRelative": "tools/bindings/README.md",
+      "action": "copied",
+      "destinationSha256": "ce0b015268ebb0c61bdc61f6f877868fdfb65f9d8e277a778c9f9c6a9935d2eb",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "tools/packaging/README.md",
+      "sourceHash": "8b48f841d9f77198810f350a89373d76743e21228729abdbfed6f5eadd26f77e",
+      "status": "new",
+      "destinationRelative": "tools/packaging/README.md",
+      "action": "copied",
+      "destinationSha256": "8b48f841d9f77198810f350a89373d76743e21228729abdbfed6f5eadd26f77e",
+      "expectedMigrationEdit": false
+    },
+    {
+      "relative": "tools/verify-project.cjs",
+      "sourceHash": "d0445a5cfb6242d1e70c8707c65397f81a54f541b76c00a57779bd6f5004ec19",
+      "status": "new",
+      "destinationRelative": "tools/verify-project.cjs",
+      "action": "copied",
+      "destinationSha256": "1532a03186ea526ad1ab58a972f1357ee49de9cd6648953b2ea2102f4d9c7245",
+      "expectedMigrationEdit": true
+    }
+  ],
+  "postCopyEdited": [
+    "tools/verify-project.cjs",
+    "docs/implementation/README.md",
+    "docs/implementation/P0_CHECKLIST.md",
+    "docs/VALIDATION.md",
+    "docs/PROJECT_TREE.md",
+    "docs/validation-latest.json"
+  ],
+  "status": "VERIFIED",
+  "alreadyIdentical": 1,
+  "structureValidation": {
+    "status": "PASS",
+    "functionCount": 197,
+    "markdownLinks": 1178
+  },
+  "sourceArchive": "C:\\Users\\35828\\Documents\\Codex\\2026-10-18\\new-chat-2\\work\\archive\\chat-original-2026-10-18",
+  "sourceZipArchive": "C:\\Users\\35828\\Documents\\Codex\\2026-10-18\\new-chat-2\\work\\archive\\chat-project-original.zip"
+}

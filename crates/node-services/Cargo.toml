@@ -1,0 +1,27 @@
+[package]
+name = "chat-node-services"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chat-protocol.workspace = true
+chat-domain.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rusqlite.workspace = true
+rand.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+
+[dev-dependencies]
+chat-crypto.workspace = true
+uuid.workspace = true
+ed25519-dalek.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "p0-node-crash-worker"
+path = "src/p0_crash_worker.rs"

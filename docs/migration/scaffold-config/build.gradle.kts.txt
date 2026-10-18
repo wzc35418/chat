@@ -1,0 +1,4 @@
+plugins { base }
+
+// P0 锁定 Kotlin / Compose / AGP / Gradle / JDK 兼容组合后再启用编译插件。
+// 当前 Gradle 仅登记工程结构，不编译 Kotlin 或生成安装包。

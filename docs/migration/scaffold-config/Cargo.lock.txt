@@ -1,0 +1,99 @@
+# Bootstrap lock for local workspace packages only. No third-party dependency has been selected.
+version = 4
+
+[[package]]
+name = "chat-core"
+version = "0.0.0"
+dependencies = [
+ "chat-crypto",
+ "chat-domain",
+ "chat-identity",
+ "chat-protocol",
+ "chat-storage",
+ "chat-sync",
+ "chat-transport",
+]
+
+[[package]]
+name = "chat-crypto"
+version = "0.0.0"
+dependencies = [
+ "chat-identity",
+ "chat-protocol",
+ "chat-storage",
+]
+
+[[package]]
+name = "chat-domain"
+version = "0.0.0"
+dependencies = [
+ "chat-protocol",
+]
+
+[[package]]
+name = "chat-ffi"
+version = "0.0.0"
+dependencies = [
+ "chat-core",
+ "chat-protocol",
+]
+
+[[package]]
+name = "chat-identity"
+version = "0.0.0"
+dependencies = [
+ "chat-protocol",
+ "chat-storage",
+]
+
+[[package]]
+name = "chat-node"
+version = "0.0.0"
+dependencies = [
+ "chat-node-api",
+ "chat-node-services",
+]
+
+[[package]]
+name = "chat-node-api"
+version = "0.0.0"
+dependencies = [
+ "chat-node-services",
+ "chat-protocol",
+]
+
+[[package]]
+name = "chat-node-services"
+version = "0.0.0"
+dependencies = [
+ "chat-domain",
+ "chat-protocol",
+]
+
+[[package]]
+name = "chat-protocol"
+version = "0.0.0"
+
+[[package]]
+name = "chat-storage"
+version = "0.0.0"
+dependencies = [
+ "chat-protocol",
+]
+
+[[package]]
+name = "chat-sync"
+version = "0.0.0"
+dependencies = [
+ "chat-domain",
+ "chat-protocol",
+ "chat-storage",
+ "chat-transport",
+]
+
+[[package]]
+name = "chat-transport"
+version = "0.0.0"
+dependencies = [
+ "chat-protocol",
+]

@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/domain",
+    "crates/identity",
+    "crates/crypto",
+    "crates/storage",
+    "crates/transport",
+    "crates/sync",
+    "crates/core",
+    "crates/ffi",
+    "crates/node-services",
+    "crates/node-api",
+    "apps/node",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+chat-protocol = { path = "crates/protocol" }
+chat-domain = { path = "crates/domain" }
+chat-identity = { path = "crates/identity" }
+chat-crypto = { path = "crates/crypto" }
+chat-storage = { path = "crates/storage" }
+chat-transport = { path = "crates/transport" }
+chat-sync = { path = "crates/sync" }
+chat-core = { path = "crates/core" }
+chat-ffi = { path = "crates/ffi" }
+chat-node-services = { path = "crates/node-services" }
+chat-node-api = { path = "crates/node-api" }

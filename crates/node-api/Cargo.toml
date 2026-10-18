@@ -1,0 +1,18 @@
+[package]
+name = "chat-node-api"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chat-protocol.workspace = true
+chat-node-services.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# 真 TCP 端到端测试需要 net/io-util；版本仍取自根 Cargo.toml 的 workspace.dependencies。
+tokio = { workspace = true, features = ["net", "io-util"] }
+ed25519-dalek.workspace = true
+serde_json.workspace = true

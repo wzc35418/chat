@@ -1,0 +1,26 @@
+[package]
+name = "chat-crypto"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chat-protocol.workspace = true
+chat-identity.workspace = true
+chat-storage.workspace = true
+anyhow.workspace = true
+openmls.workspace = true
+openmls_rust_crypto.workspace = true
+openmls_basic_credential.workspace = true
+uuid.workspace = true
+rusqlite.workspace = true
+openmls_sqlite_storage.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+argon2.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+
+[[bin]]
+name = "p0-crash-worker"
+path = "src/crash_worker.rs"

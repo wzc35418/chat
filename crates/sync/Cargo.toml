@@ -1,0 +1,11 @@
+[package]
+name = "chat-sync"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chat-protocol.workspace = true
+chat-domain.workspace = true
+chat-storage.workspace = true
+chat-transport.workspace = true

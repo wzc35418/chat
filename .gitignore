@@ -1,0 +1,16 @@
+.tools/
+.gradle/
+.kotlin/
+**/build/
+target/
+local.properties
+*.log
+.idea/
+.env
+data/
+*.db
+*.db-wal
+*.db-shm
+*.recovery
+*.jks
+*.keystore

@@ -1,0 +1,51 @@
+{
+  "date": "2026-10-18T14:56:43.7635000+13:00",
+  "status": "PASS",
+  "scope": "Windows x64; ephemeral local MLS/iroh chain plus isolated disposable SQLite/OpenMLS and signed-node crash experiments; Kotlin/Compose; Android arm64 build",
+  "checks": [
+    "Rust workspace tests",
+    "Fourteen process-abort checkpoints covering T1 intent, T1-to-T2 preparation, SQLite/OpenMLS send/receive, and isolated node accept; rollback and fixed-cipher retry",
+    "Node same-submission replay, pinned-key Ed25519 receipt verification, tamper rejection, contiguous hash-chain sequence and durable delivery job",
+    "Rust CLI encrypted roundtrip",
+    "Kotlin/native bidirectional roundtrip and error lifecycle",
+    "Compose P0 desktop/compact rendering and preview presentation checks/snapshots",
+    "Android debug APK with Rust arm64 library",
+    "JVM skeleton and example plugin builds"
+  ],
+  "artifacts": [
+    {
+      "path": "build/native/host/chat_ffi.dll",
+      "sha256": "cb6c2c1d3a5bc9ac5093fccd67035d3e66d7bc988b07642680f6bd9d8a0a2768",
+      "bytes": 34156032
+    },
+    {
+      "path": "build/native/android/arm64-v8a/libchat_ffi.so",
+      "sha256": "e20597f3df02278ccfeff1038afd2bc0a905ba57946b88a95deb3d38429f86a3",
+      "bytes": 320251360
+    },
+    {
+      "path": "apps/android/build/outputs/apk/debug/android-debug.apk",
+      "sha256": "f638ce2d2d555bc758de04ec3c4bb5830b3fd669cd06fce5b411262e50d5c343",
+      "bytes": 47676304
+    }
+  ],
+  "evidence": [
+    "build/p0-evidence/rust-tests.log",
+    "build/p0-evidence/persistence-crash.log",
+    "build/p0-evidence/node-acceptance.log",
+    "build/p0-evidence/rust-roundtrip.json",
+    "build/p0-evidence/gradle-p0.log",
+    "build/p0-snapshots/desktop.png",
+    "build/p0-snapshots/compact.png",
+    "build/preview-snapshots/preview-desktop-accepted.png",
+    "build/preview-snapshots/preview-compact-chat.png"
+  ],
+  "notRun": [
+    "Android device runtime",
+    "Linux runtime",
+    "Cross-device interoperability",
+    "Formal production T1/C01, authenticated HTTP and signed node receipt for C05, C07-C10, full C06 mailbox ACK, power-loss recovery",
+    "Encrypted database and platform key protection",
+    "Self-hosted relay/NAT matrix"
+  ]
+}

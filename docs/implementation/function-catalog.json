@@ -1,0 +1,5173 @@
+{
+  "version": 1,
+  "date": "2026-10-18",
+  "status": "planned",
+  "count": 197,
+  "functions": [
+    {
+      "id": "PROTOCOL-001",
+      "name": "parse_id",
+      "signature": "parse_id(kind: IdKind, input: &str) -> Result<TypedId>",
+      "result": "返回独立强类型 ID；输入错误不能构造内部合法值",
+      "pre": "外部字符串不可信，ASCII 编码、版本和长度取决于冻结规范",
+      "steps": [
+        "先限长",
+        "解析类型前缀和版本",
+        "解码并验证字节数",
+        "检查规范形式并构造对应 ID"
+      ],
+      "tx": "纯函数；不读取网络或数据库",
+      "errors": "INVALID_ID，PROTOCOL_UNSUPPORTED；不可自动改写非法输入",
+      "tests": [
+        "超长/空串/错误类型前缀",
+        "同字节非规范编码拒绝",
+        "AccountId 不能代作 DeviceId"
+      ],
+      "calls": [],
+      "file": "crates/protocol/src/wire.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/protocol.md"
+    },
+    {
+      "id": "PROTOCOL-002",
+      "name": "encode_canonical",
+      "signature": "encode_canonical(value: WireValue, version: ProtocolVersion) -> Result<CanonicalBytes>",
+      "result": "返回所有语言一致的签名原文，不含签名自身",
+      "pre": "类型已通过字段验证，编码格式须 P0 冻结",
+      "steps": [
+        "检查版本",
+        "按规范字段序和整数范围编码",
+        "明确可选值表示",
+        "拒绝重复/未知安全字段",
+        "返回有界不可变字节"
+      ],
+      "tx": "纯函数；不允许直接签任意 JSON 字符串",
+      "errors": "PROTOCOL_UNSUPPORTED，CONTENT_TOO_LARGE",
+      "tests": [
+        "字段排列变化产出同字节",
+        "整数边界跨语言向量一致"
+      ],
+      "calls": [
+        "parse_id"
+      ],
+      "file": "crates/protocol/src/wire.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/protocol.md"
+    },
+    {
+      "id": "PROTOCOL-003",
+      "name": "decode_bounded",
+      "signature": "decode_bounded(bytes: &[u8], limits: DecodeLimits) -> Result<WireFrame>",
+      "result": "只返回结构合法但尚未认证的帧",
+      "pre": "先有帧字节上限、最大深度、集合数量和解压预算",
+      "steps": [
+        "检查总长度",
+        "有界解析",
+        "拒绝重复字段和溢出",
+        "校验必需字段",
+        "标注 Unverified 类型"
+      ],
+      "tx": "纯解析；成功不代表可信作者",
+      "errors": "MALFORMED_FRAME，CONTENT_TOO_LARGE",
+      "tests": [
+        "截断/深嵌套/巨量数组",
+        "随机畸形输入不得越界或耗尽内存"
+      ],
+      "calls": [
+        "parse_id"
+      ],
+      "file": "crates/protocol/src/wire.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/protocol.md"
+    },
+    {
+      "id": "PROTOCOL-004",
+      "name": "candidate_signing_bytes",
+      "signature": "candidate_signing_bytes(candidate: UnsignedCandidate) -> Result<CanonicalBytes>",
+      "result": "生成作者签名覆盖内容",
+      "pre": "候选包括 submission/group/device/kind/head/policy/epoch 与密文",
+      "steps": [
+        "计算 payload 摘要",
+        "加入用途域",
+        "规范编码全部路由和控制字段",
+        "排除 author_signature 自身"
+      ],
+      "tx": "纯函数；不持有私钥",
+      "errors": "INVALID_CANDIDATE，CONTENT_TOO_LARGE",
+      "tests": [
+        "替换目标群/epoch/控制元数据任一字段导致验签失败"
+      ],
+      "calls": [
+        "encode_canonical"
+      ],
+      "file": "crates/protocol/src/wire.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/protocol.md"
+    },
+    {
+      "id": "PROTOCOL-005",
+      "name": "verify_candidate",
+      "signature": "verify_candidate(candidate: SignedCandidate, credential: VerifiedCredential, context: GroupContext) -> Result<VerifiedCandidate>",
+      "result": "返回外层验签通过的候选；MLS 内层验证仍必需",
+      "pre": "凭据已验证且设备未撤销，节点与群上下文明确",
+      "steps": [
+        "检查设备和账户绑定",
+        "核对版本/大小/群",
+        "验证作者签名",
+        "核对 control 元数据是否单操作",
+        "输出带验证标记对象"
+      ],
+      "tx": "纯验证；不修改正式群状态",
+      "errors": "INVALID_SIGNATURE，DEVICE_REVOKED，PROTOCOL_UNSUPPORTED",
+      "tests": [
+        "伪造 author_device",
+        "重放到其他群",
+        "内层伪造仍需后续拒绝"
+      ],
+      "calls": [
+        "candidate_signing_bytes"
+      ],
+      "file": "crates/protocol/src/wire.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/protocol.md"
+    },
+    {
+      "id": "PROTOCOL-006",
+      "name": "receipt_signing_bytes",
+      "signature": "receipt_signing_bytes(candidate_hash: Digest, seq: u64, previous: Digest, group: GroupId) -> CanonicalBytes",
+      "result": "产生节点回执的唯一签名输入",
+      "pre": "seq 从 1 开始，group 与候选一致",
+      "steps": [
+        "加入节点回执域",
+        "编码候选全文摘要",
+        "绑定 seq/previous/group",
+        "返回原文字节"
+      ],
+      "tx": "纯函数；seq 不加入已经生成的 MLS 正文",
+      "errors": "INVALID_SEQUENCE",
+      "tests": [
+        "交换候选或前序摘要导致签名失效",
+        "跨群回执拒绝"
+      ],
+      "calls": [
+        "encode_canonical"
+      ],
+      "file": "crates/protocol/src/wire.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/protocol.md"
+    },
+    {
+      "id": "PROTOCOL-007",
+      "name": "verify_log_entry",
+      "signature": "verify_log_entry(entry: AcceptedLogEntry, expected: VerifiedHead, node_key: PinnedNodeKey) -> Result<VerifiedLogEntry>",
+      "result": "返回连续且节点签名合法的日志条目",
+      "pre": "节点公钥已固定；expected 为本机已验证头",
+      "steps": [
+        "验证作者候选",
+        "计算候选摘要",
+        "验证节点回执",
+        "核对 seq=expected+1 和 previous_hash",
+        "校验群绑定"
+      ],
+      "tx": "纯函数；后续业务与 MLS 校验成功才提交游标",
+      "errors": "MISSING_LOG_ENTRIES，LOG_CONFLICT，INVALID_SIGNATURE",
+      "tests": [
+        "跳号触发补齐",
+        "相同 seq 不同摘要暂停",
+        "换节点公钥不得静默信任"
+      ],
+      "calls": [
+        "verify_candidate",
+        "receipt_signing_bytes"
+      ],
+      "file": "crates/protocol/src/wire.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/protocol.md"
+    },
+    {
+      "id": "PROTOCOL-008",
+      "name": "encode_application_event",
+      "signature": "encode_application_event(event: PlainApplicationEvent) -> Result<SecretBytes>",
+      "result": "生成 MLS 内层事件字节，绑定事件 ID 和作者设备",
+      "pre": "content/reply/origin 已验证，时间仅用于显示",
+      "steps": [
+        "加入 group/event/account/device",
+        "编码内容类型",
+        "校验回复目标上下文",
+        "计算完整序列化大小",
+        "返回敏感缓冲区"
+      ],
+      "tx": "纯函数；调用方负责使用后清理",
+      "errors": "CONTENT_TOO_LARGE，INVALID_REPLY",
+      "tests": [
+        "64 KiB 边界按 UTF-8 完整字节计算",
+        "跨会话引用拒绝"
+      ],
+      "calls": [
+        "encode_canonical"
+      ],
+      "file": "crates/protocol/src/wire.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/protocol.md"
+    },
+    {
+      "id": "PROTOCOL-009",
+      "name": "verify_inner_event",
+      "signature": "verify_inner_event(event: DecryptedEvent, sender: MlsSender, outer: VerifiedCandidate) -> Result<AuthenticatedEvent>",
+      "result": "取得可以用于可信去重的 EventId",
+      "pre": "MLS 解密认证已成功；sender 来自 MLS 凭据",
+      "steps": [
+        "核对 group/account/device",
+        "验证内外事件类别匹配",
+        "验证 origin 不是授权替代",
+        "检查内容范围",
+        "返回认证事件"
+      ],
+      "tx": "纯函数；外层 message ID 不能提前进入永久去重表",
+      "errors": "INVALID_CREDENTIAL，INVALID_EVENT_BINDING",
+      "tests": [
+        "伪造外层 ID 不吞掉真消息",
+        "MLS sender 与外层设备不一致拒绝"
+      ],
+      "calls": [
+        "decode_bounded"
+      ],
+      "file": "crates/protocol/src/wire.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/protocol.md"
+    },
+    {
+      "id": "PROTOCOL-010",
+      "name": "validate_extension",
+      "signature": "validate_extension(content: ExtensionContent, limits: ContentLimits) -> Result<ValidatedExtension>",
+      "result": "返回 namespace/version/operation/object/payload/fallback 齐全的内容",
+      "pre": "完整消息仍受 64 KiB 上限；未知功能不能修改核心权限",
+      "steps": [
+        "检查命名空间",
+        "检查 schemaVersion",
+        "校验 operation/object ID",
+        "限制 payload 与回退文本",
+        "保留未知 payload"
+      ],
+      "tx": "纯函数；未知内容可显示回退，未知控制操作必须拒绝",
+      "errors": "INVALID_EXTENSION，CONTENT_TOO_LARGE",
+      "tests": [
+        "未安装插件仍显示 fallback",
+        "空回退/非法 namespace",
+        "重复 operation 后续幂等"
+      ],
+      "calls": [
+        "parse_id"
+      ],
+      "file": "crates/protocol/src/wire.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/protocol.md"
+    },
+    {
+      "id": "PROTOCOL-011",
+      "name": "negotiate_capabilities",
+      "signature": "negotiate_capabilities(local: Capabilities, remote: Capabilities) -> Result<SessionCapabilities>",
+      "result": "返回双方兼容主版本、必需能力交集和更小限额",
+      "pre": "本地安全必需能力不可被远端关闭",
+      "steps": [
+        "验证远端声明",
+        "选择支持版本",
+        "逐项检查必需能力",
+        "按 min 合并限额",
+        "固定会话协商结果"
+      ],
+      "tx": "连接级不可变状态；不修改身份信任",
+      "errors": "PROTOCOL_UNSUPPORTED，REQUIRED_CAPABILITY_MISSING",
+      "tests": [
+        "远端不支持 E2EE 必须失败",
+        "限额更低时严格采用较低值"
+      ],
+      "calls": [],
+      "file": "crates/protocol/src/wire.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/protocol.md"
+    },
+    {
+      "id": "PROTOCOL-012",
+      "name": "encode_page_cursor",
+      "signature": "encode_page_cursor(scope: CursorScope, position: CursorPosition, key: CursorKey) -> Result<OpaqueCursor>",
+      "result": "返回认证的有界游标，不暴露未加密本地索引",
+      "pre": "scope 包含账户/设备/会话/排序版本",
+      "steps": [
+        "规范编码 scope 和 position",
+        "认证封装",
+        "加入版本和过期策略",
+        "输出不透明 token"
+      ],
+      "tx": "纯函数；算法依 P0 锁定",
+      "errors": "INVALID_CURSOR_SCOPE",
+      "tests": [
+        "换会话/换设备游标拒绝",
+        "篡改位置拒绝"
+      ],
+      "calls": [
+        "encode_canonical"
+      ],
+      "file": "crates/protocol/src/wire.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/protocol.md"
+    },
+    {
+      "id": "PROTOCOL-013",
+      "name": "decode_page_cursor",
+      "signature": "decode_page_cursor(token: OpaqueCursor, expected: CursorScope, key: CursorKey) -> Result<CursorPosition>",
+      "result": "取得合法位置，禁止跨范围复用",
+      "pre": "限制 token 长度后再解码",
+      "steps": [
+        "验证认证标签",
+        "检查格式版本",
+        "匹配 expected",
+        "检查过期与位置范围",
+        "返回位置"
+      ],
+      "tx": "纯函数；错误不能默认跳到最新页",
+      "errors": "INVALID_CURSOR，CURSOR_EXPIRED",
+      "tests": [
+        "截断 token",
+        "旧排序版本明确要求重查",
+        "跨账户拒绝"
+      ],
+      "calls": [
+        "decode_bounded"
+      ],
+      "file": "crates/protocol/src/wire.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/protocol.md"
+    },
+    {
+      "id": "PROTOCOL-014",
+      "name": "map_error",
+      "signature": "map_error(error: InternalError, operation: Option<OperationId>) -> PublicError",
+      "result": "输出稳定脱敏错误结构",
+      "pre": "内部错误可能包含路径或输入明文，不可原样显示",
+      "steps": [
+        "按分类映射 code",
+        "确定 retryable",
+        "限幅 retryAfter",
+        "附 operationId",
+        "删除敏感 cause"
+      ],
+      "tx": "纯函数；详细诊断也须脱敏",
+      "errors": "未知错误映射 INTERNAL_FAILURE，默认不可无限重试",
+      "tests": [
+        "私钥/正文不能出现在错误",
+        "存储损坏不标普通网络重试"
+      ],
+      "calls": [],
+      "file": "crates/protocol/src/wire.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/protocol.md"
+    },
+    {
+      "id": "DOMAIN-001",
+      "name": "validate_send_permission",
+      "signature": "validate_send_permission(snapshot: GroupSnapshot, actor: Actor, size: usize) -> Result<AuthorizedSend>",
+      "result": "返回发言授权及当前 head/epoch/policy 上下文",
+      "pre": "actor 的账户与设备关系已验证",
+      "steps": [
+        "检查群未解散",
+        "设备在成员集合",
+        "账户有效且未禁言",
+        "核对大小",
+        "生成授权上下文"
+      ],
+      "tx": "纯函数；节点与客户端都调用，节点结果不替代客户端验证",
+      "errors": "PERMISSION_DENIED，DEVICE_REVOKED，CONTENT_TOO_LARGE",
+      "tests": [
+        "禁言后旧草稿不能越权",
+        "本人已撤销设备不能发送"
+      ],
+      "calls": [],
+      "file": "crates/domain/src/rules.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/domain.md"
+    },
+    {
+      "id": "DOMAIN-002",
+      "name": "authorize_group_operation",
+      "signature": "authorize_group_operation(snapshot: GroupSnapshot, actor: Actor, op: GroupOperation) -> Result<AuthorizedGroupOperation>",
+      "result": "单一合法操作，不接受顺便改变其他权限",
+      "pre": "snapshot 含角色、设备、加入位置、当前 control_head",
+      "steps": [
+        "按操作分支校验角色",
+        "验证目标成员",
+        "限制管理员只能治理普通成员",
+        "阻止任命群主",
+        "检查容量和解散状态"
+      ],
+      "tx": "纯函数；不得先更新本地正式成员",
+      "errors": "PERMISSION_DENIED，INVALID_TARGET，GROUP_LIMIT_EXCEEDED",
+      "tests": [
+        "管理员踢管理员/群主拒绝",
+        "成员给自己升权拒绝"
+      ],
+      "calls": [
+        "validate_capacity"
+      ],
+      "file": "crates/domain/src/rules.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/domain.md"
+    },
+    {
+      "id": "DOMAIN-003",
+      "name": "validate_capacity",
+      "signature": "validate_capacity(accounts: usize, devices: usize, per_account: usize, limits: GroupLimits) -> Result<()>",
+      "result": "验证 20 账户/40 设备/每账户2设备基线",
+      "pre": "实际节点可能配置更低上限",
+      "steps": [
+        "安全加法计算变化后规模",
+        "检查各维度",
+        "拒绝整数溢出",
+        "输出明确超限类型"
+      ],
+      "tx": "纯函数；客户端提示与节点权威检查并用",
+      "errors": "GROUP_LIMIT_EXCEEDED，DEVICE_LIMIT_EXCEEDED",
+      "tests": [
+        "19→20 接受、20→21拒绝",
+        "重复设备不重复计数"
+      ],
+      "calls": [],
+      "file": "crates/domain/src/rules.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/domain.md"
+    },
+    {
+      "id": "DOMAIN-004",
+      "name": "apply_policy_operation",
+      "signature": "apply_policy_operation(before: GroupSnapshot, op: AuthorizedGroupOperation) -> Result<ProposedPolicy>",
+      "result": "产出候选快照和预期设备增删差集",
+      "pre": "op 必须来自当前 before 的授权结果",
+      "steps": [
+        "匹配 head/policy",
+        "只应用该操作",
+        "计算唯一群主不变量",
+        "计算设备集合差异",
+        "递增 policy_version"
+      ],
+      "tx": "纯函数；不是正式快照，节点回执与 MLS 比对后提交",
+      "errors": "STALE_CONTROL_HEAD，INVALID_POLICY_TRANSITION",
+      "tests": [
+        "加人操作夹带管理员角色拒绝",
+        "移除账户覆盖其全部设备"
+      ],
+      "calls": [
+        "authorize_group_operation"
+      ],
+      "file": "crates/domain/src/rules.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/domain.md"
+    },
+    {
+      "id": "DOMAIN-005",
+      "name": "verify_control_result",
+      "signature": "verify_control_result(before: GroupSnapshot, metadata: ControlMetadata, mls: StagedCommit) -> Result<VerifiedControlResult>",
+      "result": "确认公开业务变更与实际 MLS 设备成员变更相同",
+      "pre": "metadata 外层签名合法；MLS Commit 已验证但未提交",
+      "steps": [
+        "重新校验原作者权限",
+        "生成预期业务快照",
+        "比对实际 added/removed 叶子和凭据",
+        "核对 epoch 变化",
+        "检查纯角色操作不夹带成员变化"
+      ],
+      "tx": "纯函数；任一失败不提交 MLS/策略/游标",
+      "errors": "INVALID_CONTROL_RESULT，LOG_CONFLICT",
+      "tests": [
+        "管理员 Invite 夹带 Remove Owner 拒绝",
+        "账户所有设备移除才通过"
+      ],
+      "calls": [
+        "apply_policy_operation"
+      ],
+      "file": "crates/domain/src/rules.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/domain.md"
+    },
+    {
+      "id": "DOMAIN-006",
+      "name": "validate_owner_exit",
+      "signature": "validate_owner_exit(snapshot: GroupSnapshot, actor: AccountId) -> Result<ExitMode>",
+      "result": "返回成员可退出或群主须转让/解散",
+      "pre": "群未解散，actor 是当前成员",
+      "steps": [
+        "查角色",
+        "普通成员返回可退出",
+        "群主返回需要明确转让或解散",
+        "空群情况不自动推断授权"
+      ],
+      "tx": "纯函数",
+      "errors": "OWNER_TRANSFER_REQUIRED，NOT_MEMBER",
+      "tests": [
+        "群主不能因最后一人而隐式越过显式解散确认"
+      ],
+      "calls": [],
+      "file": "crates/domain/src/rules.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/domain.md"
+    },
+    {
+      "id": "DOMAIN-007",
+      "name": "validate_ownership_transfer",
+      "signature": "validate_ownership_transfer(snapshot: GroupSnapshot, actor: Actor, target: AccountId) -> Result<AuthorizedGroupOperation>",
+      "result": "原群主降为普通成员、目标成为唯一群主的单一操作",
+      "pre": "目标是当前活跃成员且至少有一台有效设备",
+      "steps": [
+        "验证 actor 是群主",
+        "阻止自转让",
+        "验证目标",
+        "生成明确 before/after 角色变化",
+        "确保结果唯一群主"
+      ],
+      "tx": "纯函数；转让不自动让原群主退出",
+      "errors": "PERMISSION_DENIED，INVALID_TARGET",
+      "tests": [
+        "转让给已移除账户拒绝",
+        "旧群主重试需重新校验权限"
+      ],
+      "calls": [
+        "authorize_group_operation"
+      ],
+      "file": "crates/domain/src/rules.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/domain.md"
+    },
+    {
+      "id": "DOMAIN-008",
+      "name": "transition_send_state",
+      "signature": "transition_send_state(current: SendState, evidence: DeliveryEvidence) -> Result<SendState>",
+      "result": "只依据证据推进 QUEUED/ACCEPTED/DELIVERED/FAILED",
+      "pre": "正式接受需要经过验证的节点回执，送达需要端到端持久化回执",
+      "steps": [
+        "校验证据种类",
+        "排除 transport/mailbox ACK",
+        "按状态表推进",
+        "允许重复证据幂等",
+        "已接受后不被超时降为失败"
+      ],
+      "tx": "纯函数；FAILED 的可重试原因另记不伪装新消息",
+      "errors": "INVALID_STATE_TRANSITION",
+      "tests": [
+        "信箱 ACK 不置 DELIVERED",
+        "先到送达证据仍须验证正式接受关联"
+      ],
+      "calls": [],
+      "file": "crates/domain/src/rules.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/domain.md"
+    },
+    {
+      "id": "DOMAIN-009",
+      "name": "aggregate_delivery",
+      "signature": "aggregate_delivery(message: MessageIdentity, receipts: List<VerifiedReceipt>, members: RecipientSnapshot) -> DeliverySummary",
+      "result": "返回每设备/每账户明细和对方已送达账户数",
+      "pre": "只统计该消息当时获准收件设备，排除本人账户",
+      "steps": [
+        "按 message/device 去重",
+        "校验接收权限时点",
+        "按账户 OR 聚合",
+        "排除发件人",
+        "计算计数和缺失列表"
+      ],
+      "tx": "纯函数；不能仅取回执条数",
+      "errors": "INVALID_RECEIPT_SCOPE",
+      "tests": [
+        "两台 B 设备只计1账户",
+        "A 第二台不算对方",
+        "撤销后伪造回执拒绝"
+      ],
+      "calls": [],
+      "file": "crates/domain/src/rules.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/domain.md"
+    },
+    {
+      "id": "DOMAIN-010",
+      "name": "classify_retry",
+      "signature": "classify_retry(error: CoreError, state: OperationState) -> RetryDecision",
+      "result": "区分原字节重发、先同步、等待用户和永久失败",
+      "pre": "已生成密文的尝试与草稿身份分离",
+      "steps": [
+        "网络错误退避",
+        "旧 head/epoch 转同步",
+        "签名/损坏停止",
+        "权限错误终止",
+        "结果未知先按原 ID 查询"
+      ],
+      "tx": "纯函数；不实际 sleep 或加密",
+      "errors": "UNKNOWN_RESULT 必须保留同 SubmissionId",
+      "tests": [
+        "超时后节点已接受不重新加密",
+        "禁言不无限重试"
+      ],
+      "calls": [],
+      "file": "crates/domain/src/rules.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/domain.md"
+    },
+    {
+      "id": "DOMAIN-011",
+      "name": "validate_reply_target",
+      "signature": "validate_reply_target(conversation: ConversationId, target: MessageRef) -> Result<ReplyReference>",
+      "result": "绑定合法同会话回复引用，允许正文已过期",
+      "pre": "引用目标身份和会话须可信",
+      "steps": [
+        "核对 conversation",
+        "限制引用字段与大小",
+        "保留 ID",
+        "正文不可用输出占位引用"
+      ],
+      "tx": "纯函数；不隐式下载全部历史",
+      "errors": "INVALID_REPLY，MESSAGE_NOT_VISIBLE",
+      "tests": [
+        "跨群消息引用拒绝",
+        "删除/过期内容可显示原消息不可用"
+      ],
+      "calls": [],
+      "file": "crates/domain/src/rules.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/domain.md"
+    },
+    {
+      "id": "DOMAIN-012",
+      "name": "enforce_join_visibility",
+      "signature": "enforce_join_visibility(member: MembershipWindow, requested: SequenceRange) -> Result<SequenceRange>",
+      "result": "返回内容可见范围，控制链验证材料另有范围",
+      "pre": "默认加入后历史，不能因成员身份开放所有旧附件",
+      "steps": [
+        "计算加入/退出窗口",
+        "限制内容序号",
+        "将恢复控制链与可见正文分开",
+        "对附件采用同一授权边界"
+      ],
+      "tx": "纯函数；节点日志和 blob 下载复用",
+      "errors": "HISTORY_NOT_AUTHORIZED",
+      "tests": [
+        "新设备只能读加入后消息",
+        "合法恢复材料不包含旧正文密钥"
+      ],
+      "calls": [],
+      "file": "crates/domain/src/rules.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/domain.md"
+    },
+    {
+      "id": "IDENTITY-001",
+      "name": "create_account",
+      "signature": "create_account(display_name: String, protector: KeyProtector) -> Result<LocalAccount>",
+      "result": "原子建立账户、主管设备凭据和受保护密钥引用",
+      "pre": "尚无本地账户；显示名有长度限制；安全随机与密钥保护可用",
+      "steps": [
+        "校验显示名",
+        "生成账户/设备密钥",
+        "派生 AccountId",
+        "签发初始设备凭据",
+        "包装存储主密钥",
+        "原子写入账户和凭据"
+      ],
+      "tx": "T1：密钥引用/账户/初始凭据一事务；平台包装失败不写明文；孤立包装槽补偿删除",
+      "errors": "ACCOUNT_EXISTS，STORAGE_LOCKED，KEY_PROTECTION_UNAVAILABLE",
+      "tests": [
+        "创建中崩溃只恢复完整账户",
+        "昵称改变不影响 ID"
+      ],
+      "calls": [
+        "wrap_storage_key",
+        "verify_credential"
+      ],
+      "file": "crates/identity/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/identity.md"
+    },
+    {
+      "id": "IDENTITY-002",
+      "name": "current_account",
+      "signature": "current_account() -> Result<Option<LocalAccount>>",
+      "result": "返回脱敏账户视图，无账户返回 None，锁定返回专门错误",
+      "pre": "storage 已打开或明确处于锁定状态",
+      "steps": [
+        "检查锁状态",
+        "读取账户元数据",
+        "映射显示名/ID/设备摘要",
+        "过滤全部密钥字段"
+      ],
+      "tx": "只读快照；不触发建号",
+      "errors": "STORAGE_LOCKED，STORAGE_FAILURE",
+      "tests": [
+        "首次启动 None",
+        "数据库锁定不能伪装成无账户"
+      ],
+      "calls": [],
+      "file": "crates/identity/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/identity.md"
+    },
+    {
+      "id": "IDENTITY-003",
+      "name": "verify_credential",
+      "signature": "verify_credential(credential: DeviceCredential, trust: TrustAnchor, now: Time) -> Result<VerifiedCredential>",
+      "result": "校验设备公钥、端点、账户和有效期绑定",
+      "pre": "主管账户公钥已由邀请/本地信任锚确定，时间偏差策略已配置",
+      "steps": [
+        "有界解码",
+        "重算账户 ID",
+        "验证账户签名",
+        "检查有效期/撤销版本",
+        "绑定设备签名公钥与 EndpointId"
+      ],
+      "tx": "纯验证；服务端新公钥不能覆盖既有信任",
+      "errors": "INVALID_CREDENTIAL，DEVICE_REVOKED，IDENTITY_CHANGED",
+      "tests": [
+        "替换端点/设备公钥拒绝",
+        "时间偏差边界",
+        "信任根不同明确提示"
+      ],
+      "calls": [
+        "parse_id",
+        "encode_canonical"
+      ],
+      "file": "crates/identity/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/identity.md"
+    },
+    {
+      "id": "IDENTITY-004",
+      "name": "create_contact_invite",
+      "signature": "create_contact_invite(expires_in: Duration) -> Result<ContactInvite>",
+      "result": "生成带公钥指纹、节点提示和受限投递能力的一次性邀请",
+      "pre": "已解锁账户；邀请有效期在本地/节点允许范围",
+      "steps": [
+        "分配邀请 ID/随机能力",
+        "限定 contact-request 作用域",
+        "签名正文",
+        "本地持久化期限和消费状态",
+        "编码二维码文本"
+      ],
+      "tx": "T1：邀请记录先落盘后展示；失败不泄漏可用未记录能力",
+      "errors": "INVALID_EXPIRY，STORAGE_FAILURE",
+      "tests": [
+        "过期与重复消费拒绝",
+        "邀请不能直接授权所有群/旧历史"
+      ],
+      "calls": [
+        "encode_canonical"
+      ],
+      "file": "crates/identity/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/identity.md"
+    },
+    {
+      "id": "IDENTITY-005",
+      "name": "accept_contact_invite",
+      "signature": "accept_contact_invite(encoded: String) -> Result<ContactRequest>",
+      "result": "建立待确认联系人请求，不自动信任身份变化",
+      "pre": "来自二维码/粘贴的输入完全不可信",
+      "steps": [
+        "限长解码",
+        "验证邀请签名与期限",
+        "核对已有联系人指纹",
+        "保存待确认请求",
+        "提交受限请求消息"
+      ],
+      "tx": "本地请求与 outbox 同事务；网络失败仍可恢复待处理状态",
+      "errors": "INVITE_EXPIRED，IDENTITY_CHANGED，INVALID_CAPABILITY",
+      "tests": [
+        "重复扫描返回同请求",
+        "换公钥进入警告",
+        "未确认不能正式私聊"
+      ],
+      "calls": [
+        "verify_credential",
+        "enqueue_job"
+      ],
+      "file": "crates/identity/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/identity.md"
+    },
+    {
+      "id": "IDENTITY-006",
+      "name": "confirm_contact",
+      "signature": "confirm_contact(request_id: RequestId) -> Result<Contact>",
+      "result": "记录用户确认的信任锚和正常投递能力",
+      "pre": "用户已核验 UI 展示的公钥指纹/请求 ID",
+      "steps": [
+        "锁请求",
+        "核对未过期未被拒绝",
+        "保存信任锚",
+        "完成双向能力握手",
+        "设置联系人 accepted"
+      ],
+      "tx": "T1：联系人接受与待发送确认同事务；对端状态未完成时显示等待",
+      "errors": "CONTACT_REQUEST_NOT_FOUND，INVITE_EXPIRED，IDENTITY_CHANGED",
+      "tests": [
+        "重复确认幂等",
+        "离线确认不假称对端已完成"
+      ],
+      "calls": [
+        "enqueue_job"
+      ],
+      "file": "crates/identity/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/identity.md"
+    },
+    {
+      "id": "IDENTITY-007",
+      "name": "verification_fingerprint",
+      "signature": "verification_fingerprint(account_id: AccountId) -> Result<String>",
+      "result": "返回稳定可人工核验指纹",
+      "pre": "账户公钥来自已固定信任记录",
+      "steps": [
+        "读取公钥",
+        "加入 fingerprint 用途域",
+        "按锁定算法计算",
+        "分组格式化",
+        "返回可扫码版本"
+      ],
+      "tx": "只读；显示名/节点地址不参与指纹",
+      "errors": "CONTACT_NOT_FOUND，STORAGE_LOCKED",
+      "tests": [
+        "更换节点指纹不变",
+        "公钥改变指纹改变"
+      ],
+      "calls": [
+        "encode_canonical"
+      ],
+      "file": "crates/identity/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/identity.md"
+    },
+    {
+      "id": "IDENTITY-008",
+      "name": "begin_device_link",
+      "signature": "begin_device_link() -> Result<DeviceLinkRequest>",
+      "result": "第二设备生成本机密钥和一次性短期配对请求",
+      "pre": "未关联账户；设备本地密钥保护可用",
+      "steps": [
+        "生成设备/端点密钥",
+        "创建 nonce 和短期请求",
+        "持久化本地待配对秘密",
+        "输出公钥/端点/验证码二维码"
+      ],
+      "tx": "本机待配对记录原子写入；私钥永不进入二维码",
+      "errors": "LINK_ALREADY_ACTIVE，KEY_PROTECTION_UNAVAILABLE",
+      "tests": [
+        "重启恢复配对",
+        "过期必须重新生成",
+        "二维码无私钥"
+      ],
+      "calls": [
+        "wrap_storage_key"
+      ],
+      "file": "crates/identity/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/identity.md"
+    },
+    {
+      "id": "IDENTITY-009",
+      "name": "authorize_device",
+      "signature": "authorize_device(request: DeviceLinkRequest, confirmation: UserConfirmation) -> Result<DeviceAuthorization>",
+      "result": "初始主管设备签发第二设备授权及会话更新任务",
+      "pre": "持有主管身份密钥；用户已核对短码；当前有效设备少于2",
+      "steps": [
+        "验请求持有证明与期限",
+        "比较确认绑定摘要",
+        "签发设备凭据",
+        "登记设备",
+        "为全部会话生成加入任务"
+      ],
+      "tx": "凭据/设备计数/任务一事务；网络副作用提交后进行",
+      "errors": "DEVICE_LIMIT_EXCEEDED，LINK_EXPIRED，INVALID_PROOF",
+      "tests": [
+        "两次并发授权仅允许一台新增设备",
+        "管理员身份不能替代账户主管授权"
+      ],
+      "calls": [
+        "verify_credential",
+        "enqueue_job"
+      ],
+      "file": "crates/identity/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/identity.md"
+    },
+    {
+      "id": "IDENTITY-010",
+      "name": "complete_device_link",
+      "signature": "complete_device_link(result: DeviceAuthorization) -> Result<LinkStatus>",
+      "result": "新设备保存自己的已授权凭据，逐会话等待 Welcome",
+      "pre": "result 与本机待配对 nonce、公钥、端点完全匹配",
+      "steps": [
+        "验证主管签名",
+        "检查一次性关联",
+        "保存账户公钥和设备凭据",
+        "消费 nonce",
+        "建立 self-sync 加入任务"
+      ],
+      "tx": "T1：凭据与 nonce 消费原子化；不会获得主管私钥/旧历史",
+      "errors": "INVALID_CREDENTIAL，LINK_MISMATCH，LINK_EXPIRED",
+      "tests": [
+        "授权给不同公钥拒绝",
+        "重放不创建重复设备",
+        "加入前历史不自动出现"
+      ],
+      "calls": [
+        "verify_credential"
+      ],
+      "file": "crates/identity/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/identity.md"
+    },
+    {
+      "id": "IDENTITY-011",
+      "name": "list_devices",
+      "signature": "list_devices() -> Result<Vec<DeviceSummary>>",
+      "result": "列出设备、撤销状态和各会话密钥更新进度",
+      "pre": "账户已解锁；查询仅返回公有摘要",
+      "steps": [
+        "读当前凭据",
+        "关联撤销任务",
+        "区分有效/已撤销/待更新",
+        "返回按稳定 ID 排序视图"
+      ],
+      "tx": "只读快照；不以“最近在线”推断凭据有效",
+      "errors": "STORAGE_LOCKED",
+      "tests": [
+        "离线设备仍显示",
+        "部分群撤销未完成可追踪"
+      ],
+      "calls": [],
+      "file": "crates/identity/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/identity.md"
+    },
+    {
+      "id": "IDENTITY-012",
+      "name": "revoke_device",
+      "signature": "revoke_device(device: DeviceId) -> Result<RevocationJob>",
+      "result": "持久标记撤销并建立每会话移除设备任务",
+      "pre": "主管权限明确；默认防止误删唯一可管理设备",
+      "steps": [
+        "核对归属/授权",
+        "递增撤销版本",
+        "禁用本地新投递能力",
+        "枚举相关会话",
+        "为每群排队密钥更新并发布撤销记录"
+      ],
+      "tx": "T1：撤销/子任务/outbox 原子化；跨群完成非原子，显示每群状态",
+      "errors": "PERMISSION_DENIED，DEVICE_NOT_FOUND，LAST_DEVICE_REQUIRES_RECOVERY",
+      "tests": [
+        "部分节点离线任务保持 pending",
+        "完成的群后续消息撤销设备不可解密"
+      ],
+      "calls": [
+        "enqueue_job",
+        "propose_group_operation"
+      ],
+      "file": "crates/identity/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/identity.md"
+    },
+    {
+      "id": "IDENTITY-013",
+      "name": "export_identity_recovery",
+      "signature": "export_identity_recovery(destination: FileToken, secret: RecoverySecret) -> Result<ExportReceipt>",
+      "result": "导出只含身份恢复材料的认证加密文件",
+      "pre": "显式用户操作；恢复秘密经安全输入取得；token 仅授权目标文件",
+      "steps": [
+        "读取主管材料",
+        "选择版本化 KDF/AEAD",
+        "生成独立盐和参数",
+        "加密认证",
+        "写临时受控文件并同步后原子完成",
+        "清理缓冲区"
+      ],
+      "tx": "外部文件不在 DB 事务；成功后记录无秘密的导出时间；失败清临时文件",
+      "errors": "PERMISSION_DENIED，WEAK_RECOVERY_SECRET，FILE_IO_FAILURE",
+      "tests": [
+        "错误口令不泄漏明文",
+        "断电不产出貌似有效半文件",
+        "文件不包含聊天历史"
+      ],
+      "calls": [
+        "open_file_token"
+      ],
+      "file": "crates/identity/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/identity.md"
+    },
+    {
+      "id": "IDENTITY-014",
+      "name": "import_identity_recovery",
+      "signature": "import_identity_recovery(source: FileToken, secret: RecoverySecret) -> Result<RecoveryStatus>",
+      "result": "恢复身份并生成新的本机设备，恢复后仍需处理旧设备和群加入",
+      "pre": "无冲突本地身份；导入参数和 KDF 资源有上限",
+      "steps": [
+        "有界读取",
+        "验证版本/参数预算",
+        "解密并校验身份",
+        "生成新设备",
+        "包装存储密钥",
+        "原子保存",
+        "创建后续撤销/重新加入向导"
+      ],
+      "tx": "账户/新设备一事务；失败不覆盖原账户；不能仅有身份钥就假称已有各群 MLS 状态",
+      "errors": "RECOVERY_AUTH_FAILED，RECOVERY_LIMIT_EXCEEDED，IDENTITY_CONFLICT",
+      "tests": [
+        "伪造 KDF 极大内存拒绝",
+        "错误口令无副作用",
+        "旧历史仍不可恢复"
+      ],
+      "calls": [
+        "open_file_token",
+        "create_account"
+      ],
+      "file": "crates/identity/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/identity.md"
+    },
+    {
+      "id": "CRYPTO-001",
+      "name": "create_crypto_group",
+      "signature": "create_crypto_group(ctx: GroupCreationContext, tx: CryptoTransaction) -> Result<PreparedWrite>",
+      "result": "创建包含获准设备凭据的初始 MLS 状态",
+      "pre": "P0 套件锁定；首个设备身份已验证",
+      "steps": [
+        "绑定 GroupId 和扩展上下文",
+        "创建 OpenMLS 群",
+        "写 provider 记录",
+        "输出初始状态差异和群建立候选"
+      ],
+      "tx": "T2：MLS/业务快照/待发送建群记录统一事务；提交后才发布句柄",
+      "errors": "CRYPTO_INITIALIZATION_FAILED，INVALID_CREDENTIAL",
+      "tests": [
+        "群 ID 复用拒绝",
+        "创建时崩溃不残留可用半群"
+      ],
+      "calls": [
+        "verify_credential"
+      ],
+      "file": "crates/crypto/src/engine.rs",
+      "phase": "P0 → P3",
+      "plan": "docs/implementation/crypto.md"
+    },
+    {
+      "id": "CRYPTO-002",
+      "name": "generate_key_package",
+      "signature": "generate_key_package(device: VerifiedCredential, ttl: Duration, tx: CryptoTransaction) -> Result<PublicKeyPackage>",
+      "result": "生成带私有配套记录的一次性 KeyPackage",
+      "pre": "设备有效，套件和协议版本匹配",
+      "steps": [
+        "安全随机生成",
+        "绑定应用凭据",
+        "设置期限",
+        "存储私有 init material",
+        "返回签名公开包"
+      ],
+      "tx": "T2：公包摘要/私有材料一起保存；发布通过 outbox 进行",
+      "errors": "DEVICE_REVOKED，CRYPTO_FAILURE",
+      "tests": [
+        "公包可验签",
+        "私有材料不上传",
+        "生成后重启仍能处理 Welcome"
+      ],
+      "calls": [
+        "verify_credential"
+      ],
+      "file": "crates/crypto/src/engine.rs",
+      "phase": "P0 → P3",
+      "plan": "docs/implementation/crypto.md"
+    },
+    {
+      "id": "CRYPTO-003",
+      "name": "validate_key_package",
+      "signature": "validate_key_package(package: PublicKeyPackage, expected: DeviceId, now: Time) -> Result<VerifiedKeyPackage>",
+      "result": "验证 MLS 签名、账户设备绑定、套件与有效期",
+      "pre": "来源可能恶意；节点 claim 不能替代验证",
+      "steps": [
+        "有界解析",
+        "OpenMLS 验签",
+        "验证应用凭据",
+        "核对目标设备/版本/有效期",
+        "校验未在本地使用"
+      ],
+      "tx": "纯验证加只读消费查询；真正消费与控制操作事务绑定",
+      "errors": "INVALID_KEY_PACKAGE，KEY_PACKAGE_EXPIRED，KEY_PACKAGE_REUSED",
+      "tests": [
+        "替换凭据或旧套件拒绝",
+        "重复包不能加入两次"
+      ],
+      "calls": [
+        "verify_credential",
+        "decode_bounded"
+      ],
+      "file": "crates/crypto/src/engine.rs",
+      "phase": "P0 → P3",
+      "plan": "docs/implementation/crypto.md"
+    },
+    {
+      "id": "CRYPTO-004",
+      "name": "prepare_application",
+      "signature": "prepare_application(input: AuthenticatedLocalEvent, tx: CryptoTransaction) -> Result<PreparedWrite>",
+      "result": "生成一次密文、SubmissionId 与 MLS 状态变更",
+      "pre": "持有该群串行执行权；已校验业务权限；使用当前确认 epoch",
+      "steps": [
+        "规范编码内层事件",
+        "在事务 provider 内 MLS encrypt",
+        "分配新 SubmissionId",
+        "保存密文不可变摘要",
+        "生成外层签名",
+        "返回状态差异"
+      ],
+      "tx": "T2：加密记录/attempt/outbox 一事务；不可先改共享内存后提交",
+      "errors": "STALE_EPOCH，CRYPTO_FAILURE，STORAGE_FAILURE",
+      "tests": [
+        "每个 crash point 恢复不复用已消费状态",
+        "相同重试不再次调用 encrypt"
+      ],
+      "calls": [
+        "encode_application_event",
+        "candidate_signing_bytes"
+      ],
+      "file": "crates/crypto/src/engine.rs",
+      "phase": "P0 → P3",
+      "plan": "docs/implementation/crypto.md"
+    },
+    {
+      "id": "CRYPTO-005",
+      "name": "prepare_control",
+      "signature": "prepare_control(operation: AuthorizedGroupOperation, tx: CryptoTransaction) -> Result<PreparedControl>",
+      "result": "建立与单一业务操作一致的 pending Commit/Welcome",
+      "pre": "当前 head/epoch 已确认；目标已接受邀请且 KeyPackage 验证通过",
+      "steps": [
+        "生成预期业务差异",
+        "使用 OpenMLS 提案/Commit",
+        "比对设备增删集合",
+        "保存 pending 身份和候选",
+        "保留 Welcome 待接受后投递"
+      ],
+      "tx": "T2：pending 状态/候选/任务一事务；未获回执不合并正式成员状态",
+      "errors": "STALE_CONTROL_HEAD，INVALID_KEY_PACKAGE，CRYPTO_FAILURE",
+      "tests": [
+        "两个并发 Commit 只串行准备",
+        "夹带移除成员拒绝"
+      ],
+      "calls": [
+        "apply_policy_operation",
+        "validate_key_package"
+      ],
+      "file": "crates/crypto/src/engine.rs",
+      "phase": "P0 → P3",
+      "plan": "docs/implementation/crypto.md"
+    },
+    {
+      "id": "CRYPTO-006",
+      "name": "process_verified_entry",
+      "signature": "process_verified_entry(entry: VerifiedLogEntry, tx: CryptoTransaction) -> Result<PreparedWrite>",
+      "result": "验证并暂存收件消息或控制事件的状态推进",
+      "pre": "日志链连续；设备与群上下文可信；每群串行",
+      "steps": [
+        "识别本人 pending 回执路径",
+        "OpenMLS 验证/解密或 stage Commit",
+        "验证内层作者",
+        "控制结果与业务比对",
+        "生成应用变更和回执意图"
+      ],
+      "tx": "T3：MLS/消息/去重/游标/回执 outbox 一事务；失败整体回滚",
+      "errors": "INVALID_CIPHERTEXT，INVALID_CONTROL_RESULT，MISSING_LOG_ENTRIES",
+      "tests": [
+        "畸形 Commit 不推进任何游标",
+        "本人已发消息不重复消费发送状态"
+      ],
+      "calls": [
+        "verify_inner_event",
+        "verify_control_result"
+      ],
+      "file": "crates/crypto/src/engine.rs",
+      "phase": "P0 → P3",
+      "plan": "docs/implementation/crypto.md"
+    },
+    {
+      "id": "CRYPTO-007",
+      "name": "merge_accepted_pending",
+      "signature": "merge_accepted_pending(pending: PendingCommit, entry: VerifiedLogEntry, tx: CryptoTransaction) -> Result<PreparedWrite>",
+      "result": "仅将本机同一已接受 Commit 合并正式 MLS 状态",
+      "pre": "回执绑定同 SubmissionId、完整候选摘要与当前前置状态",
+      "steps": [
+        "验证 pending 摘要",
+        "核对 control_head",
+        "通过 OpenMLS 正式 merge",
+        "校验结果成员",
+        "输出快照与状态更新"
+      ],
+      "tx": "T3：merge 与正式日志/策略/游标同事务；不得再次把本机 Commit 当远端解密",
+      "errors": "PENDING_MISMATCH，LOG_CONFLICT",
+      "tests": [
+        "节点回执丢失后拉取同事件成功合并一次",
+        "不同摘要必须暂停"
+      ],
+      "calls": [
+        "verify_control_result"
+      ],
+      "file": "crates/crypto/src/engine.rs",
+      "phase": "P0 → P3",
+      "plan": "docs/implementation/crypto.md"
+    },
+    {
+      "id": "CRYPTO-008",
+      "name": "discard_rejected_pending",
+      "signature": "discard_rejected_pending(pending: PendingCommit, rejection: AuthenticatedRejection, tx: CryptoTransaction) -> Result<RebuildIntent>",
+      "result": "只清理明确未接受的 pending 操作，保留草稿意图",
+      "pre": "先排除超时但已接受；P0 验证库的 pending 分支恢复语义",
+      "steps": [
+        "确认拒绝绑定候选",
+        "记录被拒尝试",
+        "使用库支持的分支清理",
+        "同步胜出 Commit",
+        "返回待重新授权意图"
+      ],
+      "tx": "不可恢复旧已消费密钥快照；清理与尝试状态一事务",
+      "errors": "ACCEPTANCE_UNKNOWN，STATE_CORRUPTED",
+      "tests": [
+        "未知结果先查询旧 SubmissionId",
+        "清理后不复用发送代数"
+      ],
+      "calls": [
+        "classify_retry"
+      ],
+      "file": "crates/crypto/src/engine.rs",
+      "phase": "P0 → P3",
+      "plan": "docs/implementation/crypto.md"
+    },
+    {
+      "id": "CRYPTO-009",
+      "name": "join_from_welcome",
+      "signature": "join_from_welcome(welcome: AuthorizedWelcome, tx: CryptoTransaction) -> Result<JoinedGroup>",
+      "result": "消费本机 KeyPackage 并验证邀请与协调起点",
+      "pre": "用户已接受邀请；Welcome 绑定本机与对应合法控制日志",
+      "steps": [
+        "验证邀请能力",
+        "匹配本机包",
+        "用 OpenMLS 建群",
+        "核对成员凭据和上下文",
+        "绑定加入位置",
+        "消费私有包"
+      ],
+      "tx": "T3：群状态/包消费/加入游标一事务；重复 Welcome 返回同结果",
+      "errors": "WELCOME_NOT_AUTHORIZED，KEY_PACKAGE_REUSED，INVALID_CREDENTIAL",
+      "tests": [
+        "为另一设备的 Welcome 拒绝",
+        "重启不产生重复群",
+        "无旧历史能力"
+      ],
+      "calls": [
+        "validate_key_package",
+        "verify_control_result"
+      ],
+      "file": "crates/crypto/src/engine.rs",
+      "phase": "P0 → P3",
+      "plan": "docs/implementation/crypto.md"
+    },
+    {
+      "id": "CRYPTO-010",
+      "name": "publish_committed_state",
+      "signature": "publish_committed_state(group: GroupId, committed: CommitToken) -> Result<()>",
+      "result": "数据库提交成功后替换群内存快照并发布变化通知",
+      "pre": "CommitToken 由 storage 成功提交产生，不允许 UI 伪造",
+      "steps": [
+        "读取已提交版本",
+        "替换串行执行器状态",
+        "清理敏感临时缓冲",
+        "通知事件桥"
+      ],
+      "tx": "事务后动作；通知失败可重查，不回滚持久化",
+      "errors": "STATE_REFRESH_FAILED 触发重新加载而非重加密",
+      "tests": [
+        "提交前不显示正式成员",
+        "回调丢失后查询仍正确"
+      ],
+      "calls": [
+        "commit_transaction"
+      ],
+      "file": "crates/crypto/src/engine.rs",
+      "phase": "P0 → P3",
+      "plan": "docs/implementation/crypto.md"
+    },
+    {
+      "id": "CRYPTO-011",
+      "name": "encrypt_attachment_chunk",
+      "signature": "encrypt_attachment_chunk(key: FileKey, ctx: ChunkContext, plaintext: SecretBytes) -> Result<CipherChunk>",
+      "result": "输出独立认证分块；ctx 含 file/index/total/final/length",
+      "pre": "每个文件随机密钥；nonce 构造与套件经 P0 锁定，index 不溢出",
+      "steps": [
+        "验证 chunk 边界",
+        "按冻结方案取得唯一 nonce",
+        "规范编码 AAD",
+        "调用标准 AEAD",
+        "输出带认证标签的块"
+      ],
+      "tx": "纯密码函数；失败块不标上传成功；重试复用原密文",
+      "errors": "INVALID_CHUNK_CONTEXT，CRYPTO_FAILURE",
+      "tests": [
+        "交换 index/文件/结束边界均验签失败",
+        "不能对改变明文复用 nonce"
+      ],
+      "calls": [
+        "encode_canonical"
+      ],
+      "file": "crates/crypto/src/engine.rs",
+      "phase": "P0 → P3",
+      "plan": "docs/implementation/crypto.md"
+    },
+    {
+      "id": "CRYPTO-012",
+      "name": "decrypt_attachment_chunk",
+      "signature": "decrypt_attachment_chunk(key: FileKey, ctx: ChunkContext, chunk: CipherChunk) -> Result<SecretBytes>",
+      "result": "先认证再返回明文，不把未认证字节导出",
+      "pre": "元数据来自已验证 E2EE 附件描述",
+      "steps": [
+        "核对尺寸",
+        "重建 nonce/AAD",
+        "调用 AEAD verify/decrypt",
+        "验证声明长度",
+        "返回敏感缓冲"
+      ],
+      "tx": "纯密码函数；完整文件摘要和结束边界仍须导出流程验证",
+      "errors": "ATTACHMENT_CORRUPTED，INVALID_CHUNK_CONTEXT",
+      "tests": [
+        "截断/位翻转/块替换拒绝",
+        "最后一块伪造拒绝"
+      ],
+      "calls": [
+        "encrypt_attachment_chunk"
+      ],
+      "file": "crates/crypto/src/engine.rs",
+      "phase": "P0 → P3",
+      "plan": "docs/implementation/crypto.md"
+    },
+    {
+      "id": "STORAGE-001",
+      "name": "open_store",
+      "signature": "open_store(options: StoreOptions, key: ProtectedStorageKey) -> Result<Store>",
+      "result": "打开加密客户端库并验证版本/完整性",
+      "pre": "数据目录权限符合平台惯例，系统密钥已解包，存储加密方案已决策",
+      "steps": [
+        "独占迁移锁",
+        "配置加密和必要 PRAGMA",
+        "验证密钥与 schema",
+        "执行迁移",
+        "检查未完成事务恢复标记",
+        "返回连接池"
+      ],
+      "tx": "启动阶段串行；不能错误密钥时创建同名新空库",
+      "errors": "STORAGE_LOCKED，STATE_CORRUPTED，MIGRATION_FAILED",
+      "tests": [
+        "错误密钥不覆盖数据",
+        "重复启动单写者",
+        "数据库/WAL/临时文件敏感数据抽查"
+      ],
+      "calls": [
+        "migrate_schema",
+        "recover_incomplete_writes"
+      ],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "STORAGE-002",
+      "name": "migrate_schema",
+      "signature": "migrate_schema(store: Store, target: SchemaVersion) -> Result<MigrationReport>",
+      "result": "按顺序完整迁移且记录校验和",
+      "pre": "版本递增，不支持未知降级；迁移前备份策略明确",
+      "steps": [
+        "读取 schema_version",
+        "验证迁移链和 checksum",
+        "创建可恢复备份",
+        "每次完整迁移",
+        "更新版本",
+        "重新校验关键约束"
+      ],
+      "tx": "每步事务；对无法事务化动作先记录恢复日志；失败保留旧可恢复库",
+      "errors": "SCHEMA_TOO_NEW，MIGRATION_FAILED，DISK_FULL",
+      "tests": [
+        "中途断电恢复",
+        "重复启动不重复执行",
+        "回滚失败禁止继续写"
+      ],
+      "calls": [],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "STORAGE-003",
+      "name": "begin_transaction",
+      "signature": "begin_transaction(scope: WriteScope) -> Result<CoreTransaction>",
+      "result": "取得受限写事务并绑定群/版本上下文",
+      "pre": "单群执行器已持锁，避免其他写者绕过",
+      "steps": [
+        "检查运行状态",
+        "取得写连接",
+        "begin",
+        "读取当前版本",
+        "创建只能一次消费的事务句柄"
+      ],
+      "tx": "T1/T2/T3/T4 统一起点；禁止持有网络调用",
+      "errors": "STORAGE_BUSY，STORAGE_FAILURE",
+      "tests": [
+        "超时返回可解释错误",
+        "事务句柄 Drop 必须 rollback"
+      ],
+      "calls": [],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "STORAGE-004",
+      "name": "crypto_provider_read",
+      "signature": "crypto_provider_read(tx: CoreTransaction, key: CryptoRecordKey) -> Result<Option<SecretBytes>>",
+      "result": "OpenMLS 从当前事务读取密钥与状态",
+      "pre": "provider 不能暗中开启独立连接或事务",
+      "steps": [
+        "校验群作用域",
+        "查询版本化键",
+        "解密记录",
+        "返回敏感缓冲",
+        "标记读取版本"
+      ],
+      "tx": "使用调用方同一事务；不缓存未提交跨群状态",
+      "errors": "STATE_CORRUPTED，STORAGE_FAILURE",
+      "tests": [
+        "同事务读到刚写内容",
+        "回滚后 provider 缓存不可泄漏新状态"
+      ],
+      "calls": [],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "STORAGE-005",
+      "name": "crypto_provider_write",
+      "signature": "crypto_provider_write(tx: CoreTransaction, changes: CryptoStorageChanges) -> Result<()>",
+      "result": "在同一事务写入 OpenMLS 记录变化",
+      "pre": "changes 归属群与事务相同；删除与新增均完整收集",
+      "steps": [
+        "验证记录类型/版本",
+        "加密敏感值",
+        "批量 upsert/delete",
+        "记录受影响版本",
+        "不发布内存状态"
+      ],
+      "tx": "T2/T3 的组成步骤，不能单独 commit",
+      "errors": "CRYPTO_SCOPE_MISMATCH，STORAGE_FAILURE",
+      "tests": [
+        "故意插入错误群记录整体拒绝",
+        "部分写入失败全部回滚"
+      ],
+      "calls": [
+        "crypto_provider_read"
+      ],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "STORAGE-006",
+      "name": "persist_send_intent",
+      "signature": "persist_send_intent(tx: CoreTransaction, request: ValidatedSendRequest) -> Result<DraftRecord>",
+      "result": "以用户操作 ID 建立唯一草稿和初始排队状态",
+      "pre": "clientOperationId 在本账户作用域唯一；内容敏感",
+      "steps": [
+        "查 operationId 唯一索引",
+        "同请求返回旧草稿",
+        "不同摘要同 ID 拒绝",
+        "保存加密内容/回复/来源",
+        "插入待准备任务"
+      ],
+      "tx": "T1：草稿与准备任务一事务；UI 得到成功前必须 commit",
+      "errors": "OPERATION_ID_CONFLICT，STORAGE_FAILURE",
+      "tests": [
+        "连点发送只一条草稿",
+        "同 ID 换正文不能静默复用"
+      ],
+      "calls": [
+        "enqueue_job"
+      ],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "STORAGE-007",
+      "name": "persist_prepared_attempt",
+      "signature": "persist_prepared_attempt(tx: CoreTransaction, prepared: PreparedWrite) -> Result<AttemptRecord>",
+      "result": "保存不可变密文、摘要、SubmissionId 与草稿关联",
+      "pre": "crypto 状态变化来自同 tx；attempt 不可原地换密文",
+      "steps": [
+        "核对 draft 和 epoch",
+        "写 message_attempts",
+        "验证 submission 唯一性",
+        "写 crypto 变化",
+        "排入发送 outbox"
+      ],
+      "tx": "T2：密文/MLS/attempt/outbox 原子提交；失败不能单独发布任何一项",
+      "errors": "SUBMISSION_ID_CONFLICT，STORAGE_FAILURE",
+      "tests": [
+        "提交前后 crash 恢复有完整可重发尝试",
+        "相同 ID 不同摘要拒绝"
+      ],
+      "calls": [
+        "crypto_provider_write",
+        "enqueue_job"
+      ],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "STORAGE-008",
+      "name": "apply_verified_entry",
+      "signature": "apply_verified_entry(tx: CoreTransaction, entry: FullyVerifiedEntry, changes: PreparedWrite) -> Result<AppliedEntry>",
+      "result": "一次写入正式事件、消息视图、MLS、去重、游标和必要回执",
+      "pre": "日志连续、领域与加密校验全部通过；EventId 已认证",
+      "steps": [
+        "检查 seq/hash 和 EventId 唯一约束",
+        "写日志",
+        "更新 crypto/策略",
+        "物化消息",
+        "记录去重",
+        "推进游标",
+        "入队端到端回执"
+      ],
+      "tx": "T3：所有写入同事务；不跨群共享 mutable provider",
+      "errors": "LOG_CONFLICT，STATE_CORRUPTED，STORAGE_FAILURE",
+      "tests": [
+        "任一步失败都不推进游标",
+        "重复事件不重复可见、不重复回执"
+      ],
+      "calls": [
+        "crypto_provider_write",
+        "enqueue_job"
+      ],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "STORAGE-009",
+      "name": "commit_transaction",
+      "signature": "commit_transaction(tx: CoreTransaction) -> Result<CommitToken>",
+      "result": "耐久提交并返回唯一发布凭证",
+      "pre": "所有不变量/外键/期望版本已检查，T2/3 中无网络 I/O",
+      "steps": [
+        "最终版本比较",
+        "提交数据库",
+        "确认 durable 策略",
+        "消耗 tx",
+        "返回已提交版本和变化摘要"
+      ],
+      "tx": "失败 rollback；返回成功才可更新内存或发布 UI 事件",
+      "errors": "DISK_FULL，STORAGE_FAILURE，VERSION_CONFLICT",
+      "tests": [
+        "fsync 边界 crash",
+        "提交成功回调前 crash 可重查",
+        "失败无半消息"
+      ],
+      "calls": [],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "STORAGE-010",
+      "name": "rollback_transaction",
+      "signature": "rollback_transaction(tx: CoreTransaction) -> Result<()>",
+      "result": "丢弃未提交变更并使 provider 临时状态失效",
+      "pre": "未提交 tx 句柄，Drop 亦调用同清理路径",
+      "steps": [
+        "执行 rollback",
+        "作废 PreparedWrite",
+        "清理敏感缓冲与缓存",
+        "释放锁",
+        "如无法确认则关闭连接并标故障"
+      ],
+      "tx": "不恢复已提交或已消费的历史密钥快照",
+      "errors": "ROLLBACK_FAILED 进入 fail-closed",
+      "tests": [
+        "事务 drop/取消相同语义",
+        "失败连接不能回池继续使用"
+      ],
+      "calls": [],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "STORAGE-011",
+      "name": "recover_incomplete_writes",
+      "signature": "recover_incomplete_writes(store: Store) -> Result<RecoveryReport>",
+      "result": "启动时恢复耐久 outbox 与未发布状态，不重造已存在密文",
+      "pre": "只能使用 P0 通过验证的事务/provider 策略",
+      "steps": [
+        "读恢复记录",
+        "检查提交版本",
+        "加载完整已提交群",
+        "重置过期任务租约",
+        "原字节恢复尝试",
+        "将无法证明一致项隔离"
+      ],
+      "tx": "统一事务方案依 DB WAL；备用 journal 方案需另有 ADR 与阶段机，不混用",
+      "errors": "STATE_CORRUPTED，RECOVERY_REQUIRED",
+      "tests": [
+        "每个注入崩溃点得到旧完整或新完整状态",
+        "恢复不重新 encrypt 同尝试"
+      ],
+      "calls": [
+        "rollback_transaction"
+      ],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "STORAGE-012",
+      "name": "query_message_page",
+      "signature": "query_message_page(conversation: ConversationId, before: Option<Cursor>, limit: u32) -> Result<Page<MessageView>>",
+      "result": "返回稳定分页含本机待发意图与已接受消息的展示投影",
+      "pre": "limit 1..100；会话可见；不导出密钥或 pending Commit",
+      "steps": [
+        "验证游标范围",
+        "固定查询排序",
+        "取 limit+1",
+        "映射只读 DTO",
+        "生成下页游标",
+        "不读全历史"
+      ],
+      "tx": "只读快照；正式按 seq，待发用独立本地排序键",
+      "errors": "INVALID_CURSOR，PERMISSION_DENIED，STORAGE_LOCKED",
+      "tests": [
+        "并发到达消息翻页不重复/跳页",
+        "待发转正式 ID 关联稳定"
+      ],
+      "calls": [
+        "decode_page_cursor",
+        "encode_page_cursor"
+      ],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "STORAGE-013",
+      "name": "query_conversation_page",
+      "signature": "query_conversation_page(cursor: Option<Cursor>, limit: u32) -> Result<Page<ConversationView>>",
+      "result": "返回列表、未读/待发/故障摘要",
+      "pre": "会话索引受存储加密保护，不建立 Kotlin 第二数据库",
+      "steps": [
+        "验证分页参数",
+        "固定 last_activity/local_id 排序",
+        "读取摘要与故障状态",
+        "输出游标"
+      ],
+      "tx": "只读快照；活动时间不参与协议授权",
+      "errors": "INVALID_CURSOR，STORAGE_FAILURE",
+      "tests": [
+        "同时间会话用稳定次键",
+        "锁库时不泄漏旧缓存摘要"
+      ],
+      "calls": [
+        "decode_page_cursor",
+        "encode_page_cursor"
+      ],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "STORAGE-014",
+      "name": "claim_outbox_batch",
+      "signature": "claim_outbox_batch(now: Time, limit: u32, worker: WorkerId) -> Result<Vec<LeasedJob>>",
+      "result": "原子租用到期任务，防双 worker 重发状态竞争",
+      "pre": "任务有 retry_at/lease_until/cancel_state；群内任务有顺序约束",
+      "steps": [
+        "筛选到期任务",
+        "排除未满足依赖",
+        "原子 CAS 租约",
+        "返回不可变 payload 引用",
+        "限制批量字节"
+      ],
+      "tx": "短写事务；发送在事务外；成功 ACK 再短事务完成任务",
+      "errors": "STORAGE_BUSY，JOB_LEASE_CONFLICT",
+      "tests": [
+        "worker 崩溃租约到期恢复",
+        "两 worker 不同时拥有同 lease"
+      ],
+      "calls": [],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "STORAGE-015",
+      "name": "mark_outbox_result",
+      "signature": "mark_outbox_result(lease: LeasedJob, result: JobResult) -> Result<JobState>",
+      "result": "只允许当前 lease owner 更新结果",
+      "pre": "result 区分 transport/mailbox/正式接受/送达",
+      "steps": [
+        "核对 lease 版本",
+        "保存明确结果",
+        "按 retry 决策更新 next_attempt",
+        "清除租约",
+        "记录不含正文的诊断"
+      ],
+      "tx": "短事务；取消与已接受竞争遵从正式回执证据",
+      "errors": "JOB_LEASE_CONFLICT，INVALID_STATE_TRANSITION",
+      "tests": [
+        "迟到旧 worker 不覆盖新结果",
+        "mailbox ACK 不升级送达"
+      ],
+      "calls": [
+        "classify_retry",
+        "transition_send_state"
+      ],
+      "file": "crates/storage/src/store.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/storage.md"
+    },
+    {
+      "id": "TRANSPORT-001",
+      "name": "start_endpoint",
+      "signature": "start_endpoint(config: TransportConfig, device_key: DeviceKeyRef) -> Result<EndpointHandle>",
+      "result": "启动 iroh 端点并返回受控句柄",
+      "pre": "P0 验证目标 ABI；密钥已保护；公共 fallback 默认显式策略",
+      "steps": [
+        "验证配置",
+        "装载设备端点密钥",
+        "建立运行时",
+        "注册有界入站队列",
+        "记录脱敏端点状态"
+      ],
+      "tx": "启动可取消；失败关闭已创建任务；不写消息状态",
+      "errors": "INVALID_CONFIG，ENDPOINT_START_FAILED",
+      "tests": [
+        "关闭公共服务后仍使用自托管",
+        "端口冲突无遗留任务"
+      ],
+      "calls": [],
+      "file": "crates/transport/src/network.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/transport.md"
+    },
+    {
+      "id": "TRANSPORT-002",
+      "name": "verify_discovery_record",
+      "signature": "verify_discovery_record(record: SignedDiscoveryRecord, credential: VerifiedCredential, cached_version: u64) -> Result<VerifiedPeerAddress>",
+      "result": "验证设备地址版本、防旧记录回滚与期限",
+      "pre": "记录携带设备签名，地址/URL受策略限制",
+      "steps": [
+        "验证签名",
+        "核对端点绑定",
+        "检查期限",
+        "比较单调版本",
+        "剔除未授权地址",
+        "输出已验证地址"
+      ],
+      "tx": "只在验证后更新地址缓存；不能顺便更新信任根",
+      "errors": "INVALID_SIGNATURE，DISCOVERY_ROLLBACK，RECORD_EXPIRED",
+      "tests": [
+        "重放旧版本拒绝",
+        "伪造局域网地址不能绑定他人设备"
+      ],
+      "calls": [
+        "verify_credential"
+      ],
+      "file": "crates/transport/src/network.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/transport.md"
+    },
+    {
+      "id": "TRANSPORT-003",
+      "name": "connect_peer",
+      "signature": "connect_peer(peer: VerifiedPeerAddress, budget: ConnectBudget) -> Result<Connection>",
+      "result": "按受支持路径尝试直连/穿透/中继",
+      "pre": "peer 已验证；尝试共享总超时，禁止无限并发探测",
+      "steps": [
+        "尝试已知局域网/直接地址",
+        "进行库支持的穿透",
+        "失败按配置使用中继",
+        "验证对端 EndpointId",
+        "输出路径诊断"
+      ],
+      "tx": "网络异步；取消关闭所有竞赛连接；不持 DB tx",
+      "errors": "NETWORK_UNAVAILABLE，PEER_UNREACHABLE，ENDPOINT_MISMATCH",
+      "tests": [
+        "对称 NAT 回退",
+        "中继不可用明确错误",
+        "取消无后台重试泄漏"
+      ],
+      "calls": [
+        "verify_discovery_record"
+      ],
+      "file": "crates/transport/src/network.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/transport.md"
+    },
+    {
+      "id": "TRANSPORT-004",
+      "name": "send_peer_frame",
+      "signature": "send_peer_frame(connection: Connection, frame: ImmutableFrame) -> Result<TransportAck>",
+      "result": "传输确认只表示字节接收",
+      "pre": "帧已完成规范编码/签名，长度符合双方协商",
+      "steps": [
+        "校验长度",
+        "写入帧和边界",
+        "等待有限 ACK",
+        "验证连接关联",
+        "返回纯传输证据"
+      ],
+      "tx": "不改变 ACCEPTED/DELIVERED；网络重试不能改密文",
+      "errors": "TRANSPORT_TIMEOUT，CONNECTION_CLOSED",
+      "tests": [
+        "ACK 丢失后重发相同 bytes",
+        "P2P 待确认消息不触发正式插件行为"
+      ],
+      "calls": [
+        "negotiate_capabilities"
+      ],
+      "file": "crates/transport/src/network.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/transport.md"
+    },
+    {
+      "id": "TRANSPORT-005",
+      "name": "read_peer_frame",
+      "signature": "read_peer_frame(connection: Connection, limits: FrameLimits) -> Result<UnverifiedFrame>",
+      "result": "输出有界未认证帧交给核心验证",
+      "pre": "连接身份只证明端点，不代表应用事件授权",
+      "steps": [
+        "读长度头",
+        "预拒绝超限",
+        "按预算读取",
+        "有界解析",
+        "投递入站队列",
+        "队列满施加背压"
+      ],
+      "tx": "不写正式 inbox 去重；断开时保留已耐久队列由上层处理",
+      "errors": "MALFORMED_FRAME，CONTENT_TOO_LARGE，BACKPRESSURE",
+      "tests": [
+        "超大长度声明不分配巨内存",
+        "伪造 EventId 不被提前去重"
+      ],
+      "calls": [
+        "decode_bounded"
+      ],
+      "file": "crates/transport/src/network.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/transport.md"
+    },
+    {
+      "id": "TRANSPORT-006",
+      "name": "append_candidate",
+      "signature": "append_candidate(node: VerifiedNode, candidate: ImmutableCandidate) -> Result<AppendOutcome>",
+      "result": "返回正式签名回执、明确拒绝或结果未知",
+      "pre": "固定 SubmissionId/候选字节；设备请求鉴权有效",
+      "steps": [
+        "规范请求并签名",
+        "带限时发送",
+        "有界读响应",
+        "校验回执绑定",
+        "超时返回 Unknown 而非 Rejected"
+      ],
+      "tx": "无 DB tx；本地 worker 负责耐久记录结果",
+      "errors": "NODE_UNAVAILABLE，STALE_EPOCH，STALE_CONTROL_HEAD，ACCEPTANCE_UNKNOWN",
+      "tests": [
+        "响应丢失按同 ID 重新 append 得原结果",
+        "篡改回执拒绝"
+      ],
+      "calls": [
+        "verify_log_entry"
+      ],
+      "file": "crates/transport/src/network.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/transport.md"
+    },
+    {
+      "id": "TRANSPORT-007",
+      "name": "fetch_group_entries",
+      "signature": "fetch_group_entries(node: VerifiedNode, group: GroupId, after: u64, limit: u32) -> Result<UnverifiedLogPage>",
+      "result": "有界拉取连续日志材料，正式验证归 sync",
+      "pre": "节点授权设备属于允许可见范围",
+      "steps": [
+        "签名请求",
+        "限制条数/响应字节",
+        "读取页",
+        "核对群与起点",
+        "返回未验证条目"
+      ],
+      "tx": "不提前推进本地 verified cursor",
+      "errors": "NODE_UNAVAILABLE，HISTORY_NOT_AUTHORIZED，MALFORMED_RESPONSE",
+      "tests": [
+        "节点跳号返回给 sync 检测",
+        "巨响应截断为错误"
+      ],
+      "calls": [
+        "decode_bounded"
+      ],
+      "file": "crates/transport/src/network.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/transport.md"
+    },
+    {
+      "id": "TRANSPORT-008",
+      "name": "put_mailbox",
+      "signature": "put_mailbox(item: AuthorizedMailboxItem) -> Result<MailboxReceipt>",
+      "result": "返回节点持久信箱 ACK，不能显示已送达",
+      "pre": "目标设备/能力/TTL明确，payload 只含密文与必要路由",
+      "steps": [
+        "签名请求",
+        "写目标条目",
+        "验证 item 摘要回执",
+        "输出 MailboxStored 类型"
+      ],
+      "tx": "网络重试同 item ID 与同摘要",
+      "errors": "INVALID_CAPABILITY，QUOTA_EXCEEDED，NODE_UNAVAILABLE",
+      "tests": [
+        "过期能力拒绝",
+        "ACK 后收件人离线仍不是 delivered"
+      ],
+      "calls": [],
+      "file": "crates/transport/src/network.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/transport.md"
+    },
+    {
+      "id": "TRANSPORT-009",
+      "name": "pull_mailbox",
+      "signature": "pull_mailbox(cursor: Option<MailboxCursor>, limit: u32) -> Result<MailboxPage>",
+      "result": "获取当前设备信箱条目，保持稳定翻页位置",
+      "pre": "鉴权设备固定；cursor 不跨设备",
+      "steps": [
+        "校验游标",
+        "签名请求",
+        "有界读取",
+        "核对 target device",
+        "返回条目与游标候选"
+      ],
+      "tx": "获取成功不删除条目、不推进正式群游标",
+      "errors": "INVALID_CURSOR，DEVICE_REVOKED，NODE_UNAVAILABLE",
+      "tests": [
+        "WS 丢失后仍完整拉取",
+        "重复页上层幂等处理"
+      ],
+      "calls": [
+        "decode_page_cursor"
+      ],
+      "file": "crates/transport/src/network.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/transport.md"
+    },
+    {
+      "id": "TRANSPORT-010",
+      "name": "ack_mailbox",
+      "signature": "ack_mailbox(ids: Vec<MailboxItemId>, proof: LocalPersistProof) -> Result<()>",
+      "result": "本地验证并耐久落盘后确认信箱消费",
+      "pre": "proof 不由传输 ACK 生成；条目均归当前设备",
+      "steps": [
+        "限制批次",
+        "绑定 IDs 和设备签名",
+        "发送 ACK",
+        "成功记录可重试完成状态"
+      ],
+      "tx": "与本地已提交消费记录配合；ACK 失败可重复发送",
+      "errors": "PERMISSION_DENIED，NODE_UNAVAILABLE",
+      "tests": [
+        "先 crash 再 ACK 仍能恢复",
+        "他设备 item 不可确认"
+      ],
+      "calls": [],
+      "file": "crates/transport/src/network.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/transport.md"
+    },
+    {
+      "id": "TRANSPORT-011",
+      "name": "subscribe_node_hints",
+      "signature": "subscribe_node_hints(token: OneTimeWsToken) -> Result<HintStream>",
+      "result": "仅提供有更新提示，丢失提示由游标同步兜底",
+      "pre": "短期一次性 WS token，不把长期秘密放 URL",
+      "steps": [
+        "升级连接",
+        "消费一次性 token",
+        "创建有界队列",
+        "合并重复提示",
+        "断线触发重新拉取"
+      ],
+      "tx": "提示非权威存储；溢出触发 resync 标记",
+      "errors": "WS_AUTH_EXPIRED，NETWORK_UNAVAILABLE",
+      "tests": [
+        "提示重复/乱序不重复消息",
+        "token 重用拒绝"
+      ],
+      "calls": [],
+      "file": "crates/transport/src/network.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/transport.md"
+    },
+    {
+      "id": "TRANSPORT-012",
+      "name": "shutdown_transport",
+      "signature": "shutdown_transport(handle: EndpointHandle, deadline: Duration) -> Result<ShutdownReport>",
+      "result": "关闭端点、WS 和网络任务并报告超时",
+      "pre": "允许重复调用，不能再接收新任务",
+      "steps": [
+        "标记 draining",
+        "停止连接建立",
+        "取消流",
+        "等待有界完成",
+        "释放密钥引用和运行时"
+      ],
+      "tx": "未完成可靠任务由 outbox 下次恢复",
+      "errors": "SHUTDOWN_TIMEOUT",
+      "tests": [
+        "重复 shutdown 不崩溃",
+        "睡眠恢复用新连接"
+      ],
+      "calls": [],
+      "file": "crates/transport/src/network.rs",
+      "phase": "P0 → P1",
+      "plan": "docs/implementation/transport.md"
+    },
+    {
+      "id": "SYNC-001",
+      "name": "enqueue_job",
+      "signature": "enqueue_job(tx: CoreTransaction, job: NewOutboxJob) -> Result<JobId>",
+      "result": "基于唯一业务键插入/复用持久任务",
+      "pre": "调用方持有统一事务；任务引用已持久 payload 或同事务新记录",
+      "steps": [
+        "验证 job 类型和依赖",
+        "建立 dedup key",
+        "同键同 payload 返回原 job",
+        "不同 payload 拒绝",
+        "插入 pending"
+      ],
+      "tx": "事务组成步骤；绝不自己 commit 调用方事务",
+      "errors": "JOB_KEY_CONFLICT，STORAGE_FAILURE",
+      "tests": [
+        "连点、重启或重复回执入队均幂等",
+        "不存在 payload 不可排队"
+      ],
+      "calls": [],
+      "file": "crates/sync/src/engine.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/sync.md"
+    },
+    {
+      "id": "SYNC-002",
+      "name": "run_outbox_once",
+      "signature": "run_outbox_once(now: Time, worker: WorkerId, budget: WorkBudget) -> Result<WorkSummary>",
+      "result": "执行一批到期任务并持久记录结果",
+      "pre": "core 已启动；网络/电量/前后台预算可用",
+      "steps": [
+        "短事务租用任务",
+        "按群依赖顺序执行",
+        "网络等待事务外",
+        "分类结果",
+        "短事务保存",
+        "报告计数"
+      ],
+      "tx": "租约保证恢复；每批有界条数/字节/时间，避免 UI 饥饿",
+      "errors": "NETWORK_UNAVAILABLE，STORAGE_FAILURE",
+      "tests": [
+        "任务执行后落盘前 crash 允许原字节重复",
+        "断网不忙循环"
+      ],
+      "calls": [
+        "claim_outbox_batch",
+        "mark_outbox_result"
+      ],
+      "file": "crates/sync/src/engine.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/sync.md"
+    },
+    {
+      "id": "SYNC-003",
+      "name": "prepare_draft_job",
+      "signature": "prepare_draft_job(draft: DraftId) -> Result<AttemptId>",
+      "result": "把待发意图变为一次耐久加密尝试",
+      "pre": "群串行执行权；附件已上传完成或明确依赖阻塞",
+      "steps": [
+        "读取草稿",
+        "同步必要控制状态",
+        "重新校验发言权限",
+        "建立事务",
+        "加密一次并保存 attempt/outbox",
+        "提交发布"
+      ],
+      "tx": "T2；已有可用 attempt 直接复用，不重复加密",
+      "errors": "PERMISSION_DENIED，ATTACHMENT_NOT_READY，STALE_EPOCH",
+      "tests": [
+        "创建意图后被禁言应失败",
+        "同 job 重跑取得同 attempt"
+      ],
+      "calls": [
+        "validate_send_permission",
+        "prepare_application",
+        "persist_prepared_attempt",
+        "commit_transaction"
+      ],
+      "file": "crates/sync/src/engine.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/sync.md"
+    },
+    {
+      "id": "SYNC-004",
+      "name": "submit_attempt_job",
+      "signature": "submit_attempt_job(attempt: AttemptId) -> Result<AttemptOutcome>",
+      "result": "提交原始密文并处理正式接受或冲突",
+      "pre": "attempt 不可变且已耐久；群前序控制任务满足",
+      "steps": [
+        "加载原 bytes",
+        "调用 append",
+        "回执成功交验证应用",
+        "明确旧状态转 rebuild",
+        "结果未知只原 ID 重试/查询"
+      ],
+      "tx": "网络外执行；状态更新短事务；不得自行新建密文",
+      "errors": "ACCEPTANCE_UNKNOWN，STALE_CONTROL_HEAD，STALE_EPOCH",
+      "tests": [
+        "超时实际已成功恢复同 seq",
+        "同 ID 同 bytes 多次提交只接受一次"
+      ],
+      "calls": [
+        "append_candidate",
+        "apply_log_page",
+        "classify_retry"
+      ],
+      "file": "crates/sync/src/engine.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/sync.md"
+    },
+    {
+      "id": "SYNC-005",
+      "name": "rebuild_stale_attempt",
+      "signature": "rebuild_stale_attempt(draft: DraftId, rejected: AttemptId) -> Result<RebuildResult>",
+      "result": "旧尝试明确拒绝后按新 epoch 创建新尝试",
+      "pre": "必须证明旧候选未被接受；草稿未取消；重新授权仍允许",
+      "steps": [
+        "同步日志",
+        "清理 pending 分支",
+        "重新查角色/设备",
+        "保留 DraftId",
+        "生成新 SubmissionId/密文",
+        "记录旧新关联"
+      ],
+      "tx": "T2；不回滚密码学已消费状态；旧 Attempt 不原地覆盖",
+      "errors": "ACCEPTANCE_UNKNOWN，PERMISSION_DENIED，STATE_CORRUPTED",
+      "tests": [
+        "并发禁言后不重发",
+        "新尝试 ID/摘要与旧尝试不同"
+      ],
+      "calls": [
+        "discard_rejected_pending",
+        "catch_up_group",
+        "prepare_draft_job"
+      ],
+      "file": "crates/sync/src/engine.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/sync.md"
+    },
+    {
+      "id": "SYNC-006",
+      "name": "sync_now",
+      "signature": "sync_now(budget: SyncBudget) -> Result<SyncResult>",
+      "result": "合并同步请求，返回已完成/受限/待重试摘要",
+      "pre": "启动完成；请求可以来自用户/前台/WS/恢复",
+      "steps": [
+        "合并并发触发",
+        "拉信箱",
+        "按群补日志",
+        "执行 outbox",
+        "发送已耐久 ACK",
+        "重新查本地状态"
+      ],
+      "tx": "每群各自事务，跨群不假称全局原子；取消保留进度",
+      "errors": "NODE_UNAVAILABLE，SYNC_PARTIAL，STORAGE_FAILURE",
+      "tests": [
+        "多次同时触发不创建重复 worker",
+        "断线恢复按游标续拉"
+      ],
+      "calls": [
+        "pull_mailbox",
+        "catch_up_group",
+        "run_outbox_once"
+      ],
+      "file": "crates/sync/src/engine.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/sync.md"
+    },
+    {
+      "id": "SYNC-007",
+      "name": "consume_mailbox_page",
+      "signature": "consume_mailbox_page(page: MailboxPage) -> Result<MailboxConsumeResult>",
+      "result": "只 ACK 已安全处理或持久隔离的条目",
+      "pre": "页面 target=当前设备；外层 item ID 不作可信消息去重",
+      "steps": [
+        "检查授权与 envelope",
+        "Welcome 走加入路径",
+        "日志走补齐验证",
+        "毒性条目按政策隔离告警",
+        "持久消费记录",
+        "排队 ACK"
+      ],
+      "tx": "T3 或独立隔离事务；缺失前置日志时先耐久待补，不能丢条目",
+      "errors": "INVALID_CREDENTIAL，MISSING_LOG_ENTRIES，WELCOME_NOT_AUTHORIZED",
+      "tests": [
+        "先收到 seq 8 必须补1..7",
+        "坏条目不阻塞全设备但不能被当真消息"
+      ],
+      "calls": [
+        "join_from_welcome",
+        "catch_up_group",
+        "ack_mailbox"
+      ],
+      "file": "crates/sync/src/engine.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/sync.md"
+    },
+    {
+      "id": "SYNC-008",
+      "name": "catch_up_group",
+      "signature": "catch_up_group(group: GroupId, target: Option<u64>, budget: SyncBudget) -> Result<VerifiedHead>",
+      "result": "补齐连续日志到目标/当前节点头",
+      "pre": "当前 verified head 已持久；节点公钥固定",
+      "steps": [
+        "查询签名 head",
+        "从 verified+1 分页",
+        "检查页连续",
+        "逐条验证并应用",
+        "达到预算保存进度",
+        "冲突暂停该群"
+      ],
+      "tx": "按条或有限连续批次 T3；不直接跳到新 epoch",
+      "errors": "MISSING_LOG_ENTRIES，LOG_CONFLICT，NODE_UNAVAILABLE",
+      "tests": [
+        "缺控制日志不能直接解密新 epoch",
+        "暂停群不阻断其他群"
+      ],
+      "calls": [
+        "fetch_group_entries",
+        "apply_log_page"
+      ],
+      "file": "crates/sync/src/engine.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/sync.md"
+    },
+    {
+      "id": "SYNC-009",
+      "name": "apply_log_page",
+      "signature": "apply_log_page(group: GroupId, page: UnverifiedLogPage) -> Result<AppliedPage>",
+      "result": "依次完成链/权限/MLS 验证并提交",
+      "pre": "页有界；群串行执行；不能信任服务端已标 validated",
+      "steps": [
+        "验证 seq/hash/签名",
+        "业务授权",
+        "MLS stage/解密",
+        "写消息/状态/去重",
+        "提交",
+        "发布",
+        "下一条"
+      ],
+      "tx": "T3，每条或经证明安全的有限批；失败停止当前分支",
+      "errors": "LOG_CONFLICT，INVALID_CONTROL_RESULT，STATE_CORRUPTED",
+      "tests": [
+        "后条失败不撤销已成功前条",
+        "回执循环不产生新回执"
+      ],
+      "calls": [
+        "verify_log_entry",
+        "process_verified_entry",
+        "apply_verified_entry",
+        "commit_transaction",
+        "publish_committed_state"
+      ],
+      "file": "crates/sync/src/engine.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/sync.md"
+    },
+    {
+      "id": "SYNC-010",
+      "name": "process_delivery_receipt",
+      "signature": "process_delivery_receipt(receipt: AuthenticatedReceipt) -> Result<DeliverySummary>",
+      "result": "将对端已持久化证据归入对应消息",
+      "pre": "receipt 自身经 MLS/设备认证且属于接收集合",
+      "steps": [
+        "匹配 EventId/SubmissionId",
+        "核对接收设备权限时点",
+        "幂等保存",
+        "聚合账户数",
+        "更新视图"
+      ],
+      "tx": "短事务；回执消息类型不再生成送达回执",
+      "errors": "INVALID_RECEIPT_SCOPE，INVALID_CREDENTIAL",
+      "tests": [
+        "伪造目标/自己第二台不增加对方计数",
+        "重复回执不重复计数"
+      ],
+      "calls": [
+        "aggregate_delivery",
+        "transition_send_state"
+      ],
+      "file": "crates/sync/src/engine.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/sync.md"
+    },
+    {
+      "id": "SYNC-011",
+      "name": "schedule_retry",
+      "signature": "schedule_retry(job: JobId, error: CoreError, now: Time) -> Result<RetrySchedule>",
+      "result": "写入有抖动指数退避/服务器 Retry-After",
+      "pre": "retry 计数和截止策略来自配置；可注入时钟/RNG用于验收",
+      "steps": [
+        "分类错误",
+        "计算有上限退避",
+        "遵守 retryAfter 下界",
+        "记录下一时刻",
+        "需要用户处理时停止自动重试"
+      ],
+      "tx": "短事务；不在工作线程长 sleep；恢复后仍使用同计划",
+      "errors": "PERMANENT_FAILURE，RETRY_BUDGET_EXHAUSTED",
+      "tests": [
+        "断网一小时不忙轮询",
+        "重启不把失败计数归零"
+      ],
+      "calls": [
+        "classify_retry"
+      ],
+      "file": "crates/sync/src/engine.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/sync.md"
+    },
+    {
+      "id": "SYNC-012",
+      "name": "set_lifecycle",
+      "signature": "set_lifecycle(state: AppLifecycleState) -> Result<SyncStatus>",
+      "result": "前台恢复补齐，后台保存进度并收缩连接",
+      "pre": "Android/桌面通过平台事件调用，状态可重复",
+      "steps": [
+        "原子更新生命周期",
+        "后台暂停非必要任务",
+        "耐久保存检查点",
+        "前台重建连接并触发同步",
+        "发布状态"
+      ],
+      "tx": "不因进入后台删除 outbox；系统可直接杀进程",
+      "errors": "STORAGE_FAILURE，BACKGROUND_BUDGET_EXCEEDED",
+      "tests": [
+        "Android kill 后重启恢复",
+        "前后台频繁切换不漏消息"
+      ],
+      "calls": [
+        "sync_now",
+        "shutdown_transport"
+      ],
+      "file": "crates/sync/src/engine.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/sync.md"
+    },
+    {
+      "id": "SYNC-013",
+      "name": "set_connectivity",
+      "signature": "set_connectivity(state: ConnectivityState) -> Result<SyncStatus>",
+      "result": "断网暂停网络工作，恢复后合并触发重连",
+      "pre": "OS 网络提示不保证节点可达",
+      "steps": [
+        "记录连接 hint",
+        "失网取消有限网络任务",
+        "在线使到期 job 可执行",
+        "节点实际失败仍退避"
+      ],
+      "tx": "只改调度状态，不改消息已接受事实",
+      "errors": "NETWORK_UNAVAILABLE",
+      "tests": [
+        "有 Wi-Fi 无互联网保持待发",
+        "旧连接 ACK 不覆盖新状态"
+      ],
+      "calls": [
+        "schedule_retry",
+        "sync_now"
+      ],
+      "file": "crates/sync/src/engine.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/sync.md"
+    },
+    {
+      "id": "SYNC-014",
+      "name": "configure_node",
+      "signature": "configure_node(profile: NodeProfile) -> Result<NodeConfigurationStatus>",
+      "result": "验证并保存节点设置，不自动迁移已有会话协调者",
+      "pre": "用户显式输入地址和信任确认；禁止静默公共回退",
+      "steps": [
+        "校验 HTTPS/主机策略",
+        "抓能力",
+        "核对公钥信任",
+        "保存 profile",
+        "新会话使用新设置",
+        "旧会话保留固定协调关系"
+      ],
+      "tx": "配置短事务；网络检查事务外；错误保留旧可用配置",
+      "errors": "INVALID_NODE_PROFILE，NODE_KEY_CHANGED，PROTOCOL_UNSUPPORTED",
+      "tests": [
+        "换节点不改变账户 ID",
+        "旧群不被误指到新节点"
+      ],
+      "calls": [
+        "negotiate_capabilities"
+      ],
+      "file": "crates/sync/src/engine.rs",
+      "phase": "P1 → P3",
+      "plan": "docs/implementation/sync.md"
+    },
+    {
+      "id": "CORE-001",
+      "name": "start_core",
+      "signature": "start_core(options: CoreStartOptions, platform: PlatformCapabilities) -> Result<CoreHandle>",
+      "result": "返回已恢复可查询的内核，锁定时返回明确锁状态",
+      "pre": "一个数据目录只允许一个活动 core；平台密钥/文件桥已注入",
+      "steps": [
+        "验证配置",
+        "解包存储主密钥",
+        "打开库并恢复",
+        "装载身份和群执行器",
+        "注册有界事件桥",
+        "启动网络和调度"
+      ],
+      "tx": "启动逆序清理；恢复完成前不发送；无网络可本地启动",
+      "errors": "STORAGE_LOCKED，STATE_CORRUPTED，CORE_ALREADY_RUNNING",
+      "tests": [
+        "启动中取消无遗留进程",
+        "离线可查本地",
+        "损坏库不继续发送"
+      ],
+      "calls": [
+        "open_store",
+        "unwrap_storage_key",
+        "recover_incomplete_writes",
+        "start_endpoint"
+      ],
+      "file": "crates/core/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/core.md"
+    },
+    {
+      "id": "CORE-002",
+      "name": "close_core",
+      "signature": "close_core(handle: CoreHandle) -> Result<CloseReport>",
+      "result": "停止接收新操作、持久保存并释放原生句柄",
+      "pre": "允许重复 close；存在进行中操作时使用明确截止时间",
+      "steps": [
+        "转 draining",
+        "停止调度",
+        "等待当前本地事务",
+        "关闭传输",
+        "关闭事件桥",
+        "释放数据库/敏感引用"
+      ],
+      "tx": "已提交任务保留下次恢复；不得硬中断一半提交",
+      "errors": "SHUTDOWN_TIMEOUT，STORAGE_FAILURE",
+      "tests": [
+        "close 后业务调用返回 CLOSED",
+        "重复 close 不 double free"
+      ],
+      "calls": [
+        "shutdown_transport"
+      ],
+      "file": "crates/core/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/core.md"
+    },
+    {
+      "id": "CORE-003",
+      "name": "observe_events",
+      "signature": "observe_events(listener: EventListener, capacity: u32) -> Result<SubscriptionHandle>",
+      "result": "返回可释放、有界、只通知变化的订阅",
+      "pre": "容量有上下限；listener 不能访问原生内部状态",
+      "steps": [
+        "登记 listener",
+        "分配有界队列",
+        "串行转发事件",
+        "溢出合并为 ResyncRequired",
+        "释放后停止回调"
+      ],
+      "tx": "事务提交后发布；通知不是可靠消息日志",
+      "errors": "CORE_CLOSED，INVALID_SUBSCRIPTION",
+      "tests": [
+        "消费者慢导致 resync 仍可查询完整状态",
+        "release 后无回调"
+      ],
+      "calls": [
+        "publish_committed_state"
+      ],
+      "file": "crates/core/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/core.md"
+    },
+    {
+      "id": "CORE-004",
+      "name": "open_direct",
+      "signature": "open_direct(contact: AccountId, client_operation: OperationId) -> Result<ConversationId>",
+      "result": "复用或建立与已接受联系人设备组成的协调私聊",
+      "pre": "联系人双向接受；用户选择节点；设备凭据有效",
+      "steps": [
+        "查现有 direct 索引",
+        "检查联系人状态",
+        "建立幂等私聊创建任务",
+        "收集 KeyPackage",
+        "创建 MLS/协调群",
+        "等待加入握手"
+      ],
+      "tx": "本地意图先 T1；建立 MLS 用 T2；远端创建未完成显示 pending",
+      "errors": "CONTACT_NOT_ACCEPTED，INVALID_CREDENTIAL，NODE_UNAVAILABLE",
+      "tests": [
+        "重复点击只一会话",
+        "联系人拒绝不能绕过",
+        "双方并发打开按明确握手去重"
+      ],
+      "calls": [
+        "create_group",
+        "validate_key_package"
+      ],
+      "file": "crates/core/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/core.md"
+    },
+    {
+      "id": "CORE-005",
+      "name": "list_conversations",
+      "signature": "list_conversations(cursor: Option<Cursor>, limit: u32) -> Result<Page<ConversationView>>",
+      "result": "向 UI 提供会话摘要/待发/同步状态",
+      "pre": "core started；limit 受控",
+      "steps": [
+        "校验账户锁定状态",
+        "委托分页",
+        "加入 group paused/identity warning 状态",
+        "映射 DTO"
+      ],
+      "tx": "只读；无需等待网络",
+      "errors": "STORAGE_LOCKED，INVALID_CURSOR",
+      "tests": [
+        "断网仍可列会话",
+        "预传未接受不算正式最后消息"
+      ],
+      "calls": [
+        "query_conversation_page"
+      ],
+      "file": "crates/core/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/core.md"
+    },
+    {
+      "id": "CORE-006",
+      "name": "list_messages",
+      "signature": "list_messages(conversation: ConversationId, before: Option<Cursor>, limit: u32) -> Result<Page<MessageView>>",
+      "result": "提供消息历史页与本机草稿状态",
+      "pre": "当前账户可访问 conversation；不自动导入旧历史",
+      "steps": [
+        "验证会话访问",
+        "委托 storage 分页",
+        "映射内容回退/附件状态",
+        "返回 nextCursor"
+      ],
+      "tx": "只读；DTO 不包含 crypto/provider 对象",
+      "errors": "PERMISSION_DENIED，INVALID_CURSOR",
+      "tests": [
+        "未安装插件显示 fallback",
+        "加入前正文不可查询"
+      ],
+      "calls": [
+        "query_message_page",
+        "enforce_join_visibility"
+      ],
+      "file": "crates/core/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/core.md"
+    },
+    {
+      "id": "CORE-007",
+      "name": "send_message",
+      "signature": "send_message(request: SendRequest) -> Result<SendTicket>",
+      "result": "持久化发送意图后立即返回 QUEUED，正式接受异步完成",
+      "pre": "UI 或已确认插件草稿；稳定 clientOperationId；正文有界",
+      "steps": [
+        "解析 IDs/内容",
+        "校验当前权限与回复",
+        "查操作 ID",
+        "持久化意图/任务",
+        "提交",
+        "发 DraftChanged",
+        "唤醒 worker"
+      ],
+      "tx": "T1：成功返回意味着草稿耐久；网络/MLS 由后续 T2/T3 执行",
+      "errors": "PERMISSION_DENIED，CONTENT_TOO_LARGE，OPERATION_ID_CONFLICT",
+      "tests": [
+        "双击/跨 FFI 重试只同 Draft",
+        "节点离线仍 QUEUED",
+        "取消回调后查询可恢复"
+      ],
+      "calls": [
+        "validate_send_permission",
+        "validate_reply_target",
+        "persist_send_intent",
+        "commit_transaction"
+      ],
+      "file": "crates/core/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/core.md"
+    },
+    {
+      "id": "CORE-008",
+      "name": "retry_draft",
+      "signature": "retry_draft(draft: DraftId) -> Result<SendTicket>",
+      "result": "按当前失败原因恢复原意图，不能伪造新消息或跳权限",
+      "pre": "草稿属于本账户；未已接受/取消；原因允许重试",
+      "steps": [
+        "读 draft/attempt",
+        "查询未知接受结果",
+        "重新验证权限",
+        "复用已有原始尝试或排队重建",
+        "返回持久状态"
+      ],
+      "tx": "短事务更新任务；明确未接受才能生成新尝试",
+      "errors": "DRAFT_ALREADY_ACCEPTED，PERMISSION_DENIED，RETRY_NOT_ALLOWED",
+      "tests": [
+        "超时但已接受显示 ACCEPTED",
+        "禁言后重试拒绝"
+      ],
+      "calls": [
+        "classify_retry",
+        "rebuild_stale_attempt",
+        "enqueue_job"
+      ],
+      "file": "crates/core/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/core.md"
+    },
+    {
+      "id": "CORE-009",
+      "name": "cancel_queued",
+      "signature": "cancel_queued(draft: DraftId) -> Result<CancelResult>",
+      "result": "区分 Cancelled、AlreadyAccepted、AcceptanceUnknown",
+      "pre": "只针对本机未正式接受意图；不承诺网络撤回",
+      "steps": [
+        "锁 draft/任务",
+        "已接受直接返回",
+        "已发在途先标 cancel_requested",
+        "未提交任务取消",
+        "释放未引用附件",
+        "发布状态"
+      ],
+      "tx": "短事务；在途不删除原 attempt，必须对账接受结果",
+      "errors": "DRAFT_NOT_FOUND，ACCEPTANCE_UNKNOWN",
+      "tests": [
+        "取消与节点提交竞争最终显示真实接受",
+        "不误删已接受记录"
+      ],
+      "calls": [
+        "transition_send_state"
+      ],
+      "file": "crates/core/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/core.md"
+    },
+    {
+      "id": "CORE-010",
+      "name": "get_draft_status",
+      "signature": "get_draft_status(draft: DraftId) -> Result<DraftStatus>",
+      "result": "返回本地意图、最新尝试、失败原因和可操作动作",
+      "pre": "草稿属于当前账户",
+      "steps": [
+        "查询 draft/attempt/job",
+        "归类 waiting network/attachment/conflict",
+        "映射稳定错误",
+        "输出状态"
+      ],
+      "tx": "只读快照；不暴露密文字节或密钥",
+      "errors": "DRAFT_NOT_FOUND，STORAGE_LOCKED",
+      "tests": [
+        "节点存信箱状态独立展示",
+        "同意图多尝试可追踪"
+      ],
+      "calls": [
+        "map_error"
+      ],
+      "file": "crates/core/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/core.md"
+    },
+    {
+      "id": "CORE-011",
+      "name": "get_delivery",
+      "signature": "get_delivery(message: MessageId) -> Result<DeliverySummary>",
+      "result": "返回每账户/设备送达摘要",
+      "pre": "message 已正式接受且属于可查询会话",
+      "steps": [
+        "读取消息当时收件集合",
+        "读取已认证回执",
+        "排除本人",
+        "聚合 DTO"
+      ],
+      "tx": "只读；传输 ACK 与 mailbox ACK 不参与",
+      "errors": "MESSAGE_NOT_FOUND，PERMISSION_DENIED",
+      "tests": [
+        "二设备同账户仅1计数",
+        "退出后的状态按消息接收窗口"
+      ],
+      "calls": [
+        "aggregate_delivery"
+      ],
+      "file": "crates/core/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/core.md"
+    },
+    {
+      "id": "CORE-012",
+      "name": "handle_peer_pretransfer",
+      "signature": "handle_peer_pretransfer(frame: UnverifiedFrame) -> Result<PretransferResult>",
+      "result": "保存有界待确认密文或已确认日志提示",
+      "pre": "入站连接已验证端点；预传仍不能证明正式接受",
+      "steps": [
+        "有界解析/验外层",
+        "已确认 entry 交日志验证",
+        "未确认候选暂存受配额缓存",
+        "触发节点补齐",
+        "不触发正式消息插件"
+      ],
+      "tx": "预传缓存独立 TTL/配额；不推进正式 MLS 或 verified cursor",
+      "errors": "INVALID_SIGNATURE，PRETRANSFER_QUOTA_EXCEEDED",
+      "tests": [
+        "恶意发送大量未接受候选被限额",
+        "禁言前后以正式 seq 为准"
+      ],
+      "calls": [
+        "verify_candidate",
+        "catch_up_group"
+      ],
+      "file": "crates/core/src/service.rs",
+      "phase": "P1 → P2",
+      "plan": "docs/implementation/core.md"
+    },
+    {
+      "id": "GROUPS-001",
+      "name": "create_group",
+      "signature": "create_group(request: CreateGroupRequest) -> Result<GroupCreationTicket>",
+      "result": "建立固定协调节点的新群和本地创建任务",
+      "pre": "群名有界、账户解锁、节点已验证；首批成员仍须接受邀请",
+      "steps": [
+        "分配 GroupId/operationId",
+        "验证自己设备凭据",
+        "保存创建意图",
+        "构建初始 MLS",
+        "向节点幂等创建",
+        "验证回执并落正式快照"
+      ],
+      "tx": "T1 意图→T2 MLS准备→远端创建→T3确认；不持 DB 网络 await",
+      "errors": "NODE_UNAVAILABLE，GROUP_LIMIT_EXCEEDED，OPERATION_ID_CONFLICT",
+      "tests": [
+        "创建响应丢失用同 group/operation 复用",
+        "初始只有自己获准设备"
+      ],
+      "calls": [
+        "create_crypto_group",
+        "register_group"
+      ],
+      "file": "crates/core/src/groups.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/groups.md"
+    },
+    {
+      "id": "GROUPS-002",
+      "name": "group_snapshot",
+      "signature": "group_snapshot(group: GroupId) -> Result<GroupSnapshotView>",
+      "result": "返回正式成员/角色/head/policy/epoch/seq及 pending 提示",
+      "pre": "当前账户可见，库未锁定",
+      "steps": [
+        "读取已验证快照",
+        "关联 pending operations",
+        "附 coordinator/故障状态",
+        "剔除秘密和未确认成员"
+      ],
+      "tx": "只读一致快照；pending 不混入正式 members",
+      "errors": "GROUP_NOT_FOUND，PERMISSION_DENIED",
+      "tests": [
+        "节点离线仍返回最后正式状态",
+        "移除任务尚未确认清晰可见"
+      ],
+      "calls": [],
+      "file": "crates/core/src/groups.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/groups.md"
+    },
+    {
+      "id": "GROUPS-003",
+      "name": "propose_group_operation",
+      "signature": "propose_group_operation(group: GroupId, expected: ControlHead, op: GroupOperation, operation: OperationId) -> Result<GroupOperationTicket>",
+      "result": "持久化单一管理意图，不直接改变正式群",
+      "pre": "调用方提供 UI 看到的 expected head；actor 取内核身份，不能从插件伪造",
+      "steps": [
+        "群串行检查 head",
+        "重新授权",
+        "查 operation 幂等",
+        "保存 pending",
+        "需要对方接受则发邀请",
+        "否则排队 prepare-control"
+      ],
+      "tx": "T1 意图；之后 T2 pending Commit；T3 正式确认",
+      "errors": "STALE_CONTROL_HEAD，PERMISSION_DENIED，OPERATION_ID_CONFLICT",
+      "tests": [
+        "旧 UI 任免按最新角色重新校验",
+        "同 ID 不同 op 拒绝"
+      ],
+      "calls": [
+        "authorize_group_operation",
+        "enqueue_job"
+      ],
+      "file": "crates/core/src/groups.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/groups.md"
+    },
+    {
+      "id": "GROUPS-004",
+      "name": "accept_group_invite",
+      "signature": "accept_group_invite(invite: InviteId) -> Result<GroupJoinTicket>",
+      "result": "持久记录接受并准备一次性 KeyPackage",
+      "pre": "邀请签名/目标/期限合法，用户显式接受",
+      "steps": [
+        "核对 inviter 和群上下文",
+        "检查未拒绝/过期",
+        "生成包",
+        "排队接受响应",
+        "等待节点正式加入和 Welcome"
+      ],
+      "tx": "T1 接受/包/响应任务同事务或经验证 T2；不提前显示已加入",
+      "errors": "INVITE_EXPIRED，INVITE_NOT_AUTHORIZED，GROUP_LIMIT_EXCEEDED",
+      "tests": [
+        "接受后断网恢复",
+        "重复接受同 ticket",
+        "无 Welcome 不假称可解密"
+      ],
+      "calls": [
+        "generate_key_package",
+        "enqueue_job"
+      ],
+      "file": "crates/core/src/groups.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/groups.md"
+    },
+    {
+      "id": "GROUPS-005",
+      "name": "decline_group_invite",
+      "signature": "decline_group_invite(invite: InviteId) -> Result<()>",
+      "result": "拒绝邀请并发送幂等拒绝结果",
+      "pre": "邀请归当前账户，尚未正式加入",
+      "steps": [
+        "验证状态",
+        "持久 declined",
+        "排队拒绝通知",
+        "清理未发布 KeyPackage 引用"
+      ],
+      "tx": "短事务；已加入需走 leave，不能以 decline 移除",
+      "errors": "ALREADY_JOINED，INVITE_NOT_FOUND",
+      "tests": [
+        "重复 decline 幂等",
+        "接受与拒绝竞争只一个最终状态"
+      ],
+      "calls": [
+        "enqueue_job"
+      ],
+      "file": "crates/core/src/groups.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/groups.md"
+    },
+    {
+      "id": "GROUPS-006",
+      "name": "prepare_group_operation",
+      "signature": "prepare_group_operation(ticket: OperationTicket) -> Result<PendingControl>",
+      "result": "把已满足前置条件的意图转为签名控制候选",
+      "pre": "当前群 head/epoch 已同步；新增成员已接受邀请",
+      "steps": [
+        "重新检查角色",
+        "验证成员 KeyPackage",
+        "计算 expected policy",
+        "生成 pending Commit",
+        "保存不可变候选/outbox"
+      ],
+      "tx": "T2：pending MLS/业务差异/候选/任务一事务",
+      "errors": "STALE_EPOCH，PERMISSION_DENIED，KEY_PACKAGE_EXPIRED",
+      "tests": [
+        "接受邀请不保证管理员权限仍有效",
+        "过期包先重新获取"
+      ],
+      "calls": [
+        "authorize_group_operation",
+        "prepare_control",
+        "persist_prepared_attempt"
+      ],
+      "file": "crates/core/src/groups.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/groups.md"
+    },
+    {
+      "id": "GROUPS-007",
+      "name": "operation_status",
+      "signature": "operation_status(ticket: OperationTicket) -> Result<GroupOperationStatus>",
+      "result": "返回 AwaitingAcceptance/Preparing/Submitted/Accepted/Rejected/NeedsUser 等",
+      "pre": "ticket 属于可见会话",
+      "steps": [
+        "查询意图/尝试/正式日志",
+        "附可重试原因",
+        "将跨设备撤销子任务展开",
+        "输出 pending 与最终结果"
+      ],
+      "tx": "只读；网络发送成功不等于生效",
+      "errors": "OPERATION_NOT_FOUND，PERMISSION_DENIED",
+      "tests": [
+        "旧 head 重建显示同业务意图新尝试",
+        "节点离线永不 Accepted"
+      ],
+      "calls": [],
+      "file": "crates/core/src/groups.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/groups.md"
+    },
+    {
+      "id": "GROUPS-008",
+      "name": "remove_account_devices",
+      "signature": "remove_account_devices(group: GroupId, target: AccountId, expected: ControlHead) -> Result<OperationTicket>",
+      "result": "一次授权控制操作移除目标账户的全部当前设备",
+      "pre": "调用方有移除普通成员权限；target 不得是群主或同级管理员",
+      "steps": [
+        "读取完整设备集合",
+        "授权 RemoveMember",
+        "冻结预期集合版本",
+        "构建全部叶子移除",
+        "节点确认后正式应用"
+      ],
+      "tx": "T2/T3；设备集合并发变化导致冲突后重新构造",
+      "errors": "PERMISSION_DENIED，STALE_CONTROL_HEAD，INVALID_CONTROL_RESULT",
+      "tests": [
+        "目标两台设备均失去后续解密",
+        "不能只踢当前在线设备"
+      ],
+      "calls": [
+        "propose_group_operation",
+        "verify_control_result"
+      ],
+      "file": "crates/core/src/groups.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/groups.md"
+    },
+    {
+      "id": "GROUPS-009",
+      "name": "rename_group",
+      "signature": "rename_group(group: GroupId, name: String, expected: ControlHead) -> Result<OperationTicket>",
+      "result": "加密新群名，公开控制只暴露授权所需摘要",
+      "pre": "仅群主/管理员；新名 UTF-8 字节/显示长度有界",
+      "steps": [
+        "验证名字",
+        "创建 Rename 单操作",
+        "密文保存新名",
+        "按正式日志排序",
+        "确认后刷新标题"
+      ],
+      "tx": "T1/T2/T3；明文名不写节点公开元数据",
+      "errors": "INVALID_GROUP_NAME，PERMISSION_DENIED",
+      "tests": [
+        "节点存储搜索不到测试群名",
+        "未确认 UI 保留旧正式名"
+      ],
+      "calls": [
+        "propose_group_operation"
+      ],
+      "file": "crates/core/src/groups.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/groups.md"
+    },
+    {
+      "id": "GROUPS-010",
+      "name": "transfer_ownership",
+      "signature": "transfer_ownership(group: GroupId, target: AccountId, expected: ControlHead) -> Result<OperationTicket>",
+      "result": "生成明确唯一群主转让操作",
+      "pre": "仅当前群主，target 为活跃成员",
+      "steps": [
+        "验证转让条件",
+        "构造单一 TransferOwnership",
+        "保留原群主为普通成员",
+        "提交确认"
+      ],
+      "tx": "与一般控制同 T1/T2/T3；之后退出是独立操作",
+      "errors": "OWNER_TRANSFER_REQUIRED，PERMISSION_DENIED，INVALID_TARGET",
+      "tests": [
+        "并发踢目标导致重校验",
+        "正式快照始终一个 owner"
+      ],
+      "calls": [
+        "validate_ownership_transfer",
+        "propose_group_operation"
+      ],
+      "file": "crates/core/src/groups.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/groups.md"
+    },
+    {
+      "id": "GROUPS-011",
+      "name": "leave_group",
+      "signature": "leave_group(group: GroupId, expected: ControlHead) -> Result<OperationTicket>",
+      "result": "普通成员自退出并移除自己的全部设备",
+      "pre": "群主必须先转让或显式解散",
+      "steps": [
+        "检查 actor",
+        "验证退出模式",
+        "构造 self-remove",
+        "保留本地旧历史受保护记录",
+        "确认后停止新接收授权"
+      ],
+      "tx": "T2/T3；离线退出仍为 pending，不能假称所有人已撤销",
+      "errors": "OWNER_TRANSFER_REQUIRED，STALE_CONTROL_HEAD",
+      "tests": [
+        "群主直接退出拒绝",
+        "退出后不能获取新 epoch 内容"
+      ],
+      "calls": [
+        "validate_owner_exit",
+        "propose_group_operation"
+      ],
+      "file": "crates/core/src/groups.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/groups.md"
+    },
+    {
+      "id": "GROUPS-012",
+      "name": "dissolve_group",
+      "signature": "dissolve_group(group: GroupId, expected: ControlHead, confirmation: UserConfirmation) -> Result<OperationTicket>",
+      "result": "正式解散后拒绝新应用/控制事件，保留验证链和本地历史",
+      "pre": "仅群主；显式确认绑定当前群",
+      "steps": [
+        "校验确认与权限",
+        "构造 Dissolve",
+        "正式日志确认",
+        "关闭投递能力与活跃群任务",
+        "保留必要控制/审计材料"
+      ],
+      "tx": "T3 应用解散与本地任务取消一起提交",
+      "errors": "PERMISSION_DENIED，GROUP_DISSOLVED",
+      "tests": [
+        "最后一条解散后消息被节点/客户端拒绝",
+        "解散不声称销毁他人旧明文"
+      ],
+      "calls": [
+        "propose_group_operation"
+      ],
+      "file": "crates/core/src/groups.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/groups.md"
+    },
+    {
+      "id": "ATTACHMENTS-001",
+      "name": "import_file",
+      "signature": "import_file(source: FileToken) -> Result<AttachmentId>",
+      "result": "流式导入并建立加密附件记录/上传任务",
+      "pre": "token 来自系统选择器；已解锁；文件类型/名字只作展示",
+      "steps": [
+        "打开受控流",
+        "检查声明大小并逐块累计",
+        "生成 FileId/随机密钥",
+        "加密块并写受保护缓存",
+        "计算摘要",
+        "完成记录",
+        "排队上传"
+      ],
+      "tx": "短分块检查点事务；完整导入前为 staging；失败清理未引用缓存",
+      "errors": "CONTENT_TOO_LARGE，FILE_IO_FAILURE，INVALID_FILE_TOKEN",
+      "tests": [
+        "未知大小流超25 MiB即停止",
+        "峰值内存受块预算限制"
+      ],
+      "calls": [
+        "open_file_token",
+        "encrypt_attachment_chunk",
+        "enqueue_job"
+      ],
+      "file": "crates/core/src/attachments.rs",
+      "phase": "P2",
+      "plan": "docs/implementation/attachments.md"
+    },
+    {
+      "id": "ATTACHMENTS-002",
+      "name": "attachment_status",
+      "signature": "attachment_status(id: AttachmentId) -> Result<AttachmentStatus>",
+      "result": "返回 Imported/Uploading/Available/Downloading/Failed/Cancelled 和进度",
+      "pre": "附件可见且归当前账户；进度非协议确认",
+      "steps": [
+        "查询文件/块/任务",
+        "聚合完成字节",
+        "附错误和可重试操作",
+        "不返回文件密钥"
+      ],
+      "tx": "只读快照；同块重复上传不累计两次",
+      "errors": "ATTACHMENT_NOT_FOUND，PERMISSION_DENIED",
+      "tests": [
+        "取消后可查询",
+        "进度最大值不超过实际大小"
+      ],
+      "calls": [],
+      "file": "crates/core/src/attachments.rs",
+      "phase": "P2",
+      "plan": "docs/implementation/attachments.md"
+    },
+    {
+      "id": "ATTACHMENTS-003",
+      "name": "upload_attachment",
+      "signature": "upload_attachment(id: AttachmentId) -> Result<UploadResult>",
+      "result": "按不可变块幂等上传并完成节点密文对象",
+      "pre": "附件本地加密已完成；配额/能力有效",
+      "steps": [
+        "建立上传会话",
+        "逐块发送同密文/摘要",
+        "保存已确认位图",
+        "完成密文清单",
+        "校验节点回执",
+        "标 available"
+      ],
+      "tx": "网络事务外；块 ACK 检查点短事务；完成前引用消息等待",
+      "errors": "QUOTA_EXCEEDED，UPLOAD_EXPIRED，NODE_UNAVAILABLE",
+      "tests": [
+        "响应丢失重复块不会加倍计配额",
+        "重启从位图续传"
+      ],
+      "calls": [
+        "begin_blob_upload",
+        "put_blob_chunk",
+        "complete_blob_upload"
+      ],
+      "file": "crates/core/src/attachments.rs",
+      "phase": "P2",
+      "plan": "docs/implementation/attachments.md"
+    },
+    {
+      "id": "ATTACHMENTS-004",
+      "name": "build_attachment_descriptor",
+      "signature": "build_attachment_descriptor(id: AttachmentId) -> Result<SecretDescriptor>",
+      "result": "生成 E2EE 附件内容含密钥/大小/摘要/块规则和受限下载能力",
+      "pre": "上传完成且摘要确认；不得发给未获准会话",
+      "steps": [
+        "读取受保护元数据",
+        "组装版本化 descriptor",
+        "加入文件名安全展示值",
+        "限制整体消息大小",
+        "返回敏感缓冲"
+      ],
+      "tx": "只读；只交 crypto 内层事件编码，不写公开日志",
+      "errors": "ATTACHMENT_NOT_READY，CONTENT_TOO_LARGE",
+      "tests": [
+        "节点 API/日志无文件密钥",
+        "新设备不能拿旧 descriptor 下载历史"
+      ],
+      "calls": [
+        "encode_application_event"
+      ],
+      "file": "crates/core/src/attachments.rs",
+      "phase": "P2",
+      "plan": "docs/implementation/attachments.md"
+    },
+    {
+      "id": "ATTACHMENTS-005",
+      "name": "download_attachment",
+      "signature": "download_attachment(id: AttachmentId) -> Result<TransferTicket>",
+      "result": "耐久排队下载认证密文，随后可离线导出",
+      "pre": "描述来自已认证消息；当前可见；能力未过期",
+      "steps": [
+        "校验 manifest 规则/大小",
+        "建立下载任务",
+        "查询已有块",
+        "只拉缺块",
+        "认证每块",
+        "保存加密缓存",
+        "校验完整摘要"
+      ],
+      "tx": "每块短事务；完整文件未验证不标 available",
+      "errors": "INVALID_ATTACHMENT_DESCRIPTOR，ATTACHMENT_CORRUPTED，CAPABILITY_EXPIRED",
+      "tests": [
+        "重排/替换/缺最后块失败",
+        "取消下载保留可恢复进度"
+      ],
+      "calls": [
+        "decrypt_attachment_chunk",
+        "enqueue_job"
+      ],
+      "file": "crates/core/src/attachments.rs",
+      "phase": "P2",
+      "plan": "docs/implementation/attachments.md"
+    },
+    {
+      "id": "ATTACHMENTS-006",
+      "name": "export_attachment",
+      "signature": "export_attachment(id: AttachmentId, destination: FileToken) -> Result<ExportReceipt>",
+      "result": "仅完整认证文件流式输出到用户选择目标",
+      "pre": "用户显式导出；所有块可读或已完成下载；平台支持安全输出策略",
+      "steps": [
+        "打开受控临时输出",
+        "依 index 认证解密",
+        "更新完整摘要",
+        "核对 total/final/size",
+        "同步并完成目标",
+        "清理敏感缓冲"
+      ],
+      "tx": "外部输出不在 DB 事务；失败删除临时文件；不可提前暴露未验证成品",
+      "errors": "ATTACHMENT_CORRUPTED，FILE_IO_FAILURE，EXPORT_CANCELLED",
+      "tests": [
+        "导出中取消没有假完整文件",
+        "攻击文件名不能穿越路径"
+      ],
+      "calls": [
+        "open_file_token",
+        "decrypt_attachment_chunk"
+      ],
+      "file": "crates/core/src/attachments.rs",
+      "phase": "P2",
+      "plan": "docs/implementation/attachments.md"
+    },
+    {
+      "id": "ATTACHMENTS-007",
+      "name": "cancel_transfer",
+      "signature": "cancel_transfer(id: AttachmentId) -> Result<TransferStatus>",
+      "result": "取消当前上传/下载任务，发送引用另有状态",
+      "pre": "附件归当前账户，操作可重复",
+      "steps": [
+        "标 cancel_requested",
+        "取消当前网络流",
+        "保存位图",
+        "对未完成上传排清理",
+        "不删除已发送消息引用块"
+      ],
+      "tx": "短事务；与上传完成竞争以耐久结果为准",
+      "errors": "ATTACHMENT_NOT_FOUND，TRANSFER_ALREADY_COMPLETE",
+      "tests": [
+        "取消/完成同时到达最终状态一致",
+        "共享附件引用不误删"
+      ],
+      "calls": [],
+      "file": "crates/core/src/attachments.rs",
+      "phase": "P2",
+      "plan": "docs/implementation/attachments.md"
+    },
+    {
+      "id": "ATTACHMENTS-008",
+      "name": "collect_unreferenced_attachments",
+      "signature": "collect_unreferenced_attachments(now: Time, budget: GcBudget) -> Result<GcReport>",
+      "result": "回收 staging/取消/过期且没有消息/任务引用的缓存",
+      "pre": "宽限期明确；扫描不持长事务",
+      "steps": [
+        "短事务选候选并标回收",
+        "检查引用计数",
+        "删除受控缓存",
+        "记录完成",
+        "失败下次幂等重做"
+      ],
+      "tx": "两阶段 GC 记录避免 DB 与文件系统假原子；仅工作缓存内路径",
+      "errors": "FILE_IO_FAILURE，STORAGE_FAILURE",
+      "tests": [
+        "活跃上传/已接受消息引用不能删除",
+        "crash 后能继续回收"
+      ],
+      "calls": [],
+      "file": "crates/core/src/attachments.rs",
+      "phase": "P2",
+      "plan": "docs/implementation/attachments.md"
+    },
+    {
+      "id": "NODE-001",
+      "name": "register_device",
+      "signature": "register_device(request: RegisterDeviceRequest, invite: RegistrationCapability) -> Result<DeviceRegistration>",
+      "result": "验证主管授权并幂等登记设备公开信息",
+      "pre": "注册能力有效/作用域匹配，设备证明持有私钥",
+      "steps": [
+        "验证邀请和请求鉴权",
+        "验设备凭据/撤销版本",
+        "检查账户设备上限",
+        "按设备唯一键保存",
+        "消费注册能力"
+      ],
+      "tx": "T4：设备登记/能力消费/request dedup 一事务；不收用户私钥",
+      "errors": "INVALID_CAPABILITY，INVALID_CREDENTIAL，DEVICE_LIMIT_EXCEEDED",
+      "tests": [
+        "重复注册同摘要同结果",
+        "冒充新设备第三台拒绝"
+      ],
+      "calls": [
+        "verify_credential",
+        "authenticate_request"
+      ],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-002",
+      "name": "publish_discovery",
+      "signature": "publish_discovery(record: SignedDiscoveryRecord, actor: AuthenticatedDevice) -> Result<()>",
+      "result": "保存版本递增的设备签名地址记录",
+      "pre": "actor=record.device；记录有效期有上限",
+      "steps": [
+        "验证签名/端点绑定",
+        "检查版本大于当前或同版同摘要",
+        "有界保存地址",
+        "记录过期时间"
+      ],
+      "tx": "短事务 CAS 版本；拒绝回滚",
+      "errors": "DISCOVERY_ROLLBACK，PERMISSION_DENIED",
+      "tests": [
+        "相同版本不同地址拒绝",
+        "过期记录不返回"
+      ],
+      "calls": [
+        "verify_discovery_record"
+      ],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-003",
+      "name": "publish_key_packages",
+      "signature": "publish_key_packages(packages: Vec<PublicKeyPackage>, actor: AuthenticatedDevice) -> Result<PublishSummary>",
+      "result": "保存设备公开包，不保存配套私有材料",
+      "pre": "每设备库存/批次/字节受限；actor 自己的包",
+      "steps": [
+        "逐包验签和凭据",
+        "检查套件/期限",
+        "按摘要去重",
+        "限制库存",
+        "保存可领取状态"
+      ],
+      "tx": "一批短事务，策略选择全成或全败并固定",
+      "errors": "INVALID_KEY_PACKAGE，QUOTA_EXCEEDED",
+      "tests": [
+        "重复发布不增加库存",
+        "过期包清理",
+        "非本人包拒绝"
+      ],
+      "calls": [
+        "validate_key_package"
+      ],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-004",
+      "name": "claim_key_package",
+      "signature": "claim_key_package(target: DeviceId, request_id: OperationId, actor: AuthenticatedDevice, scope: ClaimCapability) -> Result<ClaimedPackage>",
+      "result": "原子取出一个一次性包；同请求返回同结果",
+      "pre": "请求有联系人/群加入授权，不能匿名消耗库存",
+      "steps": [
+        "验证 scope",
+        "查 request dedup",
+        "选择未消费有效包",
+        "原子标 claimed_by",
+        "存请求结果",
+        "返回公开包"
+      ],
+      "tx": "T4：消费状态与幂等结果同事务；后续失败不将包无条件重新投放",
+      "errors": "KEY_PACKAGE_UNAVAILABLE，INVALID_CAPABILITY",
+      "tests": [
+        "两请求并发不拿同包",
+        "同 request ID 重试返回原包"
+      ],
+      "calls": [],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-005",
+      "name": "register_group",
+      "signature": "register_group(request: SignedGroupCreation, actor: AuthenticatedDevice) -> Result<GroupRegistration>",
+      "result": "固定 GroupId/CoordinatorId 和初始授权设备集合",
+      "pre": "actor 有创建能力；初始状态签名与设备凭据合法",
+      "steps": [
+        "验创建候选",
+        "检查 group ID 未冲突",
+        "校验单一群主/容量",
+        "保存初始 head/policy/epoch",
+        "返回节点签名起点"
+      ],
+      "tx": "T4：群/成员/head/幂等创建结果原子化",
+      "errors": "GROUP_ID_CONFLICT，PERMISSION_DENIED，INVALID_CREDENTIAL",
+      "tests": [
+        "同 ID 同摘要重试返回原结果",
+        "同 ID 换 owner 拒绝"
+      ],
+      "calls": [
+        "verify_candidate",
+        "validate_capacity"
+      ],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-006",
+      "name": "append_group_entry",
+      "signature": "append_group_entry(group: GroupId, candidate: SignedCandidate, actor: AuthenticatedDevice) -> Result<AppendResult>",
+      "result": "为合法候选持久分配唯一 seq 与签名回执",
+      "pre": "传输鉴权/大小/速率通过；actor 是候选作者；节点固定协调该群",
+      "steps": [
+        "验外层签名",
+        "在事务内查 SubmissionId",
+        "同摘要返回旧结果",
+        "核对 head/policy/epoch 和权限",
+        "分配 seq/hash",
+        "签回执",
+        "写日志/公开策略/去重/投递任务",
+        "commit 后返回"
+      ],
+      "tx": "T4：以上同 SQLite 写事务；网络 fanout 在提交后任务执行；节点不能验证 MLS 明文",
+      "errors": "SUBMISSION_ID_CONFLICT，STALE_EPOCH，STALE_CONTROL_HEAD，PERMISSION_DENIED",
+      "tests": [
+        "两管理员竞争只一个前置状态成功",
+        "超时重试得到同 seq",
+        "同 ID 不同字节拒绝"
+      ],
+      "calls": [
+        "verify_candidate",
+        "validate_send_permission",
+        "authorize_group_operation",
+        "receipt_signing_bytes"
+      ],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-007",
+      "name": "fetch_group_log",
+      "signature": "fetch_group_log(group: GroupId, after: u64, limit: u32, actor: AuthenticatedDevice) -> Result<LogPage>",
+      "result": "返回可见日志与恢复控制材料，条数/字节双限",
+      "pre": "actor 在允许的成员窗口；不能从 after=0 绕过加入历史策略",
+      "steps": [
+        "查成员窗口",
+        "限制内容范围",
+        "按 seq 返回",
+        "控制恢复材料走单独规则",
+        "返回签名 head 和分页位置"
+      ],
+      "tx": "只读快照；旧内容清理后返回明确不可恢复缺口",
+      "errors": "HISTORY_NOT_AUTHORIZED，LOG_RANGE_PRUNED，GROUP_NOT_FOUND",
+      "tests": [
+        "新成员无法拉旧正文/附件",
+        "已退出设备无权读新条目"
+      ],
+      "calls": [
+        "enforce_join_visibility"
+      ],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-008",
+      "name": "get_group_head",
+      "signature": "get_group_head(group: GroupId, actor: AuthenticatedDevice) -> Result<SignedLogHead>",
+      "result": "返回绑定 group/seq/hash/control_head/policy/epoch 的节点签名头",
+      "pre": "设备有该群对账权限，签名域与 entry 回执区分",
+      "steps": [
+        "读取一致 head",
+        "规范编码",
+        "用节点签名钥签",
+        "返回头与节点 key id"
+      ],
+      "tx": "只读快照；WS 提示不能替代此对账",
+      "errors": "PERMISSION_DENIED，GROUP_NOT_FOUND",
+      "tests": [
+        "替换 group/epoch 导致验签失败",
+        "节点重启同持久头"
+      ],
+      "calls": [
+        "encode_canonical"
+      ],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-009",
+      "name": "store_mailbox_item",
+      "signature": "store_mailbox_item(item: AuthorizedMailboxItem, actor: AuthenticatedDevice) -> Result<MailboxReceipt>",
+      "result": "配额内持久存密文/Welcome 并返回存储证据",
+      "pre": "目标设备有效；能力限定 sender/target/group/期限；payload 有界",
+      "steps": [
+        "验能力和目标",
+        "核对 accepted entry 或 Welcome 授权关联",
+        "查 item dedup",
+        "预留配额",
+        "插入条目/TTL",
+        "签存储回执"
+      ],
+      "tx": "T4：item/dedup/quota 原子提交；ACK 后故障恢复仍存在",
+      "errors": "INVALID_CAPABILITY，QUOTA_EXCEEDED，DEVICE_REVOKED",
+      "tests": [
+        "开放匿名垃圾投递拒绝",
+        "重复 item 不重占配额",
+        "节点重启后仍可拉"
+      ],
+      "calls": [
+        "validate_capability",
+        "verify_candidate"
+      ],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-010",
+      "name": "read_mailbox_page",
+      "signature": "read_mailbox_page(actor: AuthenticatedDevice, cursor: Option<MailboxCursor>, limit: u32) -> Result<MailboxPage>",
+      "result": "仅当前设备拉自己的有界页面",
+      "pre": "cursor 认证绑定 device/排序版本；不能用 ID 查询他人信箱",
+      "steps": [
+        "校验游标",
+        "按稳定 item 序列读取未消费有效条目",
+        "限制字节",
+        "生成新游标",
+        "附过期缺口提示"
+      ],
+      "tx": "只读；读取不删除；分页位置不能因 TTL 删除而跳到别人的数据",
+      "errors": "INVALID_CURSOR，DEVICE_REVOKED",
+      "tests": [
+        "跨设备游标拒绝",
+        "重复请求相同材料可重读"
+      ],
+      "calls": [
+        "decode_page_cursor",
+        "encode_page_cursor"
+      ],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-011",
+      "name": "ack_mailbox_items",
+      "signature": "ack_mailbox_items(actor: AuthenticatedDevice, ids: Vec<MailboxItemId>) -> Result<AckSummary>",
+      "result": "幂等确认当前设备消费并释放条目配额",
+      "pre": "请求签名绑定 ids；批量大小受限",
+      "steps": [
+        "去重 ids",
+        "核对归属",
+        "标 consumed 或删除可清理条目",
+        "释放精确配额",
+        "返回逐项结果"
+      ],
+      "tx": "T4：消费状态与 quota 同事务；与客户端 E2E delivered 语义分离",
+      "errors": "PERMISSION_DENIED，INVALID_ACK_BATCH",
+      "tests": [
+        "重复 ACK 不把 quota 减为负",
+        "他设备 ACK 拒绝"
+      ],
+      "calls": [],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-012",
+      "name": "begin_blob_upload",
+      "signature": "begin_blob_upload(actor: AuthenticatedDevice, descriptor: PublicBlobDescriptor, operation: OperationId) -> Result<UploadSession>",
+      "result": "创建只含密文规则的上传会话并预留配额",
+      "pre": "公共 descriptor 不含文件密钥/明文摘要；实际密文字节有界",
+      "steps": [
+        "检查能力与限额",
+        "request dedup",
+        "预留实际字节",
+        "创建随机 upload ID/期限",
+        "返回受限上传能力"
+      ],
+      "tx": "T4：quota/session/dedup 同事务；临时文件清理有日志",
+      "errors": "QUOTA_EXCEEDED，CONTENT_TOO_LARGE",
+      "tests": [
+        "并发上传不能超总配额",
+        "同 operation 重试同 session"
+      ],
+      "calls": [
+        "validate_capability"
+      ],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-013",
+      "name": "put_blob_chunk",
+      "signature": "put_blob_chunk(upload: UploadId, index: u32, bytes: CipherChunk, actor: AuthenticatedDevice) -> Result<ChunkReceipt>",
+      "result": "同 index/同摘要幂等，异摘要拒绝，不信任用户文件名",
+      "pre": "会话有效，index/块大小/总密文大小受限",
+      "steps": [
+        "核对能力/owner",
+        "计算密文摘要",
+        "查旧 index",
+        "写受控临时块并同步",
+        "短事务登记",
+        "返回摘要回执"
+      ],
+      "tx": "文件与 DB 使用 staged/committed 恢复标记；不能声称双系统天然原子",
+      "errors": "CHUNK_CONFLICT，UPLOAD_EXPIRED，CONTENT_TOO_LARGE",
+      "tests": [
+        "同块重传不占双份",
+        "写文件后 crash 启动可恢复/清理"
+      ],
+      "calls": [],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-014",
+      "name": "complete_blob_upload",
+      "signature": "complete_blob_upload(upload: UploadId, manifest: CipherManifest, actor: AuthenticatedDevice) -> Result<BlobReceipt>",
+      "result": "只发布块数/大小/摘要全部匹配的完整密文对象",
+      "pre": "会话所有必须块耐久存在，manifest 不含用户解密密钥",
+      "steps": [
+        "核对 owner/能力",
+        "验证全部 chunk 摘要和边界",
+        "完成不可变对象",
+        "登记下载授权范围",
+        "转移配额状态",
+        "返回签回执"
+      ],
+      "tx": "先文件同步再 DB 标 published；失败保持可恢复 uploading；重复 complete 同结果",
+      "errors": "MISSING_CHUNKS，MANIFEST_MISMATCH，UPLOAD_EXPIRED",
+      "tests": [
+        "缺末块拒绝",
+        "重复完成不重占配额",
+        "中途重启不发布半对象"
+      ],
+      "calls": [],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-015",
+      "name": "read_blob_chunk",
+      "signature": "read_blob_chunk(blob: BlobId, index: u32, actor: AuthenticatedDevice, capability: DownloadCapability) -> Result<CipherChunk>",
+      "result": "仅向受限持有人返回密文块",
+      "pre": "授权绑定对象/设备/群消息窗口/期限，猜 BlobId 无效",
+      "steps": [
+        "验证能力与撤销状态",
+        "检查群历史范围",
+        "验证 index",
+        "有界读取",
+        "返回实际密文摘要"
+      ],
+      "tx": "只读；不能因在群内直接获得全部旧附件",
+      "errors": "INVALID_CAPABILITY，HISTORY_NOT_AUTHORIZED，BLOB_NOT_FOUND",
+      "tests": [
+        "新设备拿到旧 URL 仍拒绝",
+        "过期/跨对象能力拒绝"
+      ],
+      "calls": [
+        "validate_capability",
+        "enforce_join_visibility"
+      ],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "NODE-016",
+      "name": "expire_node_data",
+      "signature": "expire_node_data(now: Time, budget: GcBudget) -> Result<CleanupReport>",
+      "result": "分策略回收过期信箱、上传临时物和不再引用密文，保留控制恢复日志",
+      "pre": "30天为信箱默认 TTL；控制日志不是同一 TTL",
+      "steps": [
+        "分类型选择候选",
+        "标回收",
+        "修正配额",
+        "受控路径删除",
+        "保留控制链和必要幂等结果至重试窗口结束"
+      ],
+      "tx": "短批事务+文件删除日志；禁止一条 TTL SQL 删除所有群日志",
+      "errors": "STORAGE_FAILURE，FILE_IO_FAILURE",
+      "tests": [
+        "消息过期不破坏现存群状态验证",
+        "dedup 过早删不能让旧尝试二次接受"
+      ],
+      "calls": [],
+      "file": "crates/node-services/src/services.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/node.md"
+    },
+    {
+      "id": "API-001",
+      "name": "load_node_config",
+      "signature": "load_node_config(path: ConfigPath, env: AllowedOverrides) -> Result<NodeConfig>",
+      "result": "读取、验证限额与持久目录，拒绝不完整生产配置",
+      "pre": "只允许明确 env 覆盖项；敏感配置不打印",
+      "steps": [
+        "有界解析 TOML",
+        "校验 bind/external URL",
+        "验证目录权限",
+        "检查限额乘法溢出",
+        "确认节点 key 来源与 TLS 模式"
+      ],
+      "tx": "启动只读；错误不创建监听或空数据库冒充正常",
+      "errors": "INVALID_CONFIG，INSECURE_STORAGE_PATH",
+      "tests": [
+        "缺持久卷配置拒绝生产启动",
+        "非法负限额拒绝"
+      ],
+      "calls": [],
+      "file": "crates/node-api/src/handlers.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/api.md"
+    },
+    {
+      "id": "API-002",
+      "name": "issue_auth_challenge",
+      "signature": "issue_auth_challenge(client_hint: ClientHint, now: Time) -> Result<AuthChallenge>",
+      "result": "生成节点签名的一次性短期挑战",
+      "pre": "匿名 endpoint 有 IP/全局速率和库存上限",
+      "steps": [
+        "安全随机 nonce",
+        "绑定 node_id/用途/期限",
+        "存 challenge 状态",
+        "签名返回",
+        "限制同源未消费数量"
+      ],
+      "tx": "短事务持久化或同样可靠状态机制；不能跨重启重放旧挑战",
+      "errors": "RATE_LIMITED，CHALLENGE_CAPACITY_EXCEEDED",
+      "tests": [
+        "挑战过期拒绝",
+        "高并发不会无限分配内存"
+      ],
+      "calls": [
+        "encode_canonical"
+      ],
+      "file": "crates/node-api/src/handlers.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/api.md"
+    },
+    {
+      "id": "API-003",
+      "name": "authenticate_request",
+      "signature": "authenticate_request(meta: RequestMeta, body_hash: Digest, auth: SignedAuth, now: Time) -> Result<AuthenticatedDevice>",
+      "result": "绑定方法/规范路径/查询/摘要/节点/挑战/期限并验设备签名",
+      "pre": "请求正文先受限流式读取；设备凭据有效；不能仅传 accountId 登录",
+      "steps": [
+        "规范化 method/path/query",
+        "核对 node_id 和 challenge",
+        "验证设备签名/撤销状态",
+        "原子消费 challenge",
+        "返回 actor"
+      ],
+      "tx": "消费挑战短事务；业务失败重试需新挑战但沿用业务 operation/submission ID",
+      "errors": "AUTH_REPLAY，AUTH_EXPIRED，INVALID_SIGNATURE，DEVICE_REVOKED",
+      "tests": [
+        "换方法/查询/body/节点重放失败",
+        "同挑战并发只成功一次"
+      ],
+      "calls": [
+        "verify_credential",
+        "encode_canonical"
+      ],
+      "file": "crates/node-api/src/handlers.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/api.md"
+    },
+    {
+      "id": "API-004",
+      "name": "validate_capability",
+      "signature": "validate_capability(token: Capability, actor: Actor, resource: Resource, action: Action, now: Time) -> Result<AuthorizedScope>",
+      "result": "校验投递/注册/claim/blob 权限，不采用 token 自称权限",
+      "pre": "发行者公钥可信，资源/动作/持有人/期限/版本明确",
+      "steps": [
+        "限长解析",
+        "验签",
+        "检查发行者",
+        "匹配 holder/resource/action",
+        "检查期限/撤销版本",
+        "返回最小范围"
+      ],
+      "tx": "纯验证与只读撤销查询；单次能力消费在业务事务",
+      "errors": "INVALID_CAPABILITY，CAPABILITY_EXPIRED，CAPABILITY_REVOKED",
+      "tests": [
+        "联系人邀请 token 不能用于群管理",
+        "一个 blob token 不能读另一 blob"
+      ],
+      "calls": [
+        "decode_bounded",
+        "encode_canonical"
+      ],
+      "file": "crates/node-api/src/handlers.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/api.md"
+    },
+    {
+      "id": "API-005",
+      "name": "enforce_rate_limit",
+      "signature": "enforce_rate_limit(actor: Option<DeviceId>, route: RouteClass, cost: RequestCost, now: Time) -> Result<Permit>",
+      "result": "按设备/IP/全局限制请求和字节成本",
+      "pre": "匿名挑战与注册单独限额；可信代理头策略明确",
+      "steps": [
+        "取预算键",
+        "安全累计请求/字节",
+        "检查突发和持续配额",
+        "原子扣减",
+        "返回 retryAfter"
+      ],
+      "tx": "进程内或持久计数按策略；重启不能成为无限配额绕过方式",
+      "errors": "RATE_LIMITED",
+      "tests": [
+        "伪造 X-Forwarded-For 无效",
+        "大上传按字节计而非仅请求数"
+      ],
+      "calls": [],
+      "file": "crates/node-api/src/handlers.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/api.md"
+    },
+    {
+      "id": "API-006",
+      "name": "handle_append_http",
+      "signature": "handle_append_http(request: HttpRequest) -> HttpResponse",
+      "result": "POST /v1/groups/{id}/entries 到排序服务的单一适配",
+      "pre": "content-type/主版本/请求长度明确",
+      "steps": [
+        "先 route/字节限额",
+        "解析 bounded DTO",
+        "鉴权",
+        "路由 group 与 body 一致",
+        "调用 append",
+        "映射签名回执或稳定错误"
+      ],
+      "tx": "不在 handler 另开与 service 冲突的独立事务",
+      "errors": "HTTP 401/403/409/413/429/503 映射稳定错误码，不泄漏正文",
+      "tests": [
+        "409 stale head 与403权限可区分",
+        "相同 submission 异字节409"
+      ],
+      "calls": [
+        "decode_bounded",
+        "authenticate_request",
+        "enforce_rate_limit",
+        "append_group_entry",
+        "map_error"
+      ],
+      "file": "crates/node-api/src/handlers.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/api.md"
+    },
+    {
+      "id": "API-007",
+      "name": "handle_mailbox_http",
+      "signature": "handle_mailbox_http(request: HttpRequest) -> HttpResponse",
+      "result": "分派 POST item、GET page、POST ack 并保持 actor 绑定",
+      "pre": "每路由 schema 独立，不允许客户端指定查询其他 device",
+      "steps": [
+        "限额",
+        "鉴权",
+        "校验参数",
+        "选择 store/read/ack 服务",
+        "输出分页和存储证据"
+      ],
+      "tx": "事务全部由 node service 控制",
+      "errors": "INVALID_CURSOR，INVALID_CAPABILITY，QUOTA_EXCEEDED",
+      "tests": [
+        "GET 不删除",
+        "ACK 只能本人",
+        "超响应预算分页而非截断密文"
+      ],
+      "calls": [
+        "authenticate_request",
+        "store_mailbox_item",
+        "read_mailbox_page",
+        "ack_mailbox_items"
+      ],
+      "file": "crates/node-api/src/handlers.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/api.md"
+    },
+    {
+      "id": "API-008",
+      "name": "handle_blob_http",
+      "signature": "handle_blob_http(request: HttpRequest) -> HttpResponse",
+      "result": "分派上传创建/块/完成/下载，正文流式有界",
+      "pre": "只允许密文上传；用户路径名不参与服务器文件定位",
+      "steps": [
+        "校验 route ID/index",
+        "验证设备和能力",
+        "限制字节流",
+        "调用分块服务",
+        "输出摘要回执"
+      ],
+      "tx": "长上传不持全局 DB tx；取消触发临时文件恢复策略",
+      "errors": "CONTENT_TOO_LARGE，CHUNK_CONFLICT，INVALID_CAPABILITY",
+      "tests": [
+        "路径穿越输入拒绝",
+        "网络取消无 published 半对象"
+      ],
+      "calls": [
+        "begin_blob_upload",
+        "put_blob_chunk",
+        "complete_blob_upload",
+        "read_blob_chunk"
+      ],
+      "file": "crates/node-api/src/handlers.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/api.md"
+    },
+    {
+      "id": "API-009",
+      "name": "upgrade_event_socket",
+      "signature": "upgrade_event_socket(request: HttpRequest, token: OneTimeWsToken) -> Result<Socket>",
+      "result": "建立只提示更新的 WS，不通过 URL 携带长期秘密",
+      "pre": "一次性 token 由签名 HTTP 流程签发并绑定设备/期限",
+      "steps": [
+        "核对 origin/设备/token",
+        "原子消费",
+        "设置队列预算",
+        "推合并提示",
+        "慢消费者断开并说明需同步"
+      ],
+      "tx": "短期 token 单次消费；WS 事件不替代持久日志",
+      "errors": "AUTH_REPLAY，WS_AUTH_EXPIRED，BACKPRESSURE",
+      "tests": [
+        "断线丢提示仍能补齐",
+        "日志中 URL 无长期凭据"
+      ],
+      "calls": [],
+      "file": "crates/node-api/src/handlers.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/api.md"
+    },
+    {
+      "id": "API-010",
+      "name": "run_node",
+      "signature": "run_node(config: NodeConfig, shutdown: ShutdownSignal) -> Result<NodeExit>",
+      "result": "启动数据库、服务、HTTP、后台 GC 和优雅关闭",
+      "pre": "配置已经验证；节点签名钥加载成功",
+      "steps": [
+        "打开持久库并恢复 staged 文件",
+        "创建服务依赖",
+        "绑定监听",
+        "启动限额内 worker",
+        "接关闭信号",
+        "停止接收并完成当前提交",
+        "释放资源"
+      ],
+      "tx": "先持久层后监听；停止时回执已返回的提交必须耐久",
+      "errors": "NODE_START_FAILED，MIGRATION_FAILED，SHUTDOWN_TIMEOUT",
+      "tests": [
+        "节点在 append 返回后重启不丢日志",
+        "无私钥/正文诊断输出"
+      ],
+      "calls": [
+        "load_node_config",
+        "expire_node_data"
+      ],
+      "file": "crates/node-api/src/handlers.rs",
+      "phase": "P1 → P5",
+      "plan": "docs/implementation/api.md"
+    },
+    {
+      "id": "BRIDGE-001",
+      "name": "ffi_create_core",
+      "signature": "ffi_create_core(options: FfiOptions, platform: PlatformBridge) -> Result<FfiCoreHandle>",
+      "result": "建立有生命周期计数的原生 core 对象",
+      "pre": "绑定框架和 panic 规则已 P0 验证；平台回调注册完整",
+      "steps": [
+        "校验版本/ABI",
+        "映射 options",
+        "调用 start",
+        "登记受控句柄",
+        "返回简单 DTO 和初始化状态"
+      ],
+      "tx": "句柄引用计数；创建失败释放 callback；不返回裸数据库指针",
+      "errors": "ABI_MISMATCH，STORAGE_LOCKED，CORE_START_FAILED",
+      "tests": [
+        "Windows/Linux/Android 真机创建/释放",
+        "错误回调不泄漏句柄"
+      ],
+      "calls": [
+        "start_core"
+      ],
+      "file": "crates/ffi/src/bridge.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/bridge.md"
+    },
+    {
+      "id": "BRIDGE-002",
+      "name": "ffi_dispatch",
+      "signature": "ffi_dispatch(handle: FfiCoreHandle, request: FfiRequest) -> Result<FfiResponse>",
+      "result": "将有界业务请求映射到内核，不暴露协议内部对象",
+      "pre": "handle 有效，类型/字节/超时受限",
+      "steps": [
+        "验证句柄",
+        "解析生成 DTO",
+        "进入异步任务",
+        "调用对应 core 服务",
+        "脱敏映射错误",
+        "返回稳定 DTO"
+      ],
+      "tx": "不能持 FFI 锁等待 UI 回调；操作成功以持久化为准",
+      "errors": "CORE_CLOSED，INVALID_FFI_ARGUMENT，OPERATION_CANCELLED",
+      "tests": [
+        "重复 send 保持 clientOperationId",
+        "UI 取消后已提交意图可查"
+      ],
+      "calls": [
+        "send_message",
+        "map_error"
+      ],
+      "file": "crates/ffi/src/bridge.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/bridge.md"
+    },
+    {
+      "id": "BRIDGE-003",
+      "name": "ffi_subscribe",
+      "signature": "ffi_subscribe(handle: FfiCoreHandle, callback: EventCallback) -> Result<FfiSubscription>",
+      "result": "建立可释放事件通道",
+      "pre": "回调跨线程规则已核实，UI 主线程由 Kotlin 自行切换",
+      "steps": [
+        "注册有界订阅",
+        "原生线程只投递 DTO",
+        "检测回调失败",
+        "溢出标 resync",
+        "保存订阅生命周期"
+      ],
+      "tx": "引用与 core 关联；关闭后禁止回调已释放对象",
+      "errors": "CALLBACK_FAILED，CORE_CLOSED",
+      "tests": [
+        "快速订阅/释放竞态无 use-after-free",
+        "慢消费者有 resync"
+      ],
+      "calls": [
+        "observe_events"
+      ],
+      "file": "crates/ffi/src/bridge.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/bridge.md"
+    },
+    {
+      "id": "BRIDGE-004",
+      "name": "release_ffi_subscription",
+      "signature": "release_ffi_subscription(subscription: FfiSubscription) -> Result<()>",
+      "result": "幂等解除回调与待发送队列",
+      "pre": "允许重复释放，不能从 callback 内死锁等待自己",
+      "steps": [
+        "标 closed",
+        "停止新回调",
+        "处理在途回调计数",
+        "丢弃临时通知",
+        "释放引用"
+      ],
+      "tx": "不删除持久消息；从 callback 重入时采用延迟清理",
+      "errors": "INVALID_HANDLE",
+      "tests": [
+        "Compose 页面反复打开/关闭无回调增长",
+        "release 后无新事件"
+      ],
+      "calls": [],
+      "file": "crates/ffi/src/bridge.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/bridge.md"
+    },
+    {
+      "id": "BRIDGE-005",
+      "name": "stop_event_bridge",
+      "signature": "stop_event_bridge(core: FfiCoreHandle) -> Result<()>",
+      "result": "关闭 core 的全部订阅并等待有界完成",
+      "pre": "core 已 draining；不能无限等恶意/挂起回调",
+      "steps": [
+        "快照订阅集合",
+        "逐个取消",
+        "截止时间内 drain",
+        "作废回调引用",
+        "报告未配合回调"
+      ],
+      "tx": "不回滚 core 已提交事务；平台线程不能被原生 join 死锁",
+      "errors": "CALLBACK_SHUTDOWN_TIMEOUT",
+      "tests": [
+        "关闭时 callback 触发查询得到 CLOSED 而非死锁"
+      ],
+      "calls": [
+        "release_ffi_subscription"
+      ],
+      "file": "crates/ffi/src/bridge.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/bridge.md"
+    },
+    {
+      "id": "BRIDGE-006",
+      "name": "bridge_event_flow",
+      "signature": "bridge_event_flow(native: NativeCore) -> Flow<CoreEvent>",
+      "result": "Kotlin callbackFlow 包装与 awaitClose 释放",
+      "pre": "选定 coroutine 版本已锁定；调用方遵守页面 scope",
+      "steps": [
+        "注册 FFI 回调",
+        "安全映射 DTO",
+        "投递有界 channel",
+        "溢出发 resync",
+        "awaitClose 释放订阅"
+      ],
+      "tx": "Kotlin 仅缓存 UI 状态；回调不在原生线程操作 Compose",
+      "errors": "CORE_CLOSED，INVALID_NATIVE_EVENT",
+      "tests": [
+        "collect 取消释放一次",
+        "重收集查询持久状态补丢失通知"
+      ],
+      "calls": [
+        "ffi_subscribe",
+        "release_ffi_subscription"
+      ],
+      "file": "crates/ffi/src/bridge.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/bridge.md"
+    },
+    {
+      "id": "BRIDGE-007",
+      "name": "bridge_suspend_call",
+      "signature": "bridge_suspend_call(operation: BusinessRequest) -> BusinessResult",
+      "result": "将 Rust async 业务调用包装为 Kotlin suspend",
+      "pre": "每个变更请求保留稳定 operationId；回调/任务取消语义明确",
+      "steps": [
+        "切换 IO dispatcher",
+        "映射 DTO 防御复制",
+        "调用生成绑定",
+        "取消时只发取消 hint",
+        "映射稳定错误",
+        "必要时查询状态"
+      ],
+      "tx": "取消 coroutine 不代表撤回已提交消息；原生任务有自己的所有权",
+      "errors": "OPERATION_CANCELLED，CORE_CLOSED",
+      "tests": [
+        "暂停页面导致取消后重开仍看到已排队草稿",
+        "无 UI 阻塞"
+      ],
+      "calls": [
+        "ffi_dispatch",
+        "get_draft_status"
+      ],
+      "file": "crates/ffi/src/bridge.rs",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/bridge.md"
+    },
+    {
+      "id": "PLATFORM-001",
+      "name": "wrap_storage_key",
+      "signature": "suspend fun wrapStorageKey(alias: String, secret: SecretBuffer): WrappedSecret",
+      "result": "使用系统保护封装随机存储主密钥，返回不含明文的持久包",
+      "pre": "别名命名空间/版本明确；系统服务可用；敏感缓冲有限寿命",
+      "steps": [
+        "校验 alias",
+        "查询/创建平台保护槽",
+        "调用系统封装",
+        "记录版本/平台元数据",
+        "清理临时明文"
+      ],
+      "tx": "外部密钥槽与 DB 不天然原子；通过创建意图和孤儿槽清理协调",
+      "errors": "KEY_PROTECTION_UNAVAILABLE，USER_AUTH_REQUIRED",
+      "tests": [
+        "Linux 无服务不能落明文",
+        "Android 锁屏授权",
+        "Windows 不同用户不可解包"
+      ],
+      "calls": [],
+      "file": "shared/platform-api/src/commonMain/kotlin/chat/platform/Services.kt",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/platform.md"
+    },
+    {
+      "id": "PLATFORM-002",
+      "name": "unwrap_storage_key",
+      "signature": "suspend fun unwrapStorageKey(alias: String, wrapped: WrappedSecret): SecretBuffer",
+      "result": "在可信内核启动路径恢复存储主密钥",
+      "pre": "用户/平台授权完成，格式与平台版本匹配",
+      "steps": [
+        "验证元数据",
+        "请求系统授权",
+        "解包",
+        "检查长度/用途",
+        "交受控缓冲给 storage",
+        "失败清理"
+      ],
+      "tx": "不通过 UI/插件 API 返回秘密；ByteArray 不承诺自动零化",
+      "errors": "STORAGE_LOCKED，KEY_INVALIDATED，USER_AUTH_CANCELLED",
+      "tests": [
+        "系统密钥失效返回恢复引导",
+        "错误 alias 不尝试明文 fallback"
+      ],
+      "calls": [],
+      "file": "shared/platform-api/src/commonMain/kotlin/chat/platform/Services.kt",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/platform.md"
+    },
+    {
+      "id": "PLATFORM-003",
+      "name": "delete_key_alias",
+      "signature": "suspend fun deleteKeyAlias(alias: String): Unit",
+      "result": "显式删除无引用/用户确认的保护槽",
+      "pre": "不能因临时启动失败直接删除仍引用的唯一密钥",
+      "steps": [
+        "核对允许命名空间",
+        "检查本地引用和删除授权",
+        "调用系统删除",
+        "记录无秘密结果"
+      ],
+      "tx": "外部副作用有可重试删除日志；重复删除幂等",
+      "errors": "KEY_STILL_REFERENCED，PERMISSION_DENIED",
+      "tests": [
+        "误删在用 key 阻止",
+        "槽已不存在重复成功"
+      ],
+      "calls": [],
+      "file": "shared/platform-api/src/commonMain/kotlin/chat/platform/Services.kt",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/platform.md"
+    },
+    {
+      "id": "PLATFORM-004",
+      "name": "choose_import_file",
+      "signature": "suspend fun chooseImportFile(): PlatformFileToken?",
+      "result": "系统选择器获得单文件读授权，取消返回 null",
+      "pre": "用户显式操作；Android URI 不当作 Windows 路径",
+      "steps": [
+        "打开选择器",
+        "取得系统授权",
+        "登记短期 token/读模式/生命周期",
+        "返回 opaque token"
+      ],
+      "tx": "平台 token 注册表，不写任意路径到插件可读配置",
+      "errors": "FILE_PICKER_UNAVAILABLE",
+      "tests": [
+        "用户取消无任务",
+        "Android provider 虚拟流可读",
+        "token 过期拒绝"
+      ],
+      "calls": [],
+      "file": "shared/platform-api/src/commonMain/kotlin/chat/platform/Services.kt",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/platform.md"
+    },
+    {
+      "id": "PLATFORM-005",
+      "name": "choose_export_file",
+      "signature": "suspend fun chooseExportFile(suggestedName: String): PlatformFileToken?",
+      "result": "取得用户指定目标的写授权",
+      "pre": "建议文件名仅展示且清除路径分隔符；不覆盖未授权文件",
+      "steps": [
+        "清洗名称",
+        "调用保存选择器",
+        "明确覆盖行为",
+        "登记受限写 token",
+        "返回授权"
+      ],
+      "tx": "选择本身不写内容；取消返回 null",
+      "errors": "FILE_PICKER_UNAVAILABLE，PERMISSION_DENIED",
+      "tests": [
+        "恶意附件名 ../ 不影响实际目录",
+        "覆盖由系统选择决定"
+      ],
+      "calls": [],
+      "file": "shared/platform-api/src/commonMain/kotlin/chat/platform/Services.kt",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/platform.md"
+    },
+    {
+      "id": "PLATFORM-006",
+      "name": "open_file_token",
+      "signature": "suspend fun openFileToken(token: PlatformFileToken, mode: AccessMode): ControlledStream",
+      "result": "把有效 token 换成一次受控流/句柄供 core 使用",
+      "pre": "token 由当前平台进程签发，mode 不超过授予模式",
+      "steps": [
+        "查 token 表",
+        "验证期限/调用者/读写范围",
+        "取得 URI/系统句柄",
+        "返回有限流接口",
+        "关闭释放授权"
+      ],
+      "tx": "流操作不跨 UI 线程；FFI 只传受控回调/句柄",
+      "errors": "INVALID_FILE_TOKEN，FILE_PERMISSION_REVOKED",
+      "tests": [
+        "伪造 opaqueId 不打开路径",
+        "读 token 不可写",
+        "core close 释放流"
+      ],
+      "calls": [],
+      "file": "shared/platform-api/src/commonMain/kotlin/chat/platform/Services.kt",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/platform.md"
+    },
+    {
+      "id": "PLATFORM-007",
+      "name": "show_notification",
+      "signature": "suspend fun showNotification(notification: LocalNotification): Unit",
+      "result": "显示不含正文的默认通知，尊重系统授权",
+      "pre": "MVP Android 仅前台/恢复后可用，不假设后台必达",
+      "steps": [
+        "检查通知许可",
+        "按隐私设置构造标题",
+        "限制标识/正文",
+        "调用平台 API",
+        "记录投递结果"
+      ],
+      "tx": "外部通知失败不影响消息事务",
+      "errors": "NOTIFICATION_PERMISSION_DENIED",
+      "tests": [
+        "锁屏默认不泄漏消息正文",
+        "拒绝权限不阻止同步"
+      ],
+      "calls": [],
+      "file": "shared/platform-api/src/commonMain/kotlin/chat/platform/Services.kt",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/platform.md"
+    },
+    {
+      "id": "PLATFORM-008",
+      "name": "cancel_notification",
+      "signature": "suspend fun cancelNotification(id: String): Unit",
+      "result": "幂等撤销本应用通知",
+      "pre": "id 属于本应用命名空间",
+      "steps": [
+        "校验 ID",
+        "调用系统取消",
+        "清理本地显示状态"
+      ],
+      "tx": "无核心数据库写权限",
+      "errors": "INVALID_NOTIFICATION_ID",
+      "tests": [
+        "通知不存在仍成功",
+        "不能操作其他应用通知"
+      ],
+      "calls": [],
+      "file": "shared/platform-api/src/commonMain/kotlin/chat/platform/Services.kt",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/platform.md"
+    },
+    {
+      "id": "PLATFORM-009",
+      "name": "handle_platform_lifecycle",
+      "signature": "suspend fun handlePlatformLifecycle(event: PlatformLifecycleEvent): Unit",
+      "result": "将 Android 前后台/桌面睡眠唤醒映射给 sync",
+      "pre": "应用生命周期 scope 可用；事件可重复",
+      "steps": [
+        "前后台映射",
+        "睡眠前保存工作",
+        "唤醒丢弃旧连接",
+        "重新读取网络 hint",
+        "触发增量同步"
+      ],
+      "tx": "不依赖系统一定给予后台退出回调",
+      "errors": "CORE_CLOSED",
+      "tests": [
+        "Android 直接杀进程仍依靠恢复",
+        "Windows 睡眠后不复用旧 socket"
+      ],
+      "calls": [
+        "set_lifecycle",
+        "set_connectivity"
+      ],
+      "file": "shared/platform-api/src/commonMain/kotlin/chat/platform/Services.kt",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/platform.md"
+    },
+    {
+      "id": "PLATFORM-010",
+      "name": "desktop_exit",
+      "signature": "suspend fun desktopExit(reason: ExitReason): ExitReport",
+      "result": "区分关窗口托盘常驻与显式退出",
+      "pre": "用户托盘/菜单操作；平台托盘能力明确",
+      "steps": [
+        "关闭窗口转托盘",
+        "显式退出停止插件",
+        "等待 core close",
+        "释放托盘/文件句柄",
+        "退出进程"
+      ],
+      "tx": "只在当前事务耐久完成后结束；超过截止提示状态已保存",
+      "errors": "SHUTDOWN_TIMEOUT",
+      "tests": [
+        "点击关闭不停止同步",
+        "显式退出无遗留后台网络线程"
+      ],
+      "calls": [
+        "close_core",
+        "stop_plugin"
+      ],
+      "file": "shared/platform-api/src/commonMain/kotlin/chat/platform/Services.kt",
+      "phase": "P0 → P2",
+      "plan": "docs/implementation/platform.md"
+    },
+    {
+      "id": "PRESENTATION-001",
+      "name": "bootstrap_application",
+      "signature": "suspend fun bootstrapApplication(): StartupUiState",
+      "result": "返回 Welcome/Unlock/Ready/RecoveryRequired 页面状态",
+      "pre": "平台依赖准备完毕；不在 Compose 重组中反复启动 core",
+      "steps": [
+        "调用 bridge start",
+        "判断账户/锁状态",
+        "订阅事件",
+        "拉会话第一页",
+        "映射可操作错误"
+      ],
+      "tx": "页面 scope 持有订阅；失败清理；不建第二份数据库",
+      "errors": "STORAGE_LOCKED，STATE_CORRUPTED",
+      "tests": [
+        "重组不重复建账户",
+        "损坏显示恢复页不空白登录页"
+      ],
+      "calls": [
+        "ffi_create_core",
+        "current_account",
+        "bridge_event_flow"
+      ],
+      "file": "shared/presentation/src/commonMain/kotlin/chat/presentation/UseCases.kt",
+      "phase": "P2 → P4",
+      "plan": "docs/implementation/presentation.md"
+    },
+    {
+      "id": "PRESENTATION-002",
+      "name": "load_conversation_list",
+      "signature": "suspend fun loadConversationList(cursor: Cursor?): ConversationListState",
+      "result": "展示会话摘要、待发计数和同步状态",
+      "pre": "维护页面请求代次，防旧响应覆盖新页",
+      "steps": [
+        "调用 core 列表",
+        "合并稳定 ConversationId",
+        "附同步状态",
+        "更新 loading/error/nextCursor"
+      ],
+      "tx": "UI 内存状态；离页取消查询",
+      "errors": "INVALID_CURSOR，STORAGE_LOCKED",
+      "tests": [
+        "网络离线仍可用",
+        "连续翻页不重复会话"
+      ],
+      "calls": [
+        "list_conversations"
+      ],
+      "file": "shared/presentation/src/commonMain/kotlin/chat/presentation/UseCases.kt",
+      "phase": "P2 → P4",
+      "plan": "docs/implementation/presentation.md"
+    },
+    {
+      "id": "PRESENTATION-003",
+      "name": "load_message_page",
+      "signature": "suspend fun loadMessagePage(conversation: ConversationId, before: Cursor?): MessageListState",
+      "result": "按稳定身份合并消息与本地草稿投影",
+      "pre": "当前页面会话固定，页面 limit 合理",
+      "steps": [
+        "记录请求代次",
+        "查询 core",
+        "按 MessageId/DraftId 关联去重",
+        "保留滚动锚",
+        "更新 nextCursor"
+      ],
+      "tx": "UI 仅保留有界页面缓存；内容锁定时清理内存",
+      "errors": "PERMISSION_DENIED，INVALID_CURSOR",
+      "tests": [
+        "切会话后旧异步响应不覆盖",
+        "草稿正式接受后不显示两条"
+      ],
+      "calls": [
+        "list_messages"
+      ],
+      "file": "shared/presentation/src/commonMain/kotlin/chat/presentation/UseCases.kt",
+      "phase": "P2 → P4",
+      "plan": "docs/implementation/presentation.md"
+    },
+    {
+      "id": "PRESENTATION-004",
+      "name": "submit_composer",
+      "signature": "suspend fun submitComposer(state: ComposerState, operationId: String): ComposerResult",
+      "result": "发送成功持久化后清编辑区并展示 QUEUED",
+      "pre": "operationId 在一次用户意图期间固定，插件草稿必须用户确认",
+      "steps": [
+        "校验 UI 必填",
+        "冻结输入快照",
+        "构造 SendRequest",
+        "调用 core send",
+        "成功后清当前对应输入",
+        "失败保留草稿和原因"
+      ],
+      "tx": "UI 防重复加 core 幂等；返回 QUEUED 不显示 DELIVERED",
+      "errors": "PERMISSION_DENIED，CONTENT_TOO_LARGE，STORAGE_FAILURE",
+      "tests": [
+        "连点一次提交",
+        "提交后继续输入新字不被迟到响应清掉"
+      ],
+      "calls": [
+        "send_message",
+        "bridge_suspend_call"
+      ],
+      "file": "shared/presentation/src/commonMain/kotlin/chat/presentation/UseCases.kt",
+      "phase": "P2 → P4",
+      "plan": "docs/implementation/presentation.md"
+    },
+    {
+      "id": "PRESENTATION-005",
+      "name": "retry_from_ui",
+      "signature": "suspend fun retryFromUi(draft: DraftId): DraftUiState",
+      "result": "显示可重试动作并重新查询实际状态",
+      "pre": "操作来自用户；并发点击合并",
+      "steps": [
+        "禁用重复按钮",
+        "调用 retry",
+        "查询最新状态",
+        "按错误给重新联网/取消/权限提示",
+        "恢复按钮"
+      ],
+      "tx": "UI 不直接操作 outbox 或重加密",
+      "errors": "RETRY_NOT_ALLOWED，PERMISSION_DENIED",
+      "tests": [
+        "已接受消息不再重发",
+        "被禁言不展示无限重试按钮"
+      ],
+      "calls": [
+        "retry_draft",
+        "get_draft_status"
+      ],
+      "file": "shared/presentation/src/commonMain/kotlin/chat/presentation/UseCases.kt",
+      "phase": "P2 → P4",
+      "plan": "docs/implementation/presentation.md"
+    },
+    {
+      "id": "PRESENTATION-006",
+      "name": "cancel_from_ui",
+      "signature": "suspend fun cancelFromUi(draft: DraftId): CancelUiState",
+      "result": "显示取消成功/已经接受/结果待对账",
+      "pre": "文案明确取消不保证撤回在途消息",
+      "steps": [
+        "调用取消",
+        "按三态结果更新",
+        "未知状态保持查询",
+        "监听 DraftChanged"
+      ],
+      "tx": "不乐观删除在途消息；以 core 结果为准",
+      "errors": "ACCEPTANCE_UNKNOWN",
+      "tests": [
+        "取消与接受竞争 UI 最终仍显示正式消息"
+      ],
+      "calls": [
+        "cancel_queued"
+      ],
+      "file": "shared/presentation/src/commonMain/kotlin/chat/presentation/UseCases.kt",
+      "phase": "P2 → P4",
+      "plan": "docs/implementation/presentation.md"
+    },
+    {
+      "id": "PRESENTATION-007",
+      "name": "submit_group_action",
+      "signature": "suspend fun submitGroupAction(snapshot: GroupSnapshot, op: GroupOperation, operationId: String): GroupActionUiState",
+      "result": "管理操作展示 pending，确认后才改成员列表",
+      "pre": "按钮权限来自 snapshot 仅用于提示；core 重新校验",
+      "steps": [
+        "冻结 expected head",
+        "用户确认敏感动作",
+        "调用 propose",
+        "显示 ticket 状态",
+        "正式 GroupChanged 后重查"
+      ],
+      "tx": "UI 不直接修改正式 role/muted；旧 head 展示刷新提示",
+      "errors": "STALE_CONTROL_HEAD，PERMISSION_DENIED",
+      "tests": [
+        "管理员权限被收回后旧页面按钮仍不能成功",
+        "节点离线只显示待处理"
+      ],
+      "calls": [
+        "propose_group_operation",
+        "operation_status",
+        "group_snapshot"
+      ],
+      "file": "shared/presentation/src/commonMain/kotlin/chat/presentation/UseCases.kt",
+      "phase": "P2 → P4",
+      "plan": "docs/implementation/presentation.md"
+    },
+    {
+      "id": "PRESENTATION-008",
+      "name": "handle_core_event",
+      "signature": "suspend fun handleCoreEvent(event: CoreEvent): Unit",
+      "result": "将变更提示转换为合并重查任务",
+      "pre": "事件可能重复/丢失，不能当作完整消息数据",
+      "steps": [
+        "按 conversation/draft 合并",
+        "只重查当前可见页",
+        "ResyncRequired 全局重查",
+        "身份警告显示核验动作"
+      ],
+      "tx": "UI 调度有界；避免每事件全库扫描",
+      "errors": "CORE_CLOSED",
+      "tests": [
+        "1000 个重复事件只有限查询",
+        "溢出后最终 UI 与数据库一致"
+      ],
+      "calls": [
+        "get_draft_status",
+        "list_conversations",
+        "list_messages"
+      ],
+      "file": "shared/presentation/src/commonMain/kotlin/chat/presentation/UseCases.kt",
+      "phase": "P2 → P4",
+      "plan": "docs/implementation/presentation.md"
+    },
+    {
+      "id": "PRESENTATION-009",
+      "name": "render_message_content",
+      "signature": "fun renderMessageContent(view: MessageView): RenderModel",
+      "result": "得到文本/附件/扩展回退等安全显示模型",
+      "pre": "消息来自已验证持久视图；插件原始 HTML/脚本不可直接执行",
+      "steps": [
+        "按类型分派",
+        "文字安全显示",
+        "未知扩展用 fallback",
+        "附件按钮引用 id",
+        "正式状态按 evidence 展示"
+      ],
+      "tx": "纯展示；不因渲染触发自动发送/下载代码",
+      "errors": "UNSUPPORTED_RENDER_TYPE 使用文本回退",
+      "tests": [
+        "未知插件能读文字",
+        "恶意 payload 不执行脚本",
+        "未确认预传不进入正式列表"
+      ],
+      "calls": [
+        "validate_extension"
+      ],
+      "file": "shared/presentation/src/commonMain/kotlin/chat/presentation/UseCases.kt",
+      "phase": "P2 → P4",
+      "plan": "docs/implementation/presentation.md"
+    },
+    {
+      "id": "PRESENTATION-010",
+      "name": "present_error",
+      "signature": "fun presentError(error: CoreFailure): UserActionableError",
+      "result": "错误码映射中文原因和可选操作",
+      "pre": "error 已脱敏，不展示内部堆栈",
+      "steps": [
+        "查稳定错误字典",
+        "映射重连/解锁/核验/取消",
+        "仅 retryable 提供重试",
+        "附无秘密 operationId 供诊断"
+      ],
+      "tx": "纯函数；不把权限错误说成网络问题",
+      "errors": "未知码显示安全通用信息并保留诊断码",
+      "tests": [
+        "STALE_EPOCH 显示正在同步",
+        "LOG_CONFLICT 提示群同步暂停"
+      ],
+      "calls": [
+        "map_error"
+      ],
+      "file": "shared/presentation/src/commonMain/kotlin/chat/presentation/UseCases.kt",
+      "phase": "P2 → P4",
+      "plan": "docs/implementation/presentation.md"
+    },
+    {
+      "id": "PRESENTATION-011",
+      "name": "build_adaptive_layout",
+      "signature": "fun buildAdaptiveLayout(window: WindowSize, selection: NavigationState): LayoutModel",
+      "result": "窄屏列表/会话导航与宽屏双栏共享用例",
+      "pre": "选中会话稳定 ID；布局变化不重启核心",
+      "steps": [
+        "根据可用宽度选择结构",
+        "保留导航/滚动状态",
+        "挂载页面 scope",
+        "只释放页面订阅不关闭 core"
+      ],
+      "tx": "纯布局决策；Compose 不直接持原生对象",
+      "errors": "无运行时错误；非法导航回退会话列表",
+      "tests": [
+        "旋转/窗口缩放消息不重发",
+        "桌面双栏和 Android 同一会话状态"
+      ],
+      "calls": [],
+      "file": "shared/presentation/src/commonMain/kotlin/chat/presentation/UseCases.kt",
+      "phase": "P2 → P4",
+      "plan": "docs/implementation/presentation.md"
+    },
+    {
+      "id": "PLUGINS-001",
+      "name": "inspect_plugin_package",
+      "signature": "suspend fun inspectPluginPackage(source: FileToken): PluginInspection",
+      "result": "给用户展示包来源、摘要、权限和兼容性，尚不执行代码",
+      "pre": "用户选择单一本地包；ZIP 条目数/解压量/压缩比有预算",
+      "steps": [
+        "有界读包",
+        "拒绝绝对路径/../符号链接/重复路径",
+        "schema 验清单",
+        "验 jar 摘要和可选签名",
+        "核对 SDK/平台",
+        "输出可信模式提示"
+      ],
+      "tx": "只读暂存；不初始化 ClassLoader，不运行入口",
+      "errors": "INVALID_PLUGIN_PACKAGE，ZIP_BOMB，SDK_INCOMPATIBLE",
+      "tests": [
+        "路径穿越/解压炸弹拒绝",
+        "签名存在不被描述成安全保证"
+      ],
+      "calls": [
+        "open_file_token"
+      ],
+      "file": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "phase": "P4",
+      "plan": "docs/implementation/plugins.md"
+    },
+    {
+      "id": "PLUGINS-002",
+      "name": "install_trusted_plugin",
+      "signature": "suspend fun installTrustedPlugin(inspection: PluginInspection, choice: TrustedModeChoice): InstallTicket",
+      "result": "复制到版本化插件目录并记录下次重启启用",
+      "pre": "用户明确选择“具有应用级权限”；inspection 摘要与实际包匹配",
+      "steps": [
+        "重新核对来源摘要",
+        "检查重复 ID/升级策略",
+        "写 staging",
+        "原子完成包目录",
+        "保存 pending install",
+        "返回需重启"
+      ],
+      "tx": "文件/配置两阶段恢复标记；不在安装动作执行 JAR",
+      "errors": "TRUST_CONFIRMATION_REQUIRED，PLUGIN_ID_CONFLICT，FILE_IO_FAILURE",
+      "tests": [
+        "包在检查后替换拒绝",
+        "安装中崩溃不启用半包"
+      ],
+      "calls": [
+        "inspect_plugin_package"
+      ],
+      "file": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "phase": "P4",
+      "plan": "docs/implementation/plugins.md"
+    },
+    {
+      "id": "PLUGINS-003",
+      "name": "discover_plugins",
+      "signature": "suspend fun discoverPlugins(safeMode: Boolean): PluginCatalog",
+      "result": "安全启动跳过第三方代码，正常启动列兼容启用包",
+      "pre": "宿主版本已锁定；只扫描应用插件目录",
+      "steps": [
+        "读取安装状态",
+        "检查完整性和禁用标志",
+        "safeMode 跳过执行",
+        "检查入口兼容",
+        "输出懒加载目录"
+      ],
+      "tx": "启动只读，不为每插件常驻新线程池",
+      "errors": "PLUGIN_CORRUPTED，SDK_INCOMPATIBLE",
+      "tests": [
+        "安全模式下恶意/崩溃插件入口不会调用",
+        "不兼容保留可移除记录"
+      ],
+      "calls": [],
+      "file": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "phase": "P4",
+      "plan": "docs/implementation/plugins.md"
+    },
+    {
+      "id": "PLUGINS-004",
+      "name": "start_plugin",
+      "signature": "suspend fun startPlugin(id: PluginId): PluginRuntime",
+      "result": "按首次命令/操作懒加载并注册受控资源",
+      "pre": "包已用户信任、启用且兼容；不能在 UI 线程运行未知初始化",
+      "steps": [
+        "加载隔离依赖 ClassLoader",
+        "创建插件作用域/上下文",
+        "调用 start",
+        "登记全部 Registration",
+        "失败清理并记录故障"
+      ],
+      "tx": "宿主所有权跟踪；JVM 恶意线程不能保证强制停止",
+      "errors": "PLUGIN_START_FAILED，SDK_INCOMPATIBLE",
+      "tests": [
+        "初始化异常无残留菜单",
+        "重复 start 不重复注册",
+        "共享依赖冲突可诊断"
+      ],
+      "calls": [
+        "register_plugin_command"
+      ],
+      "file": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "phase": "P4",
+      "plan": "docs/implementation/plugins.md"
+    },
+    {
+      "id": "PLUGINS-005",
+      "name": "register_plugin_command",
+      "signature": "fun registerPluginCommand(owner: PluginId, definition: CommandDefinition): Registration",
+      "result": "登记唯一命令并返回幂等撤销对象",
+      "pre": "命令命名空间归 owner，描述/参数有界",
+      "steps": [
+        "核对声明能力",
+        "校验命令名和重复项",
+        "登记 owner",
+        "包装执行上下文",
+        "返回 dispose"
+      ],
+      "tx": "注册表线程安全；stop 按 owner 全量清理",
+      "errors": "DUPLICATE_COMMAND，CAPABILITY_NOT_DECLARED",
+      "tests": [
+        "同名跨插件按 namespace 区分",
+        "dispose 两次无异常"
+      ],
+      "calls": [],
+      "file": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "phase": "P4",
+      "plan": "docs/implementation/plugins.md"
+    },
+    {
+      "id": "PLUGINS-006",
+      "name": "register_message_action",
+      "signature": "fun registerMessageAction(owner: PluginId, action: MessageActionDefinition): Registration",
+      "result": "登记用户选择消息后可见操作",
+      "pre": "SDK 不暴露全库读取，操作需要 UserActionToken",
+      "steps": [
+        "验证描述/能力",
+        "登记 handler",
+        "执行时签发短期选择 token",
+        "由宿主附所选会话上下文"
+      ],
+      "tx": "资源归 owner；失活 token 不可后台延长",
+      "errors": "INVALID_ACTION，CAPABILITY_NOT_DECLARED",
+      "tests": [
+        "没有选中内容时不可执行",
+        "stop 后菜单消失"
+      ],
+      "calls": [],
+      "file": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "phase": "P4",
+      "plan": "docs/implementation/plugins.md"
+    },
+    {
+      "id": "PLUGINS-007",
+      "name": "selected_content",
+      "signature": "suspend fun selectedContent(owner: PluginId, token: UserActionToken): SelectedContent",
+      "result": "返回本次用户明确选择的最小明文内容",
+      "pre": "token 绑定 plugin/会话/selection/期限/动作；用户已触发",
+      "steps": [
+        "验证 token",
+        "核对 owner 和选择未失效",
+        "取得受限内容",
+        "按预算返回副本",
+        "记录脱敏访问诊断"
+      ],
+      "tx": "只读；不返回历史分页 API；可信插件仍具进程权限",
+      "errors": "USER_ACTION_EXPIRED，PERMISSION_DENIED",
+      "tests": [
+        "跨插件复用 token 拒绝",
+        "切会话后旧 token 无效"
+      ],
+      "calls": [],
+      "file": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "phase": "P4",
+      "plan": "docs/implementation/plugins.md"
+    },
+    {
+      "id": "PLUGINS-008",
+      "name": "propose_plugin_send",
+      "signature": "suspend fun proposePluginSend(owner: PluginId, token: UserActionToken, content: MessageContent): SendProposal",
+      "result": "填编辑区并标来源，用户确认后走正常 send",
+      "pre": "有效用户动作与 draft.propose 能力；内容通过普通限制",
+      "steps": [
+        "核对 token/会话",
+        "校验类型/大小",
+        "设置 MessageOrigin.Plugin",
+        "交 presentation 编辑区",
+        "等待显式确认"
+      ],
+      "tx": "不创建直接发送 outbox；确认时用正常 core 权限和 operationId",
+      "errors": "USER_ACTION_EXPIRED，CONTENT_TOO_LARGE",
+      "tests": [
+        "被禁言插件不能经 SDK 发言",
+        "一提案不引发另一个自动回复循环"
+      ],
+      "calls": [
+        "validate_extension",
+        "submit_composer"
+      ],
+      "file": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "phase": "P4",
+      "plan": "docs/implementation/plugins.md"
+    },
+    {
+      "id": "PLUGINS-009",
+      "name": "render_plugin_settings",
+      "signature": "fun renderPluginSettings(schema: SettingsSchema, values: PluginValues): SettingsForm",
+      "result": "宿主渲染有限表单，插件不直接挂 Compose ABI",
+      "pre": "schema 有控件类型/长度/数量限制；仅插件私有偏好",
+      "steps": [
+        "验证 schema",
+        "映射宿主控件",
+        "安全显示描述",
+        "变更校验后保存插件私有配置",
+        "不暴露核心 DB"
+      ],
+      "tx": "独立配置事务；不把群共享配置当成本机权限授权",
+      "errors": "INVALID_SETTINGS_SCHEMA",
+      "tests": [
+        "未知控件拒绝",
+        "敏感字段不日志",
+        "插件A不能读B偏好"
+      ],
+      "calls": [],
+      "file": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "phase": "P4",
+      "plan": "docs/implementation/plugins.md"
+    },
+    {
+      "id": "PLUGINS-010",
+      "name": "stop_plugin",
+      "signature": "suspend fun stopPlugin(id: PluginId, deadline: Duration): PluginStopReport",
+      "result": "撤销注册项、合作式取消任务并记录未配合资源",
+      "pre": "插件可能 start 半途失败；stop 可重复",
+      "steps": [
+        "标 stopping",
+        "调用插件 stop",
+        "取消插件 scope",
+        "dispose 全部命令/操作",
+        "清空 token",
+        "记录泄漏/异常",
+        "建议重启"
+      ],
+      "tx": "不宣称卸载全部 JVM 类或终止恶意线程；超时不冻结 UI",
+      "errors": "PLUGIN_STOP_FAILED，PLUGIN_TASK_TIMEOUT",
+      "tests": [
+        "正常示例 stop 后无菜单/任务",
+        "异常 stop 仍由宿主清理注册表"
+      ],
+      "calls": [],
+      "file": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "phase": "P4",
+      "plan": "docs/implementation/plugins.md"
+    },
+    {
+      "id": "PLUGINS-011",
+      "name": "disable_plugin",
+      "signature": "suspend fun disablePlugin(id: PluginId): PluginState",
+      "result": "保存禁用并立即清注册，完整停用重启保证",
+      "pre": "用户显式禁用；不会删除插件私有数据除非明确移除",
+      "steps": [
+        "保存 disabled",
+        "停止活动实例",
+        "标 restart_required",
+        "刷新目录",
+        "保留故障记录"
+      ],
+      "tx": "配置先耐久，stop 失败下次启动仍不加载",
+      "errors": "PLUGIN_STOP_FAILED，STORAGE_FAILURE",
+      "tests": [
+        "崩溃后仍 disabled",
+        "安全启动可移除坏包"
+      ],
+      "calls": [
+        "stop_plugin"
+      ],
+      "file": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "phase": "P4",
+      "plan": "docs/implementation/plugins.md"
+    },
+    {
+      "id": "PLUGINS-012",
+      "name": "remove_plugin",
+      "signature": "suspend fun removePlugin(id: PluginId, removeData: Boolean): RemovalTicket",
+      "result": "停止后标记删除包，JAR占用时下次启动完成",
+      "pre": "用户明确移除；removeData 单独选择",
+      "steps": [
+        "耐久标 pending removal",
+        "停止实例",
+        "尝试受控目录删除",
+        "锁定文件延后",
+        "按选择清私有配置"
+      ],
+      "tx": "删除 journal，路径必须属于插件安装根；不会删除核心消息库",
+      "errors": "PLUGIN_FILES_IN_USE，FILE_IO_FAILURE",
+      "tests": [
+        "Windows JAR 锁定显示待重启",
+        "重复移除幂等"
+      ],
+      "calls": [
+        "stop_plugin"
+      ],
+      "file": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "phase": "P4",
+      "plan": "docs/implementation/plugins.md"
+    },
+    {
+      "id": "PLUGINS-013",
+      "name": "load_theme_config",
+      "signature": "suspend fun loadThemeConfig(source: FileToken): ThemeConfig",
+      "result": "只读取声明式主题和快捷键，不加载可执行代码",
+      "pre": "支持 schema 版本和键白名单；文件体积有上限",
+      "steps": [
+        "有界读取 JSON",
+        "检查颜色/字体/快捷键范围",
+        "拒绝外部脚本/任意资源路径",
+        "预览",
+        "用户应用后保存"
+      ],
+      "tx": "主题配置独立保存；错误保留当前主题",
+      "errors": "INVALID_THEME_CONFIG，SHORTCUT_CONFLICT",
+      "tests": [
+        "配置包不能包含 JAR 执行",
+        "颜色非法回滚",
+        "快捷键冲突可见"
+      ],
+      "calls": [
+        "open_file_token"
+      ],
+      "file": "desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt",
+      "phase": "P4",
+      "plan": "docs/implementation/plugins.md"
+    },
+    {
+      "id": "GROUP-ACTIONS-001",
+      "name": "invite_group_member",
+      "signature": "invite_group_member(group: GroupId, target: AccountId, expected: ControlHead, operation: OperationId) -> Result<OperationTicket>",
+      "result": "向普通新成员发受限邀请，接受后才加其全部获准设备",
+      "pre": "群主/管理员；target 不在群；容量可用；对方是已接受联系人",
+      "steps": [
+        "验证角色与目标",
+        "建立带群/设备/期限的邀请",
+        "保存待对方接受票据",
+        "发授权邀请",
+        "等接受后走 prepare"
+      ],
+      "tx": "T1 保存邀请和任务；不能先提交 Add Commit",
+      "errors": "PERMISSION_DENIED，ALREADY_MEMBER，GROUP_LIMIT_EXCEEDED",
+      "tests": [
+        "邀请中无法指定 ADMIN/OWNER",
+        "对方拒绝不产生 MLS 成员"
+      ],
+      "calls": [
+        "propose_group_operation"
+      ],
+      "file": "crates/core/src/group_actions.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/group-actions.md"
+    },
+    {
+      "id": "GROUP-ACTIONS-002",
+      "name": "set_group_role",
+      "signature": "set_group_role(group: GroupId, target: AccountId, role: GroupRole, expected: ControlHead) -> Result<OperationTicket>",
+      "result": "仅群主任免管理员，目标 owner 变更必须另走转让",
+      "pre": "actor 是当前群主；role 只能 ADMIN/MEMBER；target 是普通或管理员成员",
+      "steps": [
+        "验证 owner",
+        "拒绝 target 为 owner/role OWNER",
+        "校验目标仍在群",
+        "构建 SetRole",
+        "确认后刷新正式角色"
+      ],
+      "tx": "T1/T2/T3 控制路径；角色变化不允许附带 MLS 成员增删",
+      "errors": "PERMISSION_DENIED，INVALID_ROLE_CHANGE，STALE_CONTROL_HEAD",
+      "tests": [
+        "管理员不能给自己/别人升权",
+        "群主不能用 SetRole 让群无主"
+      ],
+      "calls": [
+        "propose_group_operation",
+        "verify_control_result"
+      ],
+      "file": "crates/core/src/group_actions.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/group-actions.md"
+    },
+    {
+      "id": "GROUP-ACTIONS-003",
+      "name": "set_group_muted",
+      "signature": "set_group_muted(group: GroupId, target: AccountId, muted: bool, expected: ControlHead) -> Result<OperationTicket>",
+      "result": "群主/管理员禁言普通成员，生效点为正式 seq",
+      "pre": "target 必须 MEMBER；原权限表不含对管理员禁言，MVP 统一拒绝",
+      "steps": [
+        "校验目标角色和 actor",
+        "与现值相同可幂等返回",
+        "构建 SetMuted",
+        "正式控制确认后新发送按新策略验证"
+      ],
+      "tx": "T1/T2/T3；不能用作者时间决定禁言前后",
+      "errors": "PERMISSION_DENIED，INVALID_TARGET，STALE_CONTROL_HEAD",
+      "tests": [
+        "普通成员不能禁言自己/别人",
+        "旧密文预传不越过正式禁言序号"
+      ],
+      "calls": [
+        "propose_group_operation",
+        "validate_send_permission"
+      ],
+      "file": "crates/core/src/group_actions.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/group-actions.md"
+    },
+    {
+      "id": "GROUP-ACTIONS-004",
+      "name": "sync_account_device_change",
+      "signature": "sync_account_device_change(group: GroupId, proof: AccountDeviceChangeProof) -> Result<OperationTicket>",
+      "result": "把主管签发的本账户设备增删映射为受约束 MLS 更新",
+      "pre": "证明签名合法；账户仍是该群成员；提交设备仍有效；容量足够",
+      "steps": [
+        "核对账户主管签名和单调设备版本",
+        "核对仅改该账户设备",
+        "新增包验签",
+        "新增/撤销构建单操作",
+        "更新父任务进度"
+      ],
+      "tx": "T1/T2/T3；账户已被移除不能借此重加；无有效旧设备需成员授权重新加入",
+      "errors": "INVALID_DEVICE_CHANGE_PROOF，NOT_MEMBER，DEVICE_LIMIT_EXCEEDED",
+      "tests": [
+        "成员不能签别人的设备",
+        "撤销通知不能携带新管理员角色"
+      ],
+      "calls": [
+        "verify_credential",
+        "validate_key_package",
+        "propose_group_operation"
+      ],
+      "file": "crates/core/src/group_actions.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/group-actions.md"
+    },
+    {
+      "id": "GROUP-ACTIONS-005",
+      "name": "rejoin_stale_device",
+      "signature": "rejoin_stale_device(group: GroupId, device: DeviceId, consent: MemberAuthorization) -> Result<GroupJoinTicket>",
+      "result": "日志不可补齐时由当前获准成员重新授权加入",
+      "pre": "不能让节点直接提供明文群钥；设备凭据有效，权限策略允许当前成员邀请",
+      "steps": [
+        "证明缺口不可恢复",
+        "请求有权成员邀请",
+        "生成新一次性包",
+        "清理已失效待加入状态",
+        "等正式 Commit/Welcome",
+        "记录新加入起点"
+      ],
+      "tx": "旧加密状态保留隔离直到新流程完成；不声称恢复旧历史",
+      "errors": "REJOIN_AUTHORIZATION_REQUIRED，INVALID_CREDENTIAL，GROUP_LIMIT_EXCEEDED",
+      "tests": [
+        "长期离线设备不能任意跳 epoch",
+        "未获邀请拒绝重新加入"
+      ],
+      "calls": [
+        "accept_group_invite",
+        "join_from_welcome"
+      ],
+      "file": "crates/core/src/group_actions.rs",
+      "phase": "P3",
+      "plan": "docs/implementation/group-actions.md"
+    }
+  ]
+}

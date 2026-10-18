@@ -1,0 +1,27 @@
+{
+  "status": "abstract-not-wire-format",
+  "scenario": "mute versus message",
+  "events": [
+    {
+      "seq": 1,
+      "kind": "create",
+      "owner": "test-account-A"
+    },
+    {
+      "seq": 2,
+      "kind": "join",
+      "account": "test-account-C"
+    },
+    {
+      "seq": 3,
+      "kind": "set-muted",
+      "target": "test-account-C",
+      "muted": true
+    }
+  ],
+  "candidate": {
+    "author": "test-account-C",
+    "expectedControlHead": "before-seq-3"
+  },
+  "expected": "reject-stale-context-then-recheck-permission"
+}

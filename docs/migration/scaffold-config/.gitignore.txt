@@ -1,0 +1,13 @@
+target/
+.gradle/
+**/build/
+.idea/
+local.properties
+*.jks
+*.keystore
+.env
+data/
+*.db
+*.db-wal
+*.db-shm
+*.recovery

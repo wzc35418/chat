@@ -1,0 +1,19 @@
+{
+  "id": "dev.example.message-formatter",
+  "name": "message-formatter",
+  "version": "0.0.0",
+  "sdkVersion": "1",
+  "runtime": "trusted-jvm",
+  "entrypoint": "chat.examples.FormatterPlugin",
+  "platforms": [
+    "windows-x64",
+    "linux-x64"
+  ],
+  "requestedCapabilities": [
+    "messages.selected.read",
+    "messages.draft.propose"
+  ],
+  "contributions": [
+    "message-actions"
+  ]
+}

@@ -1,0 +1,23 @@
+[package]
+name = "chat-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chat-protocol.workspace = true
+chat-domain.workspace = true
+chat-identity.workspace = true
+chat-crypto.workspace = true
+chat-storage.workspace = true
+chat-transport.workspace = true
+chat-sync.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[[bin]]
+name = "chat-p0"
+path = "src/p0_main.rs"

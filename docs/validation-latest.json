@@ -1,0 +1,47 @@
+{
+  "date": "2026-10-18",
+  "status": "PASS",
+  "scope": "delivery-structure-only",
+  "checks": [
+    {
+      "status": "PASS",
+      "message": "函数目录与源码位置、唯一ID、契约字段、调用引用已检查：197"
+    },
+    {
+      "status": "PASS",
+      "message": "本地Markdown链接及显式函数锚点已检查：1332"
+    },
+    {
+      "status": "PASS",
+      "message": "JSON语法已检查：13"
+    },
+    {
+      "status": "PASS",
+      "message": "示例manifest与主题按schema所用关键字校验；不检查未生成的JAR/签名"
+    },
+    {
+      "status": "PASS",
+      "message": "Cargo/Gradle登记模块路径已检查；未编译"
+    },
+    {
+      "status": "PASS",
+      "message": "原设计要求的应用/模块/文档/部署/测试目录齐全"
+    },
+    {
+      "status": "PASS",
+      "message": "crates/storage/migrations/0001_initial.sql：DDL执行成功，24张表，空库完整性/外键检查成功"
+    },
+    {
+      "status": "PASS",
+      "message": "crates/node-services/migrations/0001_initial.sql：DDL执行成功，17张表，空库完整性/外键检查成功"
+    }
+  ],
+  "limitations": [
+    "未运行 Rust/Kotlin 编译",
+    "未验证 MLS/密码学/跨端/网络/部署行为",
+    "SQL仅在内存普通SQLite中验证，不证明加密存储可用"
+  ],
+  "fileCount": 303,
+  "functionCount": 197,
+  "markdownLinks": 1332
+}

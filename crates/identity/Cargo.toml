@@ -1,0 +1,9 @@
+[package]
+name = "chat-identity"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chat-protocol.workspace = true
+chat-storage.workspace = true
