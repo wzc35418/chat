@@ -269,6 +269,43 @@ impl AttachmentFfi {
         }
     }
 
+    /// 批量读附件显示信息（消息附件卡片用）：只返回存在且可读的记录，未知 ID 跳过并计数。
+    ///
+    /// 返回 `AttachmentView` 列表；不会解密内容，也不会声称“已上传/可下载”。
+    pub fn records(&self, attachment_ids: Vec<String>) -> Result<Vec<AttachmentView>, FfiError> {
+        let guard = self.backend()?;
+        let mut views = Vec::new();
+        for attachment_id in attachment_ids.into_iter().take(32) {
+            let view = match &*guard {
+                Backend::Memory(store) => {
+                    let descriptor = match self.memory_descriptor(&attachment_id) {
+                        Ok(descriptor) => descriptor,
+                        Err(_) => continue,
+                    };
+                    let status = match store.attachment_status(&attachment_id) {
+                        Ok(status) => status,
+                        Err(_) => continue,
+                    };
+                    view_from_descriptor(&descriptor, &status)
+                }
+                Backend::Persisted(store) => {
+                    let record = match store.attachment_record(&attachment_id) {
+                        Ok(Some(record)) => record,
+                        Ok(None) => continue,
+                        Err(error) => return Err(failure(error)),
+                    };
+                    let status = match store.attachment_status(&attachment_id) {
+                        Ok(status) => status,
+                        Err(_) => continue,
+                    };
+                    view_from_record(&record, &status)
+                }
+            };
+            views.push(view);
+        }
+        Ok(views)
+    }
+
     /// ATTACHMENTS-006：解密导出到目标路径，返回写出的明文字节数。
     ///
     /// 没有进程内 FileKey（例如重启后）时显式 `ATTACHMENT_KEY_UNAVAILABLE`。

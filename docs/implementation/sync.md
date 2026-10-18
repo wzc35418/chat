@@ -690,3 +690,70 @@ suspend fun configureNode(node: NodeEndpoint): SyncStatus
 - 常驻运行时（`crates/core/src/sync_runtime.rs`）：独立线程 + current-thread 运行时；每轮一次拉取，成功按间隔等待、Resync 立刻追赶、失败退避、预算耗尽或不可重试错误终止；`status()` 暴露状态快照；`stop()` join 并交还库句柄。
 - 证据：`cargo test -p chat-core` 的 `sync_worker`(8) 与 `sync_runtime`(4) 用例（自动应用、stop 生效、断开退避后可恢复、缺口不跳过、5 种坏页被拒）。
 - 限制：作者签名不重复验证；无 MLS 内层应用；持久化复用 `mls_group_state`/`mls_record`（单群 4096）；同群多运行时无互斥；无事件回调。
+
+## 实现记录：常驻同步接 FFI（SyncFfi，R-71，2026-10-18，Windows x64）
+
+目标：界面能看到"常驻同步"的生老病死——打开、启动、状态轮询、停止、关闭，且状态全部是计数/稳定码。
+
+代码：[crates/ffi/src/sync_ffi.rs](../../crates/ffi/src/sync_ffi.rs)（新）；测试：
+[crates/ffi/tests/sync_ffi.rs](../../crates/ffi/tests/sync_ffi.rs)（3 个用例，**真 axum 节点 + 真临时加密库**，全程经 FFI）。
+契约细节见 [bridge.md 的“常驻同步 FFI”](bridge.md)。
+
+### 公开面（Kotlin 可见）
+
+~~~text
+SyncFfi.open(database_path, master_key_hex, endpoint_url, node_id, node_public_key_hex, group_id)
+    -> Arc<SyncFfi>            // 只装配 + 校验，不启动
+start() -> SyncStatusFfi       // 已在运行 → INVALID_STATE_TRANSITION
+stop() -> SyncStatusFfi        // 协作式停止；未运行幂等返回当前状态
+status() -> SyncStatusFfi      // 未启动 = idle；已停止 = 最后状态
+is_open() -> bool              // group_id() -> String
+shutdown()                     // 幂等；之后所有调用 CORE_CLOSED
+
+SyncStatusFfi { state, applied_total, last_error_code, next_attempt_at_ms,
+                resync_required, rounds, stopped_reason }
+~~~
+
+`state` 是稳定文本：`idle` / `pulling` / `backoff` / `stopped`。
+
+### 关键语义
+
+1. **open 只装配**：打开正式加密库读持久身份种子 → 派生设备签名钥 → 固定端点/固定节点公钥构造
+   NodeClient → **确认该群拉取游标已初始化**；任何一步失败都不留下半打开对象，且**不启动**循环。
+2. **游标必须来自可信起点**：未初始化 → `INVALID_STATE_TRANSITION`（拉取起点来自建群/加入回执，
+   不是"问节点要一个 head 然后相信它"）。
+3. **start 重建配置**：NodeClient 被运行时消费，因此每次 start 都重新派生客户端与配置；库句柄在
+   装配后立刻释放（运行时自己开/关库），所以 open 之后别的对象仍能短暂读库。
+4. **stop 幂等且保留最后状态**：停止是协作式的（等待中的条件变量被立刻唤醒），返回的状态带
+   `stopped_reason = "stop_requested"`；未运行时 stop 只返回当前状态。
+5. **shutdown 幂等**：先停循环再标记关闭；之后 start/stop/status 一律 `CORE_CLOSED`，库锁被释放。
+
+### 复现命令（全程离线；测试内起真实 loopback 节点）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi --test sync_ffi   # 3 passed
+cargo test --offline -p chat-ffi                   # 42 passed（既有 39 继续通过）
+~~~
+
+### 证据
+
+- `sync_ffi::open_is_idle_until_start_and_status_tracks_applied_entries`：open 后 status = idle /
+  applied_total 0（**open 不自动启动**）→ 节点追加 2 条 → start 后轮询到 applied_total >= 2、
+  last_error_code 为空、rounds >= 1 → stop 后 state = stopped、stopped_reason = stop_requested →
+  停止后再追加一条并等待 400 ms，applied_total **不再增长**、state 仍是 stopped。
+- `sync_ffi::uninitialized_cursor_fails_explicitly_on_open`：另一个已在节点登记但**没有本地游标**的群 →
+  open 直接 `INVALID_STATE_TRANSITION`（不构造运行时、不触网）。
+- `sync_ffi::shutdown_is_idempotent_and_closes_the_object`：运行中 shutdown → is_open = false；
+  再 shutdown 一次无副作用；start/stop/status 全部 `CORE_CLOSED`；随后另一个写者能重新打开该库
+  （说明库锁确实释放了）。
+
+### 已知限制
+
+1. **单群单运行时**：对象绑定一个群；同群多运行时没有互斥（core 侧限制不变）。
+2. **状态是轮询式**：没有事件回调，界面需要按需 `status()`。
+3. **core 侧既有语义不变**：作者签名不重复验证、无 MLS 内层应用、持久化复用 `mls_group_state`/`mls_record`。
+4. **同步阻塞**：start/stop/status 都在 FFI 的 `Mutex` 内串行；stop 会等当前那一轮网络请求结束。
+5. **一次只能有一个 SyncFfi 持有该库的运行时**：启动期间库被运行时独占，其它 FFI 对象要等 stop/shutdown。
+6. **`node_public_key_hex` 必填**：运行时拒绝未固定节点公钥的配置（core 的 `SyncRuntimeConfig::validate` 语义）。
+

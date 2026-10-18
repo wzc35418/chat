@@ -10,7 +10,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 chat-core.workspace = true
 chat-identity.workspace = true
+# SYNC-003：常驻同步对象要自己装配 NodeClient 并读持久身份种子/拉取游标。
+chat-node-client = { path = "../node-client" }
 chat-protocol.workspace = true
+chat-storage.workspace = true
 rand.workspace = true
 uniffi.workspace = true
 thiserror.workspace = true

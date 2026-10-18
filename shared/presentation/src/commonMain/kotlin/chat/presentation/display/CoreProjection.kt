@@ -299,3 +299,30 @@ fun summarizeMessageAttachments(messageId: String, attachmentIds: List<String>):
             detail = messageId.take(12) + "… → " + attachmentIds.joinToString("、") { it.take(12) + "…" },
         )
     }
+
+/** 消息附件卡片（界面用）：名称/大小/状态/是否可下载，全部来自真实记录。 */
+data class AttachmentCard(
+    val attachmentId: String,
+    val displayName: String,
+    val sizeLabel: String,
+    val stateLabel: String,
+    val downloadable: Boolean,
+)
+
+fun chat.api.LocalAttachment.toCard(): AttachmentCard = AttachmentCard(
+    attachmentId = attachmentId,
+    displayName = displayName,
+    sizeLabel = formatBytes(plainSize) + " / " + chunkCount + " 块",
+    stateLabel = toBadge().label,
+    downloadable = toBadge().downloadable,
+)
+
+/** 卡片列表：未知/已删除的附件不会出现在这里（records 已跳过）。 */
+fun chat.api.LocalAttachment.toCards(list: List<chat.api.LocalAttachment>): List<AttachmentCard> =
+    list.map { it.toCard() }
+
+private fun formatBytes(bytes: Long): String = when {
+    bytes >= 1_048_576 -> (bytes / 1_048_576).toString() + " MiB"
+    bytes >= 1024 -> (bytes / 1024).toString() + " KiB"
+    else -> bytes.toString() + " B"
+}

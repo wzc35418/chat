@@ -484,3 +484,179 @@ async fn start_endpoint_validates_configuration() {
     })
     .await;
 }
+#[tokio::test]
+async fn snapshot_matches_effective_configuration() {
+    timed(async {
+        let mut config = EndpointConfig::loopback()
+            .with_secret_key([11u8; 32])
+            .with_relay_urls(vec![
+                "https://relay.example.org".to_owned(),
+                "http://127.0.0.1:8080".to_owned(),
+            ]);
+        config.alpn = b"chat/p1/transport/test-alpn".to_vec();
+        let requested_bind = config.bind_addr;
+        let endpoint = start_endpoint(config).await.unwrap();
+        let snapshot = endpoint.snapshot();
+        let expected = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
+        assert_eq!(snapshot.node_id.as_bytes(), expected.as_bytes());
+        assert_eq!(snapshot.bind_addr, requested_bind);
+        assert!(snapshot.local_addr.ip().is_loopback());
+        assert_ne!(snapshot.local_addr.port(), 0);
+        assert!(!snapshot.allow_lan);
+        assert_eq!(snapshot.alpn, b"chat/p1/transport/test-alpn".to_vec());
+        assert_eq!(
+            snapshot.relay_urls,
+            vec![
+                "https://relay.example.org/".to_owned(),
+                "http://127.0.0.1:8080/".to_owned(),
+            ]
+        );
+        assert!(snapshot.relay_enabled);
+        assert!(!snapshot.discovery_enabled);
+        assert!(snapshot.secret_key_configured);
+        // 默认回环配置不启用中继。
+        let plain = start_endpoint(EndpointConfig::loopback()).await.unwrap();
+        assert!(!plain.snapshot().relay_enabled);
+        assert!(plain.snapshot().relay_urls.is_empty());
+        assert!(!plain.snapshot().secret_key_configured);
+        assert!(!plain.snapshot().allow_lan);
+        plain.close().await;
+        endpoint.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn lan_binding_requires_allow_lan() {
+    timed(async {
+        // 未开 allow_lan：非回环绑定被显式拒绝（启动前）。
+        let mut config = EndpointConfig::loopback();
+        config.bind_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+        assert_eq!(
+            config.validate().unwrap_err().code(),
+            "INVALID_TRANSPORT_CONFIG"
+        );
+        assert_eq!(
+            start_endpoint(config).await.unwrap_err().code(),
+            "INVALID_TRANSPORT_CONFIG"
+        );
+        // 开启 allow_lan 后允许绑定（离线可复现的通配地址）。
+        let mut config = EndpointConfig::loopback().with_allow_lan(true);
+        config.bind_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+        let endpoint = start_endpoint(config).await.unwrap();
+        let snapshot = endpoint.snapshot();
+        assert!(snapshot.allow_lan);
+        assert!(snapshot.local_addr.ip().is_unspecified());
+        assert!(!snapshot.relay_enabled);
+        // 通配地址不可直接 dial。
+        assert_eq!(
+            endpoint.address().unwrap_err().code(),
+            "ENDPOINT_START_FAILED"
+        );
+        endpoint.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn relay_configuration_is_validated_at_startup() {
+    timed(async {
+        for urls in [
+            vec!["ftp://relay.example.org/".to_owned()],
+            vec!["http://relay.example.org/".to_owned()],
+            vec!["https://user:pass@relay.example.org/".to_owned()],
+            vec!["not a url".to_owned()],
+        ] {
+            let config = EndpointConfig::loopback().with_relay_urls(urls);
+            assert_eq!(
+                start_endpoint(config).await.unwrap_err().code(),
+                "INVALID_TRANSPORT_CONFIG"
+            );
+        }
+        // 合法但不可达的中继可以启动端点（中继是可选路径）。
+        let config =
+            EndpointConfig::loopback().with_relay_urls(vec!["https://127.0.0.1:9/".to_owned()]);
+        let endpoint = start_endpoint(config).await.unwrap();
+        assert!(endpoint.snapshot().relay_enabled);
+        assert_eq!(
+            endpoint.snapshot().relay_urls,
+            vec!["https://127.0.0.1:9/".to_owned()]
+        );
+        // 回环 http 中继被接受。
+        let local =
+            EndpointConfig::loopback().with_relay_urls(vec!["http://127.0.0.1:8080".to_owned()]);
+        start_endpoint(local).await.unwrap().close().await;
+        endpoint.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn unreachable_relay_does_not_break_loopback_connection() {
+    timed(async {
+        let relay = vec!["https://127.0.0.1:9/".to_owned()];
+        let alice = start_endpoint(
+            EndpointConfig::loopback()
+                .with_secret_key([21u8; 32])
+                .with_relay_urls(relay.clone()),
+        )
+        .await
+        .unwrap();
+        let bob = start_endpoint(
+            EndpointConfig::loopback()
+                .with_secret_key([22u8; 32])
+                .with_relay_urls(relay),
+        )
+        .await
+        .unwrap();
+        assert!(alice.snapshot().relay_enabled);
+        assert!(bob.snapshot().relay_enabled);
+        let (alice_conn, bob_conn) = connected_pair(&alice, &bob).await;
+        let mut alice_stream = alice_conn.open_stream(IO_TIMEOUT).await.unwrap();
+        let alice_session = session(alice.node_id(), bob.node_id(), 0xa1, 0xb2);
+        let bob_session = session(bob.node_id(), alice.node_id(), 0xb2, 0xa1);
+        let mut retry = retry_tracker();
+        let payload = b"relay-independent".to_vec();
+        assert!(
+            alice_stream
+                .send_frame(
+                    SendFrameRequest {
+                        session: &alice_session,
+                        frame_id: 1,
+                        payload: &payload,
+                        budget: send_budget(),
+                        retry: &mut retry,
+                        now_unix_ms: 0,
+                    },
+                    IO_TIMEOUT,
+                )
+                .await
+                .unwrap()
+                .is_sent()
+        );
+        let mut bob_stream = bob_conn.accept_stream(IO_TIMEOUT).await.unwrap();
+        let mut receiver = PeerFrameReceiver::new(&bob_session, receiver_limits()).unwrap();
+        let received = bob_stream
+            .receive_frame(
+                &bob_session,
+                &mut receiver,
+                ReceiveBudget::DEFAULT,
+                IO_TIMEOUT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            received,
+            ReceiveOutcome::Frame {
+                frame_id: 1,
+                payload,
+                records: 1
+            }
+        );
+        alice_conn.close(b"done");
+        bob_conn.close(b"done");
+        alice.close().await;
+        bob.close().await;
+    })
+    .await;
+}

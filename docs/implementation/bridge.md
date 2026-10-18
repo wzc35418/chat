@@ -843,6 +843,71 @@ cargo test --offline -p chat-core -p chat-ffi                # 155 + 39 passed�
 4. **只做提交与接受**：不拉取/不对账别人的条目（SYNC 侧）、不重试队列、不投递 Welcome。
 5. `node_public_key_hex` 只影响提交时的端点固定；回执验签用回执自带公钥（这是 NODE-006 的既定语义）。
 
+## 常驻同步 FFI 契约（SyncFfi，2026-10-18，Windows x64）
+
+代码：[crates/ffi/src/sync_ffi.rs](../../crates/ffi/src/sync_ffi.rs)（新，薄封装 core 的 `SyncRuntime`）；
+测试：[crates/ffi/tests/sync_ffi.rs](../../crates/ffi/tests/sync_ffi.rs)（3 个用例，真 axum 节点 + 真临时库 + 全程经 FFI）。
+
+### 对象与方法
+
+~~~text
+SyncFfi::open(database_path, master_key_hex, endpoint_url, node_id, node_public_key_hex, group_id)
+    -> Arc<SyncFfi>      // 构造：装配 NodeClient + 校验游标；**不启动**
+start() -> SyncStatusFfi
+stop() -> SyncStatusFfi
+status() -> SyncStatusFfi
+is_open() -> bool        group_id() -> String        shutdown()
+SyncStatusFfi { state, applied_total, last_error_code, next_attempt_at_ms,
+                resync_required, rounds, stopped_reason }
+~~~
+
+### 接线要点
+
+- **设备身份复用持久身份**：open 时从库里 `load_identity_seeds` 派生设备签名钥（与 identity 同一派生函数），
+  因此节点看到的设备 ID 与库里一致；未入库身份 → `INVALID_STATE_TRANSITION`。
+- **游标先校验**：该群拉取游标未初始化 → `INVALID_STATE_TRANSITION`（起点必须来自可信回执）。
+- **open 不启动**：start 之前 status 恒为 idle（applied_total 0）；start 才起常驻线程。
+- **库锁不跨调用持有**：装配完立刻释放库句柄，运行时自己开/关库；stop 后交回的句柄也立刻释放。
+- **状态全是标量**：计数/稳定码/时间戳，不含任何密钥或正文。
+
+### 错误码（冻结）
+
+| 情形 | code |
+|---|---|
+| 已关闭 | `CORE_CLOSED` |
+| 未入库身份 / 游标未初始化 / 重复 start | `INVALID_STATE_TRANSITION` |
+| 主密钥/端点/公钥/群 ID 非法 | `INVALID_INPUT` / `INVALID_TARGET` |
+| 库打不开、密钥错、库损坏 | storage 冻结码（`STORAGE_*`） |
+| 运行时启动失败/节点不可达 | `NODE_UNAVAILABLE` |
+| 运行时内部失败 | `INTERNAL_FAILURE` |
+
+### 复现命令
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi --test sync_ffi   # 3 passed
+cargo test --offline -p chat-ffi                   # 42 passed（既有 39 继续通过）
+~~~
+
+### 证据
+
+- `sync_ffi::open_is_idle_until_start_and_status_tracks_applied_entries`：open 后 idle/applied_total 0 →
+  节点追加 2 条 → start 后 applied_total >= 2、rounds >= 1、无错误码 → stop 后 stopped/stop_requested →
+  停止后再追加一条，applied_total 不增长。
+- `sync_ffi::uninitialized_cursor_fails_explicitly_on_open`：无本地游标的群 → `INVALID_STATE_TRANSITION`。
+- `sync_ffi::shutdown_is_idempotent_and_closes_the_object`：shutdown 后 is_open=false、start/stop/status →
+  `CORE_CLOSED`，库锁释放（另一个写者可重新打开），二次 shutdown 无副作用。
+
+### 已知限制
+
+1. **单群单运行时**：对象绑定一个群；同群多运行时无互斥（core 侧既有语义）。
+2. **轮询式状态**：没有事件回调，界面按需 `status()`。
+3. **同步阻塞**：start/stop/status 在 FFI `Mutex` 内串行；stop 会等当前那一轮网络请求结束。
+4. **运行期间库被运行时独占**：同一库的其它 FFI 对象（LocalStore/Groups/Attachments）要等 stop/shutdown。
+5. `node_public_key_hex` 必填（运行时拒绝未固定节点公钥的配置）。
+6. 本对象只暴露 start/stop/status，不含待办队列/重试策略（那属 core 运行时内部）。
+
+
 
 
 

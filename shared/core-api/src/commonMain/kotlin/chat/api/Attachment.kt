@@ -29,5 +29,8 @@ interface AttachmentService {
     /** 解密导出到目标路径，返回写出的明文字节数。 */
     suspend fun exportFile(attachmentId: String, targetPath: String): Long
 
+    /** 批量读附件显示信息（消息附件卡片用）：未知 ID 跳过；不解密内容。 */
+    suspend fun records(attachmentIds: List<String>): List<LocalAttachment>
+
     suspend fun cancel(attachmentId: String): LocalAttachment
 }

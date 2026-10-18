@@ -40,6 +40,12 @@ class NativeAttachmentService(cacheRoot: String) : AttachmentService {
         }
     }
 
+    override suspend fun records(attachmentIds: List<String>): List<LocalAttachment> = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            guard { store.records(attachmentIds) }.map { it.toLocal() }
+        }
+    }
+
     override suspend fun cancel(attachmentId: String): LocalAttachment = mutex.withLock {
         withContext(Dispatchers.IO) { guard { store.cancel(attachmentId).toLocal() } }
     }

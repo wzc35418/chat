@@ -31,8 +31,9 @@ pub mod wire;
 pub mod wire_io;
 
 pub use endpoint::{
-    AcceptLoopHandle, DEFAULT_IO_TIMEOUT_MS, EndpointConfig, MAX_ACCEPT_QUEUE, MAX_IO_TIMEOUT_MS,
-    PeerConnection, TRANSPORT_ALPN, TransportEndpoint, start_endpoint, validate_timeout,
+    AcceptLoopHandle, DEFAULT_IO_TIMEOUT_MS, EndpointConfig, EndpointSnapshot, MAX_ACCEPT_QUEUE,
+    MAX_IO_TIMEOUT_MS, MAX_RELAY_URLS, PeerConnection, TRANSPORT_ALPN, TransportEndpoint,
+    start_endpoint, validate_timeout,
 };
 pub use error::{CODE_TABLE, Result, TransportError};
 pub use frame::{
