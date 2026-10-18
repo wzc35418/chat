@@ -616,33 +616,464 @@ fn build_head(
 
 impl NodeService {
     /// NODE-005：固定 GroupId/协调节点与初始授权设备集合，幂等返回节点签名回执。
+    ///
+    /// 前置条件：actor 是该群 owner 账户的已登记有效设备；创建请求由该设备私钥签名。
+    /// 同 GroupId 同创建摘要返回同一份持久回执；同 GroupId 换内容即 GROUP_ID_CONFLICT。
     pub fn register_group(
         &mut self,
         request: &SignedGroupCreation,
         actor: &AuthenticatedDevice,
         now: u64,
     ) -> NodeResult<GroupRegistration> {
-        let paused = ();
-        let _ = paused;
-        Ok(GroupRegistration {
-            ..request_fixture()
+        validate_timestamp("now", now)?;
+        let creation = &request.creation;
+        creation.validate_shape(self.policy().group_log.max_members)?;
+        let (account_id, state, _version) = self
+            .device_account_state(&actor.device_id)?
+            .ok_or(NodeError::InvalidCredential)?;
+        if state != "active" {
+            return Err(NodeError::DeviceRevoked);
+        }
+        if account_id != actor.account_id || account_id != creation.owner_account_id {
+            return Err(NodeError::PermissionDenied);
+        }
+        let device_key = self.registered_device_key(&actor.device_id)?;
+        request.verify(&device_key)?;
+        let creation_hash = request.digest()?;
+        let control_head = hex_decode::<32>("initial control head", &creation.initial_control_head)?;
+        let policy_version = creation.policy_version;
+        let mls_epoch = creation.mls_epoch;
+        let creation_hash_hex = hex_encode(&creation_hash);
+        let snapshot = NodeSnapshot::take(self);
+        let tx = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // 幂等/冲突：同 GroupId 已登记。
+        let existing: Option<(Vec<u8>, Vec<u8>)> = tx
+            .query_row(
+                "SELECT creation_hash, receipt FROM group_registrations WHERE group_id = ?1",
+                [&creation.group_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((stored_hash, receipt)) = existing {
+            if stored_hash.as_slice() != creation_hash.as_slice() {
+                return Err(NodeError::GroupIdConflict);
+            }
+            let registration: GroupRegistration = serde_json::from_slice(&receipt)?;
+            registration.verify(&snapshot.node_public_key)?;
+            if registration.group_id != creation.group_id
+                || registration.owner_account_id != creation.owner_account_id
+                || registration.creation_hash != creation_hash_hex
+            {
+                return Err(NodeError::StorageUnavailable);
+            }
+            tx.commit()?;
+            return Ok(registration);
+        }
+        // 初始成员必须是 owner 账户下的已登记有效设备。
+        for member in &creation.members {
+            let row: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT account_id, state FROM devices WHERE device_id = ?1",
+                    [&member.device_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (member_account, member_state) = row.ok_or(NodeError::InvalidCredential)?;
+            if member_state != "active" {
+                return Err(NodeError::DeviceRevoked);
+            }
+            if member_account != creation.owner_account_id {
+                return Err(NodeError::PermissionDenied);
+            }
+        }
+        tx.execute(
+            "INSERT INTO groups (group_id, coordinator_id, owner_account_id, last_seq, last_hash, state)
+             VALUES (?1, ?2, ?3, 0, ?4, 'active')",
+            params![
+                creation.group_id,
+                snapshot.node_id,
+                creation.owner_account_id,
+                ZERO_HASH.as_slice()
+            ],
+        )?;
+        let public_policy = serde_json::to_vec(&creation.members)?;
+        tx.execute(
+            "INSERT INTO group_control_heads (group_id, control_head, policy_version, mls_epoch, public_policy)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                creation.group_id,
+                control_head.as_slice(),
+                to_i64("policy version", policy_version)?,
+                to_i64("mls epoch", mls_epoch)?,
+                public_policy
+            ],
+        )?;
+        for member in &creation.members {
+            tx.execute(
+                "INSERT INTO group_members (group_id, device_id, account_id, role, muted, joined_seq, left_seq)
+                 VALUES (?1, ?2, ?3, ?4, 0, 0, NULL)",
+                params![
+                    creation.group_id,
+                    member.device_id,
+                    creation.owner_account_id,
+                    member.role
+                ],
+            )?;
+        }
+        let mut registration = GroupRegistration {
+            group_id: creation.group_id.clone(),
+            owner_account_id: creation.owner_account_id.clone(),
+            coordinator_id: snapshot.node_id.clone(),
+            initial_control_head: creation.initial_control_head.clone(),
+            policy_version,
+            mls_epoch,
+            creation_hash: creation_hash_hex,
+            members: creation.members.clone(),
+            registered_at: now,
+            node_id: snapshot.node_id.clone(),
+            node_public_key: hex_encode(&snapshot.node_public_key),
+            signature: String::new(),
+        };
+        let signature: Signature = snapshot.signing_key.sign(&registration.signing_bytes()?);
+        registration.signature = hex_encode(&signature.to_bytes());
+        tx.execute(
+            "INSERT INTO group_registrations (group_id, creation_hash, registered_at, receipt)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                creation.group_id,
+                creation_hash.as_slice(),
+                to_i64("now", now)?,
+                serde_json::to_vec(&registration)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(registration)
+    }
+
+    /// NODE-006：为合法候选持久分配唯一 seq 与签名回执（单事务、幂等、哈希链）。
+    pub fn append_group_entry(
+        &mut self,
+        group: &str,
+        candidate: &SignedCandidate,
+        actor: &AuthenticatedDevice,
+        now: u64,
+    ) -> NodeResult<AppendResult> {
+        self.append_group_entry_with_checkpoint(group, candidate, actor, now, |_| {})
+    }
+
+    /// 与 [`Self::append_group_entry`] 完全一致，只是允许注入崩溃/审计检查点。
+    ///
+    /// 该钩子只用于“进程在事务中途被杀死时数据库不留半条日志”的证据，不改变生产语义：
+    /// 检查点闭包之外没有任何额外写路径。
+    #[doc(hidden)]
+    pub fn append_group_entry_with_checkpoint(
+        &mut self,
+        group: &str,
+        candidate: &SignedCandidate,
+        actor: &AuthenticatedDevice,
+        now: u64,
+        checkpoint: impl Fn(AppendCheckpoint),
+    ) -> NodeResult<AppendResult> {
+        validate_timestamp("now", now)?;
+        validate_bounded_id("group id", group, MAX_GROUP_ID_BYTES)?;
+        let group_key = GroupId::parse(group).map_err(|_| NodeError::InvalidRequest("group id"))?;
+        let max_ciphertext = self.policy().group_log.max_candidate_ciphertext_bytes;
+        // 路由、作者与演员必须一致：不允许代别人追加，也不允许跨群重放。
+        if candidate.candidate.author_device_id != actor.device_id
+            || candidate.candidate.group_id != group
+        {
+            return Err(NodeError::PermissionDenied);
+        }
+        let author_key = self.registered_device_key(&actor.device_id)?;
+        candidate.verify_author(&author_key, max_ciphertext)?;
+        let candidate_hash = candidate.candidate_hash(max_ciphertext)?;
+        let submission_id = candidate.candidate.submission_id.clone();
+        let kind = candidate.candidate.kind.clone();
+        let declared_control_head = hex_decode::<32>(
+            "expected control head",
+            &candidate.candidate.expected_control_head,
+        )?;
+        let declared_policy = candidate.candidate.policy_version;
+        let declared_epoch = candidate.candidate.mls_epoch;
+        let immutable_entry = serde_json::to_vec(candidate)?;
+        let snapshot = NodeSnapshot::take(self);
+        let tx = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let group_row = load_group(&tx, group)?.ok_or(NodeError::GroupNotFound)?;
+        if group_row.state != "active" || group_row.coordinator_id != snapshot.node_id {
+            return Err(NodeError::PermissionDenied);
+        }
+        // 同 submission：同摘要返回旧结果，相异摘要显式拒绝。
+        let existing: Option<(Vec<u8>, Vec<u8>, Vec<u8>, i64)> = tx
+            .query_row(
+                "SELECT candidate_hash, previous_hash, signed_receipt, group_seq
+                 FROM group_log WHERE group_id = ?1 AND submission_id = ?2",
+                params![group, submission_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if let Some((stored_hash, stored_previous, stored_receipt, stored_seq)) = existing {
+            if stored_hash.as_slice() != candidate_hash.as_slice() {
+                return Err(NodeError::SubmissionIdConflict);
+            }
+            let receipt: AppendResult = serde_json::from_slice(&stored_receipt)?;
+            receipt.verify(&snapshot.node_public_key)?;
+            receipt.verify_candidate(candidate, max_ciphertext)?;
+            let stored_seq =
+                u64::try_from(stored_seq).map_err(|_| NodeError::StorageUnavailable)?;
+            if receipt.seq != stored_seq || receipt.previous_hash != hex_encode(&stored_previous) {
+                return Err(NodeError::StorageUnavailable);
+            }
+            tx.commit()?;
+            return Ok(receipt);
+        }
+        // 权限：演员必须是该群当前有效成员（窗口按 joined_seq/left_seq）。
+        let membership = load_membership(&tx, group, &actor.device_id, group_row.last_seq)?
+            .ok_or(NodeError::PermissionDenied)?;
+        if membership.1.is_some() {
+            return Err(NodeError::PermissionDenied);
+        }
+        // 公开元数据 CAS：head/policy/epoch 必须等于节点当前值。
+        let control = load_control(&tx, group)?.ok_or(NodeError::StorageUnavailable)?;
+        if declared_policy != control.policy_version || declared_control_head != control.control_head {
+            return Err(NodeError::StaleControlHead);
+        }
+        if declared_epoch != control.mls_epoch {
+            return Err(NodeError::StaleEpoch);
+        }
+        let seq = group_row
+            .last_seq
+            .checked_add(1)
+            .ok_or(NodeError::StorageUnavailable)?;
+        let log_hash = log_chain_hash(group, seq, &group_row.last_hash, &candidate_hash);
+        let mut receipt = AppendResult {
+            group_id: group.to_owned(),
+            submission_id,
+            author_device_id: actor.device_id.clone(),
+            seq,
+            candidate_hash: hex_encode(&candidate_hash),
+            previous_hash: hex_encode(&group_row.last_hash),
+            log_hash: hex_encode(&log_hash),
+            accepted_at: now,
+            node_id: snapshot.node_id.clone(),
+            node_public_key: hex_encode(&snapshot.node_public_key),
+            signature: String::new(),
+        };
+        let receipt_bytes = receipt_signing_bytes(
+            Digest::from_bytes(candidate_hash),
+            seq,
+            Digest::from_bytes(group_row.last_hash),
+            group_key,
+        )
+        .map_err(|_| NodeError::InvalidRequest("candidate"))?;
+        let signature: Signature = snapshot.signing_key.sign(receipt_bytes.as_bytes());
+        receipt.signature = hex_encode(&signature.to_bytes());
+        tx.execute(
+            "INSERT INTO group_log
+                 (group_id, group_seq, submission_id, author_device_id, kind, candidate_hash,
+                  previous_hash, log_hash, immutable_entry, signed_receipt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                group,
+                to_i64("seq", seq)?,
+                receipt.submission_id,
+                receipt.author_device_id,
+                kind,
+                candidate_hash.as_slice(),
+                group_row.last_hash.as_slice(),
+                log_hash.as_slice(),
+                immutable_entry,
+                serde_json::to_vec(&receipt)?
+            ],
+        )?;
+        checkpoint(AppendCheckpoint::AfterLogInsert);
+        // 控制候选推进“节点可观察的控制链头”。公开 policy/epoch 不由节点猜测推进。
+        if kind == KIND_CONTROL {
+            tx.execute(
+                "UPDATE group_control_heads SET control_head = ?2 WHERE group_id = ?1",
+                params![group, log_hash.as_slice()],
+            )?;
+        }
+        let updated = tx.execute(
+            "UPDATE groups SET last_seq = ?2, last_hash = ?3 WHERE group_id = ?1",
+            params![group, to_i64("seq", seq)?, log_hash.as_slice()],
+        )?;
+        if updated != 1 {
+            return Err(NodeError::StorageUnavailable);
+        }
+        checkpoint(AppendCheckpoint::BeforeCommit);
+        tx.commit()?;
+        checkpoint(AppendCheckpoint::AfterCommit);
+        Ok(receipt)
+    }
+
+    /// NODE-007：按 seq 分页返回成员窗口内的日志与签名 head。
+    pub fn fetch_group_log(
+        &mut self,
+        group: &str,
+        after: u64,
+        limit: u32,
+        actor: &AuthenticatedDevice,
+    ) -> NodeResult<LogPage> {
+        validate_bounded_id("group id", group, MAX_GROUP_ID_BYTES)?;
+        GroupId::parse(group).map_err(|_| NodeError::InvalidRequest("group id"))?;
+        validate_timestamp("after", after)?;
+        let max_entries = self.policy().group_log.max_page_entries;
+        if limit == 0 || limit > max_entries {
+            return Err(NodeError::InvalidRequest("log page limit"));
+        }
+        let snapshot = NodeSnapshot::take(self);
+        let tx = self.connection_mut().transaction()?;
+        let group_row = load_group(&tx, group)?.ok_or(NodeError::GroupNotFound)?;
+        let control = load_control(&tx, group)?.ok_or(NodeError::StorageUnavailable)?;
+        let membership = load_membership(&tx, group, &actor.device_id, group_row.last_seq)?
+            .ok_or(NodeError::HistoryNotAuthorized)?;
+        let joined_seq = membership.0;
+        let left_seq = membership.1;
+        let from = after.saturating_add(1).max(joined_seq);
+        let upper = match left_seq {
+            Some(left) => Some(to_i64("left seq", left)?),
+            None => None,
+        };
+        let mut entries: Vec<LogEntry> = Vec::new();
+        {
+            let mut statement = tx.prepare(
+                "SELECT group_seq, candidate_hash, previous_hash, log_hash, immutable_entry, signed_receipt
+                 FROM group_log
+                 WHERE group_id = ?1 AND group_seq >= ?2 AND (?3 IS NULL OR group_seq < ?3)
+                 ORDER BY group_seq LIMIT ?4",
+            )?;
+            let mut rows = statement.query(params![
+                group,
+                to_i64("after", from)?,
+                upper,
+                i64::from(limit)
+            ])?;
+            while let Some(row) = rows.next()? {
+                let seq = u64::try_from(row.get::<_, i64>(0)?)
+                    .map_err(|_| NodeError::StorageUnavailable)?;
+                let candidate_hash = column_hash("candidate hash", row.get(1)?)?;
+                let previous_hash = column_hash("previous hash", row.get(2)?)?;
+                let log_hash = column_hash("log hash", row.get(3)?)?;
+                let candidate: SignedCandidate = serde_json::from_slice(&row.get::<_, Vec<u8>>(4)?)?;
+                let receipt: AppendResult = serde_json::from_slice(&row.get::<_, Vec<u8>>(5)?)?;
+                receipt.verify(&snapshot.node_public_key)?;
+                if receipt.seq != seq
+                    || receipt.candidate_hash != hex_encode(&candidate_hash)
+                    || receipt.previous_hash != hex_encode(&previous_hash)
+                    || receipt.log_hash != hex_encode(&log_hash)
+                    || log_hash != log_chain_hash(group, seq, &previous_hash, &candidate_hash)
+                {
+                    return Err(NodeError::StorageUnavailable);
+                }
+                entries.push(LogEntry { candidate, receipt });
+            }
+        }
+        let next_after = entries
+            .last()
+            .map(|entry| entry.receipt.seq)
+            .unwrap_or_else(|| from.saturating_sub(1));
+        let window_end = match left_seq {
+            Some(left) => group_row.last_seq.min(left.saturating_sub(1)),
+            None => group_row.last_seq,
+        };
+        let has_more = entries.len() == limit as usize && next_after < window_end;
+        let head = build_head(
+            &snapshot,
+            group,
+            &group_row.coordinator_id,
+            group_row.last_seq,
+            &group_row.last_hash,
+            &control,
+        )?;
+        tx.commit()?;
+        Ok(LogPage {
+            group_id: group.to_owned(),
+            head,
+            entries,
+            next_after,
+            has_more,
         })
     }
-}
 
-fn request_fixture() -> GroupRegistration {
-    GroupRegistration {
-        group_id: String::new(),
-        owner_account_id: String::new(),
-        coordinator_id: String::new(),
-        initial_control_head: String::new(),
-        policy_version: 0,
-        mls_epoch: 0,
-        creation_hash: String::new(),
-        members: Vec::new(),
-        registered_at: 0,
-        node_id: String::new(),
-        node_public_key: String::new(),
-        signature: String::new(),
+    /// NODE-008：返回绑定 group/seq/hash/control_head/policy/epoch 的节点签名头。
+    pub fn get_group_head(
+        &mut self,
+        group: &str,
+        actor: &AuthenticatedDevice,
+    ) -> NodeResult<SignedLogHead> {
+        validate_bounded_id("group id", group, MAX_GROUP_ID_BYTES)?;
+        GroupId::parse(group).map_err(|_| NodeError::InvalidRequest("group id"))?;
+        let snapshot = NodeSnapshot::take(self);
+        let tx = self.connection_mut().transaction()?;
+        let group_row = load_group(&tx, group)?.ok_or(NodeError::GroupNotFound)?;
+        let control = load_control(&tx, group)?.ok_or(NodeError::StorageUnavailable)?;
+        let membership = load_membership(&tx, group, &actor.device_id, group_row.last_seq)?
+            .ok_or(NodeError::PermissionDenied)?;
+        if membership.1.is_some() {
+            return Err(NodeError::PermissionDenied);
+        }
+        let head = build_head(
+            &snapshot,
+            group,
+            &group_row.coordinator_id,
+            group_row.last_seq,
+            &group_row.last_hash,
+            &control,
+        )?;
+        tx.commit()?;
+        Ok(head)
+    }
+
+    /// 节点运维自检：逐条复核日志链、回执签名与 head 一致（没有 HTTP 端点）。
+    pub fn audit_group_log(&mut self, group: &str) -> NodeResult<u64> {
+        validate_bounded_id("group id", group, MAX_GROUP_ID_BYTES)?;
+        GroupId::parse(group).map_err(|_| NodeError::InvalidRequest("group id"))?;
+        let max_ciphertext = self.policy().group_log.max_candidate_ciphertext_bytes;
+        let snapshot = NodeSnapshot::take(self);
+        let tx = self.connection_mut().transaction()?;
+        let group_row = load_group(&tx, group)?.ok_or(NodeError::GroupNotFound)?;
+        let mut expected_seq = 0_u64;
+        let mut previous = ZERO_HASH;
+        {
+            let mut statement = tx.prepare(
+                "SELECT group_seq, candidate_hash, previous_hash, log_hash, immutable_entry, signed_receipt
+                 FROM group_log WHERE group_id = ?1 ORDER BY group_seq",
+            )?;
+            let mut rows = statement.query([group])?;
+            while let Some(row) = rows.next()? {
+                let seq = u64::try_from(row.get::<_, i64>(0)?)
+                    .map_err(|_| NodeError::StorageUnavailable)?;
+                let candidate_hash = column_hash("candidate hash", row.get(1)?)?;
+                let stored_previous = column_hash("previous hash", row.get(2)?)?;
+                let log_hash = column_hash("log hash", row.get(3)?)?;
+                let candidate: SignedCandidate = serde_json::from_slice(&row.get::<_, Vec<u8>>(4)?)?;
+                let receipt: AppendResult = serde_json::from_slice(&row.get::<_, Vec<u8>>(5)?)?;
+                if seq != expected_seq + 1 || stored_previous != previous {
+                    return Err(NodeError::StorageUnavailable);
+                }
+                if candidate.candidate_hash(max_ciphertext)? != candidate_hash {
+                    return Err(NodeError::StorageUnavailable);
+                }
+                if log_hash != log_chain_hash(group, seq, &previous, &candidate_hash) {
+                    return Err(NodeError::StorageUnavailable);
+                }
+                receipt.verify(&snapshot.node_public_key)?;
+                receipt.verify_candidate(&candidate, max_ciphertext)?;
+                if receipt.seq != seq {
+                    return Err(NodeError::StorageUnavailable);
+                }
+                expected_seq = seq;
+                previous = log_hash;
+            }
+        }
+        if expected_seq != group_row.last_seq || previous != group_row.last_hash {
+            return Err(NodeError::StorageUnavailable);
+        }
+        tx.commit()?;
+        Ok(expected_seq)
     }
 }

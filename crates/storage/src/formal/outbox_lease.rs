@@ -214,8 +214,9 @@ fn bounded_detail(detail: &str) -> String {
         .collect()
 }
 
+/// 第 N 次重试的退避：base × 2^(N-1)，上限 5 分钟。
 fn retry_delay_ms(retry_count: i64) -> i64 {
-    let exponent = u32::try_from(retry_count.clamp(0, 6)).unwrap_or(0);
+    let exponent = u32::try_from(retry_count.saturating_sub(1).clamp(0, 6)).unwrap_or(0);
     let factor = 1i64.checked_shl(exponent).unwrap_or(OUTBOX_RETRY_MAX_MS);
     OUTBOX_RETRY_BASE_MS
         .saturating_mul(factor)
