@@ -13,14 +13,13 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::canonical::{
-    GROUP_CREATION_DOMAIN, GROUP_REGISTRATION_DOMAIN, LOG_CHAIN_DOMAIN, LOG_HEAD_DOMAIN,
+    GROUP_CREATION_DOMAIN, GROUP_REGISTRATION_DOMAIN, LOG_CHAIN_DOMAIN, LOG_HEAD_DOMAIN, bytes32,
     decode_hex_bytes, hex_decode, hex_encode, push_field, sha256, sha256_concat,
     validate_bounded_id, validate_timestamp, verify_ed25519,
 };
 use crate::error::{NodeError, NodeResult};
 use crate::limits::{
-    MAX_ACCOUNT_ID_BYTES, MAX_GROUP_ID_BYTES, MAX_GROUP_ROLE_BYTES, MAX_SUBMISSION_ID_BYTES,
-    MAX_TIMESTAMP,
+    MAX_ACCOUNT_ID_BYTES, MAX_GROUP_ID_BYTES, MAX_GROUP_ROLE_BYTES,
 };
 use crate::services::{AuthenticatedDevice, NodeService, to_i64};
 
@@ -229,8 +228,8 @@ pub struct CandidateControlMetadata {
 /// 传输层候选字段（文本形式，具体规范编码由 PROTOCOL-004 冻结）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupCandidate {
-    pub protocol_major: u16,
-    pub protocol_minor: u16,
+    pub protocol_major: u8,
+    pub protocol_minor: u8,
     pub submission_id: String,
     pub group_id: String,
     pub author_device_id: String,
@@ -479,12 +478,11 @@ pub struct LogPage {
     pub has_more: bool,
 }
 
-struct GroupRow {
-    coordinator_id: String,
-    owner_account_id: String,
-    last_seq: u64,
-    last_hash: [u8; 32],
-    state: String,
+pub(crate) struct GroupRow {
+    pub(crate) coordinator_id: String,
+    pub(crate) last_seq: u64,
+    pub(crate) last_hash: [u8; 32],
+    pub(crate) state: String,
 }
 
 struct ControlRow {
@@ -510,29 +508,23 @@ impl NodeSnapshot {
     }
 }
 
-fn column_hash(field: &'static str, bytes: Vec<u8>) -> NodeResult<[u8; 32]> {
-    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| NodeError::StorageUnavailable)
-        .and_then(|hash| {
-            let _ = field;
-            Ok(hash)
-        })
-}
-
-fn load_group(tx: &rusqlite::Transaction<'_>, group_id: &str) -> NodeResult<Option<GroupRow>> {
-    let row: Option<(String, String, i64, Vec<u8>, String)> = tx
+pub(crate) fn load_group(
+    tx: &rusqlite::Transaction<'_>,
+    group_id: &str,
+) -> NodeResult<Option<GroupRow>> {
+    let row: Option<(String, i64, Vec<u8>, String)> = tx
         .query_row(
-            "SELECT coordinator_id, owner_account_id, last_seq, last_hash, state
+            "SELECT coordinator_id, last_seq, last_hash, state
              FROM groups WHERE group_id = ?1",
             [group_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    row.map(|(coordinator_id, owner_account_id, last_seq, last_hash, state)| {
+    row.map(|(coordinator_id, last_seq, last_hash, state)| {
         Ok(GroupRow {
             coordinator_id,
-            owner_account_id,
             last_seq: u64::try_from(last_seq).map_err(|_| NodeError::StorageUnavailable)?,
-            last_hash: column_hash("last hash", last_hash)?,
+            last_hash: bytes32("last hash", last_hash)?,
             state,
         })
     })
@@ -550,7 +542,7 @@ fn load_control(tx: &rusqlite::Transaction<'_>, group_id: &str) -> NodeResult<Op
         .optional()?;
     row.map(|(control_head, policy_version, mls_epoch)| {
         Ok(ControlRow {
-            control_head: column_hash("control head", control_head)?,
+            control_head: bytes32("control head", control_head)?,
             policy_version: u64::try_from(policy_version)
                 .map_err(|_| NodeError::StorageUnavailable)?,
             mls_epoch: u64::try_from(mls_epoch).map_err(|_| NodeError::StorageUnavailable)?,
@@ -560,7 +552,7 @@ fn load_control(tx: &rusqlite::Transaction<'_>, group_id: &str) -> NodeResult<Op
 }
 
 /// 成员窗口：某设备在某群的有效成员记录（joined_seq, left_seq）。
-fn load_membership(
+pub(crate) fn load_membership(
     tx: &rusqlite::Transaction<'_>,
     group_id: &str,
     device_id: &str,
@@ -955,9 +947,9 @@ impl NodeService {
             while let Some(row) = rows.next()? {
                 let seq = u64::try_from(row.get::<_, i64>(0)?)
                     .map_err(|_| NodeError::StorageUnavailable)?;
-                let candidate_hash = column_hash("candidate hash", row.get(1)?)?;
-                let previous_hash = column_hash("previous hash", row.get(2)?)?;
-                let log_hash = column_hash("log hash", row.get(3)?)?;
+                let candidate_hash = bytes32("candidate hash", row.get(1)?)?;
+                let previous_hash = bytes32("previous hash", row.get(2)?)?;
+                let log_hash = bytes32("log hash", row.get(3)?)?;
                 let candidate: SignedCandidate = serde_json::from_slice(&row.get::<_, Vec<u8>>(4)?)?;
                 let receipt: AppendResult = serde_json::from_slice(&row.get::<_, Vec<u8>>(5)?)?;
                 receipt.verify(&snapshot.node_public_key)?;
@@ -1047,9 +1039,9 @@ impl NodeService {
             while let Some(row) = rows.next()? {
                 let seq = u64::try_from(row.get::<_, i64>(0)?)
                     .map_err(|_| NodeError::StorageUnavailable)?;
-                let candidate_hash = column_hash("candidate hash", row.get(1)?)?;
-                let stored_previous = column_hash("previous hash", row.get(2)?)?;
-                let log_hash = column_hash("log hash", row.get(3)?)?;
+                let candidate_hash = bytes32("candidate hash", row.get(1)?)?;
+                let stored_previous = bytes32("previous hash", row.get(2)?)?;
+                let log_hash = bytes32("log hash", row.get(3)?)?;
                 let candidate: SignedCandidate = serde_json::from_slice(&row.get::<_, Vec<u8>>(4)?)?;
                 let receipt: AppendResult = serde_json::from_slice(&row.get::<_, Vec<u8>>(5)?)?;
                 if seq != expected_seq + 1 || stored_previous != previous {

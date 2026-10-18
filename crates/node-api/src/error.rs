@@ -77,7 +77,9 @@ impl ApiError {
     /// 把服务错误映射为 HTTP 错误。
     pub fn from_node(error: NodeError) -> Self {
         let status = match &error {
-            NodeError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            NodeError::InvalidRequest(_)
+            | NodeError::InvalidCursor
+            | NodeError::InvalidAckBatch => StatusCode::BAD_REQUEST,
             NodeError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             NodeError::InvalidChallenge
             | NodeError::NodeIdMismatch
@@ -87,8 +89,17 @@ impl ApiError {
             | NodeError::InvalidCredential => StatusCode::UNAUTHORIZED,
             NodeError::DeviceRevoked
             | NodeError::InvalidCapability
-            | NodeError::PermissionDenied => StatusCode::FORBIDDEN,
-            NodeError::DeviceLimitExceeded => StatusCode::CONFLICT,
+            | NodeError::PermissionDenied
+            | NodeError::HistoryNotAuthorized => StatusCode::FORBIDDEN,
+            NodeError::GroupNotFound => StatusCode::NOT_FOUND,
+            NodeError::DeviceLimitExceeded
+            | NodeError::GroupIdConflict
+            | NodeError::GroupCapacityExceeded
+            | NodeError::SubmissionIdConflict
+            | NodeError::StaleControlHead
+            | NodeError::StaleEpoch
+            | NodeError::QuotaExceeded
+            | NodeError::ItemIdConflict => StatusCode::CONFLICT,
             NodeError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             NodeError::ChallengeCapacityExceeded
             | NodeError::StorageUnavailable

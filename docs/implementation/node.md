@@ -1,6 +1,6 @@
 # 节点服务、排序日志、密文信箱与文件
 
-阶段：P1 → P5。状态：函数级设计。NODE-001 register_device 与 [api.md](api.md) 的 API-002/API-003 已在 [crates/node-services/src/services.rs](../../crates/node-services/src/services.rs) 与 [crates/node-api](../../crates/node-api) 落地并通过自动化测试（见各函数“实现状态”）；其余 NODE 函数仍未实现。NODE-006 的独立 P0 事务实验见 [节点接受报告](../P0_NODE_ACCEPTANCE.md)。
+阶段：P1 → P5。状态：函数级设计。NODE-001 register_device 与 [api.md](api.md) 的 API-002/API-003 已在 [crates/node-services/src/services.rs](../../crates/node-services/src/services.rs) 与 [crates/node-api](../../crates/node-api) 落地并通过自动化测试（见各函数“实现状态”）。NODE-005~008 群登记/日志（[src/group.rs](../../crates/node-services/src/group.rs)）与 NODE-009~011 密文信箱（[src/mailbox.rs](../../crates/node-services/src/mailbox.rs)）已在同一轮落地，HTTP 端点见 [api.md](api.md)。NODE-006 的独立 P0 事务实验仍见 [节点接受报告](../P0_NODE_ACCEPTANCE.md)。NODE-002~004、NODE-012~016 仍未实现。
 
 节点只持节点签名钥与用户公开凭据，不持用户解密钥。使用独立 SQLite 与密文文件目录；默认一个应用进程。设备/角色元数据可见是设计取舍。节点对 Commit 只能做公开元数据校验，最终加密结果由客户端验证。
 
@@ -87,7 +87,7 @@ register_device(request: RegisterDeviceRequest, invite: RegistrationCapability) 
 - 注册能力撤销只读取 0001 的 `capability_revocations`（按 issuer_id=account_id + capability_id 匹配版本）；本阶段没有对外撤销端点，撤销记录需由后续阶段或运维写入。
 - 挑战只持久化 nonce 的 SHA-256（沿用 0001 表结构），因此客户端必须回送 nonce；挑战不可跨重启重放，但节点重启后旧挑战仍会按过期时间被拒绝。
 - 已登记设备更换凭据（撤销后重新授权）在 P1-03 明确拒绝（`INVALID_CREDENTIAL` / `DEVICE_REVOKED`），设备撤销与重授权流程属后续阶段。
-- NODE-002 publish_discovery、NODE-003～NODE-016、API-005～API-010（含 `run_node` 与事件套接字）仍未实现；[apps/node](../../apps/node) 仍是明确以 78 退出的骨架，不能被当作可部署节点。
+- NODE-002 publish_discovery、NODE-003～NODE-004、NODE-012～NODE-016（密钥包、密文文件、TTL 回收）与 API-005～API-010（逐设备限流、事件套接字、`run_node` 与运行入口）仍未实现；[apps/node](../../apps/node) 仍是明确以 78 退出的骨架，不能被当作可部署节点。NODE-005~011 已有正式实现，但仍是“单进程、单 SQLite 连接串行”的形态，没有部署级运行入口。
 
 通过本函数用例不自动代表整个模块完成。
 
@@ -219,10 +219,24 @@ register_group(request: SignedGroupCreation, actor: AuthenticatedDevice) -> Resu
 
 **完成验收**：
 
-- [ ] 同 ID 同摘要重试返回原结果。
-- [ ] 同 ID 换 owner 拒绝。
+- [x] 同 ID 同摘要重试返回原结果。
+- [x] 同 ID 换 owner 拒绝。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（P1，群日志与信箱轮次）。
+
+实现签名：`NodeService::register_group(&mut self, request: &SignedGroupCreation, actor: &AuthenticatedDevice, now: u64) -> NodeResult<GroupRegistration>`，源码 [crates/node-services/src/group.rs](../../crates/node-services/src/group.rs)。
+
+已实现行为：
+
+1. 请求形状与容量：`GroupCreation::validate_shape` 要求 GroupId 是协议规范文本（PROTOCOL-001）、owner 账户有界、初始控制头为 32 字节摘要、policy_version/mls_epoch 有界、成员数在节点策略 `GroupLogPolicy.max_members` 以内（超限 GROUP_CAPACITY_EXCEEDED）、设备互不重复且恰好一个 owner。
+2. 权限：actor 必须是 owner 账户下的已登记 active 设备（未登记 INVALID_CREDENTIAL、已撤销 DEVICE_REVOKED、跨账户 PERMISSION_DENIED）；创建请求必须由该设备私钥签名（域分隔原文 `chat/p1/node-group-creation/v1`），验签失败 INVALID_SIGNATURE。
+3. 初始成员必须是同一 owner 账户下的已登记 active 设备；跨账户成员 PERMISSION_DENIED，未登记 INVALID_CREDENTIAL。
+4. T4 单事务写入 groups（coordinator_id 固定为本节点、last_seq=0、last_hash=全零）、group_control_heads（初始 head/policy/epoch 与公开成员快照）、group_members（joined_seq=0）与 group_registrations（幂等回执）；回执由节点签名（域分隔 `chat/p1/node-group-registration/v1`）。
+5. 幂等：同 GroupId 同创建摘要（含签名）返回同一份持久回执；同 GroupId 相异内容（含换 owner）返回 GROUP_ID_CONFLICT，不覆盖已登记状态。
+
+验证证据（`cargo test --offline -p chat-node-services -p chat-node-api` 全绿）：`register_group_is_idempotent_and_rejects_conflicts`（服务层：幂等、换内容冲突、跨账户 owner、跨账户成员）、`group_registration_and_append_are_idempotent_over_http`（真 TCP 端到端：登记回执签名可验证、重复登记同回执）。
+
+已知限制：创建能力（API-004 validate_capability）未实现，本阶段以“owner 账户的已登记设备私钥签名”作为创建授权，尚无独立的一次性群创建能力令牌；控制头/epoch 的语义见 NODE-006 的说明。通过本函数用例不自动代表整个模块完成。
 
 <a id="node-006"></a>
 
@@ -255,11 +269,38 @@ append_group_entry(group: GroupId, candidate: SignedCandidate, actor: Authentica
 
 **完成验收**：
 
-- [ ] 两管理员竞争只一个前置状态成功。
-- [ ] 超时重试得到同 seq。
-- [ ] 同 ID 不同字节拒绝。
+- [x] 两管理员竞争只一个前置状态成功。
+- [x] 超时重试得到同 seq。
+- [x] 同 ID 不同字节拒绝。
 
-**实现状态**：正式函数未开始。独立 [`p0_accept`](../../crates/node-services/src/p0_accept.rs) 已通过同 ID 同密文重试、换密文拒绝、8 并发连续 seq、3 个进程终止断点与固定公钥的 P0 Ed25519 回执验证；尚无鉴权、生产密钥托管、正式签名编码和 HTTP，故上方正式验收框仍未勾选。证据见 [节点实验报告](../P0_NODE_ACCEPTANCE.md)。
+**实现状态**：正式函数已实现（P1，群日志与信箱轮次）。实现签名：`NodeService::append_group_entry(&mut self, group: &str, candidate: &SignedCandidate, actor: &AuthenticatedDevice, now: u64) -> NodeResult<AppendResult>`，源码 [crates/node-services/src/group.rs](../../crates/node-services/src/group.rs)；另有 `#[doc(hidden)] append_group_entry_with_checkpoint` 只用于崩溃证据注入，生产语义完全相同。独立 [`p0_accept`](../../crates/node-services/src/p0_accept.rs) 仍是分离的 P0 实验（其 4 个既有测试继续通过），与本正式路径没有共享代码。
+
+已实现行为：
+
+1. 外层签名：候选转成 PROTOCOL-004 的 `UnsignedCandidate` 后用作者设备已登记公钥严格验签（`candidate_signing_bytes` + `verify_strict`），任何字段（群/设备/kind/expected_control_head/policy_version/mls_epoch/密文摘要/控制元数据）变化都会失败。路由 group、候选 group 与 actor 设备三者必须一致，否则 PERMISSION_DENIED。
+2. 幂等：同一 (group, submission_id) 在事务内比对候选摘要；同摘要返回原持久回执（先复核回执签名与“回执-候选”绑定），相异摘要 SUBMISSION_ID_CONFLICT。`group_log` 的 `UNIQUE(group_id, submission_id)` 是该语义的数据库兜底。
+3. 权限：actor 必须是该群当前有效成员（按 `group_members` 的 joined_seq/left_seq 窗口判定）；未加入或已退出的一律 PERMISSION_DENIED。
+4. 公开元数据 CAS：policy_version 与 expected_control_head 必须等于节点当前值（否则 STALE_CONTROL_HEAD），mls_epoch 必须等于当前值（否则 STALE_EPOCH）。接受控制候选时节点只推进“节点可观察的控制链头”（= 该条日志的 log_hash）；policy_version/mls_epoch 不由节点猜测推进（见下方已知限制）。
+5. seq 与哈希链：seq = last_seq + 1（溢出即 STORAGE_FAILURE），previous = 当前 last_hash，`log_hash = SHA-256(域 chat/p1/node-log-chain/v1 || group || seq || previous_hash || candidate_hash)`；回执用 PROTOCOL-006 `receipt_signing_bytes(candidate_hash, seq, previous_hash, group)` 由节点签名。
+6. 原子性：日志行、控制头（仅控制候选）与 groups.last_seq/last_hash 全部在同一个 IMMEDIATE 事务内提交；事务之外没有任何第二轮写。
+
+验证证据（`cargo test --offline -p chat-node-services -p chat-node-api` 全绿）：
+
+- 幂等与相异摘要：`append_is_idempotent_and_rejects_divergent_bytes`、`group_registration_and_append_are_idempotent_over_http`（真 TCP 端到端 409 SUBMISSION_ID_CONFLICT）。
+- 提交后结果丢失用同密文重试同结果：`append_is_idempotent_and_rejects_divergent_bytes`、`crash_after_commit_keeps_result_and_retry_is_idempotent`（子进程在提交后 abort，重启后重试拿回同一 seq/回执）。
+- 并发 ≥8 路序号连续：`concurrent_appends_allocate_contiguous_sequence`（8 线程各自打开同一文件库并发追加，seq 结果恰为 1..=8，audit 结果为 8）。
+- 原子提交、无半条日志：`crash_before_commit_rolls_back_the_whole_log_entry`（在“日志已写入未提交”和“提交前”两个检查点用 `std::process::abort()` 杀死子进程 [src/append_crash_worker.rs](../../crates/node-services/src/append_crash_worker.rs)；重启后 audit 为 0、head.seq 为 0、重试得到 seq 1）。
+- 前置状态竞争：`stale_control_head_and_epoch_are_rejected`（两个管理员基于同一 expected_control_head，第二个 STALE_CONTROL_HEAD；epoch 不符 STALE_EPOCH）。
+- 越权与畸形输入：`unauthorized_appends_are_rejected`（跨群/代签/篡改签名/超上限密文/未知群）、`append_requires_bound_authentication_and_matching_group`（缺鉴权头、换方法/路径/正文、路径与正文 group 不一致、挑战重放）。
+
+已知限制（诚实的不完整状态，不是模拟成功）：
+
+- 节点不解析 MLS 明文，也不做 MLS/DOMAIN 控制结果验证（PROTOCOL-005、DOMAIN-001/002 的控制语义尚未交付）。因此接受控制候选后，节点回执只声明“该条控制日志的位置”，不声明“MLS 状态已按此 commit 推进”。公开的 policy_version/mls_epoch 在本阶段被当作 CAS 常量：客户端应按注册时声明的值签名，直到“客户端验证过的控制应用路径”落地。这是明确的能力缺口，节点不会猜测 epoch += 1。
+- 没有 fanout/投递任务（0001 的 node_jobs 未使用）：NODE-009 的投递由客户端显式调用信箱端点完成，节点不在事务内创建异步任务。
+- 没有按设备/群的速率限制（API-005 未实现），只有策略上限（密文大小、分页条数）与 SQLite 事务串行化。
+- 没有日志裁剪（NODE-016 未实现），因此 LOG_RANGE_PRUNED 路径尚不存在；`fetch_group_log` 对 after 大于 head 的情况返回明确空页。
+
+通过本函数用例不自动代表整个模块完成。
 
 <a id="node-007"></a>
 
@@ -289,10 +330,23 @@ fetch_group_log(group: GroupId, after: u64, limit: u32, actor: AuthenticatedDevi
 
 **完成验收**：
 
-- [ ] 新成员无法拉旧正文/附件。
-- [ ] 已退出设备无权读新条目。
+- [x] 新成员无法拉旧正文/附件。
+- [x] 已退出设备无权读新条目。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（P1，群日志与信箱轮次）。实现签名：`NodeService::fetch_group_log(&mut self, group: &str, after: u64, limit: u32, actor: &AuthenticatedDevice) -> NodeResult<LogPage>`，源码 [crates/node-services/src/group.rs](../../crates/node-services/src/group.rs)。
+
+已实现行为：
+
+1. 只读快照：整个读取（成员窗口 + 日志页 + 控制头 + head）在同一个 deferred 事务内完成，返回的 head 与这一页来自同一快照。
+2. 成员窗口：设备必须在该群有有效成员记录（按 joined_seq/left_seq 取最近一段），否则 HISTORY_NOT_AUTHORIZED；可见范围是 `[max(after+1, joined_seq), left_seq)`，因此后加入的设备读不到自己加入前的条目、已退出的设备读不到退出后的条目。
+3. 分页：limit 必须在 `[1, GroupLogPolicy.max_page_entries]` 内（否则 INVALID_REQUEST），返回 `entries`、下一位置 `next_after` 与 `has_more`；after 大于 head 时返回明确空页而不是回到开头。
+4. 双限：单条密文受 `GroupLogPolicy.max_candidate_ciphertext_bytes` 限制；单页条数受 `max_page_entries` 限制。
+5. 逐条复核：读出的每一条都会重算 candidate 摘要、哈希链与回执签名，任何不一致都返回 STORAGE_FAILURE（不返回被篡改的日志）。
+6. 返回签名 head（NODE-008 的同一份编码）与页码位置；控制恢复材料不走本端点。
+
+验证证据：`log_paging_and_head_are_consistent`（分页两页、head 与页一致、after 越界空页、limit 0/超上限拒绝、非成员 HISTORY_NOT_AUTHORIZED/PERMISSION_DENIED、未知群 GROUP_NOT_FOUND）、`membership_window_limits_history_and_left_device_cannot_append`（真实文件库中把成员窗口改成 joined_seq=3 后只读到 seq 3；改成 joined=1/left=3 后只读到 seq 1,2 且追加被拒绝）、`log_and_head_endpoints_paginate_and_reject_bad_input`（HTTP 端到端分页与 limit/未知参数拒绝）。
+
+已知限制：没有历史裁剪（NODE-016），因此不会返回 LOG_RANGE_PRUNED；没有按字节的分页预算，只有条数上限（单条密文上限远小于正文上限）。通过本函数用例不自动代表整个模块完成。
 
 <a id="node-008"></a>
 
@@ -321,10 +375,20 @@ get_group_head(group: GroupId, actor: AuthenticatedDevice) -> Result<SignedLogHe
 
 **完成验收**：
 
-- [ ] 替换 group/epoch 导致验签失败。
-- [ ] 节点重启同持久头。
+- [x] 替换 group/epoch 导致验签失败。
+- [x] 节点重启同持久头。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（P1，群日志与信箱轮次）。实现签名：`NodeService::get_group_head(&mut self, group: &str, actor: &AuthenticatedDevice) -> NodeResult<SignedLogHead>`，源码 [crates/node-services/src/group.rs](../../crates/node-services/src/group.rs)。
+
+已实现行为：
+
+1. 只读一致快照：groups.last_seq/last_hash 与 group_control_heads 在同一事务内读取。
+2. 规范编码 + 节点签名：head 绑定 `node_id + node_public_key + group_id + coordinator_id + seq + log_hash + control_head + policy_version + mls_epoch`（域分隔 `chat/p1/node-log-head/v1`，与条目回执的 PROTOCOL-006 域严格不同）。
+3. 权限：actor 必须是该群当前有效成员，否则 PERMISSION_DENIED；未知群 GROUP_NOT_FOUND；句柄包含节点 key id（node_public_key），客户端据此固定节点身份。
+
+验证证据：`head_survives_restart_and_binds_group_sequence_and_hash`（重启前后同一 head；篡改 group_id/seq/mls_epoch 都导致验签失败）、`log_paging_and_head_are_consistent`（head 端点与日志页 head 完全相等）、`stale_control_head_and_epoch_are_rejected`（控制候选被接受后 head.control_head 等于该条日志摘要，而 policy/epoch 不被节点猜测推进）。
+
+已知限制：head 声明的是“节点自己的日志链位置与公开控制头”，不是 MLS 状态的证明；WS 提示（API-009）未实现，本端点是对账的唯一正式入口。通过本函数用例不自动代表整个模块完成。
 
 <a id="node-009"></a>
 
@@ -355,11 +419,24 @@ store_mailbox_item(item: AuthorizedMailboxItem, actor: AuthenticatedDevice) -> R
 
 **完成验收**：
 
-- [ ] 开放匿名垃圾投递拒绝。
-- [ ] 重复 item 不重占配额。
-- [ ] 节点重启后仍可拉。
+- [x] 开放匿名垃圾投递拒绝。
+- [x] 重复 item 不重占配额。
+- [x] 节点重启后仍可拉。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（P1，群日志与信箱轮次）。实现签名：`NodeService::store_mailbox_item(&mut self, item: &MailboxItem, actor: &AuthenticatedDevice, now: u64) -> NodeResult<MailboxReceipt>`，源码 [crates/node-services/src/mailbox.rs](../../crates/node-services/src/mailbox.rs)。
+
+已实现行为：
+
+1. 只收密文：`ciphertext_envelope` 是客户端密文（小写十六进制），节点按 `MailboxPolicy.max_item_bytes` 有界解码，不解析明文、不保存文件密钥。
+2. 授权关联（拒绝匿名/无关联投递）：actor 必须是已登记 active 设备；目标设备必须是该群当前有效成员；`source_seq` 必须指向一条已接受日志条目，且该条目作者正是发送设备本人。任一条件不满足即 PERMISSION_DENIED（未知条目、他设备条目、非成员目标都返回同一码，不泄漏存在性）。
+3. 期限：`expires_at` 必须满足 now < expires_at ≤ now + MailboxPolicy.default_ttl_seconds（默认 30 天），否则 INVALID_REQUEST。
+4. 幂等：同 item_id 同内容返回同一份持久回执；同 item_id 相异密文 ITEM_ID_CONFLICT。回执由节点签名（域分隔 `chat/p1/node-mailbox-receipt/v1`），并绑定 item/group/target/sender/source_seq/摘要/字节数/ordinal/时间。
+5. 配额：T4 单事务内按未过期且未消费条目的字节合计核算该目标设备的持久占用，超出 `max_bytes_per_device` 即 QUOTA_EXCEEDED，不静默驱逐旧条目。
+6. 稳定序：ordinal 在事务内分配（全局单调），分页按 ordinal 键集推进。
+
+验证证据：`store_is_idempotent_and_rejects_divergent_payload`、`store_requires_authorized_entry_and_group_membership`（未知 source_seq、非成员目标、代别人条目、过期/超 TTL、伪造 actor）、`quota_is_enforced_and_released_by_ack`（配额硬上限与 ACK 释放）、`mailbox_survives_restart_and_ack_stays_consumed`（重启后仍可拉取）、`mailbox_store_read_and_ack_over_http`（真 TCP 端到端投递与签名回执）。
+
+已知限制：API-004 validate_capability 未实现，因此没有独立的“一次性投递能力令牌”（例如把 Welcome 投给尚未入群的新设备所需的能力）；本阶段只支持“已入群成员 + 已接受条目”的授权关联，Welcome 场景明确未支持。通过本函数用例不自动代表整个模块完成。
 
 <a id="node-010"></a>
 
@@ -389,10 +466,22 @@ read_mailbox_page(actor: AuthenticatedDevice, cursor: Option<MailboxCursor>, lim
 
 **完成验收**：
 
-- [ ] 跨设备游标拒绝。
-- [ ] 重复请求相同材料可重读。
+- [x] 跨设备游标拒绝。
+- [x] 重复请求相同材料可重读。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（P1，群日志与信箱轮次）。实现签名：`NodeService::read_mailbox_page(&mut self, actor: &AuthenticatedDevice, cursor: Option<&str>, limit: u32, now: u64) -> NodeResult<MailboxPage>`，源码 [crates/node-services/src/mailbox.rs](../../crates/node-services/src/mailbox.rs)。
+
+已实现行为：
+
+1. 只作用于自己的信箱：查询目标恒为 actor 设备，客户端不能指定 device id（HTTP 层拒绝未知查询参数）。
+2. 游标复用 PROTOCOL-012/013：`encode_page_cursor/decode_page_cursor` 的 scope 绑定 账户/设备/资源（Mailbox）/排序版本，位置是稳定键（ordinal），AEAD 密钥由节点签名种子派生（跨重启稳定、不外泄）。跨设备、伪造、过期游标一律 INVALID_CURSOR，绝不退化为跳到最新页。
+3. 分页边界：limit 必须在 `[1, MailboxPolicy.max_page_items]` 内（否则 INVALID_REQUEST）；单页还受 `max_page_bytes` 预算约束，超出预算就分页而不是截断单条密文（策略校验保证单条能放进一页）。
+4. 只读不删：读取不改变条目状态，因此同一游标重复请求得到同一批材料。
+5. 过期缺口：只返回仍存储且未过期的条目，并返回 `expired_items`（本设备已过期未消费的条数）作为历史缺口提示。
+
+验证证据：`read_page_paginates_and_rejects_foreign_or_forged_cursors`（两页推进、重复读同材料、跨设备游标、伪造游标、过期游标、limit 0/超上限）、`read_hides_expired_items_and_reports_the_gap`、`mailbox_store_read_and_ack_over_http`（HTTP 端到端 GET 分页与 400 INVALID_CURSOR）。
+
+已知限制：游标放在 GET 查询串里，而 PROTOCOL-013 的 token 上限是 1024 字节，因此本轮把节点查询串上限从 512 放宽到 2048（`limits::MAX_QUERY_BYTES`），否则合法游标无法通过签名原文规范化；整段查询串仍参与签名，仍是明确的有界值。通过本函数用例不自动代表整个模块完成。
 
 <a id="node-011"></a>
 
@@ -422,10 +511,21 @@ ack_mailbox_items(actor: AuthenticatedDevice, ids: Vec<MailboxItemId>) -> Result
 
 **完成验收**：
 
-- [ ] 重复 ACK 不把 quota 减为负。
-- [ ] 他设备 ACK 拒绝。
+- [x] 重复 ACK 不把 quota 减为负。
+- [x] 他设备 ACK 拒绝。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（P1，群日志与信箱轮次）。实现签名：`NodeService::ack_mailbox_items(&mut self, actor: &AuthenticatedDevice, ids: &[String], now: u64) -> NodeResult<AckSummary>`，源码 [crates/node-services/src/mailbox.rs](../../crates/node-services/src/mailbox.rs)。
+
+已实现行为：
+
+1. 批量上限：ids 非空且不超过 `MailboxPolicy.max_ack_batch`（否则 INVALID_ACK_BATCH）；请求内重复 id 去重且保留顺序。
+2. 归属校验：逐个核对 target_device_id，未知条目与他设备条目都返回 PERMISSION_DENIED，不泄漏存在性；只要有一项不满足，整批在写任何消费状态之前就失败（原子拒绝，没有部分消费）。
+3. 幂等：已消费的条目进入 `already_consumed` 且 `released_bytes` 为 0；只有真正从 stored 改为 consumed 的条目计入 `acknowledged` 与释放字节数，所以重复 ACK 不会把配额减成负数。
+4. 结果：返回逐项状态与精确释放字节；消费状态与配额释放同事务（配额由未消费条目的字节合计派生，不存在独立计数器漂移）。
+
+验证证据：`ack_is_idempotent_and_only_acks_own_items`（重复 ACK、他设备条目、未知条目、空批量、超批量、批量混入未知项无部分消费）、`quota_is_enforced_and_released_by_ack`、`mailbox_survives_restart_and_ack_stays_consumed`（重启后仍为已消费且不再释放）、`mailbox_store_read_and_ack_over_http`（HTTP 端到端 200 幂等与 403 越权）。
+
+已知限制：ACK 只表示节点侧条目已消费，与客户端 E2E delivered 语义无关；没有单独的 TTL 回收任务（NODE-016），过期条目仍以 stored 状态保留在原表。通过本函数用例不自动代表整个模块完成。
 
 <a id="node-012"></a>
 

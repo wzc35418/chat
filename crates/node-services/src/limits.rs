@@ -16,7 +16,10 @@ pub const MAX_CAPABILITY_ID_BYTES: usize = 128;
 /// HTTP 方法、规范路径与查询串上限。签名原文只覆盖规范后的这些值。
 pub const MAX_METHOD_BYTES: usize = 16;
 pub const MAX_PATH_BYTES: usize = 512;
-pub const MAX_QUERY_BYTES: usize = 512;
+/// 查询串上限。必须能放下一个完整的分页游标（PROTOCOL-013 的 token 上限是
+/// 1024 字节），否则合法游标无法通过签名原文的规范化；这里仍是有界值，
+/// 且整段原文都参与签名。
+pub const MAX_QUERY_BYTES: usize = 2048;
 
 /// 单个 HTTP 请求正文上限。注册请求本身远小于此值，超出即 413。
 pub const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;

@@ -1,33 +1,53 @@
-//! axum 路由与端点适配（API-006 风格的单一适配层）。
+//! axum 路由与端点适配（API-006 / API-007 风格的单一适配层）。
 //!
 //! 每个 handler 只做：限制正文、解码 DTO、鉴权、调用服务、映射结果。
 //! 领域规则与事务全部在 crates/node-services；本层不重复实现，也不放宽任何安全条件。
+//! 所有已登记设备端点都走同一个 API-003 鉴权：请求签名绑定 method + 规范 path + query + 正文摘要。
+use std::collections::BTreeMap;
+
 use axum::body::Bytes;
-use axum::{Json, Router};
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
 use axum::http::{HeaderMap, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use chat_node_services::auth::{ChallengePurpose, RequestMeta};
+use chat_node_services::services::AuthenticatedDevice;
 use chat_node_services::canonical::sha256;
 use chat_node_services::limits::MAX_HTTP_BODY_BYTES;
 use serde::de::DeserializeOwned;
 
 use crate::dto::{
-    ChallengeRequestDto, ChallengeResponseDto, DeviceRegistrationResponseDto,
-    RegisterDeviceRequestDto, SignedAuthHeaders,
+    AckMailboxItemsRequestDto, AckMailboxItemsResponseDto, AppendGroupEntryRequestDto,
+    AppendGroupEntryResponseDto, ChallengeRequestDto, ChallengeResponseDto,
+    DeviceRegistrationResponseDto, GroupHeadResponseDto, GroupLogResponseDto,
+    GroupRegistrationResponseDto, MailboxPageResponseDto, MailboxReceiptResponseDto,
+    RegisterDeviceRequestDto, RegisterGroupRequestDto, SignedAuthHeaders,
+    StoreMailboxItemRequestDto,
 };
 use crate::error::ApiError;
 use crate::state::AppState;
 
+/// 日志分页默认条数（服务层再按策略上限校验）。
+const DEFAULT_LOG_PAGE_LIMIT: u32 = 50;
+/// 信箱分页默认条数（服务层再按策略上限校验）。
+const DEFAULT_MAILBOX_PAGE_LIMIT: u32 = 20;
+
 /// 构造节点 HTTP 路由。
 ///
-/// 公开端点只有挑战签发；authenticated 端点目前是设备注册。
+/// 公开端点只有挑战签发；其余端点都要求 API-003 已登记设备鉴权。
 /// 逐 IP 限流（API-005）与事件套接字（API-009）尚未在本阶段实现。
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/v1/auth/challenge", post(issue_challenge))
         .route("/v1/devices", post(register_device))
+        .route("/v1/groups", post(register_group))
+        .route("/v1/groups/{group_id}/entries", post(append_group_entry))
+        .route("/v1/groups/{group_id}/log", get(fetch_group_log))
+        .route("/v1/groups/{group_id}/head", get(group_head))
+        .route("/v1/mailbox/items", post(store_mailbox_item))
+        .route("/v1/mailbox", get(read_mailbox_page))
+        .route("/v1/mailbox/ack", post(ack_mailbox_items))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state)
 }
@@ -44,6 +64,75 @@ fn parse_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
         .map_err(|_| ApiError::invalid_request("request body is not valid json for this endpoint"))
 }
 
+/// API-003：用请求头里的设备签名完成鉴权，返回已登记设备身份。
+///
+/// 签名原文由服务层从 method/path/query/正文摘要重建，因此换方法、换路径、换查询、
+/// 换正文、换节点或重放同一挑战都会在鉴权阶段失败。
+fn authenticate(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    method: &str,
+    body: &[u8],
+    now: u64,
+) -> Result<AuthenticatedDevice, ApiError> {
+    let auth_headers = SignedAuthHeaders::from_headers(headers)?;
+    let meta = RequestMeta::canonical(method, uri.path(), uri.query().unwrap_or(""))
+        .map_err(ApiError::from_node)?;
+    let body_hash = sha256(body);
+    let signed = auth_headers.to_signed_auth();
+    state.with_service(|service| {
+        service.authenticate_request(&meta, &body_hash, &signed, ChallengePurpose::RequestAuth, now)
+    })
+}
+
+/// 严格解析查询串：只接受 `key=value`、不重复、字符集受限。
+///
+/// 查询串本身参与请求签名，因此这里不做百分号解码：让线上原文与签名原文只有唯一写法。
+fn parse_query(query: &str) -> Result<BTreeMap<String, String>, ApiError> {
+    let mut parsed = BTreeMap::new();
+    if query.is_empty() {
+        return Ok(parsed);
+    }
+    for pair in query.split('&') {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| ApiError::invalid_request("query parameter must be key=value"))?;
+        if key.is_empty() || parsed.contains_key(key) {
+            return Err(ApiError::invalid_request("query key is empty or repeated"));
+        }
+        if !key
+            .bytes()
+            .chain(value.bytes())
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(ApiError::invalid_request(
+                "query parameter contains unsupported characters",
+            ));
+        }
+        parsed.insert(key.to_owned(), value.to_owned());
+    }
+    Ok(parsed)
+}
+
+fn take_number<T: std::str::FromStr>(parsed: &mut BTreeMap<String, String>, key: &str) -> Result<Option<T>, ApiError> {
+    match parsed.remove(key) {
+        Some(text) => text
+            .parse::<T>()
+            .map(Some)
+            .map_err(|_| ApiError::invalid_request("query parameter is not a valid number")),
+        None => Ok(None),
+    }
+}
+
+fn ensure_no_unknown_query(parsed: &BTreeMap<String, String>) -> Result<(), ApiError> {
+    if parsed.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::invalid_request("unknown query parameter"))
+    }
+}
+
 /// POST /v1/auth/challenge：签发一次性短期挑战。
 pub async fn issue_challenge(
     State(state): State<AppState>,
@@ -53,16 +142,13 @@ pub async fn issue_challenge(
     let request: ChallengeRequestDto = parse_body(&body)?;
     let purpose = request.purpose()?;
     let now = state.now();
-    let challenge =
-        state.with_service(|service| service.issue_auth_challenge(purpose, now))?;
+    let challenge = state.with_service(|service| service.issue_auth_challenge(purpose, now))?;
     Ok(Json(ChallengeResponseDto::new(challenge)).into_response())
 }
 
 /// POST /v1/devices：设备证明持有私钥后幂等注册。
 ///
 /// 顺序：限长 -> 解码 DTO -> 用凭据中的设备公钥验证请求签名（消费挑战）-> 注册。
-/// 请求签名绑定实际请求的 method/path/query 与正文摘要，换方法、换路径、换正文、
-/// 换节点或重放同一挑战都会在鉴权阶段失败。
 pub async fn register_device(
     State(state): State<AppState>,
     uri: Uri,
@@ -94,4 +180,122 @@ pub async fn register_device(
     })?;
     let registration = state.with_service(|service| service.register_device(&request, &proof, now))?;
     Ok(Json(DeviceRegistrationResponseDto::new(registration)).into_response())
+}
+
+/// POST /v1/groups：群登记（NODE-005）。
+pub async fn register_group(
+    State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    ensure_body_bounded(&state, body.len())?;
+    let request: RegisterGroupRequestDto = parse_body(&body)?;
+    let request = request.into_signed()?;
+    let now = state.now();
+    let actor = authenticate(&state, &headers, &uri, "POST", &body, now)?;
+    let registration =
+        state.with_service(|service| service.register_group(&request, &actor, now))?;
+    Ok(Json(GroupRegistrationResponseDto::new(registration)).into_response())
+}
+
+/// POST /v1/groups/{id}/entries：日志追加（NODE-006）。
+pub async fn append_group_entry(
+    State(state): State<AppState>,
+    UrlPath(group_id): UrlPath<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    ensure_body_bounded(&state, body.len())?;
+    let request: AppendGroupEntryRequestDto = parse_body(&body)?;
+    let candidate = request.into_signed()?;
+    let now = state.now();
+    let actor = authenticate(&state, &headers, &uri, "POST", &body, now)?;
+    let result = state
+        .with_service(|service| service.append_group_entry(&group_id, &candidate, &actor, now))?;
+    Ok(Json(AppendGroupEntryResponseDto::new(result)).into_response())
+}
+
+/// GET /v1/groups/{id}/log?after=N&limit=M：分页日志（NODE-007）。
+pub async fn fetch_group_log(
+    State(state): State<AppState>,
+    UrlPath(group_id): UrlPath<String>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let mut query = parse_query(uri.query().unwrap_or(""))?;
+    let after = take_number::<u64>(&mut query, "after")?.unwrap_or(0);
+    let limit = take_number::<u32>(&mut query, "limit")?.unwrap_or(DEFAULT_LOG_PAGE_LIMIT);
+    ensure_no_unknown_query(&query)?;
+    let now = state.now();
+    let actor = authenticate(&state, &headers, &uri, "GET", b"", now)?;
+    let page = state.with_service(|service| service.fetch_group_log(&group_id, after, limit, &actor))?;
+    Ok(Json(GroupLogResponseDto::new(page)).into_response())
+}
+
+/// GET /v1/groups/{id}/head：节点签名 head（NODE-008）。
+pub async fn group_head(
+    State(state): State<AppState>,
+    UrlPath(group_id): UrlPath<String>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let query = parse_query(uri.query().unwrap_or(""))?;
+    ensure_no_unknown_query(&query)?;
+    let now = state.now();
+    let actor = authenticate(&state, &headers, &uri, "GET", b"", now)?;
+    let head = state.with_service(|service| service.get_group_head(&group_id, &actor))?;
+    Ok(Json(GroupHeadResponseDto::new(head)).into_response())
+}
+
+/// POST /v1/mailbox/items：投递密文条目（NODE-009）。
+pub async fn store_mailbox_item(
+    State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    ensure_body_bounded(&state, body.len())?;
+    let request: StoreMailboxItemRequestDto = parse_body(&body)?;
+    let item = request.into_item()?;
+    let now = state.now();
+    let actor = authenticate(&state, &headers, &uri, "POST", &body, now)?;
+    let receipt = state.with_service(|service| service.store_mailbox_item(&item, &actor, now))?;
+    Ok(Json(MailboxReceiptResponseDto::new(receipt)).into_response())
+}
+
+/// GET /v1/mailbox?cursor=...&limit=N：分页读取本设备信箱（NODE-010）。
+pub async fn read_mailbox_page(
+    State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let mut query = parse_query(uri.query().unwrap_or(""))?;
+    let cursor = query.remove("cursor");
+    let limit =
+        take_number::<u32>(&mut query, "limit")?.unwrap_or(DEFAULT_MAILBOX_PAGE_LIMIT);
+    ensure_no_unknown_query(&query)?;
+    let now = state.now();
+    let actor = authenticate(&state, &headers, &uri, "GET", b"", now)?;
+    let page = state.with_service(|service| {
+        service.read_mailbox_page(&actor, cursor.as_deref(), limit, now)
+    })?;
+    Ok(Json(MailboxPageResponseDto::new(page)).into_response())
+}
+
+/// POST /v1/mailbox/ack：幂等 ACK 本设备条目（NODE-011）。
+pub async fn ack_mailbox_items(
+    State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    ensure_body_bounded(&state, body.len())?;
+    let request: AckMailboxItemsRequestDto = parse_body(&body)?;
+    let ids = request.into_ids()?;
+    let now = state.now();
+    let actor = authenticate(&state, &headers, &uri, "POST", &body, now)?;
+    let summary = state.with_service(|service| service.ack_mailbox_items(&actor, &ids, now))?;
+    Ok(Json(AckMailboxItemsResponseDto::new(summary)).into_response())
 }

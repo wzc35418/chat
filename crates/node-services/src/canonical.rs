@@ -89,6 +89,12 @@ pub fn hex_decode<const N: usize>(field: &'static str, value: &str) -> NodeResul
     Ok(out)
 }
 
+/// 读取 SQLite 列里的 32 字节摘要；长度不符即视为存储损坏（显式 STORAGE_FAILURE）。
+pub fn bytes32(field: &'static str, bytes: Vec<u8>) -> NodeResult<[u8; 32]> {
+    let _ = field;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| NodeError::StorageUnavailable)
+}
+
 /// 严格解码可变长度十六进制字段（例如候选密文）；调用方先限制最大长度。
 ///
 /// 拒绝奇数长度、非十六进制字符与超过 `max_bytes` 的输入，绝不截断。

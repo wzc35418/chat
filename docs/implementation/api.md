@@ -1,6 +1,6 @@
 # 节点 HTTP、鉴权、限流与运行入口
 
-阶段：P1 → P5。状态：函数级设计。API-002 issue_auth_challenge 与 API-003 authenticate_request 已随 P1-03 在 [crates/node-api](../../crates/node-api) 与 [crates/node-services](../../crates/node-services) 落地（端点见“已实现端点（P1-03）”），其余函数仍未实现。目标源码：[crates/node-api/src/handlers.rs](../../crates/node-api/src/handlers.rs)。
+阶段：P1 → P5。状态：函数级设计。API-002 issue_auth_challenge 与 API-003 authenticate_request 已随 P1-03 在 [crates/node-api](../../crates/node-api) 与 [crates/node-services](../../crates/node-services) 落地（端点见“已实现端点（P1-03）”）。群日志与信箱的七个端点（NODE-005~011 的 HTTP 适配，对应 API-006 handle_append_http 与 API-007 handle_mailbox_http 的当前范围）已在同一轮落地，见“已实现端点（群日志与信箱）”。其余函数仍未实现。目标源码：[crates/node-api/src/handlers.rs](../../crates/node-api/src/handlers.rs)。
 
 所有 HTTP DTO 与错误结构单独版本化。公开 /capabilities 与 challenge 也限流。默认监听本地端口，通过明确的 TLS 部署入口提供 HTTPS/WSS；管理接口独立且默认关闭。每个 HTTP handler 只鉴权、解码、调用服务、映射结果，不重复实现领域规则。
 
@@ -25,6 +25,33 @@
 - 错误体：`{"schema_version":1,"error":{"code","message"}}`；状态映射：400 INVALID_REQUEST/UNSUPPORTED_SCHEMA_VERSION，401 INVALID_CHALLENGE/NODE_ID_MISMATCH/AUTH_EXPIRED/AUTH_REPLAY/INVALID_SIGNATURE/INVALID_CREDENTIAL，403 DEVICE_REVOKED/INVALID_CAPABILITY/PERMISSION_DENIED，409 DEVICE_LIMIT_EXCEEDED，413 PAYLOAD_TOO_LARGE，429 RATE_LIMITED，503 CHALLENGE_CAPACITY_EXCEEDED/STORAGE_FAILURE，500 MIGRATION_FAILED/NODE_IDENTITY_MISMATCH/INVALID_CONFIG/ENCODING_FAILURE。
 
 本阶段**没有**实现：API-005 逐 IP 限流（`RATE_LIMITED` 只预留错误码）、API-009 事件套接字、API-010 run_node（[apps/node](../../apps/node) 仍是明确 78 退出的骨架）、TLS 终止与管理接口。
+
+## 已实现端点（群日志与信箱）
+
+路由同样由 `build_router` 构造；全部端点都走 API-003 已登记设备鉴权（挑战 + 设备签名），没有任何绕过鉴权的入口，也没有仅凭账户/设备 ID 的查询路径。
+
+|方法/路径|作用|附加签名/约束|
+|---|---|---|
+|`POST /v1/groups`|群登记（NODE-005）|正文内 `device_signature`：创建设备对创建原文的签名|
+|`POST /v1/groups/{group_id}/entries`|日志追加（NODE-006）|正文内 `author_signature`：作者对 PROTOCOL-004 原文的签名；路径 group 必须等于候选 group|
+|`GET /v1/groups/{group_id}/log?after=N&limit=M`|分页日志（NODE-007）|limit 上限取节点策略；after 大于 head 返回明确空页|
+|`GET /v1/groups/{group_id}/head`|节点签名 head（NODE-008）|与条目回执使用不同签名域|
+|`POST /v1/mailbox/items`|密文投递（NODE-009）|必须指向本人已接受的日志条目且目标设备在群内|
+|`GET /v1/mailbox?cursor=...&limit=N`|本设备信箱分页（NODE-010）|游标由 PROTOCOL-012/013 认证并绑定账户/设备|
+|`POST /v1/mailbox/ack`|幂等 ACK（NODE-011）|只作用于本设备条目；批量上限由策略决定|
+
+请求/响应同样带 `schema_version`（当前只接受 1）。校验顺序固定为：正文限长 → DTO 解码 → API-003 鉴权 → 领域调用 → 结果映射；handler 不另开事务、不重复领域规则。
+
+- 查询串：只接受 `key=value`（不重复、无未知键），字符集限定为 `ASCII 字母数字 + _ - .`，不做百分号解码——线上原文就是签名原文，避免同一语义多种写法。为此查询串上限从 512 放宽到 2048（`limits::MAX_QUERY_BYTES`），以便放得下 PROTOCOL-013 的分页游标（token 上限 1024 字节）；整段查询串仍然参与签名。
+- 正文上限：沿用 64 KiB（`limits::MAX_HTTP_BODY_BYTES`，可用 `NodeAuthPolicy.max_request_body_bytes` 收紧）；超出 413 `PAYLOAD_TOO_LARGE`。
+- 单条候选密文上限：`GroupLogPolicy.max_candidate_ciphertext_bytes`（默认 16 KiB，密文以十六进制出现在 JSON 中，因此小于正文上限）；超出 413 `PAYLOAD_TOO_LARGE`。
+- 稳定错误码（新增，全部登记在此处）：
+  - 400 `INVALID_CURSOR`（游标非法/过期/不属于本设备）、`INVALID_ACK_BATCH`（空批量或超上限）。
+  - 403 `HISTORY_NOT_AUTHORIZED`（设备不在该群允许的历史/成员窗口内）。
+  - 404 `GROUP_NOT_FOUND`（群不存在或不由本节点协调）。
+  - 409 `GROUP_ID_CONFLICT`、`GROUP_CAPACITY_EXCEEDED`、`SUBMISSION_ID_CONFLICT`、`STALE_CONTROL_HEAD`、`STALE_EPOCH`、`QUOTA_EXCEEDED`、`ITEM_ID_CONFLICT`。
+- 复用既有码：401 `INVALID_CHALLENGE/NODE_ID_MISMATCH/AUTH_EXPIRED/AUTH_REPLAY/INVALID_SIGNATURE/INVALID_CREDENTIAL`，403 `DEVICE_REVOKED/INVALID_CAPABILITY/PERMISSION_DENIED`，400 `INVALID_REQUEST/UNSUPPORTED_SCHEMA_VERSION`，503 `STORAGE_FAILURE`。
+- 不泄漏语义：未知信箱条目、他人条目、越权目标都统一返回 403 `PERMISSION_DENIED`；日志读取的成员窗口失败返回 403 `HISTORY_NOT_AUTHORIZED`，不返回“该 seq 存在但你看不到”。
 
 ## 函数导航
 
@@ -246,10 +273,21 @@ handle_append_http(request: HttpRequest) -> HttpResponse
 
 **完成验收**：
 
-- [ ] 409 stale head 与403权限可区分。
-- [ ] 相同 submission 异字节409。
+- [x] 409 stale head 与403权限可区分。
+- [x] 相同 submission 异字节409。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：当前范围已实现（P1，群日志与信箱轮次）。本轮交付的是本函数在现有阶段可落地的部分：群的 `POST /v1/groups` 与日志的 `POST /v1/groups/{group_id}/entries` 适配，源码 [crates/node-api/src/handlers.rs](../../crates/node-api/src/handlers.rs)。
+
+已实现行为：
+
+1. 顺序固定：正文限长（超限 413，不进入领域逻辑）→ DTO/`schema_version` 解码 → API-003 鉴权（消费一次性挑战）→ 领域调用 → 映射签名回执或稳定错误。
+2. 路由与正文一致：路径上的 group 与候选自带的 group 不一致即 403 `PERMISSION_DENIED`；作者/演员不一致同样 403。
+3. 错误可区分：`STALE_CONTROL_HEAD`/`STALE_EPOCH`/`SUBMISSION_ID_CONFLICT` 都是 409，权限类是 403，鉴权类（换方法/路径/查询/正文/节点、重放挑战）是 401 —— 客户端可以按状态与错误码分流重试策略。
+4. handler 不开独立事务：日志/控制头/head 的原子性完全由 [NODE-006](node.md#node-006) 的单个 IMMEDIATE 事务保证。
+
+验证证据（`cargo test --offline -p chat-node-api` 全绿）：`group_registration_and_append_are_idempotent_over_http`（登记 + 追加幂等、409 SUBMISSION_ID_CONFLICT、409 STALE_CONTROL_HEAD 与 403 PERMISSION_DENIED 并列出现）、`append_requires_bound_authentication_and_matching_group`（缺鉴权头 400、换方法/路径/正文 401、路径与正文 group 不一致 403、挑战重放 401）、`non_member_is_forbidden_on_group_and_mailbox_endpoints`（未知群 404）。
+
+已知限制：本函数规划中的“路由/字节限额”里的逐设备速率限额（API-005）仍未实现，当前只有正文与密文大小上限；日志端点没有 fanout/事件推送（API-009 未实现）。通过本函数用例不自动代表整个模块完成。
 
 <a id="api-007"></a>
 
@@ -279,11 +317,23 @@ handle_mailbox_http(request: HttpRequest) -> HttpResponse
 
 **完成验收**：
 
-- [ ] GET 不删除。
-- [ ] ACK 只能本人。
-- [ ] 超响应预算分页而非截断密文。
+- [x] GET 不删除。
+- [x] ACK 只能本人。
+- [x] 超响应预算分页而非截断密文。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：当前范围已实现（P1，群日志与信箱轮次）。三个路由 `POST /v1/mailbox/items`、`GET /v1/mailbox`、`POST /v1/mailbox/ack` 已在 [crates/node-api/src/handlers.rs](../../crates/node-api/src/handlers.rs) 落地，分别调用 [NODE-009](node.md#node-009)/[NODE-010](node.md#node-010)/[NODE-011](node.md#node-011)。
+
+已实现行为：
+
+1. actor 绑定：三个路由都要求 API-003 鉴权，查询目标恒为鉴权设备本身，客户端无法指定 device id；`GET /v1/mailbox` 的未知查询键直接 400。
+2. GET 不删除：读取只返回未过期未消费条目并给出下一游标与过期缺口计数，不改变任何状态。
+3. ACK 只能本人：批量在写任何状态前先做归属校验，未知条目与他设备条目统一 403 `PERMISSION_DENIED`，整批原子拒绝。
+4. 分页而非截断：单页受条数上限与字节预算双重约束，超出预算就返回更少条目并给出 `next_cursor`；单条密文自身必须能放进一页（策略启动时校验，否则拒绝启动）。
+5. 游标：PROTOCOL-012/013 认证游标绑定账户/设备/资源/排序版本，跨设备、伪造、过期一律 400 `INVALID_CURSOR`。
+
+验证证据（`cargo test --offline -p chat-node-api` 全绿）：`mailbox_store_read_and_ack_over_http`（投递 → 两页读取 → 跨设备/伪造游标 400 → ACK 幂等 → 他设备与未知条目 403）、`non_member_is_forbidden_on_group_and_mailbox_endpoints`。服务层证据见 NODE-009~011 的“验证证据”。
+
+已知限制：Welcome/未入群设备的投递依赖 API-004 validate_capability（未实现），当前明确不支持；没有按设备的速率限额（API-005）与 TTL 回收任务（NODE-016）。通过本函数用例不自动代表整个模块完成。
 
 <a id="api-008"></a>
 

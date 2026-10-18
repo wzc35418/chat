@@ -25,3 +25,8 @@ serde_json.workspace = true
 [[bin]]
 name = "p0-node-crash-worker"
 path = "src/p0_crash_worker.rs"
+
+# NODE-006 正式追加路径的崩溃/提交证据（仅测试用子进程，见 src/append_crash_worker.rs）。
+[[bin]]
+name = "node-append-crash-worker"
+path = "src/append_crash_worker.rs"
