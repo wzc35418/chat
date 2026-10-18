@@ -137,7 +137,8 @@ fn derived_key_opens_the_formal_store_and_wrong_passphrase_is_rejected() {
             derived.key,
         )
         .unwrap();
-        assert_eq!(store.schema_version(), 2);
+        // 迁移版本随 formal store 演进而增加（本轮新增 0003 identity）。
+        assert!(store.schema_version() >= 2);
         store
             .connection()
             .execute(

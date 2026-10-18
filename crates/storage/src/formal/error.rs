@@ -63,6 +63,9 @@ pub enum StorageError {
     /// 目标状态与当前状态冲突（例如把终态结果改成另一种结果）。
     #[error("invalid state transition: {0}")]
     InvalidStateTransition(String),
+    /// 单账户身份已绑定到另一个账户或另一份密钥材料；不覆盖已有身份。
+    #[error("identity account conflict: {0}")]
+    IdentityAccountConflict(String),
 }
 
 impl StorageError {
@@ -87,6 +90,7 @@ impl StorageError {
             Self::Busy(_) => "STORAGE_BUSY",
             Self::JobLeaseConflict(_) => "JOB_LEASE_CONFLICT",
             Self::InvalidStateTransition(_) => "INVALID_STATE_TRANSITION",
+            Self::IdentityAccountConflict(_) => "IDENTITY_ACCOUNT_CONFLICT",
         }
     }
 }

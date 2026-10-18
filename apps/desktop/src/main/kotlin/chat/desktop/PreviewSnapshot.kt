@@ -12,6 +12,12 @@ import chat.presentation.preview.fillSampleInviteToken
 import chat.presentation.preview.openInvite
 import chat.api.IdentityAccount
 import chat.bridge.createIdentityService
+import chat.bridge.createLocalStore
+import chat.presentation.preview.PreviewStoreState
+import chat.presentation.preview.opened
+import chat.presentation.preview.withConversations
+import chat.presentation.preview.withDraft
+import chat.presentation.preview.withError
 import chat.presentation.display.presentContact
 import chat.presentation.display.presentInvitePreview
 import chat.presentation.preview.PreviewIdentityState
@@ -27,6 +33,8 @@ import chat.ui.PreviewChatScreen
 import kotlinx.coroutines.runBlocking
 import org.jetbrains.skia.EncodedImageFormat
 import java.io.File
+import java.nio.file.Files
+import kotlin.random.Random
 
 /**
  * DS-03/DS-06/DS-07 预览壳的离屏截图入口，与 P0 真链路分开运行。
@@ -95,6 +103,8 @@ fun main() {
 
     val realIdentity = realIdentityState()
     println("real identity state ready=" + realIdentity.ready + " contacts=" + realIdentity.contacts.size)
+    val realStore = realStoreState()
+    println("real store state ready=" + realStore.ready + " drafts=" + realStore.drafts.size)
     val identityRenders = listOf(
         Render(
             "preview-desktop-real-identity",
@@ -114,7 +124,18 @@ fun main() {
         ),
     )
 
-    for (render in renders + identityRenders) {
+    val storeRenders = listOf(
+        Render(
+            "preview-desktop-local-store",
+            1024,
+            860,
+            base,
+            storeState = realStore,
+            storeOpen = true,
+        ),
+    )
+
+    for (render in renders + identityRenders + storeRenders) {
         renderScene(render)
     }
 }
@@ -123,6 +144,34 @@ fun main() {
  * 用**真实身份服务**构造面板状态：两个独立身份互相校验口令。
  * 任何一步失败都退回“服务不可用”的显式状态，不伪造指纹或口令。
  */
+/**
+ * 用真实 formal store 构造“本机存储”面板状态：临时加密库、真实草稿写入、真实会话分页。
+ * 任何一步失败都退回显式错误状态，不伪造数据。
+ */
+private fun realStoreState(): PreviewStoreState {
+    val directory = runCatching { Files.createTempDirectory("chat-preview-store-snap-").toFile() }.getOrNull()
+        ?: return PreviewStoreState().withError("STORAGE_FAILURE", "无法创建临时目录")
+    val key = Random.nextBytes(32).joinToString("") { "%02x".format(it) }
+    val path = File(directory, "snapshot.db").absolutePath
+    return runCatching {
+        runBlocking {
+            val store = createLocalStore()
+            try {
+                store.open(path, key)
+                var state = PreviewStoreState().opened(path, "截图用真实加密库（临时，渲染后删除）。")
+                val conversations = store.listConversations(null, 50)
+                state = state.withConversations(conversations.nextCursor, conversations.items)
+                val operationId = "op:1:" + Random.nextBytes(32).joinToString("") { "%02x".format(it) }
+                val draft = store.createDraft("conv:1:" + "aa".repeat(32), operationId, "## 截图草稿\n本机真实写入，未发送。")
+                state.withDraft(draft)
+            } finally {
+                runCatching { store.close() }
+                directory.deleteRecursively()
+            }
+        }
+    }.getOrElse { error -> PreviewStoreState().withError("UNKNOWN_RESULT", error.message) }
+}
+
 private fun realIdentityState(): PreviewIdentityState {
     val node = "node:1:" + "0a".repeat(32)
     return runCatching {
@@ -158,6 +207,8 @@ private data class Render(
     val fontScale: Float = 1f,
     val identityState: PreviewIdentityState = PreviewIdentityState(),
     val identityOpen: Boolean = false,
+    val storeState: PreviewStoreState = PreviewStoreState(),
+    val storeOpen: Boolean = false,
 )
 
 @OptIn(ExperimentalComposeUiApi::class)
@@ -167,6 +218,8 @@ private fun renderScene(render: Render) {
             initialState = render.state,
             identityState = render.identityState,
             initialIdentityOpen = render.identityOpen,
+            storeState = render.storeState,
+            initialStoreOpen = render.storeOpen,
         )
     }
     try {

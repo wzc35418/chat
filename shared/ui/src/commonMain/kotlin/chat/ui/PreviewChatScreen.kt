@@ -74,6 +74,7 @@ import chat.presentation.preview.PreviewChatState
 import chat.presentation.preview.PreviewContact
 import chat.presentation.preview.PreviewContactState
 import chat.presentation.preview.PreviewIdentityState
+import chat.presentation.preview.PreviewStoreState
 import chat.presentation.preview.PreviewDraftSample
 import chat.presentation.preview.PreviewInviteStep
 import chat.presentation.preview.PreviewInviteValidation
@@ -120,10 +121,15 @@ fun PreviewChatScreen(
     identityState: PreviewIdentityState = PreviewIdentityState(),
     identityHandlers: IdentityHandlers = IdentityHandlers.None,
     initialIdentityOpen: Boolean = false,
+    storeState: PreviewStoreState = PreviewStoreState(),
+    storeHandlers: StoreHandlers = StoreHandlers.None,
+    storeDraftText: String = "",
+    initialStoreOpen: Boolean = false,
 ) {
     var state by remember { mutableStateOf(initialState) }
     // 真实身份面板是独立浮层：默认关闭，由侧栏按钮打开；截图入口可指定初始打开。
     var showIdentity by remember { mutableStateOf(initialIdentityOpen) }
+    var showStore by remember { mutableStateOf(initialStoreOpen) }
 
     MaterialTheme(
         colorScheme = lightColorScheme(
@@ -159,6 +165,7 @@ fun PreviewChatScreen(
                                     onSearch = { state = state.updateSearch(it) },
                                     onOpenInvite = { state = state.openInvite() },
                                     onOpenIdentity = { showIdentity = true },
+                                    onOpenStore = { showStore = true },
                                 )
                                 Box(Modifier.width(1.dp).fillMaxHeight().background(Color(0xFFE1E6E1)))
                                 ChatPane(
@@ -198,10 +205,27 @@ fun PreviewChatScreen(
                                     onSearch = { state = state.updateSearch(it) },
                                     onOpenInvite = { state = state.openInvite() },
                                     onOpenIdentity = { showIdentity = true },
+                                    onOpenStore = { showStore = true },
                                 )
                             }
                         }
                     }
+                }
+            }
+            if (showStore) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color(0x66000000))
+                        .pointerInput(Unit) { detectTapGestures(onTap = { showStore = false }) }
+                        .semantics { contentDescription = "本机存储面板遮罩" },
+                ) {
+                    LocalStorePanel(
+                        state = storeState,
+                        draftText = storeDraftText,
+                        handlers = storeHandlers,
+                        onClose = { showStore = false },
+                    )
                 }
             }
             if (showIdentity) {
@@ -276,6 +300,7 @@ private fun Sidebar(
     onSearch: (String) -> Unit,
     onOpenInvite: () -> Unit,
     onOpenIdentity: () -> Unit,
+    onOpenStore: () -> Unit,
 ) {
     Surface(modifier, color = Color.White) {
         Column(
@@ -337,14 +362,25 @@ private fun Sidebar(
             ) {
                 Text(UiCopy.PREVIEW_ADD_FRIEND)
             }
-            OutlinedButton(
-                onClick = onOpenIdentity,
-                modifier = Modifier.fillMaxWidth().semantics {
-                    contentDescription = "打开真实身份（本机）面板"
-                },
-                contentPadding = PaddingValues(vertical = 8.dp),
-            ) {
-                Text("真实身份（本机）", style = MaterialTheme.typography.labelMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = onOpenIdentity,
+                    modifier = Modifier.weight(1f).semantics {
+                        contentDescription = "打开真实身份（本机）面板"
+                    },
+                    contentPadding = PaddingValues(vertical = 8.dp, horizontal = 6.dp),
+                ) {
+                    Text("真实身份", style = MaterialTheme.typography.labelMedium)
+                }
+                OutlinedButton(
+                    onClick = onOpenStore,
+                    modifier = Modifier.weight(1f).semantics {
+                        contentDescription = "打开本机存储（真实）面板"
+                    },
+                    contentPadding = PaddingValues(vertical = 8.dp, horizontal = 6.dp),
+                ) {
+                    Text("本机存储", style = MaterialTheme.typography.labelMedium)
+                }
             }
             Surface(color = PreviewCanvas, shape = RoundedCornerShape(10.dp)) {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {

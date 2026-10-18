@@ -51,6 +51,10 @@ pub enum SealPurpose {
     PageCursor,
     /// `conversations.protected_metadata`：本地会话摘要（标题、预览、活动时间、本机作者）。
     ConversationMetadata,
+    /// `identity_account.protected_account`：账户/设备种子、公钥与账户展示信息。
+    IdentityAccount,
+    /// `contacts.protected_record`：对端账户、显示名、观测指纹与联系人状态。
+    ContactRecord,
 }
 
 impl SealPurpose {
@@ -64,6 +68,8 @@ impl SealPurpose {
             Self::MessageContent => b"message-content",
             Self::PageCursor => b"page-cursor",
             Self::ConversationMetadata => b"conversation-metadata",
+            Self::IdentityAccount => b"identity-account",
+            Self::ContactRecord => b"contact-record",
         }
     }
 }

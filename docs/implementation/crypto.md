@@ -1,6 +1,6 @@
 # MLS、单群串行状态与附件密码学
 
-阶段：P0 → P3。状态：函数级设计；CRYPTO-001..012 的 MLS/附件语义尚未实现，P0-04 存储主密钥与敏感列加密基础已实现（Windows x64 实测，见下文实现记录）。目标源码：[crates/crypto/src/engine.rs](../../crates/crypto/src/engine.rs) 与 [crates/crypto/src/key_store.rs](../../crates/crypto/src/key_store.rs)。
+阶段：P0 → P3。状态：函数级设计；CRYPTO-011/012 附件分块 AEAD 与 P0-04 存储主密钥/敏感列加密基础已实现（Windows x64 实测，见下文实现记录），CRYPTO-001..010 的 MLS 语义仍未实现。目标源码：[crates/crypto/src/engine.rs](../../crates/crypto/src/engine.rs)、[crates/crypto/src/attachment.rs](../../crates/crypto/src/attachment.rs) 与 [crates/crypto/src/key_store.rs](../../crates/crypto/src/key_store.rs)。
 
 必须使用成熟实现。TxnCryptoProvider 在同一 storage 事务中读写；如果 OpenMLS provider 不能安全接入，则先 ADR 决策并实现幂等日志恢复再继续。PreparedWrite 不是已正式发布的新内存状态。每群串行执行，网络等待不跨持有 SQLite 写事务。
 
@@ -22,6 +22,25 @@ CRYPTO-004/006/007/008 的 MLS 语义仍未实现；本轮实现的是它们共�
 cargo test --offline -p chat-crypto --test formal_master_key   # 5 passed（派生确定性/盐与口令绑定/参数边界/密钥文件长度/store 端到端）
 cargo test --offline -p chat-storage                           # 22 passed（含 AEAD 封装单测与磁盘明文/主密钥扫描）
 ```
+
+## CRYPTO-011/012 附件分块 AEAD 实现记录（2026-10-18，Windows x64）
+
+代码在 [crates/crypto/src/attachment.rs](../../crates/crypto/src/attachment.rs)；上层本地导入/导出在 [crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)（见 [attachments.md](attachments.md#attachments-001)）。
+
+- 密钥与分块：每个附件独立随机 FileKey（32 字节，Drop 清零、Debug 不输出）与随机 FileId（16 字节）；固定 256 KiB 分块，最后一块可 0..=256 KiB，非最后一块必须满块。
+- 密文格式：version(1) || nonce(12) || ciphertext || tag(16)，每块随机 nonce，密文自带认证标签。
+- AAD：域分隔 + file_id + index + total_chunks + plain_length + is_final + format_version 的规范编码；交换块、换文件、伪造最后一块、改声明长度都会认证失败。
+- 边界：单文件上限 25 MiB（100 块）、块数上限 4096、单块密文长度上界；越界或畸形上下文显式返回 CONTENT_TOO_LARGE / INVALID_CHUNK_CONTEXT。
+- 失败语义：认证失败返回 ATTACHMENT_CORRUPTED，不返回任何未认证字节；解密结果用 Zeroizing 缓冲。
+
+复现命令（全程离线）：
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-crypto --test attachment_chunks   # 9 passed
+```
+
+已知限制：未对照 RFC 8439 官方测试向量（实现来自 chacha20poly1305 =0.11.0）；nonce 随机生成而非冻结的计数器方案，唯一性靠 96-bit 随机 + 每附件 100 块量级的概率论证，尚无形式化证明；分块层不校验“块数覆盖”与整文件摘要，这两项由导出流程负责。
 
 ## 函数导航
 
@@ -398,10 +417,10 @@ encrypt_attachment_chunk(key: FileKey, ctx: ChunkContext, plaintext: SecretBytes
 
 **完成验收**：
 
-- [ ] 交换 index/文件/结束边界均验签失败。
-- [ ] 不能对改变明文复用 nonce。
+- [x] 交换 index/文件/结束边界均验签失败：`attachment_chunks::reordered_duplicated_or_foreign_chunks_are_rejected`、`attachment_chunks::forged_final_chunk_is_rejected`（index、total_chunks、is_final、file_id 全在 AAD 内）。
+- [x] 不能对改变明文复用 nonce：`attachment_chunks::multi_chunk_roundtrip_and_size_helpers`（同上下文两次加密的密文不同，nonce 每块随机）。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（Windows x64 实测），代码在 [crates/crypto/src/attachment.rs](../../crates/crypto/src/attachment.rs)。固定 256 KiB 分块，密文格式 version(1)||nonce(12)||ciphertext||tag(16)；AAD = 域分隔 + file_id(16) + index(u32 BE) + total_chunks(u32 BE) + plain_length(u32 BE) + is_final + format_version；非最后一块必须是满块，最后一块 0..=256 KiB；单文件上限 25 MiB、块数上限 4096，越界显式拒绝。证据：`cargo test --offline -p chat-crypto --test attachment_chunks`（9 passed）。限制：未做 RFC 8439 官方测试向量对照（用的是 chacha20poly1305 =0.11.0 成熟实现）；nonce 随机而非常量计数器，未形式化证明唯一性。
 
 <a id="crypto-012"></a>
 
@@ -431,8 +450,8 @@ decrypt_attachment_chunk(key: FileKey, ctx: ChunkContext, chunk: CipherChunk) ->
 
 **完成验收**：
 
-- [ ] 截断/位翻转/块替换拒绝。
-- [ ] 最后一块伪造拒绝。
+- [x] 截断/位翻转/块替换拒绝：`attachment_chunks::truncation_and_impossible_lengths_are_rejected`、`attachment_chunks::single_byte_tampering_is_rejected`、`attachment_chunks::reordered_duplicated_or_foreign_chunks_are_rejected`。
+- [x] 最后一块伪造拒绝：`attachment_chunks::forged_final_chunk_is_rejected`（把非最后一块当成单块文件的最后一块解密必须失败）。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（Windows x64 实测）。解密先按上下文核算期望密文长度（1+12+plain_length+16），再认证解密；失败一律返回 ATTACHMENT_CORRUPTED 或 INVALID_CHUNK_CONTEXT，绝不返回未认证字节，明文用 Zeroizing 缓冲返回。层内不解总数覆盖与完整摘要：这两项由 [ATTACHMENTS-006 export_attachment](attachments.md#attachments-006) 逐块认证 + 全文件摘要复核完成（`attachments::tests` 覆盖）。
 

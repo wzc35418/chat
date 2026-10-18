@@ -14,6 +14,7 @@
 mod cursor;
 mod entry;
 mod error;
+mod identity;
 mod migrations;
 mod outbox_lease;
 mod query;
@@ -25,6 +26,11 @@ pub use entry::{
     VerifiedEntryInput, apply_verified_entry, materialize_session, verified_entry_submission_id,
 };
 pub use error::StorageError;
+pub use identity::{
+    ACCOUNT_SEED_BYTES, ContactRecord, ContactUpsertInput, ConsumedInviteRecord, DEVICE_SEED_BYTES,
+    FINGERPRINT_BYTES, IdentityAccountInput, IdentityAccountRecord, MAX_CONTACTS,
+    MAX_IDENTITY_DISPLAY_NAME_BYTES, PUBLIC_KEY_BYTES, contact_id_for,
+};
 pub use migrations::MigrationReport;
 pub use outbox_lease::{
     JobOutcome, JobResult, JobState, LeasedJob, MAX_CLAIM_BATCH, MAX_CLAIM_BATCH_BYTES,
@@ -276,6 +282,8 @@ pub enum WriteScopeKind {
     Outbox,
     /// T3：已验证条目写入（STORAGE-008），只作用在单个会话上。
     Inbound,
+    /// 身份账户/联系人/邀请消费（P1 身份持久化）：只动身份表，不绑定会话。
+    Identity,
 }
 
 /// 受限写事务的作用域。
@@ -327,6 +335,15 @@ impl WriteScope {
     pub fn outbox() -> Self {
         Self {
             kind: WriteScopeKind::Outbox,
+            conversation_id: None,
+            expected_version: None,
+        }
+    }
+
+    /// 身份持久化作用域（不受单会话限制；只动 identity_account/contacts/consumed_invites）。
+    pub fn identity() -> Self {
+        Self {
+            kind: WriteScopeKind::Identity,
             conversation_id: None,
             expected_version: None,
         }

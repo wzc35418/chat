@@ -26,11 +26,16 @@ use std::fmt;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chat_identity::contact::transition_allowed;
+use chat_identity::{
+    ContactState, DeviceKeys, Fingerprint, IdentityError, LocalAccount, MAX_DISPLAY_NAME_BYTES,
+};
 use chat_protocol::{AccountId, ConversationId, DeviceId, MessageId, OperationId};
+use sha2::{Digest, Sha256};
 use chat_storage::formal::{
-    MAX_ID_BYTES, MAX_SESSION_TITLE_BYTES, KeyProvenance, MessageContent, MessageOrigin,
-    MessageView, PageCursor, ProtectedStorageKey, SessionSummary, StorageError, Store,
-    StoreOptions, ValidatedSendRequest, WriteScope, commit_transaction, materialize_session,
+    MASTER_KEY_BYTES, MAX_ID_BYTES, MAX_SESSION_TITLE_BYTES, KeyProvenance, MessageContent,
+    MessageOrigin, MessageView, PageCursor, ProtectedStorageKey, SessionSummary, StorageError,
+    Store, StoreOptions, ValidatedSendRequest, WriteScope, commit_transaction, materialize_session,
     open_store, persist_send_intent, rollback_transaction,
 };
 
@@ -77,6 +82,10 @@ fn closed() -> anyhow::Error {
 pub fn error_code(error: &anyhow::Error) -> &'static str {
     if let Some(storage) = error.downcast_ref::<StorageError>() {
         return storage.code();
+    }
+    // 身份层错误码由 PROTOCOL-014 冻结（identity 不新增码），直接透传码表字符串。
+    if let Some(identity) = error.downcast_ref::<IdentityError>() {
+        return identity.code().as_str();
     }
     if let Some(core) = error.downcast_ref::<CoreError>() {
         return core.code();
@@ -155,6 +164,93 @@ pub struct ConversationPageView {
     pub next_cursor: Option<String>,
 }
 
+/// 身份账户持久化输入（IDENTITY-001 的本地持久化）。
+///
+/// 两个种子都是机密材料：只在内存中解码，交给 storage 后由 storage 的
+/// `Zeroizing` 缓冲封装落盘；本类型不实现 `Clone`，`Debug` 只打印长度。
+pub struct IdentityAccountInput {
+    /// 显示名（1..=64 字节，不含控制字符）。
+    pub display_name: String,
+    /// 32 字节账户根密钥种子（64 位十六进制）。
+    pub account_seed_hex: String,
+    /// 32 字节设备密钥种子（64 位十六进制）。
+    pub device_seed_hex: String,
+    /// 创建时间（Unix 毫秒；0 表示使用当前时钟）。
+    pub created_at_ms: u64,
+}
+
+impl fmt::Debug for IdentityAccountInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IdentityAccountInput")
+            .field("display_name", &self.display_name)
+            .field("account_seed_len", &self.account_seed_hex.len())
+            .field("device_seed_len", &self.device_seed_hex.len())
+            .field("created_at_ms", &self.created_at_ms)
+            .finish()
+    }
+}
+
+/// 身份账户投影：**不含任何种子/私钥**，可直接交给 UI。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityAccountView {
+    /// 账户 ID（PROTOCOL-001 文本）。
+    pub account_id: String,
+    /// 设备 ID（PROTOCOL-001 文本）。
+    pub device_id: String,
+    /// 显示名。
+    pub display_name: String,
+    /// 分组展示的人工核验指纹（IDENTITY-007）。
+    pub fingerprint: String,
+    /// 创建时间（Unix 毫秒）。
+    pub created_at_ms: u64,
+    /// 本次调用是否命中既有记录（读取路径恒为 `true`）。
+    pub already_existed: bool,
+}
+
+/// 联系人写入请求（IDENTITY-006 的持久化形式）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContactUpsertRequest {
+    /// 对端账户 ID（PROTOCOL-001 文本）。
+    pub account_id: String,
+    /// 显示名（1..=64 字节，不含控制字符）。
+    pub display_name: String,
+    /// 观测/固定指纹（分组或连续十六进制文本）。
+    pub fingerprint: String,
+    /// 联系人状态：requested / accepted / declined / blocked / identity_changed。
+    pub state: String,
+    /// 事件时间（Unix 毫秒，用于列表排序）。
+    pub updated_at_ms: u64,
+}
+
+/// 联系人投影（不含任何密钥材料）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContactView {
+    /// 派生联系人键（幂等键）。
+    pub contact_id: String,
+    /// 对端账户 ID。
+    pub account_id: String,
+    /// 显示名。
+    pub display_name: String,
+    /// 分组展示的指纹文本。
+    pub fingerprint: String,
+    /// 联系人状态。
+    pub state: String,
+    /// 事件时间。
+    pub updated_at_ms: u64,
+    /// 本次调用是否命中既有记录（读取路径恒为 `true`）。
+    pub already_existed: bool,
+}
+
+/// 邀请一次性消费结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumedInviteView {
+    /// 邀请 ID。
+    pub invite_id: String,
+    /// 消费时间（Unix 毫秒）。
+    pub consumed_at_ms: u64,
+}
+
 /// 一页消息。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessagePageView {
@@ -192,34 +288,41 @@ fn decode_hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
-/// 解析 64 位十六进制主密钥（32 字节）；解码缓冲用后立即清零。
-fn decode_master_key(master_key_hex: &str) -> anyhow::Result<ProtectedStorageKey> {
-    let bytes = master_key_hex.as_bytes();
-    if bytes.len() != chat_storage::formal::MASTER_KEY_BYTES * 2 {
-        return Err(invalid_input(
-            "master key must be exactly 64 hexadecimal characters (32 bytes)",
-        ));
+/// 解析 64 位十六进制密钥材料（32 字节）；解码缓冲用后由调用方清零。
+fn decode_seed_hex(value: &str, label: &str) -> anyhow::Result<[u8; MASTER_KEY_BYTES]> {
+    let bytes = value.as_bytes();
+    if bytes.len() != MASTER_KEY_BYTES * 2 {
+        return Err(invalid_input(format!(
+            "{label} must be exactly 64 hexadecimal characters (32 bytes)"
+        )));
     }
-    let mut raw = [0u8; chat_storage::formal::MASTER_KEY_BYTES];
-    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+    let mut raw = [0u8; MASTER_KEY_BYTES];
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    debug_assert!(remainder.is_empty(), "hex length was checked above");
+    for (index, pair) in pairs.iter().enumerate() {
         let Some(high) = decode_hex_digit(pair[0]) else {
             raw.fill(0);
-            return Err(invalid_input("master key contains a non-hexadecimal character"));
+            return Err(invalid_input(format!(
+                "{label} contains a non-hexadecimal character"
+            )));
         };
         let Some(low) = decode_hex_digit(pair[1]) else {
             raw.fill(0);
-            return Err(invalid_input("master key contains a non-hexadecimal character"));
+            return Err(invalid_input(format!(
+                "{label} contains a non-hexadecimal character"
+            )));
         };
         raw[index] = (high << 4) | low;
     }
-    let key = ProtectedStorageKey::try_from_slice(&raw)
-        .map_err(anyhow::Error::new)
-        .map_err(|error: anyhow::Error| {
-            raw.fill(0);
-            error
-        })?;
+    Ok(raw)
+}
+
+/// 解析 64 位十六进制主密钥（32 字节）；解码缓冲用后立即清零。
+fn decode_master_key(master_key_hex: &str) -> anyhow::Result<ProtectedStorageKey> {
+    let mut raw = decode_seed_hex(master_key_hex, "master key")?;
+    let key = ProtectedStorageKey::try_from_slice(&raw).map_err(anyhow::Error::new);
     raw.fill(0);
-    Ok(key)
+    key
 }
 
 fn now_unix_ms() -> anyhow::Result<i64> {
@@ -505,6 +608,223 @@ impl ConversationCore {
             items,
             next_cursor: page.next_cursor.map(|cursor| cursor.to_string()),
         })
+    }
+
+    /// 保存（或更新展示信息）本机身份账户，返回脱敏投影。
+    ///
+    /// 语义与 storage 一致：首次写入插入单行记录；同账户同种子同显示名/指纹幂等
+    /// （不写行、不推进库版本）；同账户不同显示名更新展示信息（创建时间保留）；
+    /// 另一个账户返回 `IDENTITY_ACCOUNT_CONFLICT`，绝不覆盖已绑定身份。
+    pub fn save_identity_account(
+        &mut self,
+        input: IdentityAccountInput,
+    ) -> anyhow::Result<IdentityAccountView> {
+        let mut account_seed = decode_seed_hex(&input.account_seed_hex, "account_seed_hex")?;
+        let mut device_seed = decode_seed_hex(&input.device_seed_hex, "device_seed_hex")?;
+        let display_name = input.display_name.trim().to_owned();
+        let created_at_ms = if input.created_at_ms == 0 {
+            u64::try_from(now_unix_ms()?)
+                .map_err(|_| invalid_input("system clock is outside the supported range"))?
+        } else {
+            input.created_at_ms
+        };
+        let account = LocalAccount::from_seed(&display_name, created_at_ms, &account_seed)
+            .map_err(anyhow::Error::new)?;
+        let account_id = account.account_id();
+        let anchor = account.trust_anchor();
+        let device = DeviceKeys::from_seed(&device_seed);
+        let device_id = device.device_id(account_id);
+        let storage_input = chat_storage::formal::IdentityAccountInput {
+            account_id: account_id.encode(),
+            device_id: device_id.encode(),
+            account_public_key: *anchor.account_public_key(),
+            device_public_key: device.public_key(),
+            account_seed: account_seed.to_vec(),
+            device_seed: device_seed.to_vec(),
+            display_name: account.display_name().to_owned(),
+            fingerprint: *account.fingerprint().as_bytes(),
+            created_at_ms: i64::try_from(created_at_ms)
+                .map_err(|_| invalid_input("created_at_ms is outside the supported range"))?,
+        };
+        account_seed.fill(0);
+        device_seed.fill(0);
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        let record = store
+            .save_identity_account(storage_input)
+            .map_err(anyhow::Error::new)?;
+        Ok(identity_account_view(record))
+    }
+
+    /// 读取本机身份账户投影；未保存时返回 `None`。
+    pub fn load_identity_account(&self) -> anyhow::Result<Option<IdentityAccountView>> {
+        let guard = self.store_guard()?;
+        let store = guard.as_ref().ok_or_else(closed)?;
+        let record = store
+            .load_identity_account()
+            .map_err(anyhow::Error::new)?;
+        Ok(record.map(identity_account_view))
+    }
+
+    /// 按 `contact_id`（由对端账户派生）幂等写入联系人。
+    ///
+    /// 已存在的联系人必须先通过 identity 的冻结状态机（`transition_allowed`），
+    /// 非法迁移返回 `INVALID_STATE_TRANSITION`，绝不把状态静默归一。
+    pub fn upsert_contact(
+        &mut self,
+        request: ContactUpsertRequest,
+    ) -> anyhow::Result<ContactView> {
+        let account = parse_account(&request.account_id)?;
+        let fingerprint = Fingerprint::parse(&request.fingerprint).map_err(anyhow::Error::new)?;
+        let state = parse_contact_state(&request.state)?;
+        let display_name = request.display_name.trim().to_owned();
+        if display_name.is_empty() || display_name.len() > MAX_DISPLAY_NAME_BYTES {
+            return Err(invalid_input(format!(
+                "display_name must be 1..={MAX_DISPLAY_NAME_BYTES} bytes"
+            )));
+        }
+        if display_name.chars().any(char::is_control) {
+            return Err(invalid_input(
+                "display_name must not contain control characters",
+            ));
+        }
+        let account_text = account.encode();
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        if let Some(existing) = store
+            .read_contact(&account_text)
+            .map_err(anyhow::Error::new)?
+        {
+            let previous = parse_contact_state(&existing.state)?;
+            if !transition_allowed(previous, state) {
+                return Err(anyhow::Error::new(IdentityError::InvalidStateTransition {
+                    from: previous,
+                    to: state,
+                }));
+            }
+        }
+        let storage_input = chat_storage::formal::ContactUpsertInput {
+            account_id: account_text,
+            display_name,
+            fingerprint: *fingerprint.as_bytes(),
+            state: state.as_str().to_owned(),
+            updated_at_ms: i64::try_from(request.updated_at_ms)
+                .map_err(|_| invalid_input("updated_at_ms is outside the supported range"))?,
+        };
+        let record = store
+            .upsert_contact(storage_input)
+            .map_err(anyhow::Error::new)?;
+        Ok(contact_view(record))
+    }
+
+    /// 列出全部联系人（按事件时间降序，其次联系人键升序）。
+    pub fn list_contacts(&self) -> anyhow::Result<Vec<ContactView>> {
+        let guard = self.store_guard()?;
+        let store = guard.as_ref().ok_or_else(closed)?;
+        let records = store.list_contacts().map_err(anyhow::Error::new)?;
+        Ok(records.into_iter().map(contact_view).collect())
+    }
+
+    /// 一次性消费邀请；同一 `invite_id` 只允许成功一次。
+    ///
+    /// 第二次调用（以及同 ID 不同摘要）返回 `INVALID_STATE_TRANSITION`，且不写行。
+    /// 本方法只记录“已消费”，**不验证邀请本身**：邀请的签名/期限/信任锚校验由
+    /// IDENTITY-004/005（`chat_identity::verify_invite`）在调用前完成。
+    pub fn consume_invite(&mut self, invite_id: &str) -> anyhow::Result<ConsumedInviteView> {
+        let digest = invite_digest(invite_id);
+        let consumed_at_ms = now_unix_ms()?;
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        let record = store
+            .consume_invite(invite_id, &digest, consumed_at_ms)
+            .map_err(anyhow::Error::new)?;
+        Ok(ConsumedInviteView {
+            invite_id: record.invite_id,
+            consumed_at_ms: u64::try_from(record.consumed_at_ms).unwrap_or(0),
+        })
+    }
+
+    /// 由邀请口令文本派生稳定的一次性邀请 ID（供 `consume_invite` 使用）。
+    ///
+    /// 只校验前缀与长度，不验证签名/期限：派生 ID 与校验口令是两件事，后者属于
+    /// IDENTITY-004/005。同一口令永远得到同一 ID。
+    pub fn invite_id_for_token(invite_token: &str) -> anyhow::Result<String> {
+        let token = invite_token.trim();
+        if !token.starts_with(chat_identity::invite::INVITE_TOKEN_VERSION) {
+            return Err(invalid_input(
+                "invite token must start with the inv1 version prefix",
+            ));
+        }
+        if token.len() > chat_identity::invite::MAX_INVITE_TOKEN_BYTES {
+            return Err(invalid_input(format!(
+                "invite token exceeds {} bytes",
+                chat_identity::invite::MAX_INVITE_TOKEN_BYTES
+            )));
+        }
+        let digest = domain_digest(b"chat/core/invite-token-id/v1", token.as_bytes());
+        Ok(format!("invite-{}", lower_hex(&digest[..16])))
+    }
+}
+
+fn domain_digest(domain: &[u8], value: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(digest.as_slice());
+    bytes
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+        text.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+    }
+    text
+}
+
+fn invite_digest(invite_id: &str) -> [u8; 32] {
+    domain_digest(b"chat/core/invite-consumption/v1", invite_id.as_bytes())
+}
+
+fn parse_contact_state(text: &str) -> anyhow::Result<ContactState> {
+    match text {
+        "requested" => Ok(ContactState::Requested),
+        "accepted" => Ok(ContactState::Accepted),
+        "declined" => Ok(ContactState::Declined),
+        "blocked" => Ok(ContactState::Blocked),
+        "identity_changed" => Ok(ContactState::IdentityChanged),
+        _ => Err(invalid_input(
+            "contact state must be requested/accepted/declined/blocked/identity_changed",
+        )),
+    }
+}
+
+fn identity_account_view(
+    record: chat_storage::formal::IdentityAccountRecord,
+) -> IdentityAccountView {
+    IdentityAccountView {
+        account_id: record.account_id,
+        device_id: record.device_id,
+        display_name: record.display_name,
+        fingerprint: Fingerprint::from_bytes(record.fingerprint).grouped(),
+        created_at_ms: u64::try_from(record.created_at_ms).unwrap_or(0),
+        already_existed: record.already_existed,
+    }
+}
+
+fn contact_view(record: chat_storage::formal::ContactRecord) -> ContactView {
+    ContactView {
+        contact_id: record.contact_id,
+        account_id: record.account_id,
+        display_name: record.display_name,
+        fingerprint: Fingerprint::from_bytes(record.fingerprint).grouped(),
+        state: record.state,
+        updated_at_ms: u64::try_from(record.updated_at_ms).unwrap_or(0),
+        already_existed: record.already_existed,
     }
 }
 

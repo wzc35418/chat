@@ -1,6 +1,6 @@
 # 客户端内核与 Kotlin 业务服务映射
 
-阶段：P1 → P2。状态：函数级设计；竖直切片（`ConversationCore` 的 open / create_draft / draft_status / apply_verified_entry / list_conversations / list_messages / close）已在 Windows x64 实测通过，其余 CORE 函数未开始。目标源码：[crates/core/src/service.rs](../../crates/core/src/service.rs)。
+阶段：P1 → P2。状态：函数级设计；竖直切片（`ConversationCore` 的 open / create_draft / draft_status / apply_verified_entry / list_conversations / list_messages / close）与 P1 身份持久化增量（save_identity_account / load_identity_account / upsert_contact / list_contacts / consume_invite）已在 Windows x64 实测通过，其余 CORE 函数未开始。目标源码：[crates/core/src/service.rs](../../crates/core/src/service.rs)。
 
 本层编排，不把各子模块的事务拆成独立提交。函数名与 Kotlin 的 camelCase 一一对应；底层 TaskId/AttemptId 不必全暴露 UI。start/close 是幂等生命周期，所有查询都来自 Rust 持久真相。身份与群、附件服务分别委托对应章节。
 
@@ -20,6 +20,77 @@
 - [CORE-010 get_draft_status](core.md#core-010)
 - [CORE-011 get_delivery](core.md#core-011)
 - [CORE-012 handle_peer_pretransfer](core.md#core-012)
+
+## 身份持久化 API（core 服务层增量，无计划书编号）
+
+计划书的 CORE-001..012 只覆盖启动/会话/消息/送达；本轮把 IDENTITY-001/002/006 与
+邀请一次性消费接到正式加密存储，在 `ConversationCore` 上**只新增方法**（未改动既有
+签名），实现在 [crates/core/src/service.rs](../../crates/core/src/service.rs)：
+
+~~~text
+save_identity_account(input: IdentityAccountInput) -> Result<IdentityAccountView>
+load_identity_account() -> Result<Option<IdentityAccountView>>
+upsert_contact(request: ContactUpsertRequest) -> Result<ContactView>
+list_contacts() -> Result<Vec<ContactView>>
+consume_invite(invite_id: &str) -> Result<ConsumedInviteView>
+invite_id_for_token(invite_token: &str) -> Result<String>   // 关联辅助函数
+~~~
+
+**职责与输出**：
+
+- `save_identity_account`：把本机账户（单账户/单设备）落到正式库。输入只有显示名、
+  账户种子十六进制、设备种子十六进制与创建时间（0 表示取当前时钟）；账户/设备 ID、
+  公钥与指纹**由 core 用 `chat-identity` 从种子派生**，不信任调用方传入的 ID。
+  显示名与时间由 `LocalAccount::from_seed` 校验（1..=64 字节、非空白、无控制字符、
+  时间 > 0）。
+- `load_identity_account`：返回脱敏投影（账户/设备 ID、显示名、**分组展示的核验指纹**、
+  创建时间），未保存时返回 `None`；不含任何种子或私钥。
+- `upsert_contact`：`account_id` 必须是 PROTOCOL-001 `acct:1:<64 hex>`；`fingerprint`
+  接受分组或连续十六进制（identity `Fingerprint::parse`）；`state` 只用 identity 的
+  五个冻结状态。记录按 storage 派生的 `contact_id` 幂等；**已存在记录必须先通过
+  identity 的冻结迁移表**（`transition_allowed`），非法迁移返回
+  `INVALID_STATE_TRANSITION`，绝不静默归一。
+- `list_contacts`：按事件时间降序、联系人键升序返回脱敏投影。
+- `consume_invite`：在单笔身份作用域事务内记录一次性消费。**第二次（或同 ID 不同
+  摘要）返回 `INVALID_STATE_TRANSITION`**；失败整体回滚，不存在半消费。
+- `invite_id_for_token`：只校验 `inv1` 前缀与长度上限，然后派生稳定的
+  `invite-<32 hex>` 一次性 ID（同一口令永远同 ID）。**不验证签名/期限/信任锚**。
+
+**失败处理**：`INVALID_INPUT`（种子十六进制、显示名长度/控制字符、状态白名单、
+指纹/账户 ID 文本、超长邀请 ID）、`INVALID_TARGET`（identity 的显示名错误映射）、
+`IDENTITY_ACCOUNT_CONFLICT`（已绑定另一账户/另一份密钥材料）、
+`INVALID_STATE_TRANSITION`（非法联系人迁移或邀请已消费）、
+`STATE_CORRUPTED`（密封记录被篡改/错误主密钥）、`CORE_CLOSED`（close 之后）。
+`error_code` 现在也透传 `IdentityError` 的 PROTOCOL-014 冻结码；既有 `StorageError` /
+`CoreError` 映射不变。
+
+**持久化、并发与副作用**：全部写入走 storage 的 `WriteScope::identity` 单笔事务；
+种子只在内存中解码，交给 storage 的副本由 storage 的 `Zeroizing` 缓冲持有并在返回前
+清零；core 不扩散、不记录、不返回种子。core 用 `Mutex` 串行化单写者，跨进程并发由
+`open_store` 的独占锁拒绝。
+
+**完成验收**（本轮已覆盖）：
+
+- [x] 写入后重开（同主密钥）能读回账户与联系人：`identity::identity_account_round_trips_across_reopen`、`identity::contacts_upsert_list_and_enforce_the_identity_state_machine`。
+- [x] 错误主密钥拒绝且不覆盖数据：`identity::identity_duplicate_and_conflict_are_explicit_and_wrong_key_is_rejected`（`STATE_CORRUPTED`，原密钥仍读回同一账户）。
+- [x] 重复保存同内容幂等、不同账户显式冲突：同上（`already_existed` 为真；另一账户 → `IDENTITY_ACCOUNT_CONFLICT`）。
+- [x] 邀请并发/重复消费只成功一次：`identity::invite_consumption_is_one_shot_even_under_concurrent_calls`（4 线程并发只 1 个成功，重开仍为已消费）。
+- [x] 畸形输入与关闭后显式失败：`identity::malformed_identity_inputs_and_closed_core_fail_explicitly`。
+- [ ] Android kill 后重启恢复身份会话（未验证：core 尚不重建 `LocalAccount`，见限制 1）。
+
+**证据**：`cargo test --offline -p chat-core`（本轮实测 lib 9 + identity 5 + p0 2 + service 5 = 21 passed，0 失败；新增的 5 个用例都在 `tests/identity.rs`，其余既有用例未改动）；`cargo test --offline -p chat-storage -p chat-core` 与 `cargo build --locked --offline` 全绿。存储层语义、明文扫描与损坏记录证据见 [storage.md](storage.md) 的“身份/联系人持久化与邀请一次性消费实现记录”段。
+
+**已知限制**：
+
+1. **种子不外流**：本轮不提供把种子读回内存重建 `LocalAccount` 的 trusted-path 方法，
+   因此核心的会话签名/邀请签发路径还没有接到已持久化的身份上（需要后续 trusted-path
+   接口，禁止把种子放进普通 DTO）。`load_identity_account` 只返回脱敏投影。
+2. 设备凭据/撤销集合（IDENTITY-003）未持久化；本轮只保存单设备种子与公钥，多设备与
+   撤销版本留给后续任务。
+3. `consume_invite` 只保证“同一 ID 只成功一次”，**不校验邀请本身**；调用方必须先用
+   `chat_identity::verify_invite`（签名/期限/信任锚/作用域）校验并通过
+   `invite_id_for_token` 派生 ID，否则可以消费任意合法 ID。
+4. core 的并发模型是单写者 `Mutex` + 独占库锁；跨进程同时打开仍返回 `STORAGE_LOCKED`。
 
 <a id="core-001"></a>
 

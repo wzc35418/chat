@@ -1,8 +1,27 @@
 # 文件导入、分块上传、下载和导出
 
-阶段：P2。状态：函数级设计，尚未实现。目标源码：[crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)。
+阶段：P2。状态：函数级设计；本地导入/导出与本地状态机（ATTACHMENTS-001/002/004/006/007 的本地部分）已实现，上传/下载、持久化与含 FileKey 的 E2EE SecretDescriptor 未实现。目标源码：[crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)。
 
 平台 file token 仅代表用户授权的一次访问，不将任意路径传入内核。默认单附件 25 MiB，按完整原文大小计；节点配额按密文实际字节计。文件密钥只在受保护本地记录和 E2EE 描述中，不能放节点 URL 或公开清单。
+
+## 本地导入/导出实现记录（2026-10-18，Windows x64）
+
+代码在 [crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)；分块 AEAD 在 [crates/crypto/src/attachment.rs](../../crates/crypto/src/attachment.rs)（见 [crypto.md CRYPTO-011/012](crypto.md#crypto-011)）。本轮只做本地路径，不发起任何网络请求，也不写节点：
+
+- import_file：只接受平台令牌提供的普通文件且必须声明大小；大于 25 MiB 在读取前拒绝；按 256 KiB 流式读取，逐块用 CRYPTO-011 加密后写入缓存根下的 att-<hex>/chunk-<index>.bin；同时计算明文 SHA-256 与密文摘要；任何失败删除整个未引用缓存目录。大小漂移（流比声明更长/更短）显式 FILE_IO_FAILURE，不静默截断。
+- build_attachment_descriptor：返回只含公开字段的描述符（ID、明文大小、块大小/块数、明文摘要、展示文件名），不含 FileKey 与明文；另有 attachment_manifest 只给密文块数/大小/摘要（TYPES.md 的 PublicBlobDescriptor）。
+- export_attachment：按 index 逐块认证解密到同目录临时文件，全部分块通过且总长与明文摘要都匹配后才 rename 成目标文件；任何失败删除临时文件，不产生未验证成品。
+- attachment_status / cancel_transfer：进程内状态机（staging/imported/uploading/available/downloading/failed/cancelled）；available_chunks 按缓存实际文件计数，transferred_chunks 在网络接入前恒为 0；取消幂等、保留本地缓存与进度，available 状态拒绝取消（TRANSFER_ALREADY_COMPLETE）。
+
+复现命令（全程离线）：
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --lib    # 9 passed（附件本地导入/导出）
+cargo test --offline -p chat-crypto        # 附件分块 9 + 既有用例全绿
+```
+
+已知限制：附件记录只在进程内，重启后缓存视为未引用（需接入 storage 的 attachments 表与 ATTACHMENTS-008 回收）；未知大小流按 fail-closed 显式拒绝（分块 AAD 必须绑定 total_chunks）；上传/下载、持久化进度、磁盘满处理、含 FileKey 的 E2EE SecretDescriptor 与下载能力未实现；导出取消（EXPORT_CANCELLED）未实现（没有导出中的取消入口）。
 
 返回类型与字段约束见 [类型字典](TYPES.md)，事务编号见 [事务和并发约定](TRANSACTIONS.md)，纵向流程见 [关键调用链](FLOWS.md)。所有 Result<T> 表示显式可恢复错误，不允许安全验证失败后继续推进。
 
@@ -47,10 +66,10 @@ import_file(source: FileToken) -> Result<AttachmentId>
 
 **完成验收**：
 
-- [ ] 未知大小流超25 MiB即停止。
-- [ ] 峰值内存受块预算限制。
+- [ ] 未知大小流超25 MiB即停止。（未实现：分块 AAD 必须绑定 total_chunks，未知大小流按 fail-closed 返回 INVALID_FILE_TOKEN，不接受“边读边猜总数”的导入）
+- [ ] 峰值内存受块预算限制。（未用分配器实测；实现按单块 256 KiB 缓冲 + 流式读写，`attachments::tests::oversized_or_misdeclared_streams_stop_at_the_bound` 只证明越界/大小漂移被拒绝且缓存被清理）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（Windows x64 实测）。`import_file` 校验平台令牌与声明大小、25 MiB 上限（读前拒绝）、逐块加密写缓存、明文/密文摘要、失败清理；证据 `cargo test --offline -p chat-core --lib` 的 `import_then_export_roundtrip_and_cache_has_no_plaintext`、`exactly_25_mib_is_accepted_and_oversize_is_rejected`、`oversized_or_misdeclared_streams_stop_at_the_bound`。限制：记录只在内存、重启丢失；未持久化 staging/上传任务（需接入 storage attachments 表与 SYNC-001）；未知大小流不支持。
 
 <a id="attachments-002"></a>
 
@@ -79,10 +98,10 @@ attachment_status(id: AttachmentId) -> Result<AttachmentStatus>
 
 **完成验收**：
 
-- [ ] 取消后可查询。
-- [ ] 进度最大值不超过实际大小。
+- [x] 取消后可查询：`attachments::tests::cancel_transfer_state_machine_preserves_progress`（取消后 attachment_status 仍返回 Cancelled 且缓存块数不变）。
+- [x] 进度最大值不超过实际大小：同一用例与 `import_then_export_roundtrip_and_cache_has_no_plaintext`（available_chunks/transferred_chunks 都被 min 到 chunk_count；网络接入前 transferred_chunks 恒为 0）。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（本地内存状态机）。查询聚合的是本地缓存实际块数与已记录进度，不返回 FileKey；取消是终态之一且可重复查询。限制：无持久化（重启丢失状态）、无网络进度与错误重试信息；PERMISSION_DENIED 需要账户作用域，当前单账户本地库未实现。
 
 <a id="attachments-003"></a>
 
@@ -146,10 +165,10 @@ build_attachment_descriptor(id: AttachmentId) -> Result<SecretDescriptor>
 
 **完成验收**：
 
-- [ ] 节点 API/日志无文件密钥。
-- [ ] 新设备不能拿旧 descriptor 下载历史。
+- [x] 节点 API/日志无文件密钥：`attachments::tests::import_then_export_roundtrip_and_cache_has_no_plaintext`（描述符类型没有密钥字段；attachment_manifest 只含密文摘要；缓存文件里不出现明文摘要/正文）。
+- [ ] 新设备不能拿旧 descriptor 下载历史。（未实现：受限下载能力与设备作用域绑定属于 E2EE SecretDescriptor/能力令牌，本轮未做）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现。只产出公开描述符 AttachmentDescriptor（ID、明文大小、块参数、明文摘要、展示文件名）与公开清单 AttachmentManifest（仅密文块数/大小/摘要）；不含 FileKey 与明文。ATTACHMENTS-004 契约要求的是含文件密钥/受限下载能力的 E2EE SecretDescriptor，本轮未实现，因此不标完整。
 
 <a id="attachments-005"></a>
 
@@ -215,10 +234,10 @@ export_attachment(id: AttachmentId, destination: FileToken) -> Result<ExportRece
 
 **完成验收**：
 
-- [ ] 导出中取消没有假完整文件。
-- [ ] 攻击文件名不能穿越路径。
+- [ ] 导出中取消没有假完整文件。（导出未提供取消入口；失败路径删除同目录临时文件、不产生假完整文件，由 `attachments::tests::tampered_chunks_are_rejected_on_export` 与 `export_rejects_a_digest_mismatch` 覆盖失败语义）
+- [x] 攻击文件名不能穿越路径：`attachments::tests::invalid_inputs_fail_explicitly`（展示名含分隔符/控制字符/过长/./.. 一律 INVALID_DISPLAY_NAME；畸形或穿越形式的附件 ID 一律 ATTACHMENT_NOT_FOUND）与 `cache_paths_derive_only_from_attachment_ids`（缓存路径只由附件 ID 派生，展示名不进路径）。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（本地导出，Windows x64 实测）。逐块认证解密 → 全文件总长与明文 SHA-256 复核 → rename 目标；任何失败删除临时文件。证据：`cargo test --offline -p chat-core --lib`（tampered_chunks_are_rejected_on_export / export_rejects_a_digest_mismatch / empty_file_roundtrip）。限制：无下载来源（只用本地缓存）、无 EXPORT_CANCELLED、无平台受控输出句柄。
 
 <a id="attachments-007"></a>
 
@@ -248,10 +267,10 @@ cancel_transfer(id: AttachmentId) -> Result<TransferStatus>
 
 **完成验收**：
 
-- [ ] 取消/完成同时到达最终状态一致。
-- [ ] 共享附件引用不误删。
+- [ ] 取消/完成同时到达最终状态一致。（未验证：没有网络流与并发完成竞争；当前状态机在单 Mutex 下串行，只有单元级终态语义）
+- [x] 共享附件引用不误删：`attachments::tests::cancel_transfer_state_machine_preserves_progress`（取消只置 cancel_requested，不删除本地缓存块，取消后仍可查询与导出）。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（本地状态机）。已实现：可重复取消幂等、available 拒绝取消（TRANSFER_ALREADY_COMPLETE）、取消保留缓存与进度。限制：无网络流取消、无持久化 cancel_requested、无“与上传完成竞争以耐久结果为准”的竞争模型。
 
 <a id="attachments-008"></a>
 

@@ -83,6 +83,13 @@ import chat.presentation.preview.PreviewInviteStep
 import chat.presentation.preview.PreviewInviteValidation
 import chat.presentation.preview.PreviewLayout
 import chat.presentation.preview.PreviewScenario
+import chat.presentation.preview.PreviewStoreState
+import chat.presentation.preview.opened
+import chat.presentation.preview.selecting
+import chat.presentation.preview.withConversations
+import chat.presentation.preview.withDraft
+import chat.presentation.preview.withError
+import chat.presentation.preview.withMessages
 import chat.presentation.preview.addSampleMessage
 import chat.presentation.preview.advanceDraftSample
 import chat.presentation.preview.advancePagingSample
@@ -128,6 +135,7 @@ fun main() = runBlocking {
     checkFrozenErrorCoverage()
     checkCoreProjection()
     checkIdentityPresentation()
+    checkStorePanelState()
     checkPreviewStates()
     checkPreviewInviteValidation()
     checkConversationDisplayMerger()
@@ -379,6 +387,65 @@ private fun checkErrorPresentation() {
     val nonRetryableStorage = presentError(CoreFailure("STORAGE_FAILURE", false, null, null))
     check(nonRetryableStorage.action == ErrorAction.NONE)
     println("PASS DS-04 known/unknown/non-retryable error mapping")
+}
+
+private fun checkStorePanelState() {
+    var state = PreviewStoreState()
+    state = state.opened("/tmp/demo.db", "已打开")
+    check(state.ready && state.lastErrorCode == null)
+    check(state.databasePath == "/tmp/demo.db")
+
+    // 真实会话/消息投影：游标透传、去重、unread 保持 null
+    state = state.withConversations(
+        cursor = "cur-2",
+        items = listOf(
+            StoredConversation("c1", "林然", "第一条", unreadCount = null, updatedAtMillis = 10),
+            StoredConversation("c1", "林然", "更新后", unreadCount = null, updatedAtMillis = 11),
+            StoredConversation("c2", "周其", "另一条", unreadCount = 2, updatedAtMillis = 9),
+        ),
+    )
+    check(state.conversations.map { it.id } == listOf("c1", "c2")) { "重复会话必须合并" }
+    check(state.conversations.first().preview == "更新后")
+    check(state.conversations.first().unreadCount == null) { "没有 unread 计数时必须保持 null" }
+    check(state.nextConversationCursor == "cur-2")
+
+    state = state.selecting("c1")
+    check(state.selectedConversationId == "c1" && state.messages.isEmpty())
+    state = state.withMessages(
+        "c1",
+        cursor = null,
+        items = listOf(
+            StoredMessage("m1", "c1", "林然", "你好", mine = false, createdAtMillis = 1),
+            StoredMessage("m1", "c1", "林然", "你好（更新）", mine = false, createdAtMillis = 1),
+        ),
+    )
+    check(state.messages.map { it.id } == listOf("m1"))
+    check(state.messages.first().body == "你好（更新）")
+
+    // 选中会话以外的迟到结果不得覆盖当前会话
+    val otherConversation = state.withMessages("c2", null, listOf(StoredMessage("x", "c2", "周其", "别的", false, 2)))
+    check(otherConversation.messages == state.messages) { "非当前会话的结果必须被忽略" }
+
+    // 草稿状态只显示本机事实：queued 不得变成已接受
+    val draft = StoredDraft("draft-" + "ab".repeat(16), "op:1:" + "cd".repeat(32), "c1", "**草稿**", "queued", null)
+    state = state.withDraft(draft)
+    check(state.drafts.size == 1)
+    check(state.drafts.first().phase == DraftPhase.QUEUED)
+    check(state.drafts.first().label == "待发送")
+    check(!state.drafts.first().canRetry) { "本机排队草稿不得出现重试" }
+
+    val prepared = StoredDraft("draft-" + "ef".repeat(16), "op:1:" + "12".repeat(32), "c1", "x", "prepared", "sub-1")
+    state = state.withDraft(prepared)
+    check(state.drafts.size == 2)
+    check(state.drafts.first { it.draftId == prepared.draftId }.phase == DraftPhase.QUEUED) {
+        "prepared 仍只是本机尝试，不得升级为已接受"
+    }
+
+    // 错误态不得被当成成功
+    val failed = state.withError("STORAGE_LOCKED", "库被占用")
+    check(failed.lastErrorCode == "STORAGE_LOCKED" && failed.notice == "库被占用")
+
+    println("PASS P2-01 store panel: real page dedupe, cursor passthrough, null unread, draft stays queued")
 }
 
 private fun checkIdentityPresentation() {

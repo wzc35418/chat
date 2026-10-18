@@ -33,6 +33,11 @@ pub(crate) const MIGRATIONS: &[MigrationDef] = &[
         name: "0002_formal_store",
         sql: include_str!("../../migrations/0002_formal_store.sql"),
     },
+    MigrationDef {
+        version: 3,
+        name: "0003_identity",
+        sql: include_str!("../../migrations/0003_identity.sql"),
+    },
 ];
 
 /// 迁移结果。

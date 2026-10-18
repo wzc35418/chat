@@ -1,12 +1,14 @@
 # SQLite、统一事务、数据表与崩溃恢复
 
-阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/008/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过，STORAGE-004/005 未开始。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
+阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/008/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过；P1 身份/联系人持久化与邀请一次性消费（迁移 0003，无计划书编号）也已实测通过；STORAGE-004/005 未开始。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
 
 状态补充（2026-10-18）：`store.rs` 已有独立的未加密 P0 事务试验表，覆盖 T1/C01 意图与准备任务和 T2 MLS/attempt/outbox 崩溃断点，局部证据见 [P0-03 报告](../P0_PERSISTENCE.md)。`crates/storage/src/formal/` 新增正式加密存储路径，实现 STORAGE-001/003/006/007/009/010/011 与 002 的迁移器，证据见下文“P0-04 正式存储路径实现记录”；其余 STORAGE-004/005/008 仍未实现，MLS 加密语义（CRYPTO-004 等）也未接入。
 
 状态补充（2026-10-18）：STORAGE-012/013/014/015 已实现，新增 `crates/storage/src/formal/cursor.rs`（内部认证分页游标）、`query.rs`（消息页与会话页）、`outbox_lease.rs`（租约领取与三态结果），证据见下文“分页查询与 outbox 租约实现记录”。本轮未新增迁移、未改动 0001/0002 既有内容，也未改动 `store.rs`/`persistence.rs`/`formal_crash_worker.rs`。
 
 状态补充（2026-10-18，竖直切片）：STORAGE-008 `apply_verified_entry` 已实现（新增 `crates/storage/src/formal/entry.rs`，并新增 `WriteScope::inbound` 作用域、`MESSAGE_ID_CONFLICT` 错误码与 `conversation-metadata` 封装用途），证据见下文“已验证条目写入实现记录（STORAGE-008）”。本轮仍未新增迁移（会话摘要复用 `conversations.protected_metadata`），未改动 `store.rs`/`persistence.rs`/`crash_worker.rs`。
+
+状态补充（2026-10-18，P1 身份持久化）：新增迁移 [0003_identity.sql](../../crates/storage/migrations/0003_identity.sql)（**只新增表，未改动 0001/0002 任何内容**）与 [crates/storage/src/formal/identity.rs](../../crates/storage/src/formal/identity.rs)，实现身份账户（单账户/单设备）、联系人、邀请一次性消费的正式持久化；同时新增 `WriteScope::identity` 作用域、`IDENTITY_ACCOUNT_CONFLICT` 错误码与 `identity-account`/`contact-record` 两个封装用途。schema 版本由 2 提升到 3（既有库在 `open_store` 时自动迁移，校验和机制不变；库内版本更高仍返回 `SCHEMA_TOO_NEW`）。证据见下文“身份/联系人持久化与邀请一次性消费实现记录”。
 
 Rust storage 唯一拥有客户端核心数据库；节点库单独实现于 node-services，不能复用客户端敏感数据写入口。默认先验证全库加密或等价方案，因为会话 ID、索引、时间戳同样敏感。事务句柄不跨 FFI、不跨网络 await；读分页使用稳定快照。
 
@@ -32,6 +34,69 @@ cargo test --offline -p chat-crypto    # 3 engine + 5 formal_master_key + 7 p0_p
 ```
 
 已知限制：只在 Windows x64 实测；当前是应用层列级加密，SQLite 页头、索引键、时间戳等元数据仍是明文，未证明“全库加密或等价方案”；未模拟断电/电源缓存丢失，不能从 `synchronous=FULL` 推出断电耐久保证；MLS 加密本身（CRYPTO-004/006/007/008）未接入，T2 只持久化调用方提供的 PreparedWrite；SQLite 回滚失败路径无法注入，fail-closed 闸门经 `mark_faulted` 公开入口验证。
+
+## 身份/联系人持久化与邀请一次性消费实现记录（2026-10-18，Windows x64）
+
+实现位置：
+
+- [crates/storage/migrations/0003_identity.sql](../../crates/storage/migrations/0003_identity.sql)：新迁移（`identity_account` / `contacts` / `consumed_invites`），只新增表，0001/0002 未被改动。
+- [crates/storage/src/formal/identity.rs](../../crates/storage/src/formal/identity.rs)：身份账户、联系人、邀请消费的全部读写与幂等/冲突语义。
+- [crates/storage/src/formal/migrations.rs](../../crates/storage/src/formal/migrations.rs)：`MIGRATIONS` 追加版本 3（`target_version() = 3`）。
+- [crates/storage/src/formal/seal.rs](../../crates/storage/src/formal/seal.rs)：新增封装用途 `identity-account` / `contact-record`。
+- [crates/storage/src/formal/error.rs](../../crates/storage/src/formal/error.rs)：新增 `IDENTITY_ACCOUNT_CONFLICT`。
+- [crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)：新增 `WriteScope::identity()` 作用域（`WriteScopeKind::Identity`），只作用于身份表。
+
+表结构与字段映射（**敏感字段只以密封记录落盘**）：
+
+| 表 | 明文列 | 密封列 | 说明 |
+|---|---|---|---|
+| `identity_account` | `id`（CHECK id = 1）、`account_index`、`created_at`、`updated_at` | `protected_account` | 单账户/单设备；`account_index` 是账户 ID 的域分隔 SHA-256（不可逆，仅用于快速冲突判定） |
+| `contacts` | `contact_id`（主键，由账户 ID 派生的不透明键）、`updated_at` | `protected_record` | 任务清单里的 `account_id`/`fingerprint`/`display_name`/`state` 全部在密封记录内，避免账户/联系人信息以明文出现在 .db/-wal |
+| `consumed_invites` | `invite_id`（主键）、`consumed_at` | —（`invite_digest` 是邀请文本的域分隔摘要） | 一次性消费；重复消费由主键/显式查询拒绝 |
+
+加密边界：
+
+- `protected_account` 内含账户/设备私钥种子、账户/设备公钥、账户/设备 ID、显示名与核验指纹；**账户与设备种子必须先经 AEAD 封装才允许落盘**。输入类型不实现 `Clone`、`Debug` 只打印长度；storage 内部把种子持有在 `Zeroizing` 缓冲里，解析出的密封记录在 Drop 时清零种子字段。
+- 封装格式沿用 `seal.rs`：`version||nonce||ciphertext||tag`；AAD 绑定行身份与格式版本（`(account_index, "identity-account-v1")` / `(contact_id, "contact-record-v1")`），把密文挪到另一行、换主密钥或改版本都会认证失败并返回 `STATE_CORRUPTED`。
+- 主密钥/错误密钥语义不变：错误主密钥在迁移前就被拒绝（`STATE_CORRUPTED`），绝不重建同名空库，也不覆盖既有身份。
+
+API 与语义（storage 层）：
+
+- `Store::save_identity_account(IdentityAccountInput) -> IdentityAccountRecord`：
+  首次写入插入单行；同账户 + 同账户/设备种子 + 同公钥/指纹/显示名 → 幂等返回（**不写行、不推进库版本**）；同账户但显示名/公钥/指纹不同 → 更新密封记录与 `updated_at`（`created_at` 保留）；另一个账户或不同密钥材料 → `IDENTITY_ACCOUNT_CONFLICT`，绝不覆盖。
+- `Store::load_identity_account() -> Option<IdentityAccountRecord>`：只返回脱敏投影（不含种子/私钥）；密封记录被篡改、挪行或版本不符一律 `STATE_CORRUPTED`。
+- `Store::upsert_contact(ContactUpsertInput) -> ContactRecord`：按 `contact_id`（`account_id` 的域分隔哈希）幂等；同内容不写行；内容变化更新密封记录与事件时间。状态字符串只接受 `requested/accepted/declined/blocked/identity_changed`（与 identity 冻结状态机一致）；显示名 1..=64 字节且不含控制字符；时间戳非负；记录数上限 `MAX_CONTACTS = 4096`（越界 `INVALID_INPUT`，不静默丢弃）。
+- `Store::list_contacts()`：按 `updated_at DESC, contact_id ASC` 排序；密文无法解密 → `STATE_CORRUPTED`；`Store::read_contact(account_id)` 读取单个联系人。
+- `Store::consume_invite(invite_id, invite_digest, consumed_at_ms)`：单笔身份作用域事务内先查后插，**同一 `invite_id` 第二次（或同 ID 不同摘要）返回 `INVALID_STATE_TRANSITION`**（本轮选择的语义：显式失败而不是幂等成功，避免调用方把“已用过”误当“本次可用”）；失败整体回滚，不存在半消费。
+
+复现命令（全程离线，本轮实测）：
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-storage        # 7 lib + 2 formal_crash + 7 formal_entry + 8 formal_identity + 8 formal_outbox + 7 formal_query + 17 formal_store = 56 passed
+cargo test --offline -p chat-storage -p chat-core   # 两 crate 全绿（core：5 identity + 2 p0 + 5 service = 12 passed）
+```
+
+证据（测试名 → 契约点）：
+
+- `formal_identity::identity_account_round_trips_and_is_idempotent`：同主密钥重开读回账户投影；同内容重复保存幂等（库版本不前进）；显示名更新保留创建时间。
+- `formal_identity::identity_account_conflicts_are_explicit_and_never_overwrite`：另一账户/另一份密钥材料 → `IDENTITY_ACCOUNT_CONFLICT` 且原身份保留；错误主密钥打开 → `STATE_CORRUPTED`，原密钥仍能读回。
+- `formal_identity::identity_material_is_not_stored_in_plaintext`：提交后直接扫描 .db/-wal/-shm 原始字节，账户 ID、设备 ID、显示名、对端账户、账户/设备种子（原始字节与十六进制）、指纹都不出现；重开仍能解密。
+- `formal_identity::contacts_upsert_list_and_survive_reopen`：按 `contact_id` 幂等、指纹/状态更新、列表排序、重开保留。
+- `formal_identity::contact_validation_and_bounds_are_enforced`：非法状态/超长显示名/畸形账户 ID/负时间戳/邀请 ID/负消费时间 `INVALID_INPUT`；`MAX_CONTACTS` 上限显式拒绝。
+- `formal_identity::invite_consumption_is_one_shot`：首次成功、第二次与“同 ID 不同摘要”都 `INVALID_STATE_TRANSITION` 且不写行、不推进版本；新 ID 可用；重启后仍已消费。
+- `formal_identity::concurrent_invite_consumption_succeeds_exactly_once`：单写者独占下重复请求只成功一次，`consumed_invites` 只有一行。
+- `formal_identity::tampered_or_relocated_identity_records_are_state_corrupted`：篡改账户密封记录、把联系人密文挪到另一行 → `STATE_CORRUPTED`；身份作用域事务可用。
+- 迁移版本：`formal_store::open_store_configures_durable_single_writer_store` 等既有用例已更新为 `schema_version() == 3`、`schema_migrations` 3 行；`too_new_schema_version_is_rejected`、`migration_checksum_mismatch_fails_closed` 继续通过。
+
+已知限制：
+
+1. 身份表是**结构校验层**：账户 ID 与账户/设备公钥、种子之间的密码学自洽由 core 用 `chat-identity` 在写入前验证（storage 不依赖 identity crate，避免分层反转）；storage 只做长度/字符/状态白名单与时间戳边界。
+2. 指纹以原始 32 字节存放在密封记录内，分组文本由 core/展示层生成；storage 不实现指纹比对。
+3. `contact_id` 与 `account_index` 是确定性哈希（可枚举同一账户在不同库中的键），不提供跨库不可链接性；时间戳与行数是明文元数据（与既有正式路径一致）。
+4. 联系人状态机由 core 用 identity 的冻结迁移表执行；storage 只校验状态属于白名单，直接调用 storage 的更低层路径可以写入任意合法状态（本轮 core 是唯一调用方）。
+5. 未接入身份模块的设备凭据/撤销集合持久化（`device_credentials` 仍由 0001 的旧表承载、正式路径未写）；启动恢复不重建身份表（身份只由显式保存写入）。
+6. 迁移 0003 使 schema 版本变为 3：外部工具若硬编码“版本 2”需要同步更新（本轮已更新 `crates/storage` 内断言与 `crates/crypto/tests/formal_master_key.rs` 的版本断言为 `>= 2`）。
 
 ## 分页查询与 outbox 租约实现记录（2026-10-18，Windows x64）
 
