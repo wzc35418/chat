@@ -1,6 +1,6 @@
 # 客户端内核与 Kotlin 业务服务映射
 
-阶段：P1 → P2。状态：函数级设计；竖直切片（`ConversationCore` 的 open / create_draft / draft_status / apply_verified_entry / list_conversations / list_messages / close）与 P1 身份持久化增量（save_identity_account / load_identity_account / upsert_contact / list_contacts / consume_invite）已在 Windows x64 实测通过，其余 CORE 函数未开始。目标源码：[crates/core/src/service.rs](../../crates/core/src/service.rs)。
+阶段：P1 → P2。状态：函数级设计；竖直切片（`ConversationCore` 的 open / create_draft / draft_status / apply_verified_entry / list_conversations / list_messages / close）与 P1 身份持久化增量（save_identity_account / load_identity_account / upsert_contact / list_contacts / consume_invite）已在 Windows x64 实测通过；CORE-007 的发送编排（[crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)）已把「意图 → 一次真实 MLS 加密 → 提交 → Accepted/Unknown/Rejected 落库」接通（节点端口可注入，未连真实网络），其余 CORE 函数未开始。目标源码：[crates/core/src/service.rs](../../crates/core/src/service.rs) 与 [crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)。
 
 本层编排，不把各子模块的事务拆成独立提交。函数名与 Kotlin 的 camelCase 一一对应；底层 TaskId/AttemptId 不必全暴露 UI。start/close 是幂等生命周期，所有查询都来自 Rust 持久真相。身份与群、附件服务分别委托对应章节。
 
@@ -325,12 +325,14 @@ send_message(request: SendRequest) -> Result<SendTicket>
 
 **完成验收**：
 
-- [x] 双击/跨 FFI 重试只同 Draft：`service::end_to_end_draft_then_verified_entry_then_pages`（同一 operation ID 两次 create_draft 返回同一 `draft_id`）。
-- [x] 节点离线仍 QUEUED：`service::end_to_end_draft_then_verified_entry_then_pages`（完全离线、无网络调用即返回 `queued` 草稿）。
+- [x] 双击/跨 FFI 重试只同 Draft：`service::end_to_end_draft_then_verified_entry_then_pages`（同一 operation ID 两次 create_draft 返回同一 `draft_id`）、`send_orchestrator::begin_send_is_idempotent_and_prepare_encrypts_exactly_once`（同一 operation ID 两次 `begin_send` 返回同一 draft_id）。
+- [x] 节点离线仍 QUEUED：`service::end_to_end_draft_then_verified_entry_then_pages`（完全离线、无网络调用即返回 `queued` 草稿）、`send_orchestrator::accepted_result_persists_draft_and_outbox_then_replays_idempotently`（提交前草稿恒为 `queued`，接受后才 `accepted`）。
 - [x] 取消回调后查询可恢复：`service::end_to_end_draft_then_verified_entry_then_pages`（`draft_status` 读回同一草稿；未知草稿 `None`、畸形 ID `INVALID_INPUT`）。
-- [ ] 发送 worker 唤醒与网络提交：未开始（SYNC/TRANSPORT 未接线）。
+- [ ] 发送 worker 唤醒与网络提交：只完成到可注入节点端口（`NodeSubmitter`）与 `dispatch`；真实 TRANSPORT-006 `append_candidate` / SYNC-002 `run_outbox_once` 常驻 worker 未接线。
 
-**实现状态**：切片实现（对应 `ConversationCore::create_draft(conversation_id, operation_id, body)`）。校验 PROTOCOL-001 会话/操作 ID 与线协议正文上限后，在单笔 T1 事务内 `materialize_session`（会话行不存在则补建，标题由后续已验证条目补写）+ STORAGE-006 `persist_send_intent`，提交成功才返回 `DraftView { draft_id, operation_id, conversation_id, body, state, submission_id }`；失败整体回滚，不留半成品草稿。证据：`service::end_to_end_draft_then_verified_entry_then_pages`、`service::identifiers_are_validated_against_the_protocol_contract`（非规范 ID 与超长正文 `INVALID_INPUT`）。
+**实现状态**：切片实现，分两层：
+① `ConversationCore::create_draft(conversation_id, operation_id, body)`（[service.rs](../../crates/core/src/service.rs)）：校验 PROTOCOL-001 会话/操作 ID 与线协议正文上限后，在单笔 T1 事务内 `materialize_session` + STORAGE-006 `persist_send_intent`，返回 `DraftView { draft_id, operation_id, conversation_id, body, state, submission_id }`；失败整体回滚。
+② `SendOrchestrator::begin_send / prepare / dispatch`（[send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)）：把意图推进为一次真实 MLS 加密尝试并提交，见下文「发送编排实现记录（CORE-007 / SYNC-003/004）」。证据：`service::end_to_end_draft_then_verified_entry_then_pages`、`service::identifiers_are_validated_against_the_protocol_contract`、`send_orchestrator::*`（9 个用例）。
 
 <a id="core-008"></a>
 
@@ -549,3 +551,78 @@ cargo test --offline -p chat-core   # 2 p0 + 5 service = 7 passed（本切片新
 5. **无发送/同步/事件**：`create_draft` 只做 T1 持久化，不唤醒 worker、不发网络、不产生附件或回执；`observe_events`、`open_direct`、`send_message` 的正式接受路径、`get_delivery`、`handle_peer_pretransfer` 都未开始。
 6. **启动不做恢复**：`open` 只打开库与迁移，`recover_incomplete_writes`（STORAGE-011）仍需显式调用，未接进 `open`。
 7. **主密钥字符串未清零**：`master_key_hex` 由调用方持有，本轮只清零解码后的字节缓冲；`chat-core` 未引入 `zeroize` 依赖。
+
+## 发送编排实现记录（CORE-007 / SYNC-003/004，2026-10-18，Windows x64）
+
+实现位置：[crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)（新增，`lib.rs` 加一行 `pub mod send_orchestrator;`），测试：[crates/core/tests/send_orchestrator.rs](../../crates/core/tests/send_orchestrator.rs)。本轮**没有另造状态机**：所有调度决策仍由 `chat_sync::send::plan_submission`（SYNC-003/004）给出，本层只负责「按计划加密一次 → 持久化 → 调用节点端口 → 落库」。
+
+公开面：
+
+~~~text
+pub trait CryptoEngine {
+    fn epoch(&self, conversation_id: &str) -> SendResult<u64>;
+    fn encrypt(&mut self, conversation_id: &str, draft_id: &str, body: &str) -> SendResult<EncryptedPayload>;
+}
+pub trait NodeSubmitter {
+    fn submit(&self, attempt: &SubmitAttempt) -> SendResult<SubmitOutcome>;
+    fn query(&self, submission_id: &str) -> SendResult<SubmitOutcome>;
+}
+pub enum SubmitOutcome { Accepted { detail }, Unknown { detail }, Rejected { detail } }
+
+pub struct SendOrchestrator<S: NodeSubmitter, C: CryptoEngine, K: Clock> { .. }
+impl .. {
+    pub fn new(store: Store, submitter: S, engine: C, clock: K, worker: &str) -> SendResult<Self>;
+    pub fn begin_send(&mut self, conversation_id: &str, operation_id: &str, body: &str) -> SendResult<String>; // draft_id
+    pub fn prepare(&mut self, draft_id: &str) -> SendResult<PrepareOutcome>;
+    pub fn dispatch(&mut self, draft_id: &str) -> SendResult<DispatchOutcome>;
+    pub fn store(&self) -> &Store;         pub fn store_mut(&mut self) -> &mut Store;
+    pub fn clock_mut(&mut self) -> &mut K;  pub fn worker(&self) -> &str;
+}
+~~~
+
+三段语义：
+
+1. **`begin_send`（T1）**：校验 PROTOCOL-001 会话/操作 ID 与线协议正文上限 → 单笔 intent 事务内 `materialize_session` + STORAGE-006 `persist_send_intent`（同一 operation ID 幂等）→ 返回 `draft_id`。
+2. **`prepare`（T2，SYNC-003 执行侧）**：读草稿与 attempt 投影（attempt 序号按“既有 attempt 行数 - 1”推导）→ `plan_submission` → 只有 `Prepare`/`Rebuild` 才调用 `CryptoEngine::encrypt` **一次**，把 `(epoch, ciphertext)` 通过 STORAGE-007 `persist_prepared_attempt` 写入（同事务写 send outbox 任务、把 prepare 任务置 complete）。`Resubmit`（已有耐久尝试）直接复用既有字节、不重新加密；`QueryExisting`（未知）只提示对账；`WaitForLease` 等待；`Release` 报告已接受；`Abandoned` 放弃。同 SubmissionId 已存在时再次 `prepare` 返回 `already_prepared = true` 且不加密。
+3. **`dispatch`（SYNC-004 执行侧）**：按计划分支——
+   - `Resubmit`：读**耐久密文**（`Store::read_attempt`）→ `NodeSubmitter::submit` → 三态落库；
+   - `QueryExisting`（unknown）：只调用 `NodeSubmitter::query`，**绝不重发、绝不重新加密**；
+   - `Release`：幂等返回 `Accepted { idempotent: true }`，并顺手补齐草稿状态（自愈）；
+   - `WaitForLease` / `Abandoned`：不提交；`Prepare`/`Rebuild`：显式 `INVALID_STATE_TRANSITION`（必须先 `prepare`）。
+   落库走 STORAGE-015 语义：`Accepted → JobResult::FormallyAccepted`（任务 complete + attempt accepted + 草稿 accepted）、`Unknown → JobResult::Unknown`（租约延长到 6 小时对账窗口、attempt unknown）、`Rejected → JobResult::Failed{retryable:false}`（任务 failed + attempt rejected）。节点端口返回的错误（如 `STALE_EPOCH` / `INVALID_SIGNATURE`）原样上抛，状态不变，草稿保留。
+
+并发与租约：
+
+- 调度决策里的租约门来自 `AttemptSnapshot.lease_owner/lease_until/lease_version`，由发送任务行（`outbox_jobs.dedup_key = 'send:<SubmissionId>'`）投影；有效租约被其它 worker 持有时 `dispatch`/`prepare` 都返回 `WaitingForLease`，不提交也不加密。
+- storage 只提供批量领取（`claim_outbox_batch`），本层在 `WriteScope::outbox` 事务内用**同一 CAS 规则**（`lease_version` + `state/lease_until` 条件）定向领取该 SubmissionId 的任务；CAS 失手时返回 `WaitingForLease`，绝不覆盖别人的租约。unknown 对账窗口内沿用自己尚未到期的租约（`lease_for_result`），因为此时不能再“领取”。
+- 重复 `dispatch` 幂等：已接受 → `Release` 分支不再次提交；未知 → 只查询。
+
+复现命令（全程离线，本轮实测）：
+
+~~~powershell
+. .	oolsactivate.ps1
+cargo test --offline -p chat-core   # 9 lib + 5 identity + 2 p0 + 9 send_orchestrator + 5 service = 30 passed（既有 21 个继续通过）
+~~~
+
+证据（测试名 → 覆盖的契约点）：
+
+- `send_orchestrator::begin_send_is_idempotent_and_prepare_encrypts_exactly_once`：同 operation ID 两次 `begin_send` 同一 draft；`prepare` 两次只加密 1 次、attempt 行 1 条、prepare 任务 complete、send 任务 pending；**存库密文用对端真实 OpenMLS 设备解密得到原文**。
+- `send_orchestrator::unknown_result_is_never_resent_and_reconciles_by_submission_id`：提交返回 Unknown 后 `submit` 次数恒为 1、加密次数恒为 1；后续 `dispatch` 只走 `query`；对账得到 Accepted 后 attempt accepted、send 任务 complete、草稿 accepted。
+- `send_orchestrator::rejected_attempt_rebuilds_with_a_new_submission_id`：拒绝后 attempt rejected、草稿保留 queued、直接再 `dispatch` 被 `INVALID_STATE_TRANSITION` 拒绝；`prepare` 用 `attempt_index + 1` 得到**新 SubmissionId** 并再加密一次（新密文同样可被对端解密）；再 `dispatch` 接受。
+- `send_orchestrator::accepted_result_persists_draft_and_outbox_then_replays_idempotently`：接受后草稿 `accepted`、attempt `accepted`、send 任务 `complete`；重复 `dispatch` 返回 `idempotent = true` 且不再提交；再 `prepare` 直接 `AlreadyAccepted`。
+- `send_orchestrator::live_lease_from_another_worker_blocks_encryption_and_submission`：真实 `claim_outbox_batch`（worker-b）持租约期间 `dispatch`/`prepare` 都等待、零提交；租约到期后接管并提交**同一密文**。
+- `send_orchestrator::transport_error_keeps_the_draft_and_retries_after_lease_expiry`：端口返回 `STALE_EPOCH` 时草稿仍 `queued`、attempt 仍 `prepared`、不重新加密；租约到期后用同一 SubmissionId 同字节重试成功。
+- `send_orchestrator::protocol_errors_and_state_preconditions_are_classified`：非规范 ID `INVALID_ID`、空正文 `INVALID_TARGET`、未准备的草稿 `INVALID_STATE_TRANSITION`、未知草稿 `INVALID_TARGET`、端口协议错误原码上抛且状态不变。
+- `send_orchestrator::rebuild_budget_is_bounded`：铺满 `MAX_ATTEMPT_INDEX = 64` 后 `prepare` 返回 `INVALID_TARGET` 且零加密（重建序号有界）。
+- `send_orchestrator::orchestrator_rejects_malformed_worker_id`：畸形 worker 标识 `INVALID_ID`；时钟非正值 `INVALID_TARGET`（时钟故障不静默继续）。
+
+已知限制（本切片不覆盖）：
+
+1. **真实网络未接线**：`NodeSubmitter` 是可注入端口，本层不实现 TRANSPORT-006 `append_candidate`、回执验证（SYNC-009）或节点信箱；常驻 worker/SYNC-002 `run_outbox_once` 也未接。生产接法：把 `submit` 实现为 append_candidate + 正式回执校验，把 `query` 实现为节点按 SubmissionId 查询。
+2. **storage 缺三个正式入口**：按草稿枚举 attempt、按 SubmissionId 定向领取租约、把草稿置 `accepted`。本层用只读连接做投影查询、用 STORAGE-014 的同一 CAS 规则定向领取、在 intent 事务内更新 `drafts.state`；storage 补正式 API 后应替换并删除对应限制。
+3. **接受的两笔事务窗口**：`Accepted` 先落 outbox 结果再置草稿 accepted，第二笔失败时会出现 attempt accepted 而草稿仍 queued；下次 `dispatch` 走 `Release` 分支会补齐（自愈），但本轮没有专门的恢复任务。
+4. **attempt 序号不落库**：P0 schema 没有 `attempt_index` 列，本层用“既有 attempt 行数 - 1”推导，重建依赖“每个被拒绝的 attempt 行都保留”（storage 目前确实不删除）。
+5. **MLS provider 记录未写入**：`crypto_changes` 传空，加密引擎是会话级 OpenMLS 设备而非 storage 支撑的 provider；CRYPTO-004/005 的 provider 持久化接入后应改为同事务写 `mls_state_records`（并同步提升 epoch）。
+6. **无权限/附件/同步补齐**：DOMAIN-001 权限校验、DOMAIN-011 回复目标、附件依赖（ATTACHMENT_NOT_READY）、SYNC-008 补齐都未接入；本层也不产生 DraftChanged 事件（CORE-003 未实现）。
+7. **单写者**：`SendOrchestrator` 拥有独占的 `Store`，与 `ConversationCore` 不能同时打开同一库；两者合并到同一个 core 句柄的方式（让 `ConversationCore` 暴露 `&mut Store` 或把编排器作为其内部字段）留待 FFI 接线时确定。
+

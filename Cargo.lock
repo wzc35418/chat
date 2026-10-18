@@ -659,6 +659,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "chat-node-client"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chat-node-api",
+ "chat-node-services",
+ "chat-protocol",
+ "ed25519-dalek 3.0.0",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "chat-node-services"
 version = "0.1.0"
 dependencies = [

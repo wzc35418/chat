@@ -1,6 +1,6 @@
 # 节点 HTTP、鉴权、限流与运行入口
 
-阶段：P1 → P5。状态：函数级设计。API-002 issue_auth_challenge 与 API-003 authenticate_request 已随 P1-03 在 [crates/node-api](../../crates/node-api) 与 [crates/node-services](../../crates/node-services) 落地（端点见“已实现端点（P1-03）”）。群日志与信箱的七个端点（NODE-005~011 的 HTTP 适配，对应 API-006 handle_append_http 与 API-007 handle_mailbox_http 的当前范围）已在同一轮落地，见“已实现端点（群日志与信箱）”。其余函数仍未实现。目标源码：[crates/node-api/src/handlers.rs](../../crates/node-api/src/handlers.rs)。
+阶段：P1 → P5。状态：函数级设计。API-002 issue_auth_challenge 与 API-003 authenticate_request 已随 P1-03 在 [crates/node-api](../../crates/node-api) 与 [crates/node-services](../../crates/node-services) 落地（端点见“已实现端点（P1-03）”）。群日志与信箱的七个端点（NODE-005~011 的 HTTP 适配，对应 API-006 handle_append_http 与 API-007 handle_mailbox_http 的当前范围）已在同一轮落地，见“已实现端点（群日志与信箱）”。客户端侧访问这些端点的实现见 [crates/node-client](../../crates/node-client)（见“客户端（crates/node-client）”）。其余函数仍未实现。目标源码：[crates/node-api/src/handlers.rs](../../crates/node-api/src/handlers.rs)。
 
 所有 HTTP DTO 与错误结构单独版本化。公开 /capabilities 与 challenge 也限流。默认监听本地端口，通过明确的 TLS 部署入口提供 HTTPS/WSS；管理接口独立且默认关闭。每个 HTTP handler 只鉴权、解码、调用服务、映射结果，不重复实现领域规则。
 
@@ -52,6 +52,70 @@
   - 409 `GROUP_ID_CONFLICT`、`GROUP_CAPACITY_EXCEEDED`、`SUBMISSION_ID_CONFLICT`、`STALE_CONTROL_HEAD`、`STALE_EPOCH`、`QUOTA_EXCEEDED`、`ITEM_ID_CONFLICT`。
 - 复用既有码：401 `INVALID_CHALLENGE/NODE_ID_MISMATCH/AUTH_EXPIRED/AUTH_REPLAY/INVALID_SIGNATURE/INVALID_CREDENTIAL`，403 `DEVICE_REVOKED/INVALID_CAPABILITY/PERMISSION_DENIED`，400 `INVALID_REQUEST/UNSUPPORTED_SCHEMA_VERSION`，503 `STORAGE_FAILURE`。
 - 不泄漏语义：未知信箱条目、他人条目、越权目标都统一返回 403 `PERMISSION_DENIED`；日志读取的成员窗口失败返回 403 `HISTORY_NOT_AUTHORIZED`，不返回“该 seq 存在但你看不到”。
+
+## 客户端（crates/node-client）
+
+节点 HTTP 客户端在 [crates/node-client](../../crates/node-client)（本轮新增）。它只做四件事：取一次性挑战、按节点的 canonical 规则签名、发 HTTP、把稳定错误码映射成客户端错误；领域规则（谁能写、序号与哈希链、配额）全部由节点判定，客户端不重复实现，也不在失败后伪造成功。
+
+|文件|内容|
+|---|---|
+|src/endpoint.rs|`NodeEndpoint`：URL + 固定 node_id（+ 可选固定节点公钥）；只允许 http/https、无凭据、无查询/片段、无路径前缀，请求 URL 由规范化 path/query 生成|
+|src/client.rs|`NodeClient`：fetch_challenge、send_with_challenge（低层，单次发送）、register_device、create_group(+_signed)、append_entry(+_signed)、fetch_log、get_head、store_mailbox_item、read_mailbox_page、ack_mailbox_items；ClientLimits（响应/请求上限、超时、尝试预算）|
+|src/error.rs|`NodeClientError`：PROTOCOL-014 码 + 分类（network/timeout/protocol/authentication/permission/conflict/not_found/invalid_request/limit/internal/config），只带固定静态说明|
+
+端点与方法一一对应：`POST /v1/auth/challenge` → fetch_challenge；`POST /v1/devices` → register_device；`POST /v1/groups` → create_group；`POST /v1/groups/{id}/entries` → append_entry；`GET /v1/groups/{id}/log` → fetch_log；`GET /v1/groups/{id}/head` → get_head；`POST /v1/mailbox/items` → store_mailbox_item；`GET /v1/mailbox` → read_mailbox_page；`POST /v1/mailbox/ack` → ack_mailbox_items。
+
+### 签名原文与挑战生命周期
+
+- 签名原文直接复用节点侧实现（`chat_node_services::auth::request_signing_bytes` + `RequestMeta::canonical`），因此不存在“客户端一套 canonical、服务端另一套”的漂移：域分隔 + node_id + device_id + 用途 + 大写 method + 规范 path + query + sha256(正文) + nonce。
+- 高层方法**每次调用都重新取一个一次性挑战**（不缓存、不复用），挑战只用一次；节点侧的重放/过期保护因此始终生效。
+- 只在两类失败上重取一次后再返回稳定错误，总尝试次数硬上限为 2（`ClientLimits::challenge_attempts ∈ {1,2}`）：
+  1. 挑战本身不可用：节点返回 `INVALID_CHALLENGE` / `AUTH_EXPIRED` / `AUTH_REPLAY`；
+  2. 传输失败：连接失败或超时（所有业务操作都带幂等键 —— submission/item/建群摘要 —— 重发不会产生第二条日志）。
+- 其他失败（签名不匹配、权限、冲突、越界、协议错误）立即返回，不做无意义重试；`INVALID_SIGNATURE` 不会因为换一个挑战而变好。
+
+### 上限、超时与错误映射
+
+- 响应体上限默认 1 MiB（`DEFAULT_MAX_RESPONSE_BYTES`）：先用 Content-Length 预检，再按块累计；超限立刻失败（`CONTENT_TOO_LARGE` / limit），不静默截断。请求正文上限默认 64 KiB，与节点正文上限一致。
+- 单请求总超时默认 10s（`DEFAULT_TIMEOUT`），超时映射为 `NETWORK_UNAVAILABLE` + timeout 分类，且仍受“只重试一次”约束。
+- 不跟随重定向（`redirect::Policy::none()`）：跳转后的路径与签名原文不一致，属于协议违规，按协议错误返回。TLS 完全走工作区的 rustls 默认校验，没有任何“接受非法证书”的降级开关。
+- 固定节点公钥（`NodeEndpoint::with_node_public_key`）后：每个挑战都要用该公钥验签，且每个节点产物（注册回执、append 回执、head、日志条目回执、信箱回执）都要验签并绑定 node_id；未固定公钥时至少强制 `node_id` 一致（换 URL 不换节点）。
+
+节点稳定码 → PROTOCOL-014 码（客户端唯一映射表，见 src/error.rs::code_for_node_code）：
+
+|节点码|PROTOCOL-014|分类|
+|---|---|---|
+|INVALID_REQUEST / UNSUPPORTED_SCHEMA_VERSION / INVALID_ACK_BATCH|MALFORMED_FRAME|invalid_request|
+|INVALID_CHALLENGE / AUTH_EXPIRED / AUTH_REPLAY / INVALID_CREDENTIAL|INVALID_CREDENTIAL|authentication|
+|INVALID_SIGNATURE|INVALID_SIGNATURE|authentication|
+|DEVICE_REVOKED|DEVICE_REVOKED|authentication|
+|PERMISSION_DENIED|PERMISSION_DENIED|permission|
+|HISTORY_NOT_AUTHORIZED|HISTORY_NOT_AUTHORIZED|permission|
+|INVALID_CAPABILITY|REQUIRED_CAPABILITY_MISSING|permission|
+|GROUP_NOT_FOUND / NODE_ID_MISMATCH|INVALID_TARGET|not_found / protocol|
+|GROUP_ID_CONFLICT / SUBMISSION_ID_CONFLICT / ITEM_ID_CONFLICT|LOG_CONFLICT|conflict|
+|STALE_CONTROL_HEAD / STALE_EPOCH|STALE_CONTROL_HEAD / STALE_EPOCH|conflict（可重试，提示重新对齐）|
+|DEVICE_LIMIT_EXCEEDED / GROUP_CAPACITY_EXCEEDED / QUOTA_EXCEEDED / RATE_LIMITED / CHALLENGE_CAPACITY_EXCEEDED / PAYLOAD_TOO_LARGE|对应上限码|limit|
+|INVALID_CURSOR|INVALID_CURSOR|invalid_request|
+|STORAGE_FAILURE / MIGRATION_FAILED / NODE_IDENTITY_MISMATCH / INVALID_CONFIG / ENCODING_FAILURE|STORAGE_FAILURE / INTERNAL_FAILURE|internal|
+|未知码|UNKNOWN_RESULT|protocol（不当作成功）|
+
+没有可识别错误体时按 HTTP 状态归类（400/401/403/404/409/413/429/500/502-504），仍然是显式失败。
+
+### 验证证据
+
+命令与结果：`cargo test --offline -p chat-node-client` → 33 个测试全部通过（13 个 lib 单元测试 + 11 个 `tests/client_limits.rs` + 9 个 `tests/http_flow.rs`），0 警告。
+
+- 真 TCP 端到端（`tests/http_flow.rs`：在进程内用 `axum::serve` 起 [crates/node-api](../../crates/node-api) 的真实路由，服务端是真实 node-services）：`challenge_registration_and_signed_outputs_are_verified`（挑战由固定节点公钥验签、注册回执验签、重复注册幂等）、`group_log_head_and_idempotent_append_flow`（建群幂等、append 同 submission 同字节重试返回同 seq、fetch_log 分页、head 与页内 head 一致）、`mailbox_store_read_and_ack_flow`（投递幂等、读取分页与重复读、ACK 幂等与越权 403）、`wrong_device_key_is_rejected_without_retrying`、`replayed_and_expired_challenges_are_rejected`、`unknown_device_and_non_member_are_rejected`、`divergent_bytes_for_one_submission_are_a_conflict`、`wrong_node_identity_and_wrong_pinned_key_are_rejected`、`oversized_request_is_rejected_before_sending`。
+- 边界语义（`tests/client_limits.rs`：脚本化最小 HTTP/1.1 服务）：`auth_failure_is_retried_once_and_then_succeeds`（旧挑战失败后重取一次成功，挑战请求恰好 2 次）、`retry_budget_is_exactly_one_retry`、`single_attempt_budget_sends_one_request`、`oversized_response_with_content_length_is_rejected`、`oversized_chunked_response_is_rejected_by_incremental_budget`、`signed_request_timeout_is_retried_once_then_reported`、`anonymous_challenge_timeout_is_reported_without_retry`、`network_failure_is_reported_and_bounded`、`redirects_are_not_followed`（重定向不产生第二次请求）、`wrong_node_id_in_challenge_is_rejected`、`unknown_error_code_is_not_silently_treated_as_success`。
+
+### 已知限制
+
+- 客户端不含 MLS/加密层的内容构造：候选密文、Welcome 等字节由上游加密层提供，本 crate 只负责传输、签名与错误映射（领域校验仍由节点与客户端加密层各自负责）。
+- 未实现 API-005 的逐设备限流；`RATE_LIMITED` 只做码映射，客户端不内置退避循环（重试预算固定为一次，避免把限流变成忙等）。
+- 未实现事件套接字（API-009）与密文文件端点（API-008）：本 crate 只覆盖本文件已落地的七个业务端点与挑战/注册。
+- 固定节点公钥是可选项。未固定时只能保证挑战与产物里的 node_id 与端点声明一致，无法发现同一 node_id 的伪造节点；生产客户端应始终固定公钥（测试按固定公钥运行）。
+- 客户端只把节点返回的 node_public_key 用于验签，不做跨重启的 key 变更检测（节点侧已通过 node_identity 表固定身份）。
 
 ## 函数导航
 

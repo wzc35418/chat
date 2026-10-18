@@ -1,0 +1,22 @@
+[package]
+name = "chat-node-client"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# 签名原文与 DTO 直接复用节点侧实现，避免“客户端和服务端各写一遍 canonical 规则”。
+chat-node-services.workspace = true
+# PROTOCOL-014 错误码、PROTOCOL-004/006 签名原文、PROTOCOL-001 强类型 ID。
+chat-protocol.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+
+[dev-dependencies]
+# 真 TCP 端到端测试：在本进程内用 axum 起 node-api 路由，需要 tokio 的 net/io-util。
+chat-node-api.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+serde_json.workspace = true

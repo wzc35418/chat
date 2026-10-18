@@ -20,8 +20,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -207,11 +210,18 @@ private fun AnnotatedString.Builder.appendMarkdownInlines(
             }
 
             is MarkdownInline.Link -> {
-                withStyle(
-                    SpanStyle(
-                        color = accentColor,
-                        textDecoration = TextDecoration.Underline,
-                        fontWeight = FontWeight.Medium,
+                // 只有展示层白名单（http/https/mailto）里的链接才会生成 LinkAnnotation，
+                // 点击由 Compose 交给系统浏览器；危险协议在解析阶段已经降级为 BlockedLink。
+                withLink(
+                    LinkAnnotation.Url(
+                        inline.url,
+                        TextLinkStyles(
+                            style = SpanStyle(
+                                color = accentColor,
+                                textDecoration = TextDecoration.Underline,
+                                fontWeight = FontWeight.Medium,
+                            ),
+                        ),
                     ),
                 ) {
                     appendMarkdownInlines(inline.children, textColor, mutedColor, accentColor, codeBackground)
