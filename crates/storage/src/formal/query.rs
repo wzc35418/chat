@@ -5,7 +5,7 @@
 //!   `(created_at DESC, draft_id DESC)`（独立本地排序键），会话列表按
 //!   `(last_activity_at DESC, conversation_id DESC)`；同一时刻用稳定次键消歧。
 //! - **键集游标**：不使用 OFFSET，取 `limit+1` 判断是否还有下一页，`nextCursor=null`
-//!   表示没有更多；游标经认证封装（见 [cursor.rs]），改字节/换会话/过期都显式失败。
+//!   表示没有更多；游标经认证封装（见子模块 `cursor`），改字节/换会话/过期都显式失败。
 //! - **方向语义**：`before/cursor = None` 表示第一页（最新一页）；`Some` 表示
 //!   “严格更旧的一页”。没有“更新方向”的游标，调用方必须从最新页开始。
 //! - **只读快照**：整个查询在一个只读事务里完成，两条 SQL 看到同一快照，
@@ -183,8 +183,12 @@ fn open_message_content(
 enum MessageSection {
     /// 第一页：从最新的待发意图与正式消息开始。
     Start,
-    /// 从某个待发意图之后继续（严格更旧）。
-    Pending { created_at: i64, draft_id: String },
+    /// 从某个待发意图之后继续（严格更旧），并沿用游标里的正式序号水位。
+    Pending {
+        created_at: i64,
+        draft_id: String,
+        formal_boundary: i64,
+    },
     /// 正式消息段（严格更旧）；不再返回待发意图。
     Formal { group_seq: i64, message_id: String },
 }
@@ -254,6 +258,7 @@ fn query_pending_drafts(
 fn query_messages(
     connection: &Connection,
     conversation_id: &str,
+    boundary: Option<i64>,
     after: Option<(i64, &str)>,
     limit: i64,
 ) -> Result<Vec<MessagePageRow>> {
@@ -263,16 +268,17 @@ fn query_messages(
                m.display_created_at
           FROM messages m
          WHERE m.conversation_id = ?1
-           AND (?2 IS NULL OR m.group_seq < ?2 OR (m.group_seq = ?2 AND m.message_id < ?3))
+           AND (?2 IS NULL OR m.group_seq <= ?2)
+           AND (?3 IS NULL OR m.group_seq < ?3 OR (m.group_seq = ?3 AND m.message_id < ?4))
          ORDER BY m.group_seq DESC, m.message_id DESC
-         LIMIT ?4";
+         LIMIT ?5";
     let (after_group_seq, after_message_id) = match after {
         Some((group_seq, message_id)) => (Some(group_seq), Some(message_id)),
         None => (None, None),
     };
     let mut statement = connection.prepare(sql)?;
     let rows = statement.query_map(
-        params![conversation_id, after_group_seq, after_message_id, limit],
+        params![conversation_id, boundary, after_group_seq, after_message_id, limit],
         |row| {
             Ok(MessagePageRow {
                 message_id: row.get(0)?,
@@ -329,9 +335,11 @@ impl Store {
                 PagePosition::Pending {
                     created_at,
                     draft_id,
+                    formal_boundary,
                 } => MessageSection::Pending {
                     created_at,
                     draft_id,
+                    formal_boundary,
                 },
                 PagePosition::Formal {
                     group_seq,
@@ -356,6 +364,7 @@ impl Store {
             MessageSection::Pending {
                 created_at,
                 draft_id,
+                ..
             } => Some((*created_at, draft_id.as_str())),
             MessageSection::Start | MessageSection::Formal { .. } => None,
         };
@@ -376,6 +385,22 @@ impl Store {
             } => Some((*group_seq, message_id.as_str())),
             _ => None,
         };
+        // 待发段与正式段没有可比较的排序键，因此这里固定一个正式序号水位：
+        // - 第一页取当前最大序号；已经处于待发段的游标沿用（只减不增）原水位，
+        //   这样翻页期间新到的消息不会插进“更旧”的一页。
+        let (formal_cap, pending_boundary) = match &section {
+            MessageSection::Formal { .. } => (None, 0),
+            _ => {
+                let current_max = max_group_seq(&snapshot, conversation_id)?;
+                let cap = match &section {
+                    MessageSection::Pending { formal_boundary, .. } => {
+                        Some(current_max.min(*formal_boundary))
+                    }
+                    _ => None,
+                };
+                (cap, cap.unwrap_or(current_max))
+            }
+        };
 
         let mut entries: Vec<(MessageView, PagePosition)> = Vec::new();
         let capacity = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -383,19 +408,30 @@ impl Store {
         if pending_rows.len() > capacity {
             has_more = true;
             for row in pending_rows.into_iter().take(capacity) {
-                entries.push(pending_entry(self, conversation_id, row)?);
+                entries.push(pending_entry(
+                    self,
+                    conversation_id,
+                    row,
+                    pending_boundary,
+                )?);
             }
         } else {
             let remaining = capacity + 1 - pending_rows.len();
             let message_rows = query_messages(
                 &snapshot,
                 conversation_id,
+                formal_cap,
                 formal_after,
                 i64::try_from(remaining).unwrap_or(i64::MAX),
             )?;
             has_more = pending_rows.len() + message_rows.len() > capacity;
             for row in pending_rows {
-                entries.push(pending_entry(self, conversation_id, row)?);
+                entries.push(pending_entry(
+                    self,
+                    conversation_id,
+                    row,
+                    pending_boundary,
+                )?);
             }
             for row in message_rows {
                 entries.push(message_entry(self, conversation_id, row)?);
@@ -569,10 +605,20 @@ impl Store {
     }
 }
 
+fn max_group_seq(connection: &Connection, conversation_id: &str) -> Result<i64> {
+    let maximum: Option<i64> = connection.query_row(
+        "SELECT MAX(group_seq) FROM messages WHERE conversation_id = ?1",
+        [conversation_id],
+        |row| row.get(0),
+    )?;
+    Ok(maximum.unwrap_or(0))
+}
+
 fn pending_entry(
     store: &Store,
     conversation_id: &str,
     row: DraftPageRow,
+    formal_boundary: i64,
 ) -> Result<(MessageView, PagePosition)> {
     let content = open_draft_content(
         store,
@@ -584,6 +630,7 @@ fn pending_entry(
     let position = PagePosition::Pending {
         created_at: row.created_at,
         draft_id: row.draft_id.clone(),
+        formal_boundary,
     };
     Ok((
         MessageView {

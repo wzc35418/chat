@@ -1,6 +1,6 @@
 //! STORAGE-012/013 的内部认证分页游标。
 //!
-//! 契约（[docs/implementation/storage.md]）要求游标语义与 PROTOCOL-012/013 对齐：
+//! 契约（docs/implementation/storage.md）要求游标语义与 PROTOCOL-012/013 对齐：
 //! 稳定键集（keyset）、认证、防跨范围重放、过期即显式失败、失败绝不退化为“跳到最新页”。
 //! 线协议的 `encode_page_cursor`/`decode_page_cursor`（crates/protocol/src/cursor.rs）
 //! 已实现，但它的作用域要求账户/设备/会话的 32 字节二进制身份，而正式存储当前只有
@@ -78,7 +78,15 @@ pub(crate) struct CursorScope<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PagePosition {
     /// 待发意图段：(本地创建时间, 草稿 ID) 降序。
-    Pending { created_at: i64, draft_id: String },
+    ///
+    /// `formal_boundary` 是签发游标那一刻的正式序号水位：待发段没有与正式段可比较的
+    /// 排序键，翻页跨段时必须沿用同一水位，否则翻页期间新到的正式消息会插进“更旧”的
+    /// 一页，造成乱序或漏项。
+    Pending {
+        created_at: i64,
+        draft_id: String,
+        formal_boundary: i64,
+    },
     /// 正式消息段：(正式序号, 消息 ID) 降序。
     Formal {
         group_seq: i64,
@@ -159,9 +167,11 @@ fn position_payload(position: &PagePosition) -> Result<Vec<u8>> {
         PagePosition::Pending {
             created_at,
             draft_id,
+            formal_boundary,
         } => {
             ensure_id("draft", draft_id)?;
             buffer.extend_from_slice(&created_at.to_be_bytes());
+            buffer.extend_from_slice(&formal_boundary.to_be_bytes());
             push_str(&mut buffer, draft_id)?;
         }
         PagePosition::Formal {
@@ -285,13 +295,15 @@ pub(crate) fn decode_page_cursor(
                 return Err(malformed("page cursor position does not match the resource"));
             }
             let created_at = reader.i64()?;
-            if created_at < 0 {
+            let formal_boundary = reader.i64()?;
+            if created_at < 0 || formal_boundary < 0 {
                 return Err(malformed("page cursor position is out of range"));
             }
             let draft_id = reader.id("draft")?;
             PagePosition::Pending {
                 created_at,
                 draft_id,
+                formal_boundary,
             }
         }
         POSITION_FORMAL => {

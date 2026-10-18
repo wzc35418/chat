@@ -1,5 +1,5 @@
 //! 正式加密客户端存储（STORAGE-001/003/006/007/009/010/011 + P0-04 基础；
-//! 分页查询 012/013 见 [query]、outbox 租约 014/015 见 [outbox_lease]）。
+//! 分页查询 012/013 见子模块 `query`、outbox 租约 014/015 见子模块 `outbox_lease`）。
 //!
 //! 与 crate::store（隔离的 P0-03 未加密实验）完全分开，互不复用连接或表：
 //! - 打开时取得独占写锁，配置 journal_mode=WAL / synchronous=FULL / foreign_keys=ON；

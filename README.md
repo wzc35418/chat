@@ -10,6 +10,13 @@ Kotlin / Compose Multiplatform 界面、Rust 内核、iroh 与 OpenMLS。已建�
 - [完整架构设计](chat-architecture/完整架构设计.md)
 - [完整 P0 验收清单](docs/implementation/P0_CHECKLIST.md)
 - [DeepSeek 前端与轻业务任务书](docs/DEEPSEEK_WORK_PLAN.md)
+- [消息 Markdown 规格（展示与输入）](docs/design/MESSAGE_MARKDOWN.md)
+
+## 代码仓库
+
+- GitHub（私有）：<https://github.com/wzc35418/chat>
+- 发布脚本：[tools/publish-github.ps1](tools/publish-github.ps1)。仓库不包含 `.tools/` 工具链、`target/`、`build/`、本地配置与数据库（见 `.gitignore`）。
+- 仓库默认 `main` 分支；每轮开发完成后按实际验证结果提交并推送。
 
 ## Windows 运行
 

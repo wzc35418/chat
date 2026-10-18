@@ -216,8 +216,8 @@ fn message_page_merges_pending_and_accepted_without_duplicates_or_skips() {
 #[test]
 fn message_page_enforces_limits_and_rejects_bad_cursors() {
     let fixture = Fixture::new();
-    let mut store = fixture.open();
-    fixture.seed(&store, &[CONVERSATION, CONVERSATION_TWO]);
+    let store = fixture.open();
+    fixture.seed(&store, &[CONVERSATION, CONVERSATION_TWO, CONVERSATION_THREE]);
     for index in 1..=3 {
         add_remote_message(
             &store,
@@ -325,7 +325,7 @@ fn message_page_enforces_limits_and_rejects_bad_cursors() {
 #[test]
 fn message_page_reports_end_of_stream_and_bounds_the_last_page() {
     let fixture = Fixture::new();
-    let mut store = fixture.open();
+    let store = fixture.open();
     fixture.seed(&store, &[CONVERSATION]);
     let empty = store
         .query_message_page_at(CONVERSATION, None, 10, NOW)

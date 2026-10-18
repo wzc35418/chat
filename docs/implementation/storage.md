@@ -1,8 +1,10 @@
 # SQLite、统一事务、数据表与崩溃恢复
 
-阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/009/010/011（含 002 的迁移器）已在 Windows x64 实测通过，其余函数未开始。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
+阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过，STORAGE-004/005/008 未开始。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
 
-状态补充（2026-10-18）：`store.rs` 已有独立的未加密 P0 事务试验表，覆盖 T1/C01 意图与准备任务和 T2 MLS/attempt/outbox 崩溃断点，局部证据见 [P0-03 报告](../P0_PERSISTENCE.md)。`crates/storage/src/formal/` 新增正式加密存储路径，实现 STORAGE-001/003/006/007/009/010/011 与 002 的迁移器，证据见下文“P0-04 正式存储路径实现记录”；其余 STORAGE-004/005/008/012..015 仍未实现，MLS 加密语义（CRYPTO-004 等）也未接入。
+状态补充（2026-10-18）：`store.rs` 已有独立的未加密 P0 事务试验表，覆盖 T1/C01 意图与准备任务和 T2 MLS/attempt/outbox 崩溃断点，局部证据见 [P0-03 报告](../P0_PERSISTENCE.md)。`crates/storage/src/formal/` 新增正式加密存储路径，实现 STORAGE-001/003/006/007/009/010/011 与 002 的迁移器，证据见下文“P0-04 正式存储路径实现记录”；其余 STORAGE-004/005/008 仍未实现，MLS 加密语义（CRYPTO-004 等）也未接入。
+
+状态补充（2026-10-18）：STORAGE-012/013/014/015 已实现，新增 `crates/storage/src/formal/cursor.rs`（内部认证分页游标）、`query.rs`（消息页与会话页）、`outbox_lease.rs`（租约领取与三态结果），证据见下文“分页查询与 outbox 租约实现记录”。本轮未新增迁移、未改动 0001/0002 既有内容，也未改动 `store.rs`/`persistence.rs`/`formal_crash_worker.rs`。
 
 Rust storage 唯一拥有客户端核心数据库；节点库单独实现于 node-services，不能复用客户端敏感数据写入口。默认先验证全库加密或等价方案，因为会话 ID、索引、时间戳同样敏感。事务句柄不跨 FFI、不跨网络 await；读分页使用稳定快照。
 
@@ -28,6 +30,68 @@ cargo test --offline -p chat-crypto    # 3 engine + 5 formal_master_key + 7 p0_p
 ```
 
 已知限制：只在 Windows x64 实测；当前是应用层列级加密，SQLite 页头、索引键、时间戳等元数据仍是明文，未证明“全库加密或等价方案”；未模拟断电/电源缓存丢失，不能从 `synchronous=FULL` 推出断电耐久保证；MLS 加密本身（CRYPTO-004/006/007/008）未接入，T2 只持久化调用方提供的 PreparedWrite；SQLite 回滚失败路径无法注入，fail-closed 闸门经 `mark_faulted` 公开入口验证。
+
+## 分页查询与 outbox 租约实现记录（2026-10-18，Windows x64）
+
+实现位置（全部在正式路径内，未新增迁移、未改动既有实验文件）：
+
+- [crates/storage/src/formal/cursor.rs](../../crates/storage/src/formal/cursor.rs)：内部认证分页游标（编码/解码/过期/跨范围校验）。
+- [crates/storage/src/formal/query.rs](../../crates/storage/src/formal/query.rs)：STORAGE-012 `query_message_page` 与 STORAGE-013 `query_conversation_page`，以及 `messages.protected_content` 的封装契约 `Store::seal_message_content`。
+- [crates/storage/src/formal/outbox_lease.rs](../../crates/storage/src/formal/outbox_lease.rs)：STORAGE-014 `claim_outbox_batch` 与 STORAGE-015 `mark_outbox_result`。
+- 稳定错误码新增 `INVALID_CURSOR`、`PERMISSION_DENIED`、`STORAGE_BUSY`、`JOB_LEASE_CONFLICT`、`INVALID_STATE_TRANSITION`（[error.rs](../../crates/storage/src/formal/error.rs)）；封装用途新增 `message-content` 与 `page-cursor`（[seal.rs](../../crates/storage/src/formal/seal.rs)）；`WriteScope` 新增 `outbox()` 作用域（[mod.rs](../../crates/storage/src/formal/mod.rs)）。
+
+分页语义（STORAGE-012/013）：
+
+- 排序固定：正式消息 `(group_seq DESC, message_id DESC)`；本机待发意图 `(created_at DESC, draft_id DESC)`；会话列表 `(last_activity_at DESC, conversation_id DESC)`。只用键集（keyset），不用 OFFSET；查询固定取 `limit+1` 判断是否还有下一页，`next_cursor = None` 表示没有更多。
+- 方向：`before/cursor = None` = 第一页（最新）；`Some` = “严格更旧的一页”。没有“更新方向”的游标，客户端必须从最新页开始。
+- 合并顺序：本机待发意图在前（本机最新动作），随后是正式消息。待发段与正式段没有可比较的排序键，因此待发游标额外携带“正式序号水位”：第一页取当前 `MAX(group_seq)`，已处于待发段的游标只沿用（取小）原水位，翻页期间新到的正式消息不会插进更旧的一页，也不会让后续页漏项。
+- 去重：待发投影只取 `drafts.state = 'queued'` 且 `messages` 里没有相同 `draft_id` 的草稿，待发投影 ID 用 `draft_id`（本地稳定 ID），`submission_id` 取该草稿最近的 attempt；正式消息 ID 用 `messages.message_id`。单页内不会出现重复 ID。
+- 只读快照：两个查询都在一个 `unchecked_transaction`（BEGIN DEFERRED）里完成，两条 SQL（待发段与正式段）看到同一快照。
+- 上限与拒绝：`limit` 契约规定 1..100，取 `MAX_MESSAGE_PAGE_LIMIT = 100` / `MAX_CONVERSATION_PAGE_LIMIT = 100`（任务板的 200 建议被契约覆盖）；越界、时间戳为负、ID 畸形返回 `INVALID_INPUT`；会话不存在或已 `left`/`dissolved` 返回 `PERMISSION_DENIED`；游标超长/格式/认证/过期/跨会话/跨资源返回 `INVALID_CURSOR`；密文被篡改返回 `STATE_CORRUPTED`；fail-closed 后返回 `STORAGE_FAILURE`。查询失败绝不退化为“跳到最新页”。
+- 会话摘要：`last_activity_at` = 该会话 `messages.display_created_at` 与 `drafts.created_at` 的较大值（0 表示无活动）；`pending_intents`、`failed_outbox_jobs`、`unknown_attempts` 为真实计数；`unread_count` 恒为 `None`（正式未读需要 read-cursor 存储，尚未实现，不伪造 0）。
+
+outbox 语义（STORAGE-014/015）：
+
+- 领取：单笔 `BEGIN IMMEDIATE` 短事务；只领取 `state='pending' AND retry_at <= now` 或 `state='leased' AND lease_until <= now`，跳过 `cancel_requested = 1` 与依赖未 `complete` 的任务；每条任务按 `lease_version` CAS（`WHERE lease_version = 观测值`），受影响行数不为 1 即 `JOB_LEASE_CONFLICT`，领取成功 `lease_version + 1`、`lease_until = now + 30s`。条数上限 `MAX_CLAIM_BATCH = 32`，载荷字节上限 `MAX_CLAIM_BATCH_BYTES = 4 MiB`（按 attempt 密文/草稿密文的实际长度累计）。写锁被短暂占用时返回 `STORAGE_BUSY`。
+- 结果三态：success（`TransportAccepted`/`MailboxAck`/`FormallyAccepted`/`Delivered`）、failed（`retryable` 决定重排或终态）、unknown。success 把任务置 `complete` 并清租约；可重试失败置 `pending`、`retry_count + 1`、`retry_at = now + 5s × 2^(n-1)`（上限 5 分钟）；终态失败置 `failed` 并把 attempt 置 `rejected`。
+- `unknown` 不推进为完成：任务保持 `leased`、保留 `lease_owner` 与 `lease_version`，`lease_until` 延长到 6 小时对账窗口，attempt 置 `unknown`；窗口内任何 worker 都不能重领，任务行与 payload 引用都保留。窗口结束后仍可被重领（版本递增），对账得到正式送达后再置 `complete`。
+- 幂等与冲突：同一租约（版本 + 持有者一致）的重复结果按“结果类别”幂等返回——不改行、不提交事务、库版本不前进；类别冲突返回 `INVALID_STATE_TRANSITION`；旧版本/别的持有者返回 `JOB_LEASE_CONFLICT`；已 `cancelled` 的任务不能记录结果。attempt 状态只允许前进（`accepted`/`rejected` 不允许回退），因此 `MailboxAck` 只把 attempt 置 `submitted`，不会被升级为接受或送达。
+
+复现命令（全程离线，本轮实测）：
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-storage   # 5 lib + 2 formal_crash + 8 formal_outbox + 7 formal_query + 17 formal_store = 39 passed
+```
+
+证据（测试名 → 覆盖的契约点）：
+
+- `formal_query::message_page_merges_pending_and_accepted_without_duplicates_or_skips`：翻页期间插入新消息与新待发意图，旧游标不重复、不跳页，7 条历史各出现一次，顺序为“待发新 → 待发旧 → 正式 seq 降序”。
+- `formal_query::message_page_enforces_limits_and_rejects_bad_cursors`：limit 0/101/负时间戳 `INVALID_INPUT`；不存在/已离开会话 `PERMISSION_DENIED`；篡改/跨会话/过期/跨资源游标 `INVALID_CURSOR`。
+- `formal_query::message_page_reports_end_of_stream_and_bounds_the_last_page`：空会话无游标；恰好 limit 条时 `next_cursor = None`；100 条满页。
+- `formal_query::message_page_fails_closed_on_tampered_content`：消息与草稿密文被篡改都返回 `STATE_CORRUPTED`。
+- `formal_query::conversation_page_orders_by_activity_with_stable_tiebreak`：活动时间降序 + 同时间用 `conversation_id` 稳定次键；摘要计数与 `unread_count = None`；分页键集不重复；limit 与游标跨资源拒绝。
+- `formal_query::queries_fail_closed_after_the_store_is_marked_faulted`：fail-closed 后两个查询都 `STORAGE_FAILURE`，不返回旧摘要。
+- `formal_query::prepared_attempts_are_exposed_as_pending_projection_with_submission_id`：待发投影带 `draft_id` 与 attempt 的 `submission_id`。
+- `formal_outbox::claim_leases_due_jobs_once_and_reclaims_after_expiry`：到期才领取、租约内第二个 worker 拿不到、到期重领且版本递增、迟到旧 worker `JOB_LEASE_CONFLICT`。
+- `formal_outbox::claim_skips_dependencies_and_cancelled_jobs`：依赖未完成与 `cancel_requested` 的任务不领取，依赖完成后可领取。
+- `formal_outbox::claim_bounds_the_batch_by_payload_bytes`：3 MiB + 3 MiB 载荷超过 4 MiB 预算，一批只领取一条。
+- `formal_outbox::unknown_result_stays_reconcilable_and_never_completes`：`unknown` 后任务仍 `leased`、无 `complete` 投递任务、窗口内不可重领、窗口后重领 → 正式送达后 `complete` 且 attempt `accepted`。
+- `formal_outbox::mailbox_ack_does_not_upgrade_delivery`：`MailboxAck` 只把 attempt 置 `submitted`，不写消息行。
+- `formal_outbox::mark_is_idempotent_and_rejects_conflicting_or_stale_results`：重复结果幂等且库版本不前进；类别冲突 `INVALID_STATE_TRANSITION`；旧版本/伪造 worker `JOB_LEASE_CONFLICT`；已取消任务显式拒绝。
+- `formal_outbox::retryable_failure_reschedules_with_backoff_and_terminal_failure_stops`：退避期不重领、到期重领版本递增、终态失败 attempt `rejected` 且不再领取。
+- `formal_outbox::claim_and_mark_reject_malformed_input`：limit/worker/时间戳/ID 畸形 `INVALID_INPUT`，不存在的任务 `JOB_LEASE_CONFLICT`。
+
+已知限制（本记录只对已完成部分负责）：
+
+1. **游标是内部临时实现**：线协议 PROTOCOL-012/013 的 `cur1` 令牌要求账户/设备/会话的 32 字节二进制身份，而正式存储当前只有 TEXT 会话标识、也不保存本机账户/设备身份。本模块用 `spg1` 前缀的内部 AEAD 令牌（主密钥派生用途 `page-cursor`，AAD 绑定会话 + 资源 + 排序版本，TTL 10 分钟、允许 60 秒时钟超前）替代；令牌不能跨到桥接层或网络，待身份映射就绪后应替换为线协议令牌。
+2. **待发投影 ID**：待发意图暂时以 `draft_id` 作为稳定本地 ID；正式 MessageId 的关联由尚未实现的 STORAGE-008（`apply_verified_entry`）写 `messages.draft_id`/`messages.submission_id` 完成。
+3. **未读计数**：返回 `None`。正式未读需要 read-cursor 存储（schema 里没有读位置表），本轮不新增迁移。
+4. **消息正文封装契约**：`messages.protected_content` 用用途 `message-content`、AAD `(conversation_id, message_id)` 封装，唯一入口是 `Store::seal_message_content`；STORAGE-008 写入时必须使用同一契约，否则查询会显式 `STATE_CORRUPTED`。
+5. **诊断不落盘**：P0 schema 没有 outbox 诊断列，且本轮不新增迁移，结果诊断只截断（≤200 字符、去控制字符）后随 `JobState` 返回给上层日志。
+6. **unknown 的对账**：本函数只保留可对账状态（6 小时窗口 + attempt `unknown`）。真正的对账（按 SubmissionId 查询节点接受状态）属于同步/节点模块，未在本函数实现；窗口结束后若无人对账，任务仍可被重领，存在重复提交风险，需要在同步模块接入前保持 worker 侧幂等。
+7. **并发唯一性**：`open_store` 是单写者独占打开，进程内并发由 CAS 版本保证；跨进程/双 worker 的真实竞争以两把独立连接的 SQLite 锁与 CAS 语义表达，本轮用“顺序领取 + 版本 CAS”验证（无法在同一进程内同时打开第二个 Store）。
+8. **会话列表解密**：`conversations.protected_metadata`（标题等）没有在本函数解密——它属于尚未定义的会话元数据封装契约，本轮不猜测用途，只返回 `kind`/`state` 与计数摘要。
 
 ## 函数导航
 
@@ -447,10 +511,10 @@ query_message_page(conversation: ConversationId, before: Option<Cursor>, limit: 
 
 **完成验收**：
 
-- [ ] 并发到达消息翻页不重复/跳页。
-- [ ] 待发转正式 ID 关联稳定。
+- [x] 并发到达消息翻页不重复/跳页：`formal_query::message_page_merges_pending_and_accepted_without_duplicates_or_skips`（翻页中途插入新消息与新待发意图，旧游标既不重复也不跳页，7 条历史各返回一次，含待发/正式合并顺序）、`formal_query::message_page_reports_end_of_stream_and_bounds_the_last_page`（边界与满页）。
+- [ ] 待发转正式 ID 关联稳定：部分验证——待发投影以 `draft_id` 为稳定本地 ID、并带已有 attempt 的 `submission_id`（`formal_query::prepared_attempts_are_exposed_as_pending_projection_with_submission_id`），且已进入 `messages` 的草稿不再作为待发返回；正式 MessageId 关联依赖尚未实现的 STORAGE-008 写入 `messages.draft_id`/`messages.submission_id`，因此本项不勾选。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（Windows x64 实测，仅读取已提交状态）。入口 `query_message_page(conversation_id, before, limit)` 与注入时钟的 `query_message_page_at(..., now_unix_ms)`，见 [query.rs](../../crates/storage/src/formal/query.rs)；游标见 [cursor.rs](../../crates/storage/src/formal/cursor.rs)。证据：`cargo test --offline -p chat-storage`（`formal_query` 7 个用例中本函数 5 个：合并排序/边界/游标/篡改/待发投影）。限制：游标是内部 `spg1` 临时令牌（非 PROTOCOL-012 `cur1`）；待发投影 ID 暂用 `draft_id`；limit 上限取契约的 100（未采用任务板的 200 建议）；`conversations.protected_metadata` 不在本函数解密。
 
 <a id="storage-013"></a>
 
@@ -479,10 +543,10 @@ query_conversation_page(cursor: Option<Cursor>, limit: u32) -> Result<Page<Conve
 
 **完成验收**：
 
-- [ ] 同时间会话用稳定次键。
-- [ ] 锁库时不泄漏旧缓存摘要。
+- [x] 同时间会话用稳定次键：`formal_query::conversation_page_orders_by_activity_with_stable_tiebreak`（`conv-2`/`conv-3` 最近活动时间相同，按 `conversation_id DESC` 稳定排序；`last_activity_at` 取消息展示时间与本地意图创建时间的较大值）。
+- [x] 锁库时不泄漏旧缓存摘要：本函数不维护任何缓存，且 fail-closed 闸门直接拒绝——`formal_query::queries_fail_closed_after_the_store_is_marked_faulted`（`STORAGE_FAILURE`）。限制：进程内无法制造“另一个进程持有锁”的状态（`open_store` 已独占打开），等价验证走 fail-closed 闸门。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（Windows x64 实测）。入口 `query_conversation_page(cursor, limit)` 与 `query_conversation_page_at(..., now_unix_ms)`，见 [query.rs](../../crates/storage/src/formal/query.rs)；摘要包含待发意图数、`failed` outbox 任务数、`unknown` 尝试数。证据：`cargo test --offline -p chat-storage`（`formal_query::conversation_page_orders_by_activity_with_stable_tiebreak`）。限制：`unread_count` 恒为 `None`（无 read-cursor 存储，不伪造 0）；会话标题等 `protected_metadata` 未解密（封装契约未定义）；limit 上限 100。
 
 <a id="storage-014"></a>
 
@@ -512,10 +576,10 @@ claim_outbox_batch(now: Time, limit: u32, worker: WorkerId) -> Result<Vec<Leased
 
 **完成验收**：
 
-- [ ] worker 崩溃租约到期恢复。
-- [ ] 两 worker 不同时拥有同 lease。
+- [x] worker 崩溃租约到期恢复：`formal_outbox::claim_leases_due_jobs_once_and_reclaims_after_expiry`（租约 30 秒内第二个 worker 领不到，到期后被重新领取且 `lease_version` 递增）。
+- [x] 两 worker 不同时拥有同 lease：同一用例（租约有效窗口内 `worker-b` 返回空）+ CAS 版本语义（`claim_skips_dependencies_and_cancelled_jobs` 验证依赖与取消跳过；`mark_is_idempotent_and_rejects_conflicting_or_stale_results` 验证伪造/旧版本 `JOB_LEASE_CONFLICT`）。限制：`open_store` 单写者独占，无法在同一进程内同时打开两个 Store 制造真并发，用“顺序领取 + `lease_version` CAS”表达同一不变式。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（Windows x64 实测）。`claim_outbox_batch(now, limit, worker)` 在单笔短事务内按 `lease_version` CAS 领取，见 [outbox_lease.rs](../../crates/storage/src/formal/outbox_lease.rs)。上限：条数 `MAX_CLAIM_BATCH = 32`、载荷字节 `MAX_CLAIM_BATCH_BYTES = 4 MiB`（`formal_outbox::claim_bounds_the_batch_by_payload_bytes`）；跳过 `cancel_requested` 与依赖未完成；写锁短暂占用映射为 `STORAGE_BUSY`；畸形输入（limit/worker/时间戳）返回 `INVALID_INPUT`（`formal_outbox::claim_and_mark_reject_malformed_input`）。限制：真实跨进程竞争未在同一进程内复现；群内任务顺序约束只实现 `depends_on` 这一层。
 
 <a id="storage-015"></a>
 
@@ -545,8 +609,8 @@ mark_outbox_result(lease: LeasedJob, result: JobResult) -> Result<JobState>
 
 **完成验收**：
 
-- [ ] 迟到旧 worker 不覆盖新结果。
-- [ ] mailbox ACK 不升级送达。
+- [x] 迟到旧 worker 不覆盖新结果：`formal_outbox::claim_leases_due_jobs_once_and_reclaims_after_expiry`（旧 worker 用版本 1 更新版本 2 的租约 → `JOB_LEASE_CONFLICT`，行状态未被改写）、`formal_outbox::mark_is_idempotent_and_rejects_conflicting_or_stale_results`（旧版本/伪造持有者拒绝；重复相同结果幂等且不改行、不推进库版本）。
+- [x] mailbox ACK 不升级送达：`formal_outbox::mailbox_ack_does_not_upgrade_delivery`（`MailboxAck` 只把 attempt 置 `submitted`，不写 `messages` 行、不产生送达投影）；`formal_outbox::unknown_result_stays_reconcilable_and_never_completes` 证明 `unknown` 不落成 `complete`。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（Windows x64 实测）。`mark_outbox_result(lease, result)` 与注入时钟的 `mark_outbox_result_at(..., now_unix_ms)`，见 [outbox_lease.rs](../../crates/storage/src/formal/outbox_lease.rs)。三态语义：success → 任务 `complete`；可重试失败 → `pending` + 指数退避（5 秒起、上限 5 分钟）；终态失败 → `failed` + attempt `rejected`；`unknown` → 保持 `leased`、延长 6 小时对账窗口、attempt `unknown`，绝不当作成功删除投递任务。attempt 只允许前进（`accepted`/`rejected` 不回退）。限制：诊断不落盘（P0 schema 无诊断列且本轮不新增迁移，只随 `JobState` 返回）；`unknown` 的真实对账（按 SubmissionId 查询节点状态）属于同步/节点模块，未实现；重试退避策略是本地取值，正式策略待 DOMAIN-010 `classify_retry` 接入后对齐。
 
