@@ -203,3 +203,65 @@ fun chat.api.DraftCancelOutcome.toUi(): CancelUi = when (outcome) {
         keepMessage = true,
     )
 }
+
+/** 附件状态 → 界面徽标（ATTACHMENTS-002）。 */
+data class AttachmentBadge(
+    val state: String,
+    val label: String,
+    /** 只有 available 才能声称“对方可下载”。 */
+    val downloadable: Boolean,
+    val cancellable: Boolean,
+    val detail: String,
+)
+
+fun chat.api.LocalAttachment.toBadge(): AttachmentBadge = when (state) {
+    "imported" -> AttachmentBadge(
+        state = state,
+        label = "已加密导入",
+        downloadable = false,
+        cancellable = true,
+        detail = "只在本机；尚未上传，对方不可下载。",
+    )
+    "uploading" -> AttachmentBadge(
+        state = state,
+        label = "上传中",
+        downloadable = false,
+        cancellable = true,
+        detail = "正在按序提交密文块；失败可重试，已传块不会重传。",
+    )
+    "available" -> AttachmentBadge(
+        state = state,
+        label = "已上传",
+        downloadable = true,
+        cancellable = false,
+        detail = "节点已保存全部密文块并校验整体摘要。",
+    )
+    "downloading" -> AttachmentBadge(
+        state = state,
+        label = "下载中",
+        downloadable = false,
+        cancellable = true,
+        detail = "正在下载并逐块认证解密；失败会清理临时文件。",
+    )
+    "cancelled" -> AttachmentBadge(
+        state = state,
+        label = "已取消",
+        downloadable = false,
+        cancellable = false,
+        detail = "已请求取消；本地缓存与进度保留。",
+    )
+    "failed" -> AttachmentBadge(
+        state = state,
+        label = "失败",
+        downloadable = false,
+        cancellable = false,
+        detail = "失败记录不保留缓存，可以重新导入。",
+    )
+    else -> AttachmentBadge(
+        state = state,
+        label = "状态未知",
+        downloadable = false,
+        cancellable = false,
+        detail = "收到无法识别的附件状态，已按不可下载处理。",
+    )
+}

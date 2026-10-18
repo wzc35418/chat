@@ -1,6 +1,6 @@
 {
   "date": "2026-10-18",
-  "status": "PASS",
+  "status": "FAIL",
   "scope": "delivery-structure-only",
   "checks": [
     {
@@ -8,8 +8,12 @@
       "message": "函数目录与源码位置、唯一ID、契约字段、调用引用已检查：197"
     },
     {
+      "status": "FAIL",
+      "message": "失效锚点 docs/implementation/core.md -> attachments.md#上传下载接块传输端口实现记录attachments-003--0052026-10-18windows-x64"
+    },
+    {
       "status": "PASS",
-      "message": "本地Markdown链接及显式函数锚点已检查：1490"
+      "message": "本地Markdown链接及显式函数锚点已检查：1495"
     },
     {
       "status": "PASS",
@@ -41,7 +45,7 @@
     "未验证 MLS/密码学/跨端/网络/部署行为",
     "SQL仅在内存普通SQLite中验证，不证明加密存储可用"
   ],
-  "fileCount": 406,
+  "fileCount": 407,
   "functionCount": 197,
-  "markdownLinks": 1490
+  "markdownLinks": 1495
 }

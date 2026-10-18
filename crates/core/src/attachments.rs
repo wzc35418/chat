@@ -132,6 +132,23 @@ pub enum AttachmentError {
     },
     /// 文件内容密钥只在进程内：该附件当前无法解密/导出。
     KeyUnavailable(&'static str),
+    /// 块传输端口失败（节点不可用/配额/会话过期/块缺失等）：保留冻结码，调用方可重试。
+    Transport {
+        /// 稳定错误码（实现方给冻结码，例如 NODE_UNAVAILABLE）。
+        code: &'static str,
+        /// 脱敏错误消息（不含正文/密钥）。
+        detail: String,
+    },
+}
+
+impl AttachmentError {
+    /// 构造传输端口错误（实现 [BlobTransport] 的适配层使用）。
+    pub fn transport(code: &'static str, detail: impl Into<String>) -> Self {
+        Self::Transport {
+            code,
+            detail: detail.into(),
+        }
+    }
 }
 
 impl From<StorageError> for AttachmentError {
@@ -160,6 +177,7 @@ impl AttachmentError {
             Self::InternalFailure(_) => "INTERNAL_FAILURE",
             Self::Storage { code, .. } => code,
             Self::KeyUnavailable(_) => "ATTACHMENT_KEY_UNAVAILABLE",
+            Self::Transport { code, .. } => code,
         }
     }
 }
@@ -183,6 +201,9 @@ impl fmt::Display for AttachmentError {
             }
             Self::KeyUnavailable(detail) => {
                 write!(formatter, "attachment key is unavailable: {detail}")
+            }
+            Self::Transport { code, detail } => {
+                write!(formatter, "attachment transport failure {code}: {detail}")
             }
         }
     }
@@ -1010,6 +1031,441 @@ impl PersistedAttachmentStore {
     }
 }
 
+// ============================================================================
+// ATTACHMENTS-003 / 005：块传输端口（上传/下载），不依赖 node-client
+// ============================================================================
+
+/// 上传请求：只含公开清单字段（不含 FileKey、明文摘要与正文）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadRequest {
+    /// 本地附件 ID（也是节点侧的 blob 标识）。
+    pub attachment_id: String,
+    /// 明文总字节数。
+    pub plain_size: u64,
+    /// 分块大小。
+    pub chunk_size: u32,
+    /// 分块总数。
+    pub chunk_count: u32,
+    /// 密文总字节数（各分块密文长度之和）。
+    pub ciphertext_bytes: u64,
+    /// 密文整文件 SHA-256（小写 hex）；节点据此核对清单。
+    pub ciphertext_digest: String,
+}
+
+/// 上传会话句柄（不透明文本；实现方决定其有效期与幂等范围）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadSession {
+    session_id: String,
+}
+
+impl UploadSession {
+    /// 由端口实现方的会话标识构造。
+    pub fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+        }
+    }
+
+    /// 会话标识。
+    pub fn as_str(&self) -> &str {
+        &self.session_id
+    }
+
+    /// 取出会话标识。
+    pub fn into_id(self) -> String {
+        self.session_id
+    }
+}
+
+impl fmt::Display for UploadSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.session_id)
+    }
+}
+
+/// 块传输端口：由适配层（node-client / 测试替身）实现，本 crate 不依赖具体客户端。
+///
+/// 实现契约（编排层依赖这些语义，缺一不可）：
+/// - begin_upload 为一次上传尝试建立会话，返回稳定会话标识；
+/// - put_chunk 对同一 (session, index) 重复写入同一字节必须幂等
+///   （重复块不重复计费、不产生第二份数据）；
+/// - complete 收到整文件密文摘要后由节点确认清单；
+/// - read_chunk 按 blob + 序号返回分块密文；缺失/未就绪必须显式失败
+///   （不得返回空字节冒充成功）。
+pub trait BlobTransport {
+    /// 建立上传会话。
+    fn begin_upload(&mut self, request: UploadRequest) -> AttachmentResult<UploadSession>;
+
+    /// 写入一块密文（同会话同序号幂等）。
+    fn put_chunk(&mut self, session: &str, index: u32, bytes: &[u8]) -> AttachmentResult<()>;
+
+    /// 完成上传：节点按整文件密文摘要确认清单。
+    fn complete(&mut self, session: &str, total_ciphertext_digest: &str) -> AttachmentResult<()>;
+
+    /// 读取一块密文（下载路径）。
+    fn read_chunk(&mut self, blob_id: &str, index: u32) -> AttachmentResult<Vec<u8>>;
+}
+
+/// 下载回执（ATTACHMENTS-005）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadReceipt {
+    /// 本地附件 ID。
+    pub attachment_id: String,
+    /// 实际写出的明文字节数。
+    pub written_bytes: u64,
+    /// 明文的整体 SHA-256（小写 hex），与持久化记录一致才会返回成功。
+    pub content_digest: String,
+}
+
+impl AttachmentStore {
+    /// 读取本地缓存的分块密文（只读；缺块按损坏处理，不返回空字节）。
+    fn ciphertext_chunk(&self, attachment_id: &str, index: u32) -> AttachmentResult<Vec<u8>> {
+        let path = self.chunk_path(attachment_id, index)?;
+        fs::read(&path)
+            .map_err(|_| AttachmentError::AttachmentCorrupted("cached ciphertext chunk is missing"))
+    }
+
+    /// 同步进程内的传输进度与状态（缓存状态与持久化状态保持一致）。
+    ///
+    /// 重启后没有进程内记录时静默跳过：进度不是持久真相（附件表没有进度列）。
+    fn note_transfer(
+        &self,
+        attachment_id: &str,
+        state: AttachmentState,
+        transferred: u32,
+        failure: Option<&'static str>,
+    ) {
+        let Ok(mut records) = self.records.lock() else {
+            return;
+        };
+        if let Some(record) = records.get_mut(attachment_id) {
+            record.state = state;
+            record.transferred_chunks = transferred.min(record.descriptor.chunk_count);
+            record.failure = failure;
+        }
+    }
+}
+
+/// 逐块下载密文→认证解密→整体摘要校验，写入临时文件（成功后由调用方 rename）。
+fn download_ciphertext_into<T: BlobTransport + ?Sized>(
+    partial_path: &Path,
+    record: &StoredAttachmentRecord,
+    file_id: FileId,
+    file_key: &FileKey,
+    transport: &mut T,
+) -> AttachmentResult<(u64, String)> {
+    let mut file = File::create(partial_path).map_err(|_| AttachmentError::FileIoFailure)?;
+    let mut ciphertext_hasher = Sha256::new();
+    let mut plaintext_hasher = Sha256::new();
+    let mut written = 0u64;
+    for index in 0..record.chunk_count {
+        let bytes = transport.read_chunk(&record.attachment_id, index)?;
+        ciphertext_hasher.update(&bytes);
+        let context = chunk_context_for(file_id, record.plain_size, index)?;
+        let chunk = CipherChunk::from_bytes(bytes)?;
+        let plaintext = decrypt_attachment_chunk(file_key, &context, &chunk)?;
+        plaintext_hasher.update(plaintext.as_slice());
+        file.write_all(plaintext.as_slice())
+            .map_err(|_| AttachmentError::FileIoFailure)?;
+        written = written.saturating_add(plaintext.len() as u64);
+    }
+    file.sync_all().map_err(|_| AttachmentError::FileIoFailure)?;
+    drop(file);
+    if hex(&ciphertext_hasher.finalize()) != record.ciphertext_digest {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "downloaded ciphertext digest does not match the manifest",
+        ));
+    }
+    if written != record.plain_size {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "downloaded size does not match the descriptor",
+        ));
+    }
+    let content_digest = hex(&plaintext_hasher.finalize());
+    if content_digest != record.content_digest {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "downloaded content digest does not match the descriptor",
+        ));
+    }
+    Ok((written, content_digest))
+}
+
+impl PersistedAttachmentStore {
+    fn mark_persisted_state(
+        &self,
+        attachment_id: &str,
+        state: &str,
+    ) -> AttachmentResult<StoredAttachmentRecord> {
+        let mut store = self.lock_store()?;
+        store
+            .mark_attachment_state(attachment_id, state)
+            .map_err(AttachmentError::from)
+    }
+
+    /// 由持久化记录 + 进程内进度组装的对外状态（进度取缓存，状态以持久记录为准）。
+    fn persisted_status(&self, record: &StoredAttachmentRecord) -> AttachmentStatus {
+        let state =
+            AttachmentState::from_code(&record.state).unwrap_or(AttachmentState::Failed);
+        let (available_chunks, transferred_chunks, failure) =
+            match self.cache.attachment_status(&record.attachment_id) {
+                Ok(status) => (
+                    status.available_chunks,
+                    status.transferred_chunks,
+                    status.failure,
+                ),
+                Err(_) => (0, 0, None),
+            };
+        AttachmentStatus {
+            attachment_id: record.attachment_id.clone(),
+            state,
+            plain_size: record.plain_size,
+            chunk_count: record.chunk_count,
+            available_chunks,
+            transferred_chunks,
+            cancel_requested: state == AttachmentState::Cancelled,
+            failure,
+        }
+    }
+
+    /// ATTACHMENTS-003：把本地加密缓存的分块密文按序上传，成功后标 available。
+    ///
+    /// 语义：
+    /// - 状态机走 storage 白名单：imported → uploading → available（上传重试是
+    ///   uploading → uploading 幂等；取消/失败/未导入显式拒绝）；
+    /// - 已 available 时再次调用是**幂等无操作**（不建会话、不发块）；
+    /// - 中途失败保留本地密文缓存与已发送块计数（进程内），状态停在 uploading，
+    ///   可原样重试；每次尝试新建会话并按序重发全部块（同会话同序号幂等由端口保证）；
+    /// - 只有节点 complete 确认后才会把记录标成 available，绝不在网络失败时伪造成功。
+    pub fn upload_attachment<T: BlobTransport + ?Sized>(
+        &self,
+        attachment_id: &str,
+        transport: &mut T,
+    ) -> AttachmentResult<AttachmentStatus> {
+        validate_attachment_id(attachment_id)?;
+        let record = self
+            .attachment_record(attachment_id)?
+            .ok_or(AttachmentError::AttachmentNotFound)?;
+        let state = AttachmentState::from_code(&record.state).ok_or(
+            AttachmentError::AttachmentCorrupted("stored attachment state is unknown"),
+        )?;
+        match state {
+            AttachmentState::Available => return Ok(self.persisted_status(&record)),
+            AttachmentState::Imported | AttachmentState::Uploading => {}
+            AttachmentState::Cancelled => {
+                return Err(AttachmentError::AttachmentNotReady(
+                    "attachment transfer was cancelled",
+                ));
+            }
+            AttachmentState::Downloading => {
+                return Err(AttachmentError::AttachmentNotReady(
+                    "attachment is being downloaded",
+                ));
+            }
+            AttachmentState::Staging | AttachmentState::Failed => {
+                return Err(AttachmentError::AttachmentNotReady(
+                    "attachment was not imported successfully",
+                ));
+            }
+        }
+        if self.cache.available_chunks(attachment_id, record.chunk_count) != record.chunk_count {
+            return Err(AttachmentError::AttachmentCorrupted(
+                "cached ciphertext chunks are incomplete",
+            ));
+        }
+        let mut ciphertext_bytes = 0u64;
+        for index in 0..record.chunk_count {
+            let chunk = self.cache.ciphertext_chunk(attachment_id, index)?;
+            ciphertext_bytes = ciphertext_bytes.saturating_add(chunk.len() as u64);
+        }
+        let request = UploadRequest {
+            attachment_id: record.attachment_id.clone(),
+            plain_size: record.plain_size,
+            chunk_size: record.chunk_size,
+            chunk_count: record.chunk_count,
+            ciphertext_bytes,
+            ciphertext_digest: record.ciphertext_digest.clone(),
+        };
+        self.mark_persisted_state(attachment_id, AttachmentState::Uploading.code())?;
+        self.cache
+            .note_transfer(attachment_id, AttachmentState::Uploading, 0, None);
+        let session = transport.begin_upload(request)?;
+        let mut sent = 0u32;
+        for index in 0..record.chunk_count {
+            let chunk = match self.cache.ciphertext_chunk(attachment_id, index) {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    self.cache.note_transfer(
+                        attachment_id,
+                        AttachmentState::Uploading,
+                        sent,
+                        Some("cached ciphertext chunk is missing"),
+                    );
+                    return Err(error);
+                }
+            };
+            if let Err(error) = transport.put_chunk(session.as_str(), index, &chunk) {
+                // 进度与缓存都保留：状态停在 uploading，可重试。
+                self.cache.note_transfer(
+                    attachment_id,
+                    AttachmentState::Uploading,
+                    sent,
+                    Some("upload failed"),
+                );
+                return Err(error);
+            }
+            sent = sent.saturating_add(1);
+            self.cache
+                .note_transfer(attachment_id, AttachmentState::Uploading, sent, None);
+        }
+        transport.complete(session.as_str(), &record.ciphertext_digest)?;
+        let available =
+            self.mark_persisted_state(attachment_id, AttachmentState::Available.code())?;
+        self.cache.note_transfer(
+            attachment_id,
+            AttachmentState::Available,
+            record.chunk_count,
+            None,
+        );
+        Ok(self.persisted_status(&available))
+    }
+
+    /// ATTACHMENTS-005：下载认证密文→逐块认证解密→整体摘要校验→写出明文。
+    ///
+    /// 语义：
+    /// - 只接受已发布（available）或正在下载（downloading，可重试）的记录；
+    /// - expected_manifest 必须与本地持久化记录一致（块数/大小/块大小/密文摘要），
+    ///   否则在发起任何网络读取前显式拒绝（ATTACHMENT_CORRUPTED）；
+    /// - 解密需要进程内的 FileKey：重启后（没有进程内记录）显式
+    ///   ATTACHMENT_KEY_UNAVAILABLE，绝不写出未经验证的文件；
+    /// - 先写同目录临时文件，全部块认证通过 + 密文摘要 + 明文大小 + 明文摘要都一致
+    ///   才 rename 成目标文件；任何失败都会删除临时文件；
+    /// - blob_id 本轮就是本地附件 ID（节点侧 blob 标识复用附件 ID，不新增第二种 ID）。
+    pub fn download_attachment<T: BlobTransport + ?Sized>(
+        &self,
+        blob_id: &str,
+        expected_manifest: &AttachmentManifest,
+        destination: &FileToken,
+        transport: &mut T,
+    ) -> AttachmentResult<DownloadReceipt> {
+        validate_attachment_id(blob_id)?;
+        let record = self
+            .attachment_record(blob_id)?
+            .ok_or(AttachmentError::AttachmentNotFound)?;
+        let state = AttachmentState::from_code(&record.state).ok_or(
+            AttachmentError::AttachmentCorrupted("stored attachment state is unknown"),
+        )?;
+        match state {
+            AttachmentState::Available | AttachmentState::Downloading => {}
+            _ => {
+                return Err(AttachmentError::AttachmentNotReady(
+                    "attachment is not published yet",
+                ));
+            }
+        }
+        if expected_manifest.attachment_id != record.attachment_id {
+            return Err(AttachmentError::AttachmentCorrupted(
+                "expected manifest belongs to another attachment",
+            ));
+        }
+        if expected_manifest.plain_size != record.plain_size
+            || expected_manifest.chunk_size != record.chunk_size
+            || expected_manifest.chunk_count != record.chunk_count
+            || expected_manifest.ciphertext_digest != record.ciphertext_digest
+        {
+            return Err(AttachmentError::AttachmentCorrupted(
+                "expected manifest does not match the stored attachment record",
+            ));
+        }
+        let destination_path = destination.path();
+        if destination_path.is_dir() {
+            return Err(AttachmentError::InvalidFileToken(
+                "destination must name a file",
+            ));
+        }
+        let file_name = destination_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(AttachmentError::InvalidFileToken(
+                "destination must name a file",
+            ))?;
+        if let Some(parent) = destination_path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.is_dir()
+        {
+            return Err(AttachmentError::FileIoFailure);
+        }
+        let partial_path =
+            destination_path.with_file_name(format!("{file_name}.download-partial"));
+        self.mark_persisted_state(blob_id, AttachmentState::Downloading.code())?;
+        // 解密需要进程内的 FileKey（不可复制）：先用短锁确认存在，再在记录上持锁完成
+        // 整个逐块校验（注意不能在持锁时再调用会加锁的 note_transfer，否则自死锁）。
+        {
+            let records = self.cache.lock_records()?;
+            if !records.contains_key(blob_id) {
+                drop(records);
+                let _ = fs::remove_file(&partial_path);
+                self.cache.note_transfer(
+                    blob_id,
+                    AttachmentState::Downloading,
+                    0,
+                    Some("file key is unavailable"),
+                );
+                return Err(AttachmentError::KeyUnavailable(
+                    "the file key is only held in memory; the attachment must be imported in this process",
+                ));
+            }
+        }
+        let outcome = {
+            let records = self.cache.lock_records()?;
+            let cached = records.get(blob_id).ok_or(AttachmentError::KeyUnavailable(
+                "the file key is only held in memory",
+            ))?;
+            download_ciphertext_into(
+                &partial_path,
+                &record,
+                cached.file_id,
+                &cached.file_key,
+                transport,
+            )
+        };
+        match outcome {
+            Ok((written, content_digest)) => {
+                if destination_path.exists() && fs::remove_file(destination_path).is_err() {
+                    let _ = fs::remove_file(&partial_path);
+                    return Err(AttachmentError::FileIoFailure);
+                }
+                if fs::rename(&partial_path, destination_path).is_err() {
+                    let _ = fs::remove_file(&partial_path);
+                    return Err(AttachmentError::FileIoFailure);
+                }
+                self.mark_persisted_state(blob_id, AttachmentState::Available.code())?;
+                self.cache.note_transfer(
+                    blob_id,
+                    AttachmentState::Available,
+                    record.chunk_count,
+                    None,
+                );
+                Ok(DownloadReceipt {
+                    attachment_id: record.attachment_id.clone(),
+                    written_bytes: written,
+                    content_digest,
+                })
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&partial_path);
+                // 失败保留状态 downloading（可重试），不写出任何未验证文件。
+                self.cache.note_transfer(
+                    blob_id,
+                    AttachmentState::Downloading,
+                    0,
+                    Some("download failed"),
+                );
+                Err(error)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1725,5 +2181,458 @@ mod tests {
         );
         assert!(store.attachment_records(10).is_err());
     }
+
+
+    // ------------------------------------------------------------ 块传输端口测试
+
+    /// 内存块传输端口：可配置“第 N 块失败”、可篡改/缺失，便于验证中断与重试。
+    #[derive(Default)]
+    struct FakeBlobTransport {
+        sessions: HashMap<String, FakeSession>,
+        next_session: u64,
+        fail_put_at: Option<u32>,
+        puts: usize,
+        reads: usize,
+        completes: usize,
+        completed_digest: Option<String>,
+    }
+
+    struct FakeSession {
+        request: UploadRequest,
+        chunks: Vec<Option<Vec<u8>>>,
+    }
+
+    impl FakeBlobTransport {
+        fn failing_at(index: u32) -> Self {
+            let mut transport = Self::default();
+            transport.fail_put_at = Some(index);
+            transport
+        }
+
+        fn session_for(&self, blob_id: &str) -> Option<&FakeSession> {
+            self.sessions
+                .values()
+                .find(|session| session.request.attachment_id == blob_id)
+        }
+
+        fn stored_chunk(&self, blob_id: &str, index: u32) -> Option<&Vec<u8>> {
+            self.session_for(blob_id)
+                .and_then(|session| session.chunks.get(index as usize))
+                .and_then(|chunk| chunk.as_ref())
+        }
+
+        fn tamper(&mut self, blob_id: &str, index: u32, bytes: &[u8]) -> bool {
+            for session in self.sessions.values_mut() {
+                if session.request.attachment_id == blob_id
+                    && let Some(slot) = session.chunks.get_mut(index as usize)
+                {
+                    *slot = Some(bytes.to_vec());
+                    return true;
+                }
+            }
+            false
+        }
+
+        fn drop_blob(&mut self, blob_id: &str) {
+            self.sessions
+                .retain(|_, session| session.request.attachment_id != blob_id);
+        }
+    }
+
+    impl BlobTransport for FakeBlobTransport {
+        fn begin_upload(&mut self, request: UploadRequest) -> AttachmentResult<UploadSession> {
+            self.next_session = self.next_session.saturating_add(1);
+            let session_id = format!("sess-{}", self.next_session);
+            let slots = vec![None; request.chunk_count as usize];
+            self.sessions.insert(
+                session_id.clone(),
+                FakeSession {
+                    request,
+                    chunks: slots,
+                },
+            );
+            Ok(UploadSession::new(session_id))
+        }
+
+        fn put_chunk(&mut self, session: &str, index: u32, bytes: &[u8]) -> AttachmentResult<()> {
+            if self.fail_put_at == Some(index) {
+                return Err(AttachmentError::transport(
+                    "NODE_UNAVAILABLE",
+                    "fake node rejects the chunk",
+                ));
+            }
+            self.puts = self.puts.saturating_add(1);
+            let entry = self.sessions.get_mut(session).ok_or_else(|| {
+                AttachmentError::transport("UPLOAD_EXPIRED", "fake upload session is gone")
+            })?;
+            let slot = entry.chunks.get_mut(index as usize).ok_or_else(|| {
+                AttachmentError::transport("INVALID_TARGET", "chunk index is out of range")
+            })?;
+            // 幂等：同一 (session, index) 重复写同一字节只保留一份。
+            *slot = Some(bytes.to_vec());
+            Ok(())
+        }
+
+        fn complete(
+            &mut self,
+            session: &str,
+            total_ciphertext_digest: &str,
+        ) -> AttachmentResult<()> {
+            self.completes = self.completes.saturating_add(1);
+            let complete = {
+                let entry = self.sessions.get(session).ok_or_else(|| {
+                    AttachmentError::transport("UPLOAD_EXPIRED", "fake upload session is gone")
+                })?;
+                entry.chunks.iter().all(|chunk| chunk.is_some())
+            };
+            if !complete {
+                return Err(AttachmentError::transport(
+                    "INVALID_TARGET",
+                    "fake node is missing chunks",
+                ));
+            }
+            self.completed_digest = Some(total_ciphertext_digest.to_owned());
+            Ok(())
+        }
+
+        fn read_chunk(&mut self, blob_id: &str, index: u32) -> AttachmentResult<Vec<u8>> {
+            self.reads = self.reads.saturating_add(1);
+            self.stored_chunk(blob_id, index)
+                .cloned()
+                .ok_or(AttachmentError::AttachmentNotFound)
+        }
+    }
+
+    /// 三块的测试源（2 * CHUNK_BYTES + 777），保证能验证“第 3 块失败”。
+    fn upload_source(dir: &TempDir, name: &str) -> (PathBuf, Vec<u8>) {
+        let mut source = pattern(2 * CHUNK_BYTES + 777, 9);
+        source.extend_from_slice(b"ATTACHMENT-UPLOAD-PLAINTEXT-MARKER");
+        let path = dir.source(name, &source);
+        (path, source)
+    }
+
+    #[test]
+    fn upload_sends_the_cached_ciphertext_chunks_verbatim() {
+        let dir = TempDir::new("upload-ok");
+        let (source_path, source) = upload_source(&dir, "upload.bin");
+        let store =
+            PersistedAttachmentStore::open(dir.path("cache"), formal_store(&dir.path("chat.db")))
+                .expect("open persisted store");
+        let descriptor = store
+            .import_file(&FileToken::from_local_path(&source_path), "上传.bin")
+            .expect("import");
+        let manifest = store
+            .cache
+            .attachment_manifest(&descriptor.attachment_id)
+            .expect("manifest");
+        let mut transport = FakeBlobTransport::default();
+        let status = store
+            .upload_attachment(&descriptor.attachment_id, &mut transport)
+            .expect("upload");
+
+        assert_eq!(status.state, AttachmentState::Available);
+        assert_eq!(status.transferred_chunks, descriptor.chunk_count);
+        assert_eq!(status.available_chunks, descriptor.chunk_count);
+        assert_eq!(transport.completes, 1);
+        assert_eq!(transport.completed_digest.as_deref(), Some(manifest.ciphertext_digest.as_str()));
+        let session = transport
+            .session_for(&descriptor.attachment_id)
+            .expect("fake node has the blob");
+        assert_eq!(session.request.plain_size, descriptor.plain_size);
+        assert_eq!(session.request.chunk_count, descriptor.chunk_count);
+        assert_eq!(session.request.chunk_size, descriptor.chunk_size);
+        assert_eq!(session.request.ciphertext_digest, manifest.ciphertext_digest);
+        assert_eq!(session.request.ciphertext_bytes, manifest.ciphertext_bytes);
+
+        // 节点收到的每一块必须与本地缓存密文逐字节一致。
+        for index in 0..descriptor.chunk_count {
+            let local = store
+                .cache
+                .ciphertext_chunk(&descriptor.attachment_id, index)
+                .expect("local ciphertext chunk");
+            let remote = transport
+                .stored_chunk(&descriptor.attachment_id, index)
+                .expect("node ciphertext chunk");
+            assert_eq!(local, *remote, "chunk {index} must match byte for byte");
+            assert!(
+                !contains(&local, &source),
+                "the node must never receive plaintext (chunk {index})"
+            );
+        }
+        let record = store
+            .attachment_record(&descriptor.attachment_id)
+            .expect("record")
+            .expect("record exists");
+        assert_eq!(record.state, "available");
+
+        // 重复上传幂等：不再建会话、不再发块。
+        let puts_before = transport.puts;
+        let completes_before = transport.completes;
+        let repeated = store
+            .upload_attachment(&descriptor.attachment_id, &mut transport)
+            .expect("idempotent upload");
+        assert_eq!(repeated.state, AttachmentState::Available);
+        assert_eq!(transport.puts, puts_before, "an available attachment is not re-uploaded");
+        assert_eq!(transport.completes, completes_before);
+    }
+
+    #[test]
+    fn upload_failure_keeps_progress_and_retry_is_idempotent() {
+        let dir = TempDir::new("upload-retry");
+        let (source_path, _source) = upload_source(&dir, "retry.bin");
+        let store =
+            PersistedAttachmentStore::open(dir.path("cache"), formal_store(&dir.path("chat.db")))
+                .expect("open persisted store");
+        let descriptor = store
+            .import_file(&FileToken::from_local_path(&source_path), "重试.bin")
+            .expect("import");
+        let manifest = store
+            .cache
+            .attachment_manifest(&descriptor.attachment_id)
+            .expect("manifest");
+
+        // 第 3 块失败（0 起）：前 2 块已发出，进度与缓存都必须保留。
+        let mut failing = FakeBlobTransport::failing_at(2);
+        let error = store
+            .upload_attachment(&descriptor.attachment_id, &mut failing)
+            .expect_err("the fake node rejects the third chunk");
+        assert_eq!(error.code(), "NODE_UNAVAILABLE");
+        assert_eq!(failing.puts, 2, "exactly the chunks before the failure were sent");
+        assert_eq!(failing.completes, 0, "a failed upload must never complete");
+        let status = store
+            .attachment_status(&descriptor.attachment_id)
+            .expect("status after failure");
+        assert_eq!(status.state, AttachmentState::Uploading);
+        assert_eq!(status.transferred_chunks, 2);
+        assert_eq!(
+            status.available_chunks, descriptor.chunk_count,
+            "the local ciphertext cache must survive a failed upload"
+        );
+        assert_eq!(status.failure, Some("upload failed"));
+        let record = store
+            .attachment_record(&descriptor.attachment_id)
+            .expect("record")
+            .expect("record exists");
+        assert_eq!(record.state, "uploading", "state stays retryable");
+
+        // 重试：新会话、全部块重发（同字节），成功后 available。
+        let mut retry = FakeBlobTransport::default();
+        let uploaded = store
+            .upload_attachment(&descriptor.attachment_id, &mut retry)
+            .expect("retry succeeds");
+        assert_eq!(uploaded.state, AttachmentState::Available);
+        assert_eq!(retry.puts, descriptor.chunk_count as usize);
+        for index in 0..descriptor.chunk_count {
+            let local = store
+                .cache
+                .ciphertext_chunk(&descriptor.attachment_id, index)
+                .expect("local chunk");
+            assert_eq!(
+                retry.stored_chunk(&descriptor.attachment_id, index),
+                Some(&local),
+                "retry must reuse the same ciphertext bytes"
+            );
+        }
+        let record = store
+            .attachment_record(&descriptor.attachment_id)
+            .expect("record")
+            .expect("record exists");
+        assert_eq!(record.state, "available");
+        assert_eq!(record.ciphertext_digest, manifest.ciphertext_digest);
+    }
+
+    #[test]
+    fn download_roundtrip_matches_the_original_plaintext() {
+        let dir = TempDir::new("download-ok");
+        let (source_path, source) = upload_source(&dir, "roundtrip.bin");
+        let store =
+            PersistedAttachmentStore::open(dir.path("cache"), formal_store(&dir.path("chat.db")))
+                .expect("open persisted store");
+        let descriptor = store
+            .import_file(&FileToken::from_local_path(&source_path), "往返.bin")
+            .expect("import");
+        let manifest = store
+            .cache
+            .attachment_manifest(&descriptor.attachment_id)
+            .expect("manifest");
+        let mut transport = FakeBlobTransport::default();
+        store
+            .upload_attachment(&descriptor.attachment_id, &mut transport)
+            .expect("upload");
+
+        let destination = dir.path("downloaded.bin");
+        let receipt = store
+            .download_attachment(
+                &descriptor.attachment_id,
+                &manifest,
+                &FileToken::from_local_path(&destination),
+                &mut transport,
+            )
+            .expect("download");
+        assert_eq!(receipt.attachment_id, descriptor.attachment_id);
+        assert_eq!(receipt.written_bytes, source.len() as u64);
+        assert_eq!(receipt.content_digest, descriptor.content_digest);
+        assert_eq!(fs::read(&destination).expect("read target"), source);
+        assert_eq!(transport.reads, descriptor.chunk_count as usize);
+        let record = store
+            .attachment_record(&descriptor.attachment_id)
+            .expect("record")
+            .expect("record exists");
+        assert_eq!(record.state, "available");
+    }
+
+    #[test]
+    fn download_rejects_tampered_chunks_and_leaves_no_partial_file() {
+        let dir = TempDir::new("download-tamper");
+        let (source_path, _source) = upload_source(&dir, "tamper.bin");
+        let store =
+            PersistedAttachmentStore::open(dir.path("cache"), formal_store(&dir.path("chat.db")))
+                .expect("open persisted store");
+        let descriptor = store
+            .import_file(&FileToken::from_local_path(&source_path), "篡改.bin")
+            .expect("import");
+        let manifest = store
+            .cache
+            .attachment_manifest(&descriptor.attachment_id)
+            .expect("manifest");
+        let mut transport = FakeBlobTransport::default();
+        store
+            .upload_attachment(&descriptor.attachment_id, &mut transport)
+            .expect("upload");
+        assert!(transport.tamper(&descriptor.attachment_id, 1, b"tampered ciphertext"));
+
+        let destination = dir.path("tampered.out");
+        let error = store
+            .download_attachment(
+                &descriptor.attachment_id,
+                &manifest,
+                &FileToken::from_local_path(&destination),
+                &mut transport,
+            )
+            .expect_err("a tampered chunk must be rejected");
+        assert_eq!(error.code(), "ATTACHMENT_CORRUPTED");
+        assert!(!destination.exists(), "no unverified file may be written");
+        assert!(
+            !dir.path("tampered.out.download-partial").exists(),
+            "the temporary file must be removed on failure"
+        );
+        let record = store
+            .attachment_record(&descriptor.attachment_id)
+            .expect("record")
+            .expect("record exists");
+        assert_eq!(record.state, "downloading", "a failed download stays retryable");
+    }
+
+    #[test]
+    fn download_rejects_a_wrong_manifest_before_reading_any_chunk() {
+        let dir = TempDir::new("download-manifest");
+        let (source_path, _source) = upload_source(&dir, "manifest.bin");
+        let store =
+            PersistedAttachmentStore::open(dir.path("cache"), formal_store(&dir.path("chat.db")))
+                .expect("open persisted store");
+        let descriptor = store
+            .import_file(&FileToken::from_local_path(&source_path), "清单.bin")
+            .expect("import");
+        let manifest = store
+            .cache
+            .attachment_manifest(&descriptor.attachment_id)
+            .expect("manifest");
+        let mut transport = FakeBlobTransport::default();
+        store
+            .upload_attachment(&descriptor.attachment_id, &mut transport)
+            .expect("upload");
+        transport.reads = 0;
+
+        let mut wrong_digest = manifest.clone();
+        let mut digest = wrong_digest.ciphertext_digest.clone();
+        let last = digest.pop().expect("digest is not empty");
+        digest.push(if last == '0' { '1' } else { '0' });
+        wrong_digest.ciphertext_digest = digest;
+        let error = store
+            .download_attachment(
+                &descriptor.attachment_id,
+                &wrong_digest,
+                &FileToken::from_local_path(&dir.path("wrong-digest.out")),
+                &mut transport,
+            )
+            .expect_err("a divergent manifest must be rejected");
+        assert_eq!(error.code(), "ATTACHMENT_CORRUPTED");
+        assert_eq!(transport.reads, 0, "the manifest is checked before any network read");
+
+        let mut wrong_owner = manifest.clone();
+        wrong_owner.attachment_id = "att-00000000000000000000000000000000".to_owned();
+        let error = store
+            .download_attachment(
+                &descriptor.attachment_id,
+                &wrong_owner,
+                &FileToken::from_local_path(&dir.path("wrong-owner.out")),
+                &mut transport,
+            )
+            .expect_err("a manifest for another attachment must be rejected");
+        assert_eq!(error.code(), "ATTACHMENT_CORRUPTED");
+        assert_eq!(transport.reads, 0);
+    }
+
+    #[test]
+    fn download_rejects_unknown_blobs_and_missing_keys() {
+        let dir = TempDir::new("download-unknown");
+        let (source_path, _source) = upload_source(&dir, "unknown.bin");
+        let db_path = dir.path("chat.db");
+        let cache_root = dir.path("cache");
+        let (attachment_id, manifest) = {
+            let store = PersistedAttachmentStore::open(&cache_root, formal_store(&db_path))
+                .expect("open persisted store");
+            let descriptor = store
+                .import_file(&FileToken::from_local_path(&source_path), "未知.bin")
+                .expect("import");
+            let manifest = store
+                .cache
+                .attachment_manifest(&descriptor.attachment_id)
+                .expect("manifest");
+            let mut transport = FakeBlobTransport::default();
+            store
+                .upload_attachment(&descriptor.attachment_id, &mut transport)
+                .expect("upload");
+            // 节点侧记录消失：读取必须显式失败，不能返回空字节。
+            transport.drop_blob(&descriptor.attachment_id);
+            let error = store
+                .download_attachment(
+                    &descriptor.attachment_id,
+                    &manifest,
+                    &FileToken::from_local_path(&dir.path("gone.out")),
+                    &mut transport,
+                )
+                .expect_err("a missing blob must be rejected");
+            assert_eq!(error.code(), "ATTACHMENT_NOT_FOUND");
+            // 完全未知的附件（合法 ID 形式，但没有记录）。
+            let error = store
+                .download_attachment(
+                    "att-00000000000000000000000000000000",
+                    &manifest,
+                    &FileToken::from_local_path(&dir.path("unknown.out")),
+                    &mut transport,
+                )
+                .expect_err("an unknown attachment must be rejected");
+            assert_eq!(error.code(), "ATTACHMENT_NOT_FOUND");
+            (descriptor.attachment_id, manifest)
+        };
+
+        // “重启”：进程内 FileKey 消失，下载必须显式失败且不写文件。
+        let reopened =
+            PersistedAttachmentStore::open(&cache_root, formal_store(&db_path)).expect("reopen");
+        let mut transport = FakeBlobTransport::default();
+        let error = reopened
+            .download_attachment(
+                &attachment_id,
+                &manifest,
+                &FileToken::from_local_path(&dir.path("no-key.out")),
+                &mut transport,
+            )
+            .expect_err("the file key is only held in memory");
+        assert_eq!(error.code(), "ATTACHMENT_KEY_UNAVAILABLE");
+        assert!(!dir.path("no-key.out").exists());
+        assert_eq!(transport.reads, 0, "no bytes are read without the file key");
+    }
+
 }
 

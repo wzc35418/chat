@@ -1,6 +1,6 @@
 # 客户端内核与 Kotlin 业务服务映射
 
-阶段：P1 → P2。状态：函数级设计；竖直切片（`ConversationCore` 的 open / create_draft / draft_status / apply_verified_entry / list_conversations / list_messages / close）与 P1 身份持久化增量（save_identity_account / load_identity_account / upsert_contact / list_contacts / consume_invite）已在 Windows x64 实测通过；CORE-007 的发送编排（[crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)）已把「意图 → 一次真实 MLS 加密 → 提交 → Accepted/Unknown/Rejected 落库」接通（节点端口可注入，真实节点链路见 `node_submitter` 记录），CORE-008 重试 / CORE-009 取消 / outbox 结果对账 `reconcile` 也已实现（同一文件，只加方法）；CORE-010 草稿状态视图（`DraftStatusView` + 共用投影 `draft_status_view`）与 CORE-003 的拉取式事件流（`crates/core/src/core_events.rs`：有界缓冲 + 单调序号 + 溢出 resync）同样已实测通过；`ConversationCore` 层的 CORE-009 `cancel_draft` 与 CORE-003 `poll_events`（含 FFI 未接线时的 `StubSubmitter`/`StubCrypto` 显式失败）也已实测通过；其余 CORE 函数未开始。目标源码：[crates/core/src/service.rs](../../crates/core/src/service.rs) 与 [crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)。
+阶段：P1 → P2。状态：函数级设计；竖直切片（`ConversationCore` 的 open / create_draft / draft_status / apply_verified_entry / list_conversations / list_messages / close）与 P1 身份持久化增量（save_identity_account / load_identity_account / upsert_contact / list_contacts / consume_invite）已在 Windows x64 实测通过；CORE-007 的发送编排（[crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)）已把「意图 → 一次真实 MLS 加密 → 提交 → Accepted/Unknown/Rejected 落库」接通（节点端口可注入，真实节点链路见 `node_submitter` 记录），CORE-008 重试 / CORE-009 取消 / outbox 结果对账 `reconcile` 也已实现（同一文件，只加方法）；CORE-010 草稿状态视图（`DraftStatusView` + 共用投影 `draft_status_view`）与 CORE-003 的拉取式事件流（`crates/core/src/core_events.rs`：有界缓冲 + 单调序号 + 溢出 resync）同样已实测通过；`ConversationCore` 层的 CORE-009 `cancel_draft` 与 CORE-003 `poll_events`（含 FFI 未接线时的 `StubSubmitter`/`StubCrypto` 显式失败）也已实测通过；附件上传/下载（ATTACHMENTS-003/005）已在 core 层通过可注入的块传输端口接通编排与状态机（见 [attachments.md](attachments.md#上传下载接块传输端口实现记录attachments-003--0052026-10-18windows-x64)）；其余 CORE 函数未开始。目标源码：[crates/core/src/service.rs](../../crates/core/src/service.rs) 与 [crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)。
 
 本层编排，不把各子模块的事务拆成独立提交。函数名与 Kotlin 的 camelCase 一一对应；底层 TaskId/AttemptId 不必全暴露 UI。start/close 是幂等生命周期，所有查询都来自 Rust 持久真相。身份与群、附件服务分别委托对应章节。
 
@@ -936,6 +936,14 @@ cargo test --offline -p chat-core                        # lib 15（含 stub_por
 3. `cancel_draft` 的 Store 交接要求 `&mut self`（与 `create_draft` 一致）；FFI 的 `Mutex` 串行化保证不会并发交接。
 4. 事件缓冲是内存态：进程重启后序号从 0 开始（跨进程游标会被判“超前”而 resync）；事件不是可靠日志。
 
+## 附件上传/下载在 core 层的接线（ATTACHMENTS-003/005，2026-10-18，Windows x64）
 
+附件编排在 [crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)，详细记录见 [attachments.md 的上传/下载接块传输端口实现记录](attachments.md)。core 层只做两件事，不引入节点依赖：
+
+- `PersistedAttachmentStore::upload_attachment(attachment_id, &mut transport)`：按 storage 的 `mark_attachment_state` 白名单迁移 `imported → uploading → available`，从本地加密缓存按序上传分块**密文**，节点 complete 后才标 available；已 available 时幂等无操作；中断保留缓存与进程内进度可重试。
+- `PersistedAttachmentStore::download_attachment(blob_id, expected_manifest, destination, &mut transport)`：先用 manifest 与本地记录比对（不一致在任何网络读取前 `ATTACHMENT_CORRUPTED`），逐块 `read_chunk` → CRYPTO-012 认证解密 → 临时文件 → 校验密文摘要 + 明文总长 + 明文 SHA-256 后 rename；失败删临时文件、状态留在 `downloading` 可重试；没有进程内 FileKey 时 `ATTACHMENT_KEY_UNAVAILABLE` 且零读取。
+- 节点交互抽象为 `BlobTransport` 端口（begin_upload / put_chunk / complete / read_chunk），真实节点适配由上层实现；端口失败用 `AttachmentError::Transport { code, detail }` 保留冻结码（如 `NODE_UNAVAILABLE`）。
+
+证据：`cargo test --offline -p chat-core` → 70 passed（附件 20 个 lib 用例，其中新增 6 个：上传 2 + 下载 4；既有 64 个继续通过）。
 
 

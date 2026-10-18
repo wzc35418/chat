@@ -120,13 +120,37 @@
 
 ### 验证证据
 
-命令与结果：`cargo test --offline -p chat-node-client` → 38 个测试全部通过（13 个 lib 单元测试 + 11 个 `tests/client_limits.rs` + 9 个 `tests/http_flow.rs` + 5 个 `tests/blob_flow.rs`），0 警告；四 crate 合计 135 个测试（node-services 70 + node-api 19 + node-client 38 + chat-node 8）全绿。
+命令与结果：`cargo test --offline -p chat-node-client` → 39 个测试全部通过（13 个 lib 单元测试 + 11 个 `tests/client_limits.rs` + 9 个 `tests/http_flow.rs` + 5 个 `tests/blob_flow.rs` + 1 个 `tests/cross_process.rs` 跨进程用例），0 警告；四 crate 合计 136 个测试（node-services 70 + node-api 19 + node-client 39 + chat-node 8）全绿。
 
 - 真 TCP 端到端（`tests/http_flow.rs`：在进程内用 `axum::serve` 起 [crates/node-api](../../crates/node-api) 的真实路由，服务端是真实 node-services）：`challenge_registration_and_signed_outputs_are_verified`（挑战由固定节点公钥验签、注册回执验签、重复注册幂等）、`group_log_head_and_idempotent_append_flow`（建群幂等、append 同 submission 同字节重试返回同 seq、fetch_log 分页、head 与页内 head 一致）、`mailbox_store_read_and_ack_flow`（投递幂等、读取分页与重复读、ACK 幂等与越权 403）、`wrong_device_key_is_rejected_without_retrying`、`replayed_and_expired_challenges_are_rejected`、`unknown_device_and_non_member_are_rejected`、`divergent_bytes_for_one_submission_are_a_conflict`、`wrong_node_identity_and_wrong_pinned_key_are_rejected`、`oversized_request_is_rejected_before_sending`。
 - 边界语义（`tests/client_limits.rs`：脚本化最小 HTTP/1.1 服务）：`auth_failure_is_retried_once_and_then_succeeds`（旧挑战失败后重取一次成功，挑战请求恰好 2 次）、`retry_budget_is_exactly_one_retry`、`single_attempt_budget_sends_one_request`、`oversized_response_with_content_length_is_rejected`、`oversized_chunked_response_is_rejected_by_incremental_budget`、`signed_request_timeout_is_retried_once_then_reported`、`anonymous_challenge_timeout_is_reported_without_retry`、`network_failure_is_reported_and_bounded`、`redirects_are_not_followed`（重定向不产生第二次请求）、`wrong_node_id_in_challenge_is_rejected`、`unknown_error_code_is_not_silently_treated_as_success`。
 
 - 附件 blob（`tests/blob_flow.rs` + node-api 的 `tests/group_mailbox_http.rs`）：`blob_upload_and_read_round_trip_over_http`（会话/分块/发布/读取往返；上传者与群内老成员都能读到逐字节一致的密文；群外设备 403 HISTORY_NOT_AUTHORIZED）、`duplicate_chunk_is_idempotent_and_size_violation_is_rejected`、`out_of_order_and_missing_chunks_are_rejected`、`digest_mismatch_is_rejected_and_unfinished_blob_is_not_readable`、`foreign_writer_and_non_canonical_ids_are_rejected`；HTTP 契约侧 `blob_http_error_statuses_are_stable`（409/410/413/400/404 逐项断言）与 `blob_endpoints_require_bound_authentication`（缺鉴权头 400、换方法/路径/正文 401、群外设备 403、方法/路由边界 405/404）。
 - 限流与运行入口（Z 包）：`cargo test --offline -p chat-node-services -p chat-node-api -p chat-node` 全绿 —— node-services 70（含 7 个 `rate_limit::tests` 单元用例）、node-api 19（含 `tests/rate_limit_http.rs` 的 3 个真 TCP 429 用例）、chat-node 8（6 个 lib 单测 + `tests/smoke.rs` 的进程内与真实二进制冒烟）。限流证据：`anonymous_endpoints_return_429_with_retry_after`、`device_endpoints_return_429_after_the_device_budget`、`health_is_never_rate_limited`；运行入口证据：`in_process_node_serves_health_and_shuts_down_cleanly`、`binary_starts_logs_only_public_identity_and_serves_health`（真实子进程 + 启动日志不含种子）。`cargo build --offline -p chat-node` 成功。
+
+### 跨进程端到端（真 chat-node 进程 + NodeClient）
+
+`crates/node-client/tests/cross_process.rs::node_process_and_client_survive_a_hard_restart` 是唯一一条**跨进程**证据：客户端与节点不在同一进程，节点是 [apps/node](../../apps/node) 的真实二进制。
+
+运行方式（必须先构建节点二进制）：
+
+`@powershell
+. .\tools\activate.ps1
+cargo build --offline -p chat-node
+cargo test --offline -p chat-node-client --test cross_process
+`@
+
+二进制定位顺序：`CHAT_NODE_BIN` 环境变量（必须是文件）→ 测试可执行文件同级的 profile 目录（`target/debug/chat-node[.exe]`）→ workspace 的 `target/debug`（或 `CARGO_TARGET_DIR`）。**找不到时测试显式失败并打印已尝试路径与可操作命令**，不会静默跳过（避免把“什么都没测”当成通过）。
+
+用例覆盖：
+
+1. 用 `std::process::Command` 启动 node：`--bind 127.0.0.1:<随机空闲端口>`、临时 `--data-dir`、临时 `--seed-file`（64 位十六进制）、固定 `--node-id`；stdout/stderr 重定向到临时文件（避免管道写满阻塞子进程），轮询 `GET /v1/health` 直到 200（20 秒上限，超时/早退都打印 stderr 与 stdout 摘要）；端口冲突或启动失败自动换端口重试（最多 3 次，全部失败才报错并列出每次原因）。
+2. 从 health 取 `node_id` 与 `node_public_key` 并固定到 `NodeEndpoint`，之后每个挑战/产物都按该公钥验签（换端口不换身份）。
+3. 真链路：注册两台设备（真凭据 + 一次性注册能力，时间取系统时钟）→ 建两成员群 → append 一条密文并用同一 submission 重试证明幂等（seq/候选摘要/log_hash 相同）→ `fetch_log` + `get_head` → 信箱投递两条、读页、ACK 一条并确认只剩未 ACK 的那条 → 附件 blob `begin/put(含同块重传幂等)/complete/read` 往返（上传者与群内老成员都能读回逐字节一致的密文）。
+4. 强杀：`child.kill()`（不走优雅关闭，模拟崩溃），确认进程退出且库文件已落盘。
+5. 用**同一 data-dir 与同一 seed** 重启：节点身份（node_id + 公钥）必须完全一致；随后验证 `get_head` 的 seq 与 log_hash 不变、`fetch_log` 里的条目还在、未 ACK 的信箱条目还在、已发布 blob 的两块密文都能读回；最后再 append 一条新条目，断言 `seq = 旧 head + 1` 且 `previous_hash = 旧 log_hash`（重启后链继续，不是新链）。
+
+这一步证明的是**持久性与跨进程协同**：节点数据在 `<data-dir>/node.db`（附件块也在库内），重启后由迁移与 SQLite 事务恢复，不依赖任何内存状态；客户端只通过 HTTP + 设备签名与节点交互，没有任何进程内直连。
 ### 已知限制
 
 - 客户端不含 MLS/加密层的内容构造：候选密文、Welcome 等字节由上游加密层提供，本 crate 只负责传输、签名与错误映射（领域校验仍由节点与客户端加密层各自负责）。
@@ -563,7 +587,7 @@ run_node(config: NodeConfig, shutdown: ShutdownSignal) -> Result<NodeExit>
 - 进程内（`tests/smoke.rs::in_process_node_serves_health_and_shuts_down_cleanly`）：真 TCP `GET /v1/health` 返回 200 且带 `status/node_id/schema_version`，关闭后端口不可连，`node.db` 在监听之前已落盘；同时确认健康检查正文不含 `signing`/`secret`/`seed` 字样。
 - 真实二进制（`tests/smoke.rs::binary_starts_logs_only_public_identity_and_serves_health`）：用 `CARGO_BIN_EXE_chat-node` 起子进程，解析启动日志里的 `address=`，做健康检查，并断言 stdout/stderr 都**不含种子的十六进制**。
 - 库内单测 `node_id_is_derived_from_the_public_key_when_absent` 走真实 `spawn_node` + `shutdown`，并证明固定公钥不一致时拒绝启动且不建库。
-- “append 返回后重启不丢日志”由既有 `crates/node-services` 的持久库用例（`tests/group_log.rs` 的崩溃/重开用例与 `p0_accept`）证明持久层语义，run_node 只是在该持久库上启动；本轮没有新增“整进程 kill -9 后重开”的脚本化实验。
+- “append 返回后重启不丢日志”有**跨进程**证据：`crates/node-client/tests/cross_process.rs::node_process_and_client_survive_a_hard_restart` 用真实二进制跑完整链路后 `child.kill()`（强杀、不走优雅关闭），再用同一 data-dir + 同一 seed 重启，断言 head 的 seq/log_hash 不变、日志条目还在、未 ACK 的信箱条目还在、已发布 blob 仍可读，并验证重启后新 append 的 `seq = 旧 head + 1`、`previous_hash = 旧 log_hash`（详见“跨进程端到端（真 chat-node 进程 + NodeClient）”）。服务层另有 `crates/node-services` 的崩溃/重开用例（`tests/group_log.rs` 与 `p0_accept`）证明持久层语义。
 
 已知限制：没有后台 GC worker（NODE-016）、没有 TLS 终止（默认只允许回环监听，公开部署需要前置 TLS 反向代理并显式 `--allow-public-bind`）、没有管理接口/指标、没有多实例协调与租约；`SHUTDOWN_TIMEOUT` 没有实现（优雅关闭没有超时上限，靠 axum 的在途请求自然结束）；进程崩溃后没有“staged 物恢复”步骤（附件块与日志都在 SQLite，单库单事务，因此不需要文件系统恢复）。通过本函数用例不自动代表整个模块完成。
 

@@ -31,6 +31,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import chat.presentation.display.toBadge
 import chat.presentation.preview.PreviewAttachmentState
 
 /** 附件面板交互回调。 */
@@ -125,8 +126,9 @@ fun AttachmentPanel(
                 } else {
                     state.attachments.forEach { attachment ->
                         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            val badge = attachment.toBadge()
                             Text(
-                                attachment.displayName + " · " + attachment.state + " · 未上传",
+                                attachment.displayName + " · " + badge.label + (if (badge.downloadable) "" else " · 对方不可下载"),
                                 style = MaterialTheme.typography.bodySmall,
                                 fontWeight = FontWeight.Medium,
                             )
