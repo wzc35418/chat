@@ -1,6 +1,6 @@
 # 账户、联系人、双设备与恢复
 
-阶段：P1 → P2。状态：函数级设计，尚未实现。目标源码：[crates/identity/src/service.rs](../../crates/identity/src/service.rs)。
+阶段：P1 → P2。状态：IDENTITY-001~007 的纯密码学与状态部分已实现（crates/identity，验收命令与证据见下节）；IDENTITY-008~014 未开始。目标源码：[crates/identity/src/service.rs](../../crates/identity/src/service.rs)。
 
 AccountId 从规范长期公钥派生，设备密钥与传输端点分别绑定。初始设备保管主管身份密钥，第二设备不自动取得它。所有敏感读写经 storage 和系统密钥保护；签名与恢复 KDF 算法在 P0 锁定，不在此自造。
 
@@ -22,6 +22,108 @@ AccountId 从规范长期公钥派生，设备密钥与传输端点分别绑定�
 - [IDENTITY-012 revoke_device](identity.md#identity-012)
 - [IDENTITY-013 export_identity_recovery](identity.md#identity-013)
 - [IDENTITY-014 import_identity_recovery](identity.md#identity-014)
+
+## 实现状态与证据（P1-02 身份核心）
+
+本轮交付 IDENTITY-001~007 的**纯密码学与状态层**：签名/验签、账户与设备 ID 派生、
+人工核验指纹都是真实 Ed25519 / SHA-256；签名原文按 chat-protocol 的 canonical 编码
+携带用途域。全部函数不访问网络、不写数据库、不模拟成功。
+
+**验收命令与结果**（本轮实测）
+
+~~~text
+cargo test --offline -p chat-identity
+  running 34 tests  ... test result: ok. 34 passed; 0 failed   (crates/identity/src/**)
+  running 9 tests   ... test result: ok. 9 passed; 0 failed    (tests/identity_contract.rs)
+cargo clippy --offline -p chat-identity --all-targets
+  chat-identity 0 warnings
+~~~
+
+**源码位置**
+
+| 文件 | 内容 |
+|---|---|
+| [crates/identity/src/keys.rs](../../crates/identity/src/keys.rs) | AccountKeys/DeviceKeys、AccountId/DeviceId 派生、Fingerprint、TrustAnchor |
+| [crates/identity/src/device.rs](../../crates/identity/src/device.rs) | DeviceCapability/CapabilitySet、DeviceCredential 签发、verify_credential、RevocationSet |
+| [crates/identity/src/invite.rs](../../crates/identity/src/invite.rs) | inv1 邀请口令 create_invite/verify_invite、InviteExpectations、VerifiedInvite |
+| [crates/identity/src/contact.rs](../../crates/identity/src/contact.rs) | ContactState 状态机、Contact、record_identity/accept/confirm_identity_change |
+| [crates/identity/src/service.rs](../../crates/identity/src/service.rs) | LocalAccount、AccountView、current_account、accept_contact_invite、confirm_contact、verification_fingerprint |
+| [crates/identity/src/error.rs](../../crates/identity/src/error.rs) | IdentityError → chat-protocol ErrorCode 映射（不新增码） |
+| [crates/identity/tests/identity_contract.rs](../../crates/identity/tests/identity_contract.rs) | 公开 API 端到端契约测试 |
+
+**冻结的派生域与文本形式**
+
+| 用途 | 规则 |
+|---|---|
+| AccountId | SHA-256(`chat/p1/account-id/v1` ‖ Ed25519 账户公钥) → `acct:1:<64 位小写 hex>` |
+| DeviceId | SHA-256(`chat/p1/device-id/v1` ‖ AccountId 负载 ‖ 设备公钥) → `dev:1:<64 位小写 hex>` |
+| 核验指纹 | SHA-256(`chat/p1/account-fingerprint/v1` ‖ 账户公钥)；展示为 16 组 4 位大写 hex、单空格分隔（79 字符） |
+| 设备凭据签名 | `chat/p1/device-credential-signature/v1` ‖ canonical 正文 |
+| 邀请口令签名 | `chat/p1/contact-invite-signature/v1` ‖ canonical 正文 |
+| 邀请口令文本 | `inv1.<hex(固定 162 字节正文)>.<hex(64 字节签名)>` |
+
+canonical 正文使用**位置固定**的 `WireValue::List`：协议层冻结的安全字段号表属于
+protocol crate，identity 不能新增字段号，因此不借用 CURSOR_*/EXTENSION_* 字段号，
+避免跨用途混淆。列表首元素是 schema 版本，随后是协议主/次版本，其余字段位置固定。
+验签复用 protocol 的 `verify_ed25519`，签名复用 `sign_bytes`。
+
+**独立测试向量**（用 OpenSSL/Node WebCrypto 独立算出，冻结派生与展示格式）
+
+- 账户种子 `0x01 × 32` → 公钥 `8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c`
+- AccountId `acct:1:804d17d85c433dc00878aceda0dff5d4d6d72dd6dbdabda188e4ae177304bffa`
+- 指纹 `7EC8 C5E1 A37C C538 AFCB A0B0 BD28 C9E1 5A4B 1A3E 53DC 0F18 BE09 6DF9 4742 8EB4`
+- 设备种子 `0x11 × 32` 在该账户下 DeviceId `dev:1:a4ec09edbb8ceb00f41b77fed48dbda0796e4456e2a99e813dfcad390bc9e1f5`
+
+**上限（一律有界拒绝，不静默截断）**
+
+| 项 | 上限 | 失败码 |
+|---|---|---|
+| 显示名 | 1..=64 字节、非空白、无控制字符 | INVALID_TARGET |
+| 邀请有效期 | 60 s ..= 7 d（0 与溢出拒绝）；`DEFAULT_INVITE_TTL_MS` = 24 h 为产品默认 | INVALID_TARGET |
+| 邀请口令文本 | 1024 字节（先限长再解析） | CONTENT_TOO_LARGE |
+| 时钟偏差 | ±60 s | INVALID_CREDENTIAL |
+| 设备凭据有效期 | 60 s ..= 400 d | INVALID_CREDENTIAL |
+| 设备能力数量 | ≤ 8，未知能力位拒绝 | REQUIRED_CAPABILITY_MISSING / CONTENT_TOO_LARGE |
+| 撤销集合 | ≤ 64 台（排序去重） | CONTENT_TOO_LARGE |
+| 指纹文本 | ≤ 96 字节 | CONTENT_TOO_LARGE |
+
+**错误码映射**（`IdentityError::code()`，全部取自 protocol 冻结码表）
+
+| IdentityError | 冻结码 | 备注 |
+|---|---|---|
+| InvalidId(_) | INVALID_ID | 透传 PROTOCOL-001 原因 |
+| InvalidDisplayName / InvalidInviteLifetime / WrongInviteNode / WrongInviteAccount / WrongInviteDevice | INVALID_TARGET | 参数/绑定目标不合法 |
+| InvalidTimestamp / MalformedToken | MALFORMED_FRAME | 结构或时间戳畸形 |
+| InvalidAccountPublicKey / AccountKeyMismatch / InvalidCredential / CredentialExpired / CredentialNotYetValid / CredentialStale / CrossAccountDevice / DeviceIdMismatch / IdentityChanged / InviteNotYetValid / MissingIdentity | INVALID_CREDENTIAL | 凭据/身份不可信（detail_key 区分细分原因） |
+| InvalidSignature | INVALID_SIGNATURE | Ed25519 验签失败 |
+| DeviceRevoked | DEVICE_REVOKED | 设备在撤销集合内 |
+| EmptyCapabilities / UnknownCapability / WrongInviteScope | REQUIRED_CAPABILITY_MISSING | 作用域/能力不满足 |
+| TooManyCapabilities / TooManyRevocations / TokenTooLong | CONTENT_TOO_LARGE | 超过上限 |
+| UnsupportedTokenVersion | PROTOCOL_UNSUPPORTED | 口令/凭据版本不支持 |
+| InviteExpired | CURSOR_EXPIRED | 码表无 INVITE_EXPIRED，复用「不透明令牌过期」码 |
+| InvalidStateTransition | INVALID_STATE_TRANSITION | 联系人迁移非法 |
+| ContactNotAccepted | CONTACT_NOT_ACCEPTED | 未确认联系人禁止发送 |
+
+所有身份错误 `retryable() == false`（验证/状态类失败不得自动重试），有测试断言。
+
+**已知限制**
+
+- 不提供「先解析、后验签」的第二套入口：`classify_invite_text` 只校验口令信封
+  （前缀/长度/hex 规范形式），账户/设备/节点等身份字段只有 `verify_invite` 之后才可得，
+  避免 UI 展示未验证身份。
+- 每账户 ≤2 有效设备的约束属于设备注册表（IDENTITY-009/011）；本层只签发凭据，不计数。
+- 持久化未接：IDENTITY-001 的 T1 事务与密钥包装、IDENTITY-002 的锁状态与数据库读取、
+  邀请一次性消费、联系人/设备落盘都还没实现。crate 仍声明 `chat-storage` 依赖但当前
+  不调用；这些由 storage/core 集成任务补齐，本层不假装已持久化。
+- IDENTITY-008~014（双设备配对、设备列表、撤销任务、导出/导入恢复）未开始。
+- 设备凭据的端点绑定保存 32 字节端点标识，未绑定 iroh EndpointId 类型（不引入
+  transport 依赖）；等 transport 集成时做显式映射。
+- 邀请口令内只有 16 字节 nonce 供上层去重；重放窗口与一次性消费状态需要持久化。
+- 时间由调用方注入 `now_ms`（生产用系统 UTC 时钟）；本层不做时钟漂移策略与回拨检测。
+
+**Cargo.lock 变化**：`chat-identity` 的依赖列表新增 `ed25519-dalek 3.0.0`、`rand 0.10.3`、
+`zeroize 1.9.1`（三者均已在 Cargo.lock 中，版本未变，无新增传递依赖）；
+`chat-storage` 依赖保留。
 
 <a id="identity-001"></a>
 
@@ -52,10 +154,10 @@ create_account(display_name: String, protector: KeyProtector) -> Result<LocalAcc
 
 **完成验收**：
 
-- [ ] 创建中崩溃只恢复完整账户。
-- [ ] 昵称改变不影响 ID。
+- [ ] 创建中崩溃只恢复完整账户。（需要 T1 存储事务，未实现）
+- [x] 昵称改变不影响 ID。— tests/identity_contract.rs::account_identity_is_stable_across_restarts
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：本地密码学部分已实现（[service.rs](../../crates/identity/src/service.rs) 的 `LocalAccount::create` / `LocalAccount::from_seed`，密钥与派生在 [keys.rs](../../crates/identity/src/keys.rs)）；显示名上限与非法字符由 `display_name_and_bounds_are_enforced` 覆盖。原子建号、密钥包装（PLATFORM-001）与初始凭据落盘（T1）未实现：本层不写库、不做密钥保护。
 
 <a id="identity-002"></a>
 
@@ -84,10 +186,10 @@ current_account() -> Result<Option<LocalAccount>>
 
 **完成验收**：
 
-- [ ] 首次启动 None。
-- [ ] 数据库锁定不能伪装成无账户。
+- [x] 首次启动 None。— `current_account(None, 0)` 返回 None（tests/identity_contract.rs::account_view_and_debug_do_not_leak_secrets）
+- [ ] 数据库锁定不能伪装成无账户。（需要 storage 锁状态，未实现）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：脱敏投影已实现：`AccountView` 只含账户 ID、显示名、指纹与设备数，`current_account` 不读库、不做 I/O；Debug 脱敏有测试。锁状态与数据库读取由 storage 集成任务补齐，本层不把「无账户」与「锁定」混为一谈（调用方需自己区分）。
 
 <a id="identity-003"></a>
 
@@ -117,11 +219,11 @@ verify_credential(credential: DeviceCredential, trust: TrustAnchor, now: Time) -
 
 **完成验收**：
 
-- [ ] 替换端点/设备公钥拒绝。
-- [ ] 时间偏差边界。
-- [ ] 信任根不同明确提示。
+- [x] 替换端点/设备公钥拒绝。— device::tests::tampered_signature_and_device_key_are_rejected（改端点、换设备公钥、改能力位：验签失败或绑定失败）
+- [x] 时间偏差边界。— device::tests::expiry_and_clock_skew_are_enforced（±60 s；失效时刻即过期）
+- [x] 信任根不同明确提示。— device::tests::cross_account_is_rejected → INVALID_CREDENTIAL
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（[device.rs](../../crates/identity/src/device.rs) 的 `verify_credential`）。校验顺序固定：信任锚绑定 → 账户/设备 ID 自洽 → 撤销集合（设备撤销、版本落后）→ 账户签名（先验签后看时间）→ 期限与时钟偏差。`TrustAnchor` 拒绝不可解压与低阶（weak）公钥。
 
 <a id="identity-004"></a>
 
@@ -151,10 +253,10 @@ create_contact_invite(expires_in: Duration) -> Result<ContactInvite>
 
 **完成验收**：
 
-- [ ] 过期与重复消费拒绝。
-- [ ] 邀请不能直接授权所有群/旧历史。
+- [ ] 过期与重复消费拒绝。（过期已拒绝并有测试；一次性消费状态需要持久化，未实现）
+- [x] 邀请不能直接授权所有群/旧历史。— 作用域冻结为 `InviteScope::ContactRequest`，正文里的其它作用域值解码即拒（invite::tests::tampered_body_is_rejected）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（[invite.rs](../../crates/identity/src/invite.rs) 的 `create_invite`）。token 为 `inv1.<hex(162 字节正文)>.<hex(64 字节签名)>`；有效期 1 min..=7 d；nonce 16 字节安全随机；正文含账户 ID/公钥、设备 ID、节点、作用域与时间。未落盘：一次性消费与「先落盘再展示」的 T1 事务由 storage 集成任务补齐。
 
 <a id="identity-005"></a>
 
@@ -184,11 +286,11 @@ accept_contact_invite(encoded: String) -> Result<ContactRequest>
 
 **完成验收**：
 
-- [ ] 重复扫描返回同请求。
-- [ ] 换公钥进入警告。
-- [ ] 未确认不能正式私聊。
+- [ ] 重复扫描返回同请求。（需要持久化请求记录，未实现；口令内 nonce 供上层去重）
+- [x] 换公钥进入警告。— 已固定信任锚与邀请公钥不一致 → INVALID_TARGET（invite_rejections_have_stable_codes）；已接受联系人观测到新指纹 → IdentityChanged 且 can_send=false（contact::tests::identity_change_blocks_sending_until_explicit_reconfirmation）
+- [x] 未确认不能正式私聊。— `Contact::requested` 状态下 `can_send()==false`、`require_sendable()` → CONTACT_NOT_ACCEPTED（end_to_end_account_device_invite_and_contact）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（[invite.rs](../../crates/identity/src/invite.rs) 的 `classify_invite_text`、[service.rs](../../crates/identity/src/service.rs) 的 `accept_contact_invite`）。校验顺序：限长 → 前缀/结构 → hex 规范形式 → 正文长度/版本/作用域 → 时间窗口自洽 → 账户 ID 自洽 → 签名 → 信任锚 → 期望节点/账户/设备 → 本地过期。失败不会自动信任，联系人停在 Requested。outbox 请求消息与本地同事务未实现。
 
 <a id="identity-006"></a>
 
@@ -218,10 +320,10 @@ confirm_contact(request_id: RequestId) -> Result<Contact>
 
 **完成验收**：
 
-- [ ] 重复确认幂等。
-- [ ] 离线确认不假称对端已完成。
+- [x] 重复确认幂等。— contact::tests::requested_accept_pins_anchor_and_enables_send
+- [x] 离线确认不假称对端已完成。— 只写本地 ContactState::Accepted 并固定信任锚，不产生任何「对端已完成」证据（本 crate 不发网络请求、不伪造回执）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（[contact.rs](../../crates/identity/src/contact.rs) 的 `Contact::accept`、[service.rs](../../crates/identity/src/service.rs) 的 `confirm_contact`）。接受需要已观测指纹；与已固定锚不一致时转 IdentityChanged 并失败；IdentityChanged 只能通过显式 `confirm_identity_change`（用户重新核对指纹）恢复。待发送确认事务与双向能力握手未实现。
 
 <a id="identity-007"></a>
 
@@ -251,10 +353,10 @@ verification_fingerprint(account_id: AccountId) -> Result<String>
 
 **完成验收**：
 
-- [ ] 更换节点指纹不变。
-- [ ] 公钥改变指纹改变。
+- [x] 更换节点指纹不变。— 指纹只由账户公钥与用途域派生，节点/端点/显示名不参与（keys::tests::derivations_are_domain_separated_and_key_bound）
+- [x] 公钥改变指纹改变。— keys::tests::account_id_and_fingerprint_match_independent_vectors（冻结向量）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（[keys.rs](../../crates/identity/src/keys.rs) 的 `Fingerprint`、[service.rs](../../crates/identity/src/service.rs) 的 `verification_fingerprint`）。展示为 16 组 4 位大写 hex（79 字符）；`Fingerprint::parse` 接受分组/紧凑形式并做限长与字符校验。二维码承载形式（可扫码版本）未实现，等 UI 集成。
 
 <a id="identity-008"></a>
 

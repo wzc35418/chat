@@ -10,7 +10,8 @@ data class ConversationSummaryView(
     val id: String,
     val title: String,
     val preview: String,
-    val unreadCount: Int = 0,
+    /** null 表示底层没有 unread 计数；展示层不得伪造 0。 */
+    val unreadCount: Int? = null,
 )
 
 data class MessageDisplayView(

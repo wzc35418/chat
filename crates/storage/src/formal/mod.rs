@@ -12,6 +12,7 @@
 //!   绝不重新加密、也绝不从标记重建消息。
 
 mod cursor;
+mod entry;
 mod error;
 mod migrations;
 mod outbox_lease;
@@ -19,6 +20,10 @@ mod query;
 mod seal;
 
 pub use cursor::PageCursor;
+pub use entry::{
+    AppliedEntry, MAX_SESSION_PREVIEW_CHARS, MAX_SESSION_TITLE_BYTES, SessionSummary,
+    VerifiedEntryInput, apply_verified_entry, materialize_session, verified_entry_submission_id,
+};
 pub use error::StorageError;
 pub use migrations::MigrationReport;
 pub use outbox_lease::{
@@ -269,6 +274,8 @@ pub enum WriteScopeKind {
     Recovery,
     /// outbox 租约与结果标记（STORAGE-014/015）：不绑定单个会话。
     Outbox,
+    /// T3：已验证条目写入（STORAGE-008），只作用在单个会话上。
+    Inbound,
 }
 
 /// 受限写事务的作用域。
@@ -303,6 +310,15 @@ impl WriteScope {
         Self {
             kind: WriteScopeKind::Recovery,
             conversation_id: None,
+            expected_version: None,
+        }
+    }
+
+    /// STORAGE-008 已验证条目作用域（单会话）。
+    pub fn inbound(conversation_id: impl Into<String>) -> Self {
+        Self {
+            kind: WriteScopeKind::Inbound,
+            conversation_id: Some(conversation_id.into()),
             expected_version: None,
         }
     }

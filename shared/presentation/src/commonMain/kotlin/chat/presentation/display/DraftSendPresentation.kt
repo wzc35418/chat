@@ -20,6 +20,8 @@ data class DraftEvidence(
     val nodeAcceptedReceiptId: String? = null,
     /** 独立送达证据的稳定标识。 */
     val deliveredReceiptId: String? = null,
+    /** 本端已生成的提交 ID（submission id）：**不代表**节点接受或对端送达，只用于对账与诊断。 */
+    val submissionId: String? = null,
     /** 上一次发送没有拿到确定结果，需要后续对账。 */
     val acceptanceUnknown: Boolean = false,
     val cancelRequested: Boolean = false,

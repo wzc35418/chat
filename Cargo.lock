@@ -630,6 +630,9 @@ version = "0.1.0"
 dependencies = [
  "chat-protocol",
  "chat-storage",
+ "ed25519-dalek 3.0.0",
+ "rand 0.10.3",
+ "zeroize",
 ]
 
 [[package]]

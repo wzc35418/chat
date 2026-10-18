@@ -1,2 +1,540 @@
-//! 模块：客户端内核与 Kotlin 业务服务映射。详细函数契约见 docs/implementation/core.md。
-//! 当前为待实现源码位置；不提供模拟加密或模拟投递成功。
+//! 客户端内核服务层（CORE-005/006/007/010 的竖直切片）。
+//!
+//! `ConversationCore` 是 Kotlin 业务服务的唯一持久真相入口：它持有一个正式加密
+//! `Store`（主密钥由 `Store` 内部的 `ProtectedStorageKey` 持有，绝不复制到 DTO）
+//! 与生命周期状态，只编排 storage 的既有函数，不自行加密、不自行模拟投递成功：
+//!
+//! - 草稿：`create_draft` 校验 PROTOCOL-001 ID 与正文上限，在单笔 T1 事务内补建会话行
+//!   并调用 STORAGE-006 `persist_send_intent`；草稿正文只在内存与封装缓冲中出现；
+//! - 正式状态：`apply_verified_entry` 委托 STORAGE-008，单笔 T3 事务内写会话摘要与
+//!   正式消息行，失败整体回滚；
+//! - 查询：`list_conversations` / `list_messages` 委托 STORAGE-012/013 的键集分页，
+//!   把内部游标令牌原样透传给调用方（不解释、不伪造）；
+//! - 生命周期：`close` 释放 `Store`（同时释放独占写锁），之后所有方法显式
+//!   `CORE_CLOSED`，而不是返回过期快照。
+//!
+//! 已知限制（详见 docs/implementation/core.md 的对应实现状态）：
+//! - `mine` 由会话摘要记录的本机作者身份判定：本 store 尚未接入身份模块，因此
+//!   以“曾经写入过的 `mine = true` 条目的作者”作为本机身份；没有该记录的会话里
+//!   远端消息一律 `mine = false`（不猜测）；
+//! - `unread_count` 恒为 `None`：未读需要读位置存储（schema 无该表），不返回伪造的 0；
+//! - 游标是 storage 的内部 `spg1` 令牌，不是线协议 `cur1` 令牌；
+//! - 草稿 ID 是 storage 派生的本地标识（`draft-<32 位小写 hex>`），不是
+//!   PROTOCOL-001 `DraftId` 文本，调用方必须原样回传。
+
+use std::fmt;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use chat_protocol::{AccountId, ConversationId, DeviceId, MessageId, OperationId};
+use chat_storage::formal::{
+    MAX_ID_BYTES, MAX_SESSION_TITLE_BYTES, KeyProvenance, MessageContent, MessageOrigin,
+    MessageView, PageCursor, ProtectedStorageKey, SessionSummary, StorageError, Store,
+    StoreOptions, ValidatedSendRequest, WriteScope, commit_transaction, materialize_session,
+    open_store, persist_send_intent, rollback_transaction,
+};
+
+/// 已验证条目输入（STORAGE-008）。FFI 层通过本重导出构造，避免额外依赖 chat-storage。
+pub use chat_storage::formal::VerifiedEntryInput;
+
+/// 内核层稳定错误码。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreError {
+    /// 调用方输入不合法（ID 文本、长度上限、正文契约）。
+    InvalidInput,
+    /// 内核已关闭（或持有锁的线程 panic 后不可再用）。
+    Closed,
+}
+
+impl CoreError {
+    /// 稳定错误码字符串（FfiError 直接透传，UI 不解析消息）。
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "INVALID_INPUT",
+            Self::Closed => "CORE_CLOSED",
+        }
+    }
+}
+
+impl fmt::Display for CoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl std::error::Error for CoreError {}
+
+fn invalid_input(reason: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(CoreError::InvalidInput).context(reason.into())
+}
+
+fn closed() -> anyhow::Error {
+    anyhow::Error::new(CoreError::Closed)
+}
+
+/// 稳定错误码：优先返回 storage 的既有错误码，其次返回内核错误码，最后是
+/// `CORE_FAILURE`（未知错误绝不伪装成成功）。
+pub fn error_code(error: &anyhow::Error) -> &'static str {
+    if let Some(storage) = error.downcast_ref::<StorageError>() {
+        return storage.code();
+    }
+    if let Some(core) = error.downcast_ref::<CoreError>() {
+        return core.code();
+    }
+    "CORE_FAILURE"
+}
+
+/// (稳定错误码, 脱敏消息) 投影：FFI 层直接用它构造自己的错误类型，
+/// 不必依赖 `anyhow` 的具体类型。
+pub fn error_projection(error: &anyhow::Error) -> (&'static str, String) {
+    (error_code(error), error_message(error))
+}
+
+/// 脱敏后的错误消息：截断 300 字符并把换行压平，避免把 SQL 或长输入塞进 UI。
+pub fn error_message(error: &anyhow::Error) -> String {
+    let text = error.to_string();
+    let truncated: String = text.chars().take(300).collect();
+    truncated.replace('\n', " ")
+}
+
+/// 草稿投影（CORE-007 的 QUEUED 结果与 CORE-010 的状态查询共用）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftView {
+    /// 本地草稿 ID（storage 派生，原样回传给后续调用）。
+    pub draft_id: String,
+    /// 用户操作幂等键（PROTOCOL-001 文本）。
+    pub operation_id: String,
+    /// 会话 ID（PROTOCOL-001 文本）。
+    pub conversation_id: String,
+    /// 明文正文（只用于可信 UI 路径，不落盘）。
+    pub body: String,
+    /// 草稿状态：`queued` 或 `prepared`。
+    pub state: String,
+    /// 关联的 SubmissionId（尚无准备尝试时为 `None`）。
+    pub submission_id: Option<String>,
+}
+
+/// 会话列表投影（CORE-005）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationView {
+    /// 会话 ID。
+    pub conversation_id: String,
+    /// 本地摘要标题（未知时为空字符串，UI 自行回退，不伪造占位标题）。
+    pub title: String,
+    /// 最新条目的预览（按字符截断）。
+    pub preview: String,
+    /// 未读计数；当前恒为 `None`（需要读位置存储，见模块文档的限制）。
+    pub unread_count: Option<u32>,
+    /// 最近活动时间（Unix 毫秒）。
+    pub updated_at_ms: u64,
+}
+
+/// 消息行投影（CORE-006）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageRowView {
+    /// 消息 ID；本机待发意图为草稿 ID。
+    pub message_id: String,
+    /// 会话 ID。
+    pub conversation_id: String,
+    /// 作者账户 ID（本机待发意图为本机身份，未知时为空字符串）。
+    pub author: String,
+    /// 明文正文。
+    pub body: String,
+    /// 是否本机作者。
+    pub mine: bool,
+    /// 展示时间（Unix 毫秒）。
+    pub created_at_ms: u64,
+}
+
+/// 一页会话。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationPageView {
+    /// 本页条目（最近活动在前）。
+    pub items: Vec<ConversationView>,
+    /// 下一页游标；`None` 表示没有更多。
+    pub next_cursor: Option<String>,
+}
+
+/// 一页消息。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessagePageView {
+    /// 本页条目（本机待发在前，正式消息按序号降序）。
+    pub items: Vec<MessageRowView>,
+    /// 下一页游标；`None` 表示没有更多。
+    pub next_cursor: Option<String>,
+}
+
+/// 客户端内核服务：持有正式 `Store`（含主密钥）与生命周期状态。
+///
+/// `Store` 是独占单写者句柄，因此这里用 `Mutex<Option<..>>` 表达“打开/已关闭”：
+/// `close` 取走句柄即释放独占写锁；之后任何调用都显式返回 `CORE_CLOSED`。
+pub struct ConversationCore {
+    database_path: String,
+    store: Mutex<Option<Store>>,
+}
+
+impl fmt::Debug for ConversationCore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConversationCore")
+            .field("database_path", &self.database_path)
+            .field("open", &self.is_open())
+            .finish()
+    }
+}
+
+fn decode_hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 解析 64 位十六进制主密钥（32 字节）；解码缓冲用后立即清零。
+fn decode_master_key(master_key_hex: &str) -> anyhow::Result<ProtectedStorageKey> {
+    let bytes = master_key_hex.as_bytes();
+    if bytes.len() != chat_storage::formal::MASTER_KEY_BYTES * 2 {
+        return Err(invalid_input(
+            "master key must be exactly 64 hexadecimal characters (32 bytes)",
+        ));
+    }
+    let mut raw = [0u8; chat_storage::formal::MASTER_KEY_BYTES];
+    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        let Some(high) = decode_hex_digit(pair[0]) else {
+            raw.fill(0);
+            return Err(invalid_input("master key contains a non-hexadecimal character"));
+        };
+        let Some(low) = decode_hex_digit(pair[1]) else {
+            raw.fill(0);
+            return Err(invalid_input("master key contains a non-hexadecimal character"));
+        };
+        raw[index] = (high << 4) | low;
+    }
+    let key = ProtectedStorageKey::try_from_slice(&raw)
+        .map_err(anyhow::Error::new)
+        .map_err(|error: anyhow::Error| {
+            raw.fill(0);
+            error
+        })?;
+    raw.fill(0);
+    Ok(key)
+}
+
+fn now_unix_ms() -> anyhow::Result<i64> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| invalid_input("system clock is before the Unix epoch"))?;
+    i64::try_from(elapsed.as_millis())
+        .map_err(|_| invalid_input("system clock is outside the supported range"))
+}
+
+fn parse_conversation(text: &str) -> anyhow::Result<ConversationId> {
+    ConversationId::parse(text).map_err(|error| {
+        invalid_input(format!(
+            "conversation_id must be PROTOCOL-001 conversation text (conv:1:<64 lowercase hex>): {error}"
+        ))
+    })
+}
+
+fn parse_message(text: &str) -> anyhow::Result<MessageId> {
+    MessageId::parse(text).map_err(|error| {
+        invalid_input(format!(
+            "message_id must be PROTOCOL-001 message text (msg:1:<64 lowercase hex>): {error}"
+        ))
+    })
+}
+
+fn parse_operation(text: &str) -> anyhow::Result<OperationId> {
+    OperationId::parse(text).map_err(|error| {
+        invalid_input(format!(
+            "operation_id must be PROTOCOL-001 operation text (op:1:<64 lowercase hex>): {error}"
+        ))
+    })
+}
+
+fn parse_account(text: &str) -> anyhow::Result<AccountId> {
+    AccountId::parse(text).map_err(|error| {
+        invalid_input(format!(
+            "author_account must be PROTOCOL-001 account text (acct:1:<64 lowercase hex>): {error}"
+        ))
+    })
+}
+
+fn parse_device(text: &str) -> anyhow::Result<DeviceId> {
+    DeviceId::parse(text).map_err(|error| {
+        invalid_input(format!(
+            "author_device must be PROTOCOL-001 device text (dev:1:<64 lowercase hex>): {error}"
+        ))
+    })
+}
+
+/// 草稿 ID 是 storage 派生的本地标识，不是 PROTOCOL-001 文本：只做有界结构校验。
+fn validate_local_draft_id(draft_id: &str) -> anyhow::Result<()> {
+    let valid = !draft_id.is_empty()
+        && draft_id.len() <= MAX_ID_BYTES
+        && draft_id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
+        });
+    if !valid {
+        return Err(invalid_input(
+            "draft_id must be the opaque identifier returned by create_draft",
+        ));
+    }
+    Ok(())
+}
+
+fn content_text(content: MessageContent) -> String {
+    match content {
+        MessageContent::Text(text) => text,
+    }
+}
+
+fn is_mine(summary: &SessionSummary, account: &str, device: &str) -> bool {
+    match (&summary.local_account, &summary.local_device) {
+        (Some(local_account), _) => local_account == account,
+        (None, Some(local_device)) => local_device == device,
+        (None, None) => false,
+    }
+}
+
+impl ConversationCore {
+    /// 打开或创建本地加密库（CORE-001 的最小切片）。
+    ///
+    /// 数据目录必须已存在（正式存储不隐式创建目录）；错误密钥/损坏库显式失败，
+    /// 绝不重建同名空库。
+    pub fn open(database_path: &str, master_key_hex: &str) -> anyhow::Result<Self> {
+        if database_path.is_empty() {
+            return Err(invalid_input("database_path must not be empty"));
+        }
+        let key = decode_master_key(master_key_hex)?;
+        let store = open_store(
+            StoreOptions::new(database_path, KeyProvenance::Raw32),
+            key,
+        )
+        .map_err(anyhow::Error::new)?;
+        Ok(Self {
+            database_path: database_path.to_owned(),
+            store: Mutex::new(Some(store)),
+        })
+    }
+
+    /// 库文件路径。
+    pub fn database_path(&self) -> &str {
+        &self.database_path
+    }
+
+    /// 是否仍在打开状态。
+    pub fn is_open(&self) -> bool {
+        match self.store.lock() {
+            Ok(guard) => guard.is_some(),
+            Err(_) => false,
+        }
+    }
+
+    fn store_guard(&self) -> anyhow::Result<MutexGuard<'_, Option<Store>>> {
+        self.store.lock().map_err(|_| closed())
+    }
+
+    /// 关闭内核：释放存储句柄与独占写锁。重复调用是幂等的。
+    pub fn close(&self) {
+        if let Ok(mut guard) = self.store.lock() {
+            guard.take();
+        }
+    }
+
+    /// CORE-007 的本地切片：持久化一条发送意图并返回 `queued` 草稿。
+    ///
+    /// 会话行不存在时以空标题补建（标题由后续已验证条目补写），因此
+    /// “先建草稿再收到首条正式消息”的顺序也可用。
+    pub fn create_draft(
+        &mut self,
+        conversation_id: &str,
+        operation_id: &str,
+        body: &str,
+    ) -> anyhow::Result<DraftView> {
+        let conversation = parse_conversation(conversation_id)?;
+        let operation = parse_operation(operation_id)?;
+        let content = MessageContent::text(body).map_err(anyhow::Error::new)?;
+        let created_at = now_unix_ms()?;
+        let request = ValidatedSendRequest {
+            conversation_id: conversation.encode(),
+            client_operation_id: operation.encode(),
+            content,
+            reply_to: None,
+            origin: MessageOrigin::UserInput,
+            created_at,
+        };
+        let body = body.to_owned();
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        let mut transaction = store
+            .begin_transaction(WriteScope::intent(&request.conversation_id))
+            .map_err(anyhow::Error::new)?;
+        let outcome = persist_draft_in_transaction(&mut transaction, request);
+        match outcome {
+            Ok(record) => {
+                commit_transaction(transaction).map_err(anyhow::Error::new)?;
+                Ok(DraftView {
+                    draft_id: record.draft_id,
+                    operation_id: record.operation_id,
+                    conversation_id: record.conversation_id,
+                    body,
+                    state: record.state,
+                    submission_id: None,
+                })
+            }
+            Err(error) => {
+                let _ = rollback_transaction(transaction);
+                Err(anyhow::Error::new(error))
+            }
+        }
+    }
+
+    /// CORE-010 的本地切片：读取草稿状态；未知草稿返回 `None`。
+    pub fn draft_status(&self, draft_id: &str) -> anyhow::Result<Option<DraftView>> {
+        validate_local_draft_id(draft_id)?;
+        let guard = self.store_guard()?;
+        let store = guard.as_ref().ok_or_else(closed)?;
+        let Some(record) = store.read_draft(draft_id).map_err(anyhow::Error::new)? else {
+            return Ok(None);
+        };
+        let submission_id = store
+            .draft_submission_id(&record.draft_id)
+            .map_err(anyhow::Error::new)?;
+        Ok(Some(DraftView {
+            draft_id: record.draft_id,
+            operation_id: record.operation_id,
+            conversation_id: record.conversation_id,
+            body: content_text(record.content),
+            state: record.state,
+            submission_id,
+        }))
+    }
+
+    /// 写入一条已验证条目（STORAGE-008），返回可展示的消息行。
+    ///
+    /// 所有 ID 先按 PROTOCOL-001 规范文本校验：会话 `conv:1:<hex>`、消息
+    /// `msg:1:<hex>`、作者账户 `acct:1:<hex>`、作者设备 `dev:1:<hex>`。
+    pub fn apply_verified_entry(
+        &mut self,
+        input: VerifiedEntryInput,
+    ) -> anyhow::Result<MessageRowView> {
+        parse_conversation(&input.conversation_id)?;
+        parse_message(&input.message_id)?;
+        parse_account(&input.author_account)?;
+        parse_device(&input.author_device)?;
+        if input.title.len() > MAX_SESSION_TITLE_BYTES {
+            return Err(invalid_input(format!(
+                "title must not exceed {MAX_SESSION_TITLE_BYTES} bytes"
+            )));
+        }
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        let applied = store
+            .apply_verified_entry(input)
+            .map_err(anyhow::Error::new)?;
+        Ok(MessageRowView {
+            message_id: applied.message_id,
+            conversation_id: applied.conversation_id,
+            author: applied.author_account,
+            body: applied.body,
+            mine: applied.mine,
+            created_at_ms: u64::try_from(applied.created_at_ms).unwrap_or(0),
+        })
+    }
+
+    /// CORE-005 的本地切片：会话列表分页。
+    pub fn list_conversations(
+        &self,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> anyhow::Result<ConversationPageView> {
+        let guard = self.store_guard()?;
+        let store = guard.as_ref().ok_or_else(closed)?;
+        let page_cursor = cursor.map(PageCursor::from_text);
+        let page = store
+            .query_conversation_page(page_cursor.as_ref(), limit)
+            .map_err(anyhow::Error::new)?;
+        let mut items = Vec::with_capacity(page.items.len());
+        for row in page.items {
+            let summary = store
+                .session_summary(&row.conversation_id)
+                .map_err(anyhow::Error::new)?
+                .unwrap_or_default();
+            let updated_at_ms = summary.updated_at_ms.max(row.last_activity_at);
+            items.push(ConversationView {
+                conversation_id: row.conversation_id,
+                title: summary.title,
+                preview: summary.preview,
+                unread_count: row.unread_count,
+                updated_at_ms: u64::try_from(updated_at_ms).unwrap_or(0),
+            });
+        }
+        Ok(ConversationPageView {
+            items,
+            next_cursor: page.next_cursor.map(|cursor| cursor.to_string()),
+        })
+    }
+
+    /// CORE-006 的本地切片：单会话消息分页（含本机待发意图）。
+    pub fn list_messages(
+        &self,
+        conversation_id: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> anyhow::Result<MessagePageView> {
+        let conversation = parse_conversation(conversation_id)?;
+        let conversation_text = conversation.encode();
+        let guard = self.store_guard()?;
+        let store = guard.as_ref().ok_or_else(closed)?;
+        let summary = store
+            .session_summary(&conversation_text)
+            .map_err(anyhow::Error::new)?
+            .unwrap_or_default();
+        let page_cursor = cursor.map(PageCursor::from_text);
+        let page = store
+            .query_message_page(&conversation_text, page_cursor.as_ref(), limit)
+            .map_err(anyhow::Error::new)?;
+        let mut items = Vec::with_capacity(page.items.len());
+        for view in page.items {
+            items.push(message_row_view(&summary, conversation_text.clone(), view));
+        }
+        Ok(MessagePageView {
+            items,
+            next_cursor: page.next_cursor.map(|cursor| cursor.to_string()),
+        })
+    }
+}
+
+fn message_row_view(
+    summary: &SessionSummary,
+    conversation_id: String,
+    view: MessageView,
+) -> MessageRowView {
+    let (author, mine) = match (&view.author_account_id, &view.author_device_id) {
+        (Some(account), Some(device)) => (account.clone(), is_mine(summary, account, device)),
+        // 本机待发意图没有远端作者：一定是本机起草，作者取已知的本机身份。
+        _ => (
+            summary.local_account.clone().unwrap_or_default(),
+            true,
+        ),
+    };
+    MessageRowView {
+        message_id: view.message_id,
+        conversation_id,
+        author,
+        body: content_text(view.content),
+        mine,
+        created_at_ms: u64::try_from(view.display_created_at).unwrap_or(0),
+    }
+}
+
+fn persist_draft_in_transaction(
+    transaction: &mut chat_storage::formal::CoreTransaction<'_>,
+    request: ValidatedSendRequest,
+) -> chat_storage::formal::Result<chat_storage::formal::DraftRecord> {
+    materialize_session(transaction, &request.conversation_id, "")?;
+    persist_send_intent(transaction, request)
+}

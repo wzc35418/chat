@@ -6,6 +6,10 @@ import chat.api.MessageContent
 import chat.api.P0Core
 import chat.api.P0Delivery
 import chat.api.P0SessionInfo
+import chat.api.StoredConversation
+import chat.api.StoredDraft
+import chat.api.StoredMessage
+import chat.api.StoredPage
 import chat.presentation.P0Presenter
 import chat.presentation.P0Operation
 import chat.presentation.P0UiState
@@ -14,6 +18,10 @@ import chat.presentation.display.AttachmentDisplayState
 import chat.presentation.display.ConversationListDisplayState
 import chat.presentation.display.ConversationMessagesDisplayState
 import chat.presentation.display.ConversationSummaryView
+import chat.presentation.display.StoredDraftState
+import chat.presentation.display.toConversationDisplayPage
+import chat.presentation.display.toDraftEvidence
+import chat.presentation.display.toMessageDisplayPage
 import chat.presentation.display.DisplayPage
 import chat.presentation.display.DisplayQueryIntent
 import chat.presentation.display.DraftAction
@@ -111,6 +119,7 @@ fun main() = runBlocking {
     checkRenderModels()
     checkErrorPresentation()
     checkFrozenErrorCoverage()
+    checkCoreProjection()
     checkPreviewStates()
     checkPreviewInviteValidation()
     checkConversationDisplayMerger()
@@ -362,6 +371,71 @@ private fun checkErrorPresentation() {
     val nonRetryableStorage = presentError(CoreFailure("STORAGE_FAILURE", false, null, null))
     check(nonRetryableStorage.action == ErrorAction.NONE)
     println("PASS DS-04 known/unknown/non-retryable error mapping")
+}
+
+private fun checkCoreProjection() {
+    // 存储层状态只说明本端事实：queued/prepared 都不是"节点已接受"
+    val queued = StoredDraft("d1", "op-1", "c1", "hello", StoredDraftState.QUEUED, submissionId = null)
+        .toDraftEvidence()
+    check(queued.queuedLocally && queued.submissionId == null && !queued.acceptanceUnknown)
+    val queuedUi = presentDraft(queued)
+    check(queuedUi.phase == DraftPhase.QUEUED) { "queued 只能显示待发送" }
+    check(!queuedUi.canRetry) { "本端排队不得出现重试" }
+
+    val prepared = StoredDraft("d2", "op-2", "c1", "hello", StoredDraftState.PREPARED, submissionId = "sub-1")
+        .toDraftEvidence()
+    check(prepared.queuedLocally && prepared.submissionId == "sub-1")
+    check(prepared.nodeAcceptedReceiptId == null && prepared.deliveredReceiptId == null) {
+        "提交 ID 不是节点回执，也不是送达证据"
+    }
+    val preparedUi = presentDraft(prepared)
+    check(preparedUi.phase == DraftPhase.QUEUED) { "prepared 仍只显示待发送，不得升级为已接受" }
+    check(preparedUi.label != "已接受") { "本地尝试不得显示已接受" }
+
+    // 未知状态安全回退：只承认草稿存在
+    val unknown = StoredDraft("d3", "op-3", "c1", "hello", "weird-state", submissionId = null)
+        .toDraftEvidence()
+    check(!unknown.queuedLocally)
+    check(presentDraft(unknown).phase == DraftPhase.LOCAL_ONLY)
+
+    // 会话/消息分页原样透传，不伪造 unread、不改游标
+    val conversations = StoredPage(
+        items = listOf(
+            StoredConversation("c1", "林然", "最新一条", unreadCount = null, updatedAtMillis = 10),
+            StoredConversation("c2", "周其", "更旧的", unreadCount = 3, updatedAtMillis = 5),
+        ),
+        nextCursor = "cur-2",
+    ).toConversationDisplayPage()
+    check(conversations.items.map { it.id } == listOf("c1", "c2"))
+    check(conversations.items[0].unreadCount == null) { "没有计数时必须保持 null，不能伪装成 0" }
+    check(conversations.items[1].unreadCount == 3)
+    check(conversations.nextCursor == "cur-2")
+
+    val messages = StoredPage(
+        items = listOf(
+            StoredMessage("m1", "c1", "林然", "第一条", mine = false, createdAtMillis = 1),
+            StoredMessage("m2", "c1", "我", "第二条", mine = true, createdAtMillis = 2),
+        ),
+        nextCursor = null,
+    ).toMessageDisplayPage()
+    check(messages.items.map { it.id } == listOf("m1", "m2"))
+    check(messages.items[1].mine)
+    check(messages.nextCursor == null)
+
+    // 真实投影数据直接喂给 DS-08 合并器：去重、追加、代次校验都继续成立
+    var display = initialConversationDisplayState()
+    val listRequest = display.refreshConversationList()
+    display = listRequest.state.applyConversationListPage(
+        listRequest.intent as DisplayQueryIntent.LoadConversationList,
+        conversations,
+    ).state
+    check(display.list.conversations.map { it.id } == listOf("c1", "c2"))
+    val select = display.selectConversation("c1")
+    val pageRequest = select.intent as DisplayQueryIntent.LoadMessagePage
+    display = select.state.applyMessagePage(pageRequest, messages).state
+    check(display.conversation.messages.map { it.id } == listOf("m1", "m2"))
+
+    println("PASS P2-01 projection: stored facts → display without inferring acceptance, null unread kept")
 }
 
 private fun checkFrozenErrorCoverage() {

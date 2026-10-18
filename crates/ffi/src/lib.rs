@@ -2,4 +2,5 @@
 //! bridge exposes the ephemeral P0 session through generated UniFFI bindings.
 #![forbid(unsafe_code)]
 pub mod bridge;
+pub mod local_store;
 uniffi::setup_scaffolding!();

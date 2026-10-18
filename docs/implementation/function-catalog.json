@@ -1554,7 +1554,7 @@
         "crypto_provider_write",
         "enqueue_job"
       ],
-      "file": "crates/storage/src/store.rs",
+      "file": "crates/storage/src/formal/entry.rs",
       "phase": "P0 → P2",
       "plan": "docs/implementation/storage.md"
     },

@@ -1,6 +1,6 @@
 # FFI、回调、Flow 包装与资源生命周期
 
-阶段：P0 → P2。状态：函数级设计，尚未实现。目标源码：[crates/ffi/src/bridge.rs](../../crates/ffi/src/bridge.rs)。
+阶段：P0 → P2。状态：函数级设计；BRIDGE-001/002/003/004/005 的通用编排尚未实现，本地存储竖直切片的 UniFFI 对象 `LocalStoreFfi` 已在 Windows x64 编译并实测（见“本地存储竖直切片（LocalStoreFfi）”）。目标源码：[crates/ffi/src/bridge.rs](../../crates/ffi/src/bridge.rs)（P0 临时实验对象）与 [crates/ffi/src/local_store.rs](../../crates/ffi/src/local_store.rs)（正式存储对象）。
 
 真实生成绑定必须来自选定框架，P0 前不伪造 ABI。Kotlin 包装代码目标位于 shared/core-bridge/src/jvmMain 及 Android 对应 source set；Flow 只负责 UI 通知。Rust 原生方法不导出 Kotlin coroutine 或 Flow；秘密不作为普通 UI DTO。
 
@@ -248,3 +248,84 @@ bridge_suspend_call(operation: BusinessRequest) -> BusinessResult
 
 **实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
 
+## Kotlin 侧接线（2026-10-18，R-10）
+
+- `shared/core-api/.../LocalStore.kt`：`LocalStore` 接口与 `StoredDraft/StoredConversation/StoredMessage/StoredPage/VerifiedMessageInput`；`LocalStoreException(code, message)` 承载稳定错误码。
+- `shared/core-bridge/.../LocalStoreFactory.kt`（commonMain expect）+ `NativeLocalStore.kt`（jvmMain actual，桌面与 Android 共用）：原生调用切到 IO 调度、互斥串行化、`FfiException.Store` → `LocalStoreException`、close 后拒绝调用并释放句柄、u64/u32 与 Kotlin Long/Int 的显式转换。
+- 端到端验证：`:apps:desktop:localStoreSmoke`（Kotlin → UniFFI → core → formal store → 展示投影），真实临时库建草稿、写已验证消息、分页读回、明文不落盘、错误密钥拒绝、待发草稿投影可见。运行：`.\gradlew.bat :apps:desktop:localStoreSmoke --offline`。
+
+## 本地存储竖直切片（LocalStoreFfi，2026-10-18，Windows x64）
+
+实现位置：[crates/ffi/src/local_store.rs](../../crates/ffi/src/local_store.rs)（`uniffi::Object`）；P0 临时实验对象 `P0Core`（bridge.rs）保持不变，两者互不复用类型或状态。
+
+生成绑定的公开面（UniFFI 0.32，crate `chat-ffi`）：
+
+~~~text
+#[derive(uniffi::Object)] LocalStoreFfi
+
+#[uniffi::constructor]
+LocalStoreFfi::open(database_path: String, master_key_hex: String) -> Result<Arc<LocalStoreFfi>, FfiError>
+
+LocalStoreFfi::create_draft(conversation_id: String, operation_id: String, body: String) -> Result<DraftView, FfiError>
+LocalStoreFfi::draft_status(draft_id: String) -> Result<Option<DraftView>, FfiError>
+LocalStoreFfi::apply_verified_entry(
+    conversation_id: String,
+    title: String,
+    message_id: String,
+    author_account: String,
+    author_device: String,
+    body: String,
+    mine: Boolean,
+    created_at_ms: u64,
+) -> Result<MessageRowView, FfiError>
+LocalStoreFfi::list_conversations(cursor: Option<String>, limit: u32) -> Result<ConversationPageView, FfiError>
+LocalStoreFfi::list_messages(conversation_id: String, cursor: Option<String>, limit: u32) -> Result<MessagePageView, FfiError>
+LocalStoreFfi::shutdown()         // 幂等，释放独占写锁
+// 方法名必须叫 shutdown：UniFFI 为每个对象生成 AutoCloseable.close()，
+// 原生 close() 会与生成代码产生 JVM 签名冲突（与 P0Core.shutdown 的既有做法一致）。
+LocalStoreFfi::is_open() -> Boolean
+~~~
+
+记录（字段名与 core 层一一对应）：
+
+- `DraftView { draft_id, operation_id, conversation_id, body, state, submission_id: Option<String> }`。
+- `ConversationView { conversation_id, title, preview, unread_count: Option<u32>, updated_at_ms: u64 }`。
+- `MessageRowView { message_id, conversation_id, author, body, mine: Boolean, created_at_ms: u64 }`。
+- `ConversationPageView { items: Vec<ConversationView>, next_cursor: Option<String> }`。
+- `MessagePageView { items: Vec<MessageRowView>, next_cursor: Option<String> }`。
+
+错误（Kotlin 侧 `catch (e: FfiException.Store)`）：
+
+~~~text
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+enum FfiError {
+    #[error("{code}: {reason}")]
+    Store { code: String, reason: String },
+}
+~~~
+
+- `code` 是稳定错误码：`INVALID_INPUT`、`INVALID_CURSOR`、`PERMISSION_DENIED`、`MESSAGE_ID_CONFLICT`、`STATE_CORRUPTED`、`STORAGE_LOCKED`、`STORAGE_FAILURE`、`CORE_CLOSED`、`CORE_FAILED` 等；UI 只依赖它，不解析 `reason`。
+- `reason` 由 core 截断到 300 字符并压平换行，不含正文、密钥或 SQL 细节。
+
+调用约定（Kotlin 侧必须遵守）：
+
+1. 所有 ID 参数是 PROTOCOL-001 规范文本：会话 `conv:1:<64 位小写 hex>`、消息 `msg:1:<…>`、操作 `op:1:<…>`、账户 `acct:1:<…>`、设备 `dev:1:<…>`；`draft_id` 是 `create_draft` 返回的 `draft-<32 位小写 hex>` 本地标识，必须原样回传。
+2. 时间戳在 FFI 边界是 `u64`（UniFFI 生成的 Kotlin 类型是 `ULong`）；需要 `Long` 时用 `.toLong()`；越界值显式报 `INVALID_INPUT`，不静默截断。
+3. `next_cursor` 原样回传；它是 storage 内部 `spg1` 令牌（10 分钟 TTL），不是线协议 `cur1`，不要解释、不要跨设备复用；过期/伪造返回 `INVALID_CURSOR`。
+4. `close` 幂等且立即释放独占写锁（同进程内第二次 `open` 在关闭前返回 `STORAGE_LOCKED`）；关闭后所有方法返回 `CORE_CLOSED`。
+5. 记录 `Debug` 不含正文之外的密钥材料，正文只出现在返回值里；日志不得打印 `body`/`preview`。
+
+复现命令（全程离线，本轮实测）：
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi      # 2 passed（LocalStoreFfi 端到端 + 错误码映射）
+cargo build --locked --offline -p chat-ffi   # 成功，Cargo.lock 未变化
+~~~
+
+证据：
+
+- `local_store::tests::open_write_and_read_through_the_ffi_shape`：构造函数建库 → create_draft → draft_status → apply_verified_entry → list_messages（待发 + 正式）→ list_conversations（标题/预览/未读 None）→ close 后 `CORE_CLOSED`。
+- `local_store::tests::failures_are_typed_with_stable_codes`：非规范会话 ID 与 `u64::MAX` 时间戳都返回 `FfiError::Store { code = "INVALID_INPUT", .. }`。
+
+已知限制：本对象只覆盖竖直切片，没有事件订阅（BRIDGE-003/004/006）、没有异步/suspend 包装（BRIDGE-007）、没有平台回调（BRIDGE-001 的完整形态）；`#[uniffi::Object]` 内部的 `std::sync::Mutex` 会串行化所有调用，调用方不要在 UI 线程做长分页循环。Kotlin/Android 真机尚未实测（本轮只验证 Rust 侧编译与单元测试）。

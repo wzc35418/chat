@@ -27,6 +27,9 @@ pub enum StorageError {
     /// 同一 SubmissionId 已绑定到不同的密文摘要或不同的活跃尝试。
     #[error("submission ID conflict: {0}")]
     SubmissionIdConflict(String),
+    /// 同一 MessageId 已绑定到不同的已验证条目（正文/作者/展示时间不一致）。
+    #[error("message ID conflict: {0}")]
+    MessageIdConflict(String),
     /// 期望版本与库内版本不一致。
     #[error("version conflict: expected {expected}, found {found}")]
     VersionConflict { expected: u64, found: u64 },
@@ -72,6 +75,7 @@ impl StorageError {
             Self::SchemaTooNew { .. } => "SCHEMA_TOO_NEW",
             Self::OperationIdConflict(_) => "OPERATION_ID_CONFLICT",
             Self::SubmissionIdConflict(_) => "SUBMISSION_ID_CONFLICT",
+            Self::MessageIdConflict(_) => "MESSAGE_ID_CONFLICT",
             Self::VersionConflict { .. } => "VERSION_CONFLICT",
             Self::RecoveryRequired(_) => "RECOVERY_REQUIRED",
             Self::RollbackFailed(_) => "ROLLBACK_FAILED",

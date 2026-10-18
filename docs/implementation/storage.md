@@ -1,10 +1,12 @@
 # SQLite、统一事务、数据表与崩溃恢复
 
-阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过，STORAGE-004/005/008 未开始。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
+阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/008/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过，STORAGE-004/005 未开始。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
 
 状态补充（2026-10-18）：`store.rs` 已有独立的未加密 P0 事务试验表，覆盖 T1/C01 意图与准备任务和 T2 MLS/attempt/outbox 崩溃断点，局部证据见 [P0-03 报告](../P0_PERSISTENCE.md)。`crates/storage/src/formal/` 新增正式加密存储路径，实现 STORAGE-001/003/006/007/009/010/011 与 002 的迁移器，证据见下文“P0-04 正式存储路径实现记录”；其余 STORAGE-004/005/008 仍未实现，MLS 加密语义（CRYPTO-004 等）也未接入。
 
 状态补充（2026-10-18）：STORAGE-012/013/014/015 已实现，新增 `crates/storage/src/formal/cursor.rs`（内部认证分页游标）、`query.rs`（消息页与会话页）、`outbox_lease.rs`（租约领取与三态结果），证据见下文“分页查询与 outbox 租约实现记录”。本轮未新增迁移、未改动 0001/0002 既有内容，也未改动 `store.rs`/`persistence.rs`/`formal_crash_worker.rs`。
+
+状态补充（2026-10-18，竖直切片）：STORAGE-008 `apply_verified_entry` 已实现（新增 `crates/storage/src/formal/entry.rs`，并新增 `WriteScope::inbound` 作用域、`MESSAGE_ID_CONFLICT` 错误码与 `conversation-metadata` 封装用途），证据见下文“已验证条目写入实现记录（STORAGE-008）”。本轮仍未新增迁移（会话摘要复用 `conversations.protected_metadata`），未改动 `store.rs`/`persistence.rs`/`crash_worker.rs`。
 
 Rust storage 唯一拥有客户端核心数据库；节点库单独实现于 node-services，不能复用客户端敏感数据写入口。默认先验证全库加密或等价方案，因为会话 ID、索引、时间戳同样敏感。事务句柄不跨 FFI、不跨网络 await；读分页使用稳定快照。
 
@@ -85,13 +87,51 @@ cargo test --offline -p chat-storage   # 5 lib + 2 formal_crash + 8 formal_outbo
 已知限制（本记录只对已完成部分负责）：
 
 1. **游标是内部临时实现**：线协议 PROTOCOL-012/013 的 `cur1` 令牌要求账户/设备/会话的 32 字节二进制身份，而正式存储当前只有 TEXT 会话标识、也不保存本机账户/设备身份。本模块用 `spg1` 前缀的内部 AEAD 令牌（主密钥派生用途 `page-cursor`，AAD 绑定会话 + 资源 + 排序版本，TTL 10 分钟、允许 60 秒时钟超前）替代；令牌不能跨到桥接层或网络，待身份映射就绪后应替换为线协议令牌。
-2. **待发投影 ID**：待发意图暂时以 `draft_id` 作为稳定本地 ID；正式 MessageId 的关联由尚未实现的 STORAGE-008（`apply_verified_entry`）写 `messages.draft_id`/`messages.submission_id` 完成。
+2. **待发投影 ID**：待发意图暂时以 `draft_id` 作为稳定本地 ID；STORAGE-008（`apply_verified_entry`）已写 `messages.submission_id`，但本切片输入不携带 `draft_id`，因此 `messages.draft_id` 仍为 NULL，待发投影与正式消息之间的关联要等 outbox 结果把草稿置为 `accepted` 后才消失。
 3. **未读计数**：返回 `None`。正式未读需要 read-cursor 存储（schema 里没有读位置表），本轮不新增迁移。
 4. **消息正文封装契约**：`messages.protected_content` 用用途 `message-content`、AAD `(conversation_id, message_id)` 封装，唯一入口是 `Store::seal_message_content`；STORAGE-008 写入时必须使用同一契约，否则查询会显式 `STATE_CORRUPTED`。
 5. **诊断不落盘**：P0 schema 没有 outbox 诊断列，且本轮不新增迁移，结果诊断只截断（≤200 字符、去控制字符）后随 `JobState` 返回给上层日志。
 6. **unknown 的对账**：本函数只保留可对账状态（6 小时窗口 + attempt `unknown`）。真正的对账（按 SubmissionId 查询节点接受状态）属于同步/节点模块，未在本函数实现；窗口结束后若无人对账，任务仍可被重领，存在重复提交风险，需要在同步模块接入前保持 worker 侧幂等。
 7. **并发唯一性**：`open_store` 是单写者独占打开，进程内并发由 CAS 版本保证；跨进程/双 worker 的真实竞争以两把独立连接的 SQLite 锁与 CAS 语义表达，本轮用“顺序领取 + 版本 CAS”验证（无法在同一进程内同时打开第二个 Store）。
-8. **会话列表解密**：`conversations.protected_metadata`（标题等）没有在本函数解密——它属于尚未定义的会话元数据封装契约，本轮不猜测用途，只返回 `kind`/`state` 与计数摘要。
+8. **会话列表解密**：`query_conversation_page` 不解密 `conversations.protected_metadata`，只返回 `kind`/`state` 与计数摘要；会话摘要（标题/预览/活动时间/本机身份）的封装契约已由 STORAGE-008 定义（用途 `conversation-metadata`），读取入口是 `Store::session_summary`，由 core 层 `list_conversations` 组装展示投影。
+
+## 已验证条目写入实现记录（STORAGE-008，2026-10-18，Windows x64）
+
+实现位置：[crates/storage/src/formal/entry.rs](../../crates/storage/src/formal/entry.rs)（新增），配套改动：[mod.rs](../../crates/storage/src/formal/mod.rs)（`WriteScopeKind::Inbound` / `WriteScope::inbound`、重导出）、[error.rs](../../crates/storage/src/formal/error.rs)（`MESSAGE_ID_CONFLICT`）、[seal.rs](../../crates/storage/src/formal/seal.rs)（`conversation-metadata` 用途）。未新增迁移：会话摘要复用 `conversations.protected_metadata`。
+
+单笔 `BEGIN IMMEDIATE` 事务内完成（失败整体回滚）：
+
+1. **按 `message_id` 幂等**：先读 `messages` 行并解密正文比对；同内容返回 `already_existed = true` 且不写任何行、不推进库版本（生产入口 `Store::apply_verified_entry` 走只读预检，不开启事务）；同 ID 不同正文/作者/展示时间/会话返回 `MESSAGE_ID_CONFLICT`，绝不覆盖。
+2. **会话行自动创建**：会话不存在时插入 `conversations` 行，`protected_metadata` 写本地会话摘要（封装用途 `conversation-metadata`，AAD 绑定 `(conversation_id, "session-summary-v1")`），内容为 `{title, preview, updated_at_ms, local_account, local_device}`。P0 schema 不允许省略 `kind`/`coordinator_id`/`state`，本轮用占位值 `'direct'` / `''` / `'active'`（会话种类与协调者属于会话建立流程，本切片的输入不携带）。
+3. **正式消息物化**：正文用 `message-content` 用途封装，AAD 与 STORAGE-012 的读取契约完全一致（`(conversation_id, message_id)`），写 `messages`（`send_state = 'accepted'`，`draft_id = NULL`）。
+4. **attempt 记账行**：P0 schema 要求 `messages.submission_id` 非空且引用 `message_attempts`，因此同事务写一条 `origin = 'remote'`、`draft_id/operation_id = NULL` 的 attempt 行；SubmissionId 由 `(conversation_id, message_id)` 确定性派生（`verified_entry_submission_id`，PROTOCOL-001 `sub:1:<64 hex>` 文本），`immutable_ciphertext` 存封装后的正文、`candidate_hash` 用 storage 既有的域分隔摘要，保证该行自洽。
+5. **会话摘要更新**：标题只在本地为空时补写（已建立的标题不被后续条目覆盖）；预览取展示时间不早于现有 `updated_at_ms` 的条目正文（按字符截断到 `MAX_SESSION_PREVIEW_CHARS = 120`）；`updated_at_ms = max`；`mine = true` 的条目把自己的作者账户/设备记录为本机身份，供读取时判定 `mine`。
+
+复现命令（全程离线，本轮实测）：
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-storage   # 5 lib + 2 formal_crash + 7 formal_entry + 8 formal_outbox + 7 formal_query + 17 formal_store = 46 passed
+~~~
+
+证据（测试名 → 覆盖的契约点）：
+
+- `formal_entry::entry_write_is_visible_to_pages_and_session_summary`：写入后 `query_message_page` 能读到（正文解密、作者/设备、`local_pending = false`），会话页出现该会话，摘要的标题/预览/`updated_at_ms`/本机身份都正确。
+- `formal_entry::entry_write_never_leaves_plaintext_in_store_files`：扫描 `chat.db`/`-wal`/`-shm` 原始字节，正文标记与标题标记都不出现，摘要仍可解密出含标记的预览。
+- `formal_entry::entry_write_is_idempotent_and_conflicts_are_explicit`：重放返回同一 `group_seq`/`submission_id` 且 `already_existed`、库版本不前进、行数不变；不同正文、不同展示时间、不同设备都返回 `MESSAGE_ID_CONFLICT` 且不覆盖原行。
+- `formal_entry::entry_write_auto_creates_conversation_and_keeps_the_first_title`：会话行自动创建（`kind = 'direct'`、`state = 'active'`），标题不被后续条目覆盖，预览随时间前进，更早展示时间的补投不回退预览；正式消息按分配到的 `group_seq` 降序。
+- `formal_entry::entry_write_rolls_back_everything_on_failure`：制造“会话行与摘要已写入之后才失败”的路径，返回 `STATE_CORRUPTED` 后自动建的行不存在、`messages` 为 0、摘要为空、库版本不前进，随后同库仍可正常写入。
+- `formal_entry::entry_write_rejects_malformed_input_and_foreign_metadata`：空/畸形 ID、空正文、负时间戳、越界标题都是 `INVALID_INPUT` 且不写行；由别处建立、`protected_metadata` 不是本格式的会话返回 `STATE_CORRUPTED` 且原字节不被覆盖。
+- `formal_entry::materialize_session_is_idempotent_and_bounds_the_preview`：`materialize_session` 幂等且不替换已有标题；预览按字符截断到 120 且不截断半个字符。
+
+已知限制（只对本函数负责）：
+
+1. **缺少 MLS 密文与日志序号**：本切片输入不带条目密文与已验证 `group_seq`，因此 `group_seq` 按会话内 `MAX+1` 分配（写入顺序），attempt 记账行的 `immutable_ciphertext` 存封装后的正文。正式流程应改为接受已认证条目密文与日志序号，届时 attempt 行的 `origin`/密文来源随之改为真实值。
+2. **会话种类/协调者是占位值**：自动建行用 `'direct'` 与空 `coordinator_id`；正式值必须由会话建立流程（IDENTITY/GROUPS/SYNC）写入。
+3. **本机身份存在摘要里**：`messages` 没有 `mine` 列，`mine` 只能由“会话摘要记录的本机作者”在读取时判定；身份模块接入后应改为按当前登录账户判定。
+4. **摘要占用 `protected_metadata`**：该列同时是会话元数据的正式位置，本函数独占其格式；遇到非本格式字节时显式 `STATE_CORRUPTED`，不覆盖、不猜测。
+5. **未关联本地草稿**：输入不携带 `draft_id`/`operation_id`，因此同一条本机消息可能短暂同时以“待发投影 + 正式消息”出现，直到 outbox 结果（STORAGE-014/015）把草稿置为 `accepted`。
+6. **未写日志/去重/游标/回执**：STORAGE-008 契约里属于群日志与同步的部分（`group_log_entries`、`inbox_dedup`、`sync_cursors`、`receipts`）不在本切片范围内，本函数不写它们，也不推进任何游标。
 
 ## 函数导航
 
@@ -376,10 +416,10 @@ apply_verified_entry(tx: CoreTransaction, entry: FullyVerifiedEntry, changes: Pr
 
 **完成验收**：
 
-- [ ] 任一步失败都不推进游标。
-- [ ] 重复事件不重复可见、不重复回执。
+- [x] 任一步失败都不推进游标：`formal_entry::entry_write_rolls_back_everything_on_failure`（写入中途失败后自动建会话行/摘要/消息全部回滚、库版本不前进；本切片不推进任何游标，同步游标属 SYNC 模块）。
+- [x] 重复事件不重复可见、不重复回执：`formal_entry::entry_write_is_idempotent_and_conflicts_are_explicit`（同 `message_id` 同内容重放返回同一 `group_seq`/`submission_id`，行数不变、库版本不前进；不同内容 `MESSAGE_ID_CONFLICT`）。回执（`receipts`）不在本切片范围，未写也未验证。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（Windows x64 实测，竖直切片形态）。入口是 `Store::apply_verified_entry(input: VerifiedEntryInput) -> Result<AppliedEntry>` 与事务内形式 `apply_verified_entry(tx, input)`；见 [entry.rs](../../crates/storage/src/formal/entry.rs)，证据与限制见“已验证条目写入实现记录（STORAGE-008）”。与文档契约的差异：契约签名是 `apply_verified_entry(tx, entry: FullyVerifiedEntry, changes: PreparedWrite)`，本轮输入是切片冻结的 `VerifiedEntryInput`（不含 MLS 密文/日志序号/回执），因此本函数不写群日志、去重表、同步游标与回执，也不推进任何游标。
 
 <a id="storage-009"></a>
 

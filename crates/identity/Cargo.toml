@@ -7,3 +7,6 @@ publish.workspace = true
 [dependencies]
 chat-protocol.workspace = true
 chat-storage.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+zeroize.workspace = true

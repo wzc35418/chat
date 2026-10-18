@@ -49,6 +49,8 @@ pub enum SealPurpose {
     MessageContent,
     /// 内部分页游标令牌（只在本机存储边界内使用，不是线协议 `cur1` 令牌）。
     PageCursor,
+    /// `conversations.protected_metadata`：本地会话摘要（标题、预览、活动时间、本机作者）。
+    ConversationMetadata,
 }
 
 impl SealPurpose {
@@ -61,6 +63,7 @@ impl SealPurpose {
             Self::QuarantineDetail => b"quarantine-detail",
             Self::MessageContent => b"message-content",
             Self::PageCursor => b"page-cursor",
+            Self::ConversationMetadata => b"conversation-metadata",
         }
     }
 }

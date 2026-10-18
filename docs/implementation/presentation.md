@@ -83,7 +83,7 @@ suspend fun loadConversationList(cursor: Cursor?): ConversationListState
 - [ ] 网络离线仍可用。
 - [ ] 连续翻页不重复会话。
 
-**实现状态**：局部实现（2026-10-18）。`display/ConversationDisplayMerger.kt` 提供按稳定 ID 去重、分页追加/前置/reset、迟到结果按代次忽略的纯合并（DS-08）；`display/PagingPresentation.kt` 把列表状态映射为“加载中／还有更多／没有更多／失败重试”的文案、可用动作与语义播报（DS-11），加载中不给可点动作。预览用固定样例经合并器跑成功/失败/到底（`preview/PreviewPagingSample.kt`）。正式 `ConversationService` 列表查询与离线读缓存尚未接线，因此本函数复选框不勾选。
+**实现状态**：局部实现（2026-10-18）。`display/ConversationDisplayMerger.kt` 提供按稳定 ID 去重、分页追加/前置/reset、迟到结果按代次忽略的纯合并（DS-08）；`display/PagingPresentation.kt` 把列表状态映射为“加载中／还有更多／没有更多／失败重试”的文案、可用动作与语义播报（DS-11），加载中不给可点动作。`display/CoreProjection.kt`（R-09）把 `StoredPage<StoredConversation>` 直接投影成 `DisplayPage<ConversationSummaryView>`（游标原样透传、没有 unread 计数时保持 null、不伪造 0）。预览用固定样例经合并器跑成功/失败/到底（`preview/PreviewPagingSample.kt`）。正式 `ConversationService` 的 core/FFI 接线仍在进行（R-07），因此本函数复选框不勾选。
 
 <a id="presentation-003"></a>
 

@@ -68,6 +68,20 @@ tasks.register<JavaExec>("previewSnapshot") {
     workingDir(rootProject.projectDir)
 }
 
+tasks.register<JavaExec>("localStoreSmoke") {
+    group = "verification"
+    description = "P2-01 竖直链路冒烟：Kotlin → UniFFI → Rust core → formal store。"
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.LocalStoreSmokeKt")
+    systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+    val storeTemp = rootProject.layout.buildDirectory.dir("tmp/localStoreSmoke")
+    systemProperty("java.io.tmpdir", storeTemp.get().asFile.absolutePath)
+    doFirst { storeTemp.get().asFile.mkdirs() }
+}
+
 tasks.register<JavaExec>("previewApp") {
     group = "application"
     dependsOn("classes")
