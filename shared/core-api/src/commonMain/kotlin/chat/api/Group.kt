@@ -43,6 +43,9 @@ interface GroupService {
     /** 建群（本机为 owner；引导成员由本进程临时设备承担）。 */
     suspend fun createGroup(name: String): GroupSnapshot
 
+    /** 本机群列表（只读投影；skipped 是解析失败被跳过的条数）。 */
+    suspend fun listGroups(): GroupList
+
     suspend fun snapshot(groupId: String): GroupSnapshot
 
     suspend fun rename(groupId: String, newName: String): GroupSnapshot
@@ -60,3 +63,20 @@ interface GroupService {
     /** 释放独占写锁；之后所有调用返回 CORE_CLOSED。 */
     suspend fun shutdown()
 }
+/** 群摘要（列表页用；不含成员详情）。 */
+data class GroupSummaryEntry(
+    val groupId: String,
+    val name: String,
+    val epoch: Int,
+    val role: String,
+    val policyVersion: Long,
+    val dissolved: Boolean,
+    val left: Boolean,
+    val pending: Boolean,
+)
+
+data class GroupList(
+    val groups: List<GroupSummaryEntry>,
+    /** 损坏或不合规而被跳过的条目数（不静默丢）。 */
+    val skipped: Int,
+)

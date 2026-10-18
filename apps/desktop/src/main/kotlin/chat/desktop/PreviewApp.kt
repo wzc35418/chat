@@ -20,7 +20,10 @@ import chat.bridge.createLocalStore
 import chat.presentation.display.presentInviteError
 import chat.presentation.display.presentInvitePreview
 import chat.presentation.preview.PreviewAttachmentState
+import chat.presentation.preview.GroupSummary
 import chat.presentation.preview.PreviewGroupState
+import chat.presentation.preview.selectGroup
+import chat.presentation.preview.withSummaries
 import chat.presentation.preview.beginBusy
 import chat.presentation.preview.updateCreateName
 import chat.presentation.preview.updateNewName
@@ -327,6 +330,49 @@ fun main() = application {
     }
 
     val groupHandlers = GroupHandlers(
+        loadGroupList = {
+            scope.launch {
+                groupState = groupState.beginBusy()
+                withGroup { service -> service.listGroups() }
+                    .onSuccess { list ->
+                        groupState = groupState.withSummaries(
+                            list.groups.map {
+                                GroupSummary(
+                                    groupId = it.groupId,
+                                    name = it.name,
+                                    epoch = it.epoch,
+                                    role = it.role,
+                                    policyVersion = it.policyVersion,
+                                    dissolved = it.dissolved,
+                                    left = it.left,
+                                    pending = it.pending,
+                                )
+                            },
+                            list.skipped,
+                        )
+                    }
+                    .onFailure { error ->
+                        groupState = groupState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+        selectGroup = { groupId ->
+            groupState = groupState.selectGroup(groupId)
+            scope.launch {
+                groupState = groupState.beginBusy()
+                withGroup { service -> service.snapshot(groupId) }
+                    .onSuccess { groupState = groupState.withSnapshot(it) }
+                    .onFailure { error ->
+                        groupState = groupState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
         updateCreateName = { value -> groupState = groupState.updateCreateName(value) },
         createGroup = {
             scope.launch {

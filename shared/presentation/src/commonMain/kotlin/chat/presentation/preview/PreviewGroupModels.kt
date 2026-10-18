@@ -18,6 +18,10 @@ data class PreviewGroupState(
     val lastErrorCode: String? = null,
     val newName: String = "",
     val createName: String = "",
+    /** 群列表摘要（多群切换用）。 */
+    val summaryList: List<GroupSummary> = emptyList(),
+    val selectedGroupId: String? = null,
+    val skippedGroups: Int = 0,
 )
 
 fun PreviewGroupState.withRooms(rooms: List<GroupSnapshot>): PreviewGroupState =
@@ -61,3 +65,40 @@ fun describe(snapshot: GroupSnapshot): String {
 
 /** 群成员列表用于界面渲染（含 pending 标记与角色）。 */
 fun GroupSnapshot.memberRows(): List<GroupMember> = members + pendingMembers
+/** 群列表摘要（GROUP 列表页用；不含成员详情）。 */
+data class GroupSummary(
+    val groupId: String,
+    val name: String,
+    val epoch: Int,
+    val role: String,
+    val policyVersion: Long,
+    val dissolved: Boolean,
+    val left: Boolean,
+    val pending: Boolean,
+)
+
+fun GroupSummary.statusLabel(): String = when {
+    dissolved -> "已解散"
+    left -> "已退出"
+    pending -> "待收口"
+    else -> "正常"
+}
+
+/** 列表加载：保留当前选中群（若仍在列表里），否则选第一个。 */
+fun PreviewGroupState.withSummaries(summaries: List<GroupSummary>, skipped: Int): PreviewGroupState {
+    val stillThere = snapshot?.groupId?.let { id -> summaries.any { it.groupId == id } } ?: false
+    return copy(
+        summaryList = summaries,
+        skippedGroups = skipped,
+        busy = false,
+        notice = if (skipped > 0) {
+            "已列出 " + summaries.size + " 个群；" + skipped + " 条记录损坏被跳过（未计入）。"
+        } else {
+            "已列出 " + summaries.size + " 个群"
+        },
+        lastErrorCode = null,
+        selectedGroupId = if (stillThere) selectedGroupId else summaries.firstOrNull()?.groupId,
+    )
+}
+
+fun PreviewGroupState.selectGroup(groupId: String): PreviewGroupState = copy(selectedGroupId = groupId)

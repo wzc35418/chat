@@ -31,6 +31,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import chat.presentation.preview.PreviewGroupState
 import chat.presentation.preview.memberRows
+import chat.presentation.preview.statusLabel
 
 /** 群面板回调。 */
 data class GroupHandlers(
@@ -44,6 +45,8 @@ data class GroupHandlers(
     val removeMember: (String) -> Unit = {},
     val acceptPending: () -> Unit = {},
     val discardPending: () -> Unit = {},
+    val loadGroupList: () -> Unit = {},
+    val selectGroup: (String) -> Unit = {},
 ) {
     companion object {
         val None = GroupHandlers()
@@ -118,6 +121,51 @@ fun GroupPanel(
                         onClick = handlers.refresh,
                         enabled = state.ready && !state.busy,
                     ) { Text("刷新快照") }
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("本机群列表", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                    TextButton(
+                        onClick = handlers.loadGroupList,
+                        enabled = state.ready && !state.busy,
+                        modifier = Modifier.semantics { contentDescription = "加载本机群列表" },
+                    ) { Text("加载群列表", style = MaterialTheme.typography.labelMedium) }
+                    if (state.skippedGroups > 0) {
+                        Text(
+                            "跳过 " + state.skippedGroups + " 条损坏记录",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color(0xFFB26A00),
+                        )
+                    }
+                }
+                if (state.summaryList.isEmpty()) {
+                    Text("还没有群列表；点「加载群列表」后出现。", style = MaterialTheme.typography.bodySmall)
+                } else {
+                    state.summaryList.forEach { summary ->
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            TextButton(
+                                onClick = { handlers.selectGroup(summary.groupId) },
+                                enabled = state.ready && !state.busy,
+                                modifier = Modifier.semantics {
+                                    contentDescription = "切换到群 " + summary.name
+                                },
+                            ) {
+                                Text(
+                                    (if (summary.groupId == state.selectedGroupId) "● " else "○ ") + summary.name,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = if (summary.groupId == state.selectedGroupId) FontWeight.SemiBold else FontWeight.Normal,
+                                )
+                            }
+                            Text(
+                                "#" + summary.epoch + " · " + summary.role + " · " + summary.statusLabel(),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color(0xFF5F6B63),
+                            )
+                        }
+                    }
                 }
 
                 val snapshot = state.snapshot

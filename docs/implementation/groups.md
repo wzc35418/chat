@@ -1059,4 +1059,82 @@ cargo test --offline -p chat-storage -p chat-core -p chat-ffi  # 94 + 176 + 46 p
 3. **列表不触发任何同步**：状态是最后一次本地写入的投影，未同步的对端变更不会出现。
 4. **不返回成员数**：成员列表需要读整条快照（记录里有），列表页刻意只投影摘要字段。
 
+## 策略角色随控制提交同步到对端（GROUPS-014，2026-10-18，Windows x64）
+
+R-88 的已知限制是"角色不随 MLS Commit 传播"：转让后新群主在对端记录里仍是旧角色，因此无法打包他人的
+提案。本轮把它打通：控制提交的处理入口可以带**策略语义声明**，对端据此推进自己的策略快照。
+
+代码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)（`PeerEntryInput` 扩展 + 定点改动）；
+测试：[crates/core/tests/groups_role_sync.rs](../../crates/core/tests/groups_role_sync.rs)（4 个，真双设备两库）。
+
+### 公开面（扩展）
+
+~~~text
+PeerEntryInput {
+    group_id, epoch, sender_identity, expectation, payload,
+    added_members, removed_members,
+    policy_intent: Option<chat_core::group_node::ControlIntent>,   // 新增
+    policy_role: Option<MemberRole>,                               // 新增（SetRole 用）
+}
+~~~
+
+`ControlIntent` 复用 group_node 的公开语义声明（`TransferOwnership { target_credential }` /
+`SetRole { target_credential }` / 其它）。`ControlIntent::SetRole` 本身不带角色，因此额外用
+`policy_role` 声明目标角色。
+
+### 关键语义
+
+1. **先算策略、再做 MLS 合并**：带 `policy_intent` 时，在调用 CRYPTO-006 **之前**完成
+   DOMAIN-002 授权 + DOMAIN-004 派生（新 `policy_version` / `control_head`）。
+   因此声明不成立（目标不是成员、缺角色、授权不足、声明的成员变化非空）时**连合并不发生**，
+   快照完全不动。
+2. **合并后应用**：MLS 提交合并成功后再核对真实成员变化必须为空（纯角色变更），然后把准备好的
+   策略落到快照：`transfer_ownership` → 目标变 **owner**、原群主降为 **admin**；
+   `set_role` → 目标变声明角色（`owner` 不允许，只能走转让）。
+3. **不声明 = 保持现状**（向后兼容）：只合并 MLS 状态，角色/策略版本/控制头都不动——
+   这也正是 R-88 记录里"未声明就没法跨设备治理"的原因。
+4. **声明与真实提交形态不一致** → `STATE_CORRUPTED`（在合并后核对，作为第二道保险）。
+
+### 错误码
+
+`STATE_CORRUPTED`（声明与成员变化不一致）、`INVALID_INPUT`（SetRole 缺目标/缺角色、
+声明了不支持的意图）、`INVALID_TARGET`（目标不是确认成员）、`PERMISSION_DENIED`
+（声明 `owner` 角色）——以及原有 `STALE_EPOCH` / `INVALID_CIPHERTEXT` 等。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test groups_role_sync   # 4 passed
+cargo test --offline -p chat-core                            # 180 passed（既有 176 继续通过）
+~~~
+
+### 证据
+
+- `groups_role_sync::transfer_with_policy_intent_syncs_peer_roles_and_unlocks_committing`：
+  A（alice 群主）转让给 B → B 处理带 `TransferOwnership` 声明的提交后 **bob = owner、
+  alice = admin**、本机 role = Owner、`policy_version + 1`、`control_head` 前进、epoch 2 →
+  **随后 B 成功打包 alice 的离开提案**（pending remove_members base 2 → target 3）→
+  alice 合并后 `self_removed` 且不能加密。（这就是 R-88 限制的端到端解锁。）
+- `groups_role_sync::without_a_declaration_peer_roles_stay_unchanged`：同一提交不带声明 →
+  epoch 前进但角色/策略版本/控制头**全不变**，且 bob 打包他人提案仍 `PERMISSION_DENIED`
+  （向后兼容 + 旧限制可复现）。
+- `groups_role_sync::inconsistent_declarations_are_rejected_without_changing_the_snapshot`：
+  声明转让但声明了成员变化 → 拒绝且快照完全不变；`SetRole` 目标不是成员 → `INVALID_TARGET`；
+  `SetRole` 缺角色 → `INVALID_INPUT`；三次都**没有发生 MLS 合并**（快照逐字段相等）。
+- `groups_role_sync::set_role_declaration_syncs_the_target_role`：群主把 bob 设为 admin →
+  bob 侧合并带 `SetRole` 声明的提交后 bob = admin、alice 仍是 owner、`policy_version + 1`。
+
+### 已知限制
+
+1. **声明由调用方给，可信度取决于外层日志**：`policy_intent` 必须由已验证的控制元数据提供
+   （节点日志/协调者回执）；本层只按本地快照做 DOMAIN-002/004 的**再校验**，不做独立的事实发现。
+2. **只同步角色**：邀请/移除成员的成员集合同步走既有 `added_members/removed_members`；
+   禁言（`muted`）与群名仍不在提交里传播。
+3. **转让后原群主降级为 admin 是本切片的公开语义**（DOMAIN-004 的候选里是普通成员）；
+   如果策略层要改成"降为 member"，需要同时改这里与节点元数据语义。
+4. **声明必须在合并前成立**：目标在声明时还不是确认成员就整体失败（不会"合并后再补"）。
+5. **一次提交只同步一个策略操作**（声明是单个 `ControlIntent`）。
+
+
 

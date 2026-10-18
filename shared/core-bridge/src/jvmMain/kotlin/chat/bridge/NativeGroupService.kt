@@ -37,6 +37,31 @@ class NativeGroupService(
         native.groupCreate(name, "local-device", "bootstrap-device", emptyList()).toSnapshot()
     }
 
+    override suspend fun listGroups(): chat.api.GroupList = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            try {
+                val list = native.groupList()
+                chat.api.GroupList(
+                    groups = list.groups.map {
+                        chat.api.GroupSummaryEntry(
+                            groupId = it.groupId,
+                            name = it.name,
+                            epoch = it.epoch.toInt(),
+                            role = it.role,
+                            policyVersion = it.policyVersion.toLong(),
+                            dissolved = it.dissolved,
+                            left = it.left,
+                            pending = it.pending,
+                        )
+                    },
+                    skipped = list.skipped.toInt(),
+                )
+            } catch (error: FfiException.Store) {
+                throw LocalStoreException(error.code, error.reason)
+            }
+        }
+    }
+
     override suspend fun snapshot(groupId: String): GroupSnapshot = call { it.groupSnapshot(groupId).toSnapshot() }
 
     override suspend fun rename(groupId: String, newName: String): GroupSnapshot =

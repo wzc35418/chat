@@ -1426,6 +1426,13 @@ pub struct PeerEntryInput {
     pub added_members: Vec<String>,
     /// 外层已验证控制元数据里的**移除成员身份**（数量必须等于真实 Commit 的移除数）。
     pub removed_members: Vec<String>,
+    /// 可选：外层已验证控制元数据里的**策略语义声明**（角色变更来自策略层，MLS 不带）。
+    ///
+    /// 只有纯角色变更提交（`transfer_ownership` / `set_role`）才需要它；不声明 = 保持本地
+    /// 角色不变（向后兼容）。声明与真实提交形态不符（例如同时增删成员）→ `STATE_CORRUPTED`。
+    pub policy_intent: Option<crate::group_node::ControlIntent>,
+    /// 可选：`SetRole` 声明的目标角色（`ControlIntent::SetRole` 本身不带角色）。
+    pub policy_role: Option<MemberRole>,
 }
 
 impl PeerEntryInput {
@@ -1444,6 +1451,8 @@ impl PeerEntryInput {
             payload,
             added_members: Vec::new(),
             removed_members: Vec::new(),
+            policy_intent: None,
+            policy_role: None,
         }
     }
 }
@@ -1493,6 +1502,77 @@ pub enum PeerEntryOutcome {
     },
 }
 
+
+/// 把对端声明的策略语义落到本地快照（DOMAIN-002 授权 + DOMAIN-004 派生版本/控制头）。
+///
+/// - 只允许**纯角色变更**的声明：真实提交若同时增删成员 / 移除了本机 → `STATE_CORRUPTED`
+///   （声明与提交形态不一致，绝不"宽容"应用）；
+/// - `TransferOwnership`：目标变群主、原群主降为 **admin**（公开元数据语义，见 groups.md）；
+/// - `SetRole`：目标变声明角色（目标必须是确认成员；`owner` 走转让）；
+/// - 授权/派生失败一律显式失败，快照保持合并前的成员集合与旧策略版本。
+#[allow(clippy::too_many_arguments)]
+fn prepare_peer_policy_intent(
+    record: &GroupRecord,
+    intent: &crate::group_node::ControlIntent,
+    role: Option<MemberRole>,
+    sender_identity: &str,
+    declared_added: usize,
+    declared_removed: usize,
+) -> GroupResult<ProposedPolicy> {
+    use crate::group_node::ControlIntent;
+    // 声明只允许**纯角色变更**：声明的成员变化必须为空（真实的增删在合并后再核对一次）。
+    if declared_added != 0 || declared_removed != 0 {
+        return Err(GroupError::corrupted(
+            "declared policy intent does not match the commit member changes",
+        ));
+    }
+    validate_credential(sender_identity)?;
+    let snapshot = domain_snapshot(record)?;
+    let actor_index = member_index(record, sender_identity)?;
+    let actor = actor_of(record, actor_index);
+    let operation = match intent {
+        ControlIntent::TransferOwnership { target_credential } => {
+            let target_index = member_index(record, target_credential)?;
+            GroupOperation::TransferOwnership {
+                target: account_id_for(&record.members[target_index].credential),
+            }
+        }
+        ControlIntent::SetRole { target_credential } => {
+            let target_credential = target_credential.as_ref().ok_or_else(|| {
+                GroupError::new(
+                    "INVALID_INPUT",
+                    "a set_role declaration must name the target member",
+                )
+            })?;
+            let target_role = role.ok_or_else(|| {
+                GroupError::new("INVALID_INPUT", "a set_role declaration must name the role")
+            })?;
+            if target_role == MemberRole::Owner {
+                return Err(GroupError::new(
+                    "PERMISSION_DENIED",
+                    "ownership can only change through transfer_ownership",
+                ));
+            }
+            let target_index = member_index(record, target_credential)?;
+            GroupOperation::SetRole {
+                account: account_id_for(&record.members[target_index].credential),
+                role: target_role,
+            }
+        }
+        // 其它声明（邀请/移除/自移除/解散）不通过这条路径同步角色。
+        _ => {
+            return Err(GroupError::new(
+                "INVALID_INPUT",
+                "only transfer_ownership and set_role declarations update peer roles",
+            ));
+        }
+    };
+    let authorized =
+        authorize_group_operation(&snapshot, actor, operation).map_err(GroupError::from)?;
+    let proposed: ProposedPolicy =
+        apply_policy_operation(&snapshot, &authorized).map_err(GroupError::from)?;
+    Ok(proposed)
+}
 /// 把真实 MLS 成员身份写回持久记录（只用于加入/对端 Commit 的真实成员集合）。
 fn record_members_from_identities(
     identities: &[String],
@@ -1568,6 +1648,18 @@ pub fn group_process_peer_entry(
     for credential in input.added_members.iter().chain(input.removed_members.iter()) {
         validate_credential(credential)?;
     }
+    // 策略声明先算好（授权 + DOMAIN-004）：失败时**连 MLS 合并不发生**，快照完全不动。
+    let prepared_policy = match &input.policy_intent {
+        Some(intent) => Some(prepare_peer_policy_intent(
+            &record,
+            intent,
+            input.policy_role,
+            &input.sender_identity,
+            input.added_members.len(),
+            input.removed_members.len(),
+        )?),
+        None => None,
+    };
     let entry = VerifiedGroupEntry {
         group_id: record.mls_group_key.clone(),
         epoch: input.epoch,
@@ -1632,6 +1724,27 @@ pub fn group_process_peer_entry(
                     is_local: false,
                     joined_sequence,
                 });
+            }
+            // 策略声明（可选）：把角色变更同步到对端快照（MLS Commit 本身不带角色）。
+            if let Some(prepared) = prepared_policy.as_ref() {
+                if added != 0 || removed != 0 || self_removed {
+                    return Err(GroupError::corrupted(
+                        "declared policy intent does not match the commit member changes",
+                    ));
+                }
+                apply_domain_policy(&mut record, &prepared.policy)?;
+                // 转让后原群主降为**管理员**（公开元数据语义；DOMAIN-004 的候选里是普通成员）。
+                if matches!(
+                    input.policy_intent,
+                    Some(crate::group_node::ControlIntent::TransferOwnership { .. })
+                ) {
+                    let sender = input.sender_identity.clone();
+                    for member in record.members.iter_mut() {
+                        if member.credential == sender {
+                            member.role = MemberRole::Admin.as_u64();
+                        }
+                    }
+                }
             }
             record.mls_epoch = new_epoch;
             record.validate()?;
