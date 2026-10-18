@@ -122,9 +122,127 @@ cargo clippy --offline -p chat-sync --all-targets  # 0 warning
 4. **群日志起点默认 1**：已加入设备必须先由 SYNC-008 补齐并把 verified head 通过 `seed_group` 对齐；本层不推断 `joined_seq`，也不主动补拉缺号（那是 SYNC-008）。
 5. **退避参数是固定取值**：正式配置来源（用户/系统预算）待 CONFIG/BRIDGE 接入；抖动来源生产必须由桥接层注入系统 RNG，本轮只提供 `FixedJitter`/`SeededJitter`。
 6. **未接入真实网络/数据库/MLS/时钟**：SYNC-001/002(outbox 批执行)/005/006/009/010/012/013/014 未实现；因此本页的完成验收只勾选纯逻辑可证的项（SYNC-003/004/007/011 的部分项，以及 SYNC-002/008 的决策核心），整体模块不计完成。
+   **补充（SW 包）**：SYNC-002 的拉取循环与 SYNC-008 的追赶计划已经有真节点落地层（[crates/core/src/sync_worker.rs](../../crates/core/src/sync_worker.rs)，见下文“常驻拉取 worker 实现记录”）：联网/验签/落库/游标推进已实装，MLS 内层应用仍未接。
 7. **编号对照**：计划书的 SYNC-002 是 `run_outbox_once`（outbox 任务批执行）。本轮交付的 `mailbox_pull_loop` 是常驻同步 worker 的**拉取循环决策**（对应 SYNC-006 步骤 2-3 与 SYNC-008 的内环），不是 outbox 批执行本身，因此 SYNC-002 的验收框保持未勾选。
-8. **追赶计划不验签、不应用**：`catchup_plan` 假定节点 head 已由 TRANSPORT-007/PROTOCOL-007 用固定节点公钥验证；逐条验签/MLS 应用/持久化属于 SYNC-009 与 core，未接入。控制条目与 epoch 的对应关系也不由本函数猜测（`RebuildEpoch.at_sequence` 只是“不早于本次拉取末端”的水位）。
+8. **追赶计划本身不验签、不应用**：`catchup_plan` 假定节点 head 已由 TRANSPORT-007/PROTOCOL-007 用固定节点公钥验证；逐条验签/持久化已由 SW 包的 `run_catchup_once` 接上（`PullLog` 现在真的逐页验签落库），**MLS 应用与 `RebuildEpoch` 仍交回上层**（结果里的 `upper_actions`）。控制条目与 epoch 的对应关系也不由计划猜测（`RebuildEpoch.at_sequence` 只是“不早于本次拉取末端”的水位）。
 9. **拉取循环的去重/ACK 仍由 SYNC-007 负责**：`mailbox_pull_loop` 只决定“这一轮该不该拉、拉哪一段、等多久、是否需要重新对齐”，不消费条目、不写去重表、不发 ACK。
+
+## 常驻拉取 worker 实现记录（SW 包：run_pull_once / run_catchup_once，2026-10-19，Windows x64）
+
+代码：[crates/core/src/sync_worker.rs](../../crates/core/src/sync_worker.rs)（新模块，`lib.rs` 加一行 `pub mod sync_worker;`）；
+测试：[crates/core/tests/sync_worker.rs](../../crates/core/tests/sync_worker.rs)（8 个用例：真 axum 节点 + 真正式库 + 真设备签名）。
+
+这一层把两个**纯决策核心**接到真实网络上：`mailbox_pull_loop`（SYNC-002 拉取循环）与 `catchup_plan`（SYNC-008 追赶计划）。
+决策规则一条都没有在这里重写——本模块只负责“按决策读节点、验签、落库、前进游标”。
+
+### 公开面
+
+```text
+pub fn initialize_pull_state(store: &mut Store, group_id: &str, head: VerifiedHead) -> SyncResult<()>
+pub fn load_pull_state(store: &Store, group_id: &str) -> SyncResult<Option<PullStateView>>
+pub fn load_applied_entries(store: &Store, group_id: &str) -> SyncResult<Vec<LogEntry>>
+
+pub fn run_pull_once(store: &mut Store, client: &NodeClient, group_id: &str) -> SyncResult<PullOutcome>
+pub fn run_pull_once_at(store: &mut Store, client: &NodeClient, group_id: &str, now_ms: i64) -> SyncResult<PullOutcome>
+pub fn run_catchup_once(store: &mut Store, client: &NodeClient, group_id: &str) -> SyncResult<CatchupOutcome>
+pub fn run_catchup_once_at(store: &mut Store, client: &NodeClient, group_id: &str, now_ms: i64) -> SyncResult<CatchupOutcome>
+
+pub fn verify_pull_page(pinned: &[u8; 32], group_id: &str, previous: Digest, from: u64, to: u64,
+                        entries: &[LogEntry]) -> SyncResult<Vec<LogEntry>>
+```
+
+- `PullOutcome { applied, cursor_after, resync_required, resync_reason, node_head, backoff_ms, stopped }`
+- `CatchupOutcome { applied, cursor_after, executed_steps, upper_actions, awaiting, caught_up }`
+- `*_at` 变体是测试/诊断入口（显式时钟）；非 `_at` 版本用 `SystemClock`。
+
+### 关键语义
+
+1. **游标只在“验签 + 落库”成功后前进**：一页条目先整体验签，再和游标状态**同一次** storage 快照写入；
+   写入失败则游标不动（不存在“游标前进但条目没落盘”）。
+2. **未到期不触网**：先用“上次观察到的节点 head”跑一次 `mailbox_pull_loop`；得到 `Backoff{NotDue}` 或 `Stop`
+   就直接返回（不取 head、不拉条目），拿到新 head 后再用**同一个纯函数**重新决策一次。
+3. **逐条验签**（`verify_pull_page`，也是公开函数）：节点回执签名（固定节点公钥）→ 回执绑定候选（`verify_candidate`）
+   → 群绑定（回执与候选的 group 都必须等于本群）→ 序号连续（`from..=to` 逐条）→ 前序哈希连续（第一条必须接上本地游标）
+   → 页的 head 不得落后于请求范围、head 公钥必须等于固定公钥。
+4. **缺口绝不静默跳过**：决策核心给出的 `Resync` 原样返回（`resync_required=true` + 原因），由调用方转 `run_catchup_once`。
+5. **失败 = 记录退避，不 sleep**：连续失败数 + 下次允许时间写进状态（等待时长来自 `PullPolicy::failure_delay_for`），
+   然后返回显式错误；下一次调用在窗口内自然得到 `Backoff`（0 应用、不触网），到期后正常重试。
+6. **追赶计划按序执行**：`PullLog` 逐页验签落库；`CommitHead` 只有在**日志真的验到该序号**时才把节点 head 的控制状态
+   采纳为已验证；`RebuildEpoch` / `AwaitControl` 一律停下并入 `upper_actions` 返回，**不猜 epoch、不伪造推进**。
+7. **同步 API**：与 `group_node` 相同的桥（独立线程 + 独立 current-thread 运行时 + `thread::scope`），
+   不把 async 传染到 FFI；调用方即使在 tokio 运行时里也不会嵌套 panic。
+
+### 持久化形态（临时但明确的边界）
+
+- 状态与条目用 storage 的密封 KV：storage group id = `syncpull/<sha256(group_id)>`，**epoch 字段就是游标序号**
+  （storage 自带的 epoch 单调守卫因此顺带保证“游标不会倒退”）；条目每条一个 provider 记录，键 `log/<8 字节大端 seq>`。
+- 之所以这样放：schema 里给这件事准备的 `group_log_entries` / `group_policy_snapshots` 表**还没有 storage API**，
+  而 storage 不在本包写作用域。后续 storage 切片应把这两张表接出来，本模块的读写函数整块替换即可（对外签名不变）。
+- 代价：storage 的快照写入会整组替换记录，所以每次落库要重写本群已有条目（O(已应用条数)），单群上限 4096 条
+  （`MAX_PERSISTED_ENTRIES`）；超限显式 `CONTENT_TOO_LARGE`，不静默丢弃。
+
+### 语义边界（本轮不等于“已应用消息”）
+
+- **作者签名不在本层重复验证**：节点 NODE-006 接收候选时已用作者设备公钥验签；客户端没有 IDENTITY 凭据目录查远端设备公钥。
+  因此本层证明的是“节点确实接受并签发了这条条目，且链连续、候选字节与回执绑定”，不重复证明作者身份。
+- **没有 MLS 内层应用**：拉到的条目只做“链/回执/绑定”验证与落库；`process_verified_entry`、epoch 重建、消息落库
+  （SYNC-009 / CRYPTO-006）仍属上层，`upper_actions` 就是交给它们的接口。
+- **控制头水位**：只在 `CommitHead` 时把节点 head 的 control_head/policy_version 采纳为已验证值；不做“控制条目 → 策略应用”的解释。
+- **单群串行**：同一群的两次并发调用没有互斥保护（storage 的 epoch 守卫会拒绝倒退的写入）；跨群调度仍属上层。
+
+### 错误码（全部取自 PROTOCOL-014，不新增码）
+
+| 情形 | code |
+|---|---|
+| 游标未初始化 | `INVALID_CURSOR` |
+| 群 ID 非规范 / 固定公钥缺失 / 页属于别的群 | `INVALID_TARGET` |
+| 节点不可达 / 超时（含桥线程失败） | `NODE_UNAVAILABLE` |
+| 回执签名或候选绑定不成立（含换固定公钥、篡改候选） | `INVALID_SIGNATURE` |
+| 序号不连续 / 页不覆盖请求范围 | `MISSING_LOG_ENTRIES` |
+| 前序哈希断裂 / 页越过 head / 节点 head 落后 | `LOG_CONFLICT` |
+| 持久状态损坏或版本不支持 | `STATE_CORRUPTED` |
+| 落库失败 | `STORAGE_FAILURE` |
+| 单群条目超上限 | `CONTENT_TOO_LARGE` |
+
+### 复现命令（全程离线）
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test sync_worker   # 8 passed
+cargo test --offline -p chat-core                      # 全绿（0 警告）
+```
+
+### 证据（测试名 → 覆盖点）
+
+- `sync_worker::pull_applies_new_entries_and_advances_the_cursor`：空群初始化 → 节点追加 2 条 → `run_pull_once_at`
+  得到 `applied=2`、`cursor_after=2`、`resync_required=false`、`node_head=2`；条目真的落库（序号/提交 ID/密文与节点一致、
+  链尾等于节点回执的 log_hash）；状态里 `applied_entries=2`、`consecutive_failures=0`。
+- `sync_worker::repeated_pulls_are_idempotent_and_never_duplicate_entries`：第一轮 `applied=1`；已到 head 的第二轮
+  `applied=0` + 返回退避、游标仍 1、条目仍 1 条、`applied_entries` 仍 1（不重复应用）。
+- `sync_worker::local_cursor_ahead_of_the_node_requires_resync`：本地声称已到 seq 3 而节点只有 1 条 → `resync_required=true`、
+  原因 `LocalAheadOfNode`、游标**不回退**、没有落任何条目。
+- `sync_worker::tampered_or_gapped_pages_are_rejected_before_anything_is_stored`：用真页与 5 种坏页直接打 `verify_pull_page`
+  （真页通过；换固定公钥 → `INVALID_SIGNATURE`；改前序哈希 → `LOG_CONFLICT`；换候选密文 → `INVALID_SIGNATURE`；
+  页不覆盖请求范围 → `MISSING_LOG_ENTRIES`；前序对不上游标 → `LOG_CONFLICT`）。
+- `sync_worker::verification_failure_does_not_advance_the_cursor`：固定**错误**节点公钥 → 拉取失败（`INVALID_SIGNATURE` 或
+  `NODE_UNAVAILABLE`），游标/条目/`applied_entries` 全都不动；换成真节点后仍能正常拉到（失败不是破坏性的）。
+- `sync_worker::unreachable_node_fails_explicitly_and_backs_off_without_sleeping`：不可达端口 → `NODE_UNAVAILABLE`、
+  游标不动、失败计数 1、下次允许时间前进；窗口内再调用**不触网**（`applied=0` + `backoff_ms`）；到期后重试仍失败、计数 2。
+- `sync_worker::catchup_runs_pull_log_then_commits_the_head`：节点追加 3 条 → `run_catchup_once_at` 得到 `applied=3`、
+  `cursor_after=3`、`executed_steps≥2`（PullLog + CommitHead）、`upper_actions` 为空；再跑一次得到空计划（`caught_up=true`、0 应用）。
+- `sync_worker::catchup_returns_upper_actions_instead_of_faking_epoch_progress`：本地策略版本 2 > 节点 1 → 计划只给
+  `AwaitControl{PendingControlResult}`，结果 `applied=0`、`upper_actions=[AwaitControl]`、`executed_steps=0`，本地游标/策略**未被伪造推进**。
+
+### 已知限制
+
+1. **作者签名不重复验证**（见语义边界）：依赖节点在接收时验签；客户端侧完整的 PROTOCOL-005 需要 IDENTITY 凭据目录。
+2. **没有 MLS 应用**：`RebuildEpoch` / 控制策略应用 / 消息落库都交回上层，本模块只保证“链与回执正确、状态耐久”。
+3. **持久化用临时载体**：`mls_group_state` / `mls_record` 替代尚未接 API 的 `group_log_entries` / `group_policy_snapshots`；
+   每次落库重写整组记录（O(已应用条数)）、单群上限 4096 条。
+4. **单群无并发互斥**：同群并发调用靠 storage 的 epoch 守卫兜底（拒绝倒退写入），没有进程内锁；跨群调度未接入。
+5. **退避只记录不睡眠**：常驻循环（按 `backoff_ms`/`next_attempt_at_ms` 调度下一次调用）属上层 worker 循环，本轮未提供。
+6. **失败只累计不分类**：验签失败也会计入连续失败（最终 `Stop{FailureBudgetExhausted}` 停止自动重试，等人工处置）——
+   这是保守选择：宁可停下来人工排查，也不无限重试一条签名不成立的条目。
 
 ## 函数导航
 

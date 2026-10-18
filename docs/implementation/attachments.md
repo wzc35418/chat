@@ -767,9 +767,81 @@ cargo test --offline -p chat-core --lib                    # 42 passed
 ### 已知限制
 
 1. 引用来自调用方给出的附件 ID 列表（正文是密文，core 不解析附件引用）；应用层必须把
-   消息内出现的附件 ID 传给 `apply_verified_entry_with_attachments`。
+   消息内出现的附件 ID 传给 `apply_verified_entry_with_attachments`。**后续任务（R-50）已补上这一环**：
+   `crates/core/src/attachment_message.rs` 从已验证内层事件里解出附件引用并落库，见下一节。
 2. 只有消息级引用；outbox job/上传队列引用未接入。
 3. `delete_message` 只删消息行，不清理 message_attempts/草稿（各自生命周期管理）。
+
+## 对端带附件的应用消息端到端落库（R-50，2026-10-18，Windows x64）
+
+本轮补上 R-49 遗留的“谁来解析事件里的附件引用”这一环：从**已验证应用事件**出发，把正文与附件引用
+一起落库，并保证附件引用与消息同事务。
+
+### 落点与公开面
+
+代码：[crates/core/src/attachment_message.rs](../../crates/core/src/attachment_message.rs)（新）；
+测试：[crates/core/tests/attachment_message.rs](../../crates/core/tests/attachment_message.rs)（3 个用例，
+真协议层构造事件 + 真 OpenMLS 群 + 真临时加密库）。
+
+~~~text
+pub fn apply_authenticated_application_event(
+    core: &mut ConversationCore,
+    event: &AuthenticatedEvent,                 // PROTOCOL-009 verify_inner_event 的产物
+    resolve: impl FnMut(ObjectId) -> Option<String>,   // 协议附件引用 → 本地附件 ID
+) -> anyhow::Result<AppliedApplicationMessage>
+
+pub fn message_id_for_event(event: &AuthenticatedEvent) -> String      // msg:1:<hex>（取认证事件摘要）
+pub fn attachment_message_error_code(error: &anyhow::Error) -> &'static str
+pub const ATTACHMENT_ONLY_BODY: &str = "[附件]"
+~~~
+
+`AppliedApplicationMessage { message_id, conversation_id, body, attachment_ids, author_account,
+author_device, mine, sent_at_ms }`。
+
+### 关键语义
+
+1. **只接受已认证事件**：本层不做协议校验、不解密；输入必须是 `verify_inner_event` 的产物
+   （外层候选已验签、内层事件已与 MLS 发送者/群/作者绑定）。
+2. **正文与引用都取自事件**：`ApplicationContent::Text` → 只有正文；`ApplicationContent::Attachment` →
+   一个协议层附件引用（`ObjectId`），由调用方给的解析端口映射成**本地附件 ID**。
+3. **未知附件整条拒绝**：解析不到 → 在写库之前返回 `ATTACHMENT_NOT_FOUND`；解析到但正式库里不存在 →
+   `apply_verified_entry_with_attachments` 的事务整体回滚（消息不落库、引用不留一行）。
+4. **消息 ID 由认证摘要派生**：内层事件没有线协议消息 ID，因此用 `AuthenticatedEvent::digest`
+   （可信去重键）派生 `msg:1:<hex>`；同一事件重放得到同一消息 ID，落库天然幂等。
+5. **不改群快照**：应用消息只写消息行与会话摘要；群快照（epoch/成员/策略头）完全不变。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test attachment_message   # 3 passed
+cargo test --offline -p chat-core                              # 151 passed（既有 148 全部继续通过）
+~~~
+
+### 证据
+
+- `attachment_message::attachment_event_persists_the_message_and_the_reference`：真实设备签名候选 +
+  真实内层事件 → 落库后消息 ID 与 `message_id_for_event` 一致、正文是占位正文、
+  `attachments_for_message` 正好返回该附件、会话里恰好一条消息；**群快照（epoch/成员/策略版本）与落库前完全相等**；
+  同一事件重放 → 同一消息 ID、引用数仍为 1、消息数仍为 1。
+- `attachment_message::unknown_attachment_rejects_the_whole_message`：解析端口返回 `None` →
+  `ATTACHMENT_NOT_FOUND`，消息数为 0、没有登记任何引用；解析到一个正式库里不存在的本地 ID →
+  事务回滚，消息数仍为 0、群快照不变。
+- `attachment_message::text_event_persists_without_attachment_refs`：纯文本事件正常落库（正文原样）、
+  没有任何附件引用、群快照不变。
+
+### 已知限制
+
+1. **附件消息的正文是占位**：`messages.protected_content` 目前只接受非空文本，附件消息因此落库为
+   `[附件]`；真正展示走 `attachments_for_message`。PROTOCOL 附件消息与正文模型的对齐属消息模块。
+2. **单附件**：协议内层事件当前只允许一个附件引用，因此每次登记 0 或 1 条；storage 侧上限仍是 32。
+3. **解析端口由调用方提供**：本层不知道“这个 `ObjectId` 是哪条本地附件”（需要附件记录/缓存），
+   调用方负责映射；映射不到就是整条拒绝（不会退化成“先存消息后补引用”）。
+4. **不做 MLS 解密**：本层输入已经是认证事件；MLS 解密/对端条目顺序属 groups/同步层。
+5. **扩展内容（PROTOCOL-010）不落库**：显式 `PROTOCOL_UNSUPPORTED`。
+6. **没有删除/回收联动**：消息删除与附件回收仍走既有 `delete_message` / `collect_unreferenced_attachments`
+   （R-49 记录里的语义不变）。
+
 
 
 

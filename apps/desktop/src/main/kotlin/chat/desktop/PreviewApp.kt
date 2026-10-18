@@ -13,11 +13,18 @@ import androidx.compose.ui.window.rememberWindowState
 import chat.api.IdentityException
 import chat.api.LocalStoreException
 import chat.bridge.createAttachmentService
+import chat.bridge.createGroupService
 import chat.bridge.createIdentityService
 import chat.bridge.createLocalStore
 import chat.presentation.display.presentInviteError
 import chat.presentation.display.presentInvitePreview
 import chat.presentation.preview.PreviewAttachmentState
+import chat.presentation.preview.PreviewGroupState
+import chat.presentation.preview.beginBusy
+import chat.presentation.preview.updateCreateName
+import chat.presentation.preview.updateNewName
+import chat.presentation.preview.withError
+import chat.presentation.preview.withSnapshot
 import chat.presentation.preview.PreviewIdentityState
 import chat.presentation.preview.PreviewStoreState
 import chat.presentation.preview.beginBusy
@@ -46,6 +53,7 @@ import chat.presentation.preview.withInvite
 import chat.presentation.preview.withMessages
 import chat.presentation.preview.withPreview
 import chat.ui.AttachmentHandlers
+import chat.ui.GroupHandlers
 import chat.ui.IdentityHandlers
 import chat.ui.PreviewChatScreen
 import chat.ui.StoreHandlers
@@ -76,6 +84,7 @@ fun main() = application {
     val identityDatabase = remember { identityDir?.let { File(it, "identity.db").absolutePath } }
     var identityKey by remember { mutableStateOf<String?>(null) }
     var keySlotSummary by remember { mutableStateOf("密钥槽未初始化") }
+    var groupState by remember { mutableStateOf(PreviewGroupState()) }
     val store = remember { runCatching { createLocalStore() }.getOrNull() }
     val storeDirectory = remember { runCatching { Files.createTempDirectory("chat-preview-store-").toFile() }.getOrNull() }
     val scope = rememberCoroutineScope()
@@ -236,6 +245,131 @@ fun main() = application {
         },
         refreshContacts = { scope.launch { refreshContacts() } },
     )
+
+    // 群与身份共用同一个加密库（独占单写者）：进入群操作前先关闭身份服务，
+    // 操作完再重新打开身份，避免两个 FFI 对象争同一把写锁。
+    suspend fun <T> withGroup(block: suspend (chat.api.GroupService) -> T): Result<T> {
+        val database = identityDatabase
+        val key = identityKey
+        if (database == null || key == null) {
+            return Result.failure(LocalStoreException("INVALID_STATE_TRANSITION", "身份库尚未就绪"))
+        }
+        val identityService = identity
+        runCatching { identityService?.close() }
+        val service = runCatching { createGroupService(database, key, node) }
+        return try {
+            service.mapCatching { block(it) }
+        } finally {
+            service.getOrNull()?.let { runCatching { it.shutdown() } }
+            if (identityService != null) {
+                runCatching { identityService.openPersisted(database, key, node) }
+                    .onSuccess { account ->
+                        identityState = identityState.openWith(account)
+                        refreshContacts()
+                    }
+            }
+        }
+    }
+
+    val groupHandlers = GroupHandlers(
+        updateCreateName = { value -> groupState = groupState.updateCreateName(value) },
+        createGroup = {
+            scope.launch {
+                groupState = groupState.beginBusy()
+                withGroup { service -> service.createGroup(groupState.createName.trim()) }
+                    .onSuccess { groupState = groupState.withSnapshot(it).copy(ready = true) }
+                    .onFailure { error ->
+                        groupState = groupState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+        refresh = {
+            scope.launch {
+                val current = groupState.snapshot ?: return@launch
+                groupState = groupState.beginBusy()
+                withGroup { service -> service.snapshot(current.groupId) }
+                    .onSuccess { groupState = groupState.withSnapshot(it).copy(ready = true) }
+                    .onFailure { error ->
+                        groupState = groupState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+        updateNewName = { value -> groupState = groupState.updateNewName(value) },
+        rename = {
+            scope.launch {
+                val current = groupState.snapshot ?: return@launch
+                groupState = groupState.beginBusy()
+                withGroup { service -> service.rename(current.groupId, groupState.newName.trim()) }
+                    .onSuccess { groupState = groupState.withSnapshot(it) }
+                    .onFailure { error ->
+                        groupState = groupState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                    }
+            }
+        },
+        toggleMute = { credential, muted ->
+            scope.launch {
+                val current = groupState.snapshot ?: return@launch
+                groupState = groupState.beginBusy()
+                withGroup { service -> service.setMuted(current.groupId, credential, muted) }
+                    .onSuccess { groupState = groupState.withSnapshot(it) }
+                    .onFailure { error ->
+                        groupState = groupState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                    }
+            }
+        },
+        setRole = { credential, role ->
+            scope.launch {
+                val current = groupState.snapshot ?: return@launch
+                groupState = groupState.beginBusy()
+                withGroup { service -> service.setRole(current.groupId, credential, role) }
+                    .onSuccess { groupState = groupState.withSnapshot(it) }
+                    .onFailure { error ->
+                        groupState = groupState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                    }
+            }
+        },
+        removeMember = { credential ->
+            scope.launch {
+                val current = groupState.snapshot ?: return@launch
+                groupState = groupState.beginBusy()
+                withGroup { service -> service.removeMember(current.groupId, credential) }
+                    .onSuccess { groupState = groupState.withSnapshot(it) }
+                    .onFailure { error ->
+                        groupState = groupState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                    }
+            }
+        },
+        acceptPending = {
+            scope.launch {
+                val current = groupState.snapshot ?: return@launch
+                groupState = groupState.beginBusy()
+                withGroup { service -> service.acceptPending(current.groupId) }
+                    .onSuccess { groupState = groupState.withSnapshot(it) }
+                    .onFailure { error ->
+                        groupState = groupState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                    }
+            }
+        },
+        discardPending = {
+            scope.launch {
+                val current = groupState.snapshot ?: return@launch
+                groupState = groupState.beginBusy()
+                withGroup { service -> service.discardPending(current.groupId, "operator_discarded") }
+                    .onSuccess { groupState = groupState.withSnapshot(it) }
+                    .onFailure { error ->
+                        groupState = groupState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                    }
+            }
+        },
+    )
+
+    LaunchedEffect(Unit) { groupState = groupState.copy(ready = true) }
 
     val storeHandlers = StoreHandlers(
         cancelLatestDraft = {
@@ -507,6 +641,8 @@ fun main() = application {
             storeDraftText = storeDraftText,
             attachmentState = attachmentState,
             attachmentHandlers = attachmentHandlers,
+            groupState = groupState,
+            groupHandlers = groupHandlers,
         )
     }
 }
