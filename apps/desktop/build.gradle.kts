@@ -151,6 +151,17 @@ tasks.register<JavaExec>("dpapiSmoke") {
     systemProperty("stdout.encoding", "UTF-8")
 }
 
+tasks.register<JavaExec>("platformSmoke") {
+    group = "verification"
+    description = "PLATFORM-007~010 竖切：通知诚实不可用、参数校验、生命周期与单次退出。"
+    dependsOn("classes")
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.PlatformSmokeKt")
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+    systemProperty("java.awt.headless", "true")
+}
+
 tasks.register<JavaExec>("previewApp") {
     group = "application"
     dependsOn("classes")

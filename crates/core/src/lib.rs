@@ -10,6 +10,7 @@ pub mod group_actions;
 pub mod group_node;
 pub mod groups;
 pub mod node_submitter;
+pub mod outbox_worker;
 pub mod p0;
 pub mod send_orchestrator;
 pub mod send_runtime;

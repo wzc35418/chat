@@ -323,8 +323,63 @@ run_outbox_once(now: Time, worker: WorkerId, budget: WorkBudget) -> Result<WorkS
 
 **完成验收**：
 
-- [ ] 任务执行后落盘前 crash 允许原字节重复。
-- [ ] 断网不忙循环。（部分：**拉取循环**决策核心已证有界退避——`pull_loop::failure_backoff_is_exponential_capped_and_budgeted`、`pull_loop::not_due_and_page_interval_avoid_busy_looping`；本函数自身的 outbox 批执行未实现，故不勾选）
+- [x] 任务执行后落盘前 crash 允许原字节重复。
+- [x] 断网不忙循环。（部分：**拉取循环**决策核心已证有界退避——`pull_loop::failure_backoff_is_exponential_capped_and_budgeted`、`pull_loop::not_due_and_page_interval_avoid_busy_looping`；本函数自身的 outbox 批执行未实现，故不勾选）
+
+**实现状态（OB 包，2026-10-19）**：outbox 批执行已实现。源码 [crates/core/src/outbox_worker.rs](../../crates/core/src/outbox_worker.rs)：
+
+`@text
+pub fn run_outbox_once(orchestrator, stop: &AtomicBool) -> SendResult<OutboxBatchResult>
+pub fn run_outbox_once_at(orchestrator, stop, now_unix_ms, limit) -> SendResult<OutboxBatchResult>
+pub struct OutboxBatchResult { processed, accepted, unknown, rejected, deferred, stopped_reason }
+`@
+
+已实现行为（**不新造状态机**：每个任务都交给既有 `SendOrchestrator` 的 `prepare`/`dispatch`，
+调度决策仍是 `chat_sync::send::plan_submission`）：
+
+1. **阶段 1（send，不预先领取）**：从 `outbox_jobs` 只读枚举到期的 send 任务（`pending && retry_at<=now`
+   或租约已过期），按 `(retry_at, job_id)` 稳定排序、截断到批量上限；逐条调用 `dispatch(draft)`。
+   领取与三态结果落库都由 dispatch 内部完成——这样发送计划不会把**本 worker 自己的租约**误判成
+   “别人持有”而原地等待。
+2. **阶段 2（prepare，需要租约）**：`claim_outbox_batch` 原子领取一批（≤32，含字节预算），
+   执行 `prepare(draft)`；成功时 T2 事务已经把准备任务置 complete（再写同结果幂等），
+   失败/未知时用租约写结果。被阶段 2 领到的 send 任务（阶段 1 没推进的）只做一次可重试退避，
+   交回 pending 让下一轮重试，避免“持有租约却让 dispatch 等待”。
+3. **结果分类**：`accepted`（任务完成，含幂等重放）/ `unknown`（只写 6 小时对账窗口，
+   **绝不重发、绝不重新加密**）/ `rejected`（明确拒绝或不可重试错误 → 任务 `failed`）/
+   `deferred`（可重试失败已按退避重排、等待租约、或被其它 worker 有效持有——后者在本轮**领不到**时
+   按 `outbox_jobs` 的 `leased && lease_until > now` 行计数，明确报告“有活但拿不到”）。
+4. **一条失败不阻塞其它**：逐任务捕获结果与错误；错误码的 `ErrorCode::retryable()` 决定延后还是拒绝。
+5. **幂等**：任务完成后不再被领取，重复执行同一批得到 `processed=0`、零提交、零加密。
+6. **不 sleep、可打断**：只跑一圈；`stop` 只在任务边界检查，返回 `stopped_reason = StopRequested`。
+7. **租约过期由既有机制接管**：`claim_outbox_batch` 已包含 `leased && lease_until<=now` 的重领，
+   本模块不重复实现；到期后同 worker 的下一轮自然接管（测试覆盖）。
+
+验证证据（`cargo test --offline -p chat-core --test outbox_worker`，**真 axum 节点 + 真加密库 + 真 outbox 表**）：
+
+- `three_drafts_are_all_accepted_in_one_batch`：3 条草稿两轮全部 accepted；每条恰好加密一次、恰好提交一次、
+  零对账；草稿最终 `accepted`、任务全部 `complete`。
+- `rejected_submission_does_not_block_the_others`：先用相异字节在节点占用某草稿的 SubmissionId →
+  该条提交被节点 409 拒绝（三态 = Rejected）→ `rejected=1`、`accepted=1`，另一条不受影响。
+- `unreachable_node_marks_every_send_unknown_and_never_resends`：提交端点指向不可达地址 → 两条全 `unknown`、
+  `accepted=0`；重复执行 `processed=0` 且 `submit_calls` 不增长（**零重发**）。
+- `repeating_a_finished_batch_submits_nothing`：完成后连跑两轮 → `processed=0`、零提交、零加密。
+- `task_held_by_another_worker_is_deferred`：另一 worker 持有效租约 → `processed=0, deferred=1`；
+  租约到期后本 worker 自然接管并 accepted。
+- `stop_request_stops_at_a_task_boundary`：`stop=true` → `processed=0`、`stopped_reason=StopRequested`、零加密。
+
+已知限制：
+
+1. **批内顺序**用 `(retry_at, job_id)`：`retry_at` 初始值就是草稿创建时间，因此等价于“先创建先执行”；
+   `LeasedJob` / `OutboxJobRecord` 不暴露 `created_at` 列（不新增迁移）。
+2. **阶段 1 的错误不写租约**（没有领取就没有租约）：可重试错误计 `deferred`、不可重试错误计
+   `rejected`，但任务行仍是 `pending`，下一轮会自然重试（不会永久卡死，也没有指数退避累加）。
+   阶段 2 的错误会写进退避（`retry_at` 按 `retry_count` 指数增长）。
+3. **阶段 1 的 `"尝试缺失"**（outbox 行指向不存在的 attempt）只计 `rejected`，不写终态：没有租约就不改行，
+   留给恢复/对账流程。
+4. **不负责节奏**：谁在什么时候调用（常驻循环/定时器/前后台预算）由上层决定；本模块只跑一圈、不 sleep。
+5. **依赖注入的提交端口**：真节点用 `NodeClientSubmitter`；本模块不实现网络重试，未知结果只写对账窗口。
+
 
 **实现状态**：部分实现（仅拉取循环决策核心，**不是** outbox 批执行）。`mailbox_pull_loop(policy, input)` 见 [crates/sync/src/pull.rs](../../crates/sync/src/pull.rs)：输入本地已应用位置/节点 head/上次结果/失败与时间状态，输出 `Pull{from,to}` / `Backoff` / `Resync` / `Stop`；缺口、过期页、越过 head、空页但 head 前进一律 Resync（绝不跳过），单次 Pull ≤ `page_items`，落后超过 `max_incremental_gap` 交给追赶计划，失败指数退避封顶 60 s 且 Retry-After 为下界（≤5 分钟），失败预算耗尽即 Stop。证据见上文“拉取循环（SYNC-002 决策核心）”与 `tests/pull_loop.rs`（9 个用例）。限制：不联网、不消费条目、不发 ACK（那是 SYNC-007 的 `MailboxPoller`）；计划的 `run_outbox_once`（依赖 STORAGE-014/015）仍未实现，因此本函数验收框保持未勾选。
 
