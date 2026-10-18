@@ -6,6 +6,8 @@
 pub mod auth;
 pub mod blob;
 pub mod canonical;
+pub mod capability;
+pub mod cleanup;
 pub mod error;
 pub mod group;
 pub mod limits;

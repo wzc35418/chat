@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chat_node_services::error::{NodeError, NodeResult};
+use chat_node_services::cleanup::CleanupStats;
 use chat_node_services::limits::RateLimitPolicy;
 use chat_node_services::rate_limit::RateLimiter;
 use chat_node_services::services::NodeService;
@@ -119,6 +120,16 @@ impl AppState {
             .lock()
             .map(|service| service.policy().max_request_body_bytes)
             .unwrap_or(chat_node_services::limits::MAX_HTTP_BODY_BYTES)
+    }
+
+    /// NODE-016：回收过期资源（库内过期数据 + 进程内限流桶），返回合并后的统计。
+    ///
+    /// 库内清理由服务层在一个事务里完成；限流桶在进程内，因此在这里合并。
+    pub fn collect_expired(&self, now: u64) -> Result<CleanupStats, ApiError> {
+        let mut stats = self.with_service(|service| service.collect_expired(now))?;
+        stats.expired_rate_limit_buckets =
+            u64::try_from(self.rate_limiter.collect_expired(now)).unwrap_or(0);
+        Ok(stats)
     }
 
     /// 当前限流器（观测用）。

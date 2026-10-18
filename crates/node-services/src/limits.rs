@@ -218,6 +218,10 @@ pub const DEFAULT_BLOB_CHUNK_COUNT: u32 = 512;
 pub const MAX_BLOB_CHUNK_COUNT_LIMIT: u32 = 4096;
 /// 上传会话默认有效期（1 小时）；过期会话不可再写块或完成。
 pub const DEFAULT_BLOB_UPLOAD_TTL_SECONDS: u64 = 60 * 60;
+/// 已发布附件的默认保留期（30 天）：到期后由 NODE-016 回收整对象。
+pub const DEFAULT_BLOB_PUBLISHED_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
+/// 已发布附件保留期的配置上限（10 年），防止配置成“永不回收”。
+pub const MAX_BLOB_PUBLISHED_TTL_LIMIT: u64 = 10 * 365 * 24 * 60 * 60;
 
 /// 附件 blob 策略。字段在启动时校验，不接受 0 或越界配置。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -349,6 +353,56 @@ impl RateLimitPolicy {
         }
         if self.max_buckets < MIN_RATE_LIMIT_BUCKETS || self.max_buckets > MAX_RATE_LIMIT_BUCKETS {
             return Err(NodeError::InvalidConfig("rate limit buckets"));
+        }
+        Ok(())
+    }
+}
+/// NODE-016 每轮回收的默认行数上限（每类资源）。
+pub const DEFAULT_CLEANUP_ROWS_PER_KIND: u32 = 512;
+/// 每类资源每轮回收的行数硬上限。
+pub const MAX_CLEANUP_ROWS_PER_KIND: u32 = 8_192;
+/**
+ * NODE-016 过期回收策略。
+ *
+ * 每轮每类资源都有行数上限：一次回收不允许把整库扫完（大库不能因为一次维护
+ * 就长时间持写锁），因此回收是**多轮收敛**的，重复调用会继续清理剩余部分。
+ */
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CleanupPolicy {
+    /// 是否启用（关闭时 `collect_expired` 直接返回全零统计）。
+    pub enabled: bool,
+    /// 每类资源每轮最多处理多少行。
+    pub max_rows_per_kind: u32,
+    /// 限流桶在内存里最多保留多少个窗口（窗口长度的倍数）。
+    pub rate_limit_bucket_windows: u32,
+    /// 已发布附件的保留期（秒）：发布时刻 + 该值写入 blob_objects.expires_at。
+    pub published_blob_ttl_seconds: u64,
+}
+
+impl Default for CleanupPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_rows_per_kind: DEFAULT_CLEANUP_ROWS_PER_KIND,
+            rate_limit_bucket_windows: 2,
+            published_blob_ttl_seconds: DEFAULT_BLOB_PUBLISHED_TTL_SECONDS,
+        }
+    }
+}
+
+impl CleanupPolicy {
+    /// 有界校验。
+    pub fn validate(&self) -> NodeResult<()> {
+        if self.max_rows_per_kind == 0 || self.max_rows_per_kind > MAX_CLEANUP_ROWS_PER_KIND {
+            return Err(NodeError::InvalidConfig("cleanup rows per kind"));
+        }
+        if self.rate_limit_bucket_windows == 0 || self.rate_limit_bucket_windows > 64 {
+            return Err(NodeError::InvalidConfig("cleanup rate limit windows"));
+        }
+        if self.published_blob_ttl_seconds == 0
+            || self.published_blob_ttl_seconds > MAX_BLOB_PUBLISHED_TTL_LIMIT
+        {
+            return Err(NodeError::InvalidConfig("cleanup published blob ttl"));
         }
         Ok(())
     }

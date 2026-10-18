@@ -46,6 +46,8 @@ data class PreviewStoreState(
     val sendNodePublicKey: String = "",
     /** 最近一次发送步骤结果（真实状态，不含正文）。 */
     val sendStep: chat.api.SendStep? = null,
+    /** 常驻同步状态（SyncFfi 快照）。 */
+    val syncStatus: chat.api.SyncStatusView? = null,
 )
 
 fun PreviewStoreState.opened(databasePath: String, notice: String): PreviewStoreState = copy(
@@ -181,4 +183,15 @@ fun PreviewStoreState.withSendStep(step: chat.api.SendStep): PreviewStoreState =
         else -> step.detail
     },
     lastErrorCode = null,
+)
+
+fun PreviewStoreState.withSyncStatus(status: chat.api.SyncStatusView): PreviewStoreState = copy(
+    syncStatus = status,
+    busy = false,
+    notice = if (status.state == "stopped" && status.stoppedReason != null) {
+        "同步已停止（" + status.stoppedReason + "）"
+    } else {
+        "同步状态：" + status.state + "，已应用 " + status.appliedTotal + " 条"
+    },
+    lastErrorCode = status.lastErrorCode,
 )

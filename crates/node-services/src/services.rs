@@ -20,7 +20,7 @@ use crate::limits::{
     CHALLENGE_PURGE_BATCH, CHALLENGE_RETENTION_SECONDS, DEFAULT_CHALLENGE_TTL_SECONDS,
     DEFAULT_CLOCK_SKEW_SECONDS, DEFAULT_MAX_DEVICES_PER_ACCOUNT, DEFAULT_MAX_PENDING_CHALLENGES,
     BlobPolicy, GroupLogPolicy, MAX_ACCOUNT_ID_BYTES, MAX_DEVICE_ID_BYTES, MAX_HTTP_BODY_BYTES,
-    MAX_NODE_ID_BYTES, MailboxPolicy, RateLimitPolicy,
+    CleanupPolicy, MAX_NODE_ID_BYTES, MailboxPolicy, RateLimitPolicy,
 };
 use crate::registration::{DeviceRegistration, RegisterDeviceRequest};
 
@@ -28,6 +28,7 @@ const MIGRATION_0001: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_node_auth.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_group_mailbox.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_blob_attachments.sql");
+const MIGRATION_0005: &str = include_str!("../migrations/0005_retention_capabilities.sql");
 const MIGRATION_CHECKSUM_SLOT: &str = ":checksum";
 
 /// 节点鉴权与注册策略。所有字段在启动时校验，不接受 0 或越界配置。
@@ -51,6 +52,8 @@ pub struct NodeAuthPolicy {
     pub blob: BlobPolicy,
     /// API-005 HTTP 层限流策略。
     pub rate_limit: RateLimitPolicy,
+    /// NODE-016 过期回收策略。
+    pub cleanup: CleanupPolicy,
 }
 
 impl Default for NodeAuthPolicy {
@@ -65,6 +68,7 @@ impl Default for NodeAuthPolicy {
             mailbox: MailboxPolicy::default(),
             blob: BlobPolicy::default(),
             rate_limit: RateLimitPolicy::default(),
+            cleanup: CleanupPolicy::default(),
         }
     }
 }
@@ -90,6 +94,7 @@ impl NodeAuthPolicy {
         self.mailbox.validate()?;
         self.blob.validate()?;
         self.rate_limit.validate()?;
+        self.cleanup.validate()?;
         Ok(())
     }
 }
@@ -963,6 +968,28 @@ fn migrate(connection: &Connection) -> NodeResult<()> {
         }
     }
     verify_migration_checksum(connection, 4, MIGRATION_0004)?;
+    let current: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if current < 5 {
+        let sql = MIGRATION_0005.replace(MIGRATION_CHECKSUM_SLOT, &checksum(MIGRATION_0005));
+        connection
+            .execute_batch(&sql)
+            .map_err(|_| NodeError::MigrationFailed("retention migration failed"))?;
+        let applied: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if applied < 5 {
+            return Err(NodeError::MigrationFailed(
+                "retention migration did not record its version",
+            ));
+        }
+    }
+    verify_migration_checksum(connection, 5, MIGRATION_0005)?;
     Ok(())
 }
 

@@ -56,7 +56,7 @@ pub const GROUP_POLICY_VERSION: u32 = 1;
 ///
 /// v3：增加 `pending_removed`（已本地生效但尚未被接受合并的移除）与
 /// `last_control_cleared`（最近一次被丢弃的控制提交，CRYPTO-008）。
-const SNAPSHOT_VERSION: u8 = 3;
+const SNAPSHOT_VERSION: u8 = 4;
 /// 快照记录的 storage group_id 命名空间前缀。
 const SNAPSHOT_GROUP_PREFIX: &str = "grpmeta/";
 /// 快照记录体上限（字节）。
@@ -261,6 +261,15 @@ pub struct GroupView {
     pub pending: Option<GroupPendingView>,
     /// 最近一次被丢弃的控制提交（CRYPTO-008 的审计投影）。
     pub last_control_cleared: Option<GroupControlClearedView>,
+    /// 群是否已解散（GROUPS-012）。解散后所有治理操作显式拒绝，本地记录保留。
+    pub dissolved: bool,
+    /// 解散时间（Unix 毫秒；未解散为 `None`）。
+    pub dissolved_at_ms: Option<i64>,
+    /// 本机退出时间（Unix 毫秒；仍在群里为 `None`）。
+    ///
+    /// 退出是**本地策略层**语义：本机已从确认成员里移除，但 MLS 叶子仍留在群里
+    /// （CRYPTO-005 的自移除护栏禁止 `remove_members` 移除本机设备），需协调者移除。
+    pub left_at_ms: Option<i64>,
 }
 
 /// 被丢弃控制提交的投影（只含公开绑定信息与稳定原因码）。
@@ -303,6 +312,15 @@ struct GroupRecord {
     /// 最近一次被丢弃的控制提交（CRYPTO-008）；只做审计，不参与策略版本。
     #[serde(default)]
     last_control_cleared: Option<RecordControlCleared>,
+    /// 已解散（GROUPS-012）：治理全部拒绝，本地记录保留。
+    #[serde(default)]
+    dissolved: bool,
+    /// 解散时间（Unix 毫秒；未解散为 0）。
+    #[serde(default)]
+    dissolved_at_ms: i64,
+    /// 本机退出时间（Unix 毫秒；未退出为 0）。
+    #[serde(default)]
+    left_at_ms: i64,
 }
 
 /// 被丢弃的控制提交（只含公开绑定信息与稳定原因码）。
@@ -350,6 +368,16 @@ impl GroupRecord {
         {
             return Err(GroupError::corrupted(
                 "persisted group member list is empty or oversized",
+            ));
+        }
+        if self.dissolved != (self.dissolved_at_ms > 0) {
+            return Err(GroupError::corrupted(
+                "persisted group dissolve state and timestamp disagree",
+            ));
+        }
+        if self.left_at_ms < 0 {
+            return Err(GroupError::corrupted(
+                "persisted group has a negative leave timestamp",
             ));
         }
         if let Some(cleared) = &self.last_control_cleared {
@@ -543,7 +571,7 @@ fn domain_snapshot(record: &GroupRecord) -> GroupResult<GroupSnapshot> {
         verified_sequence: record.verified_sequence,
         verified_log_hash,
         coordinator: coordinator_for(&record.mls_group_key),
-        dissolved: false,
+        dissolved: record.dissolved,
         paused_reason: None,
     };
     snapshot
@@ -582,6 +610,17 @@ fn apply_domain_policy(record: &mut GroupRecord, policy: &GroupSnapshot) -> Grou
         record.pending_removed = removed;
     }
     record.validate()
+}
+
+/// 已解散的群：所有治理操作显式 `INVALID_STATE_TRANSITION`（记录保留，绝不悄悄改状态）。
+fn reject_dissolved(record: &GroupRecord) -> GroupResult<()> {
+    if record.dissolved {
+        return Err(GroupError::new(
+            "INVALID_STATE_TRANSITION",
+            "the group is dissolved; no further governance is possible",
+        ));
+    }
+    Ok(())
 }
 
 /// 在已确认成员里按凭据定位下标（pending 成员不可治理）。
@@ -661,6 +700,9 @@ fn project(
         pending_members,
         pending_removed,
         pending: pending.map(pending_view),
+        dissolved: record.dissolved,
+        dissolved_at_ms: (record.dissolved_at_ms > 0).then_some(record.dissolved_at_ms),
+        left_at_ms: (record.left_at_ms > 0).then_some(record.left_at_ms),
         last_control_cleared: record
             .last_control_cleared
             .as_ref()
@@ -872,6 +914,9 @@ pub fn create_group_with_welcome(
             .collect(),
         pending_removed: Vec::new(),
         last_control_cleared: None,
+        dissolved: false,
+        dissolved_at_ms: 0,
+        left_at_ms: 0,
     };
     record.validate()?;
     // 建群时先自检策略快照不变量（全零头 + 唯一群主）。
@@ -934,6 +979,7 @@ pub fn set_role(
     role: MemberRole,
 ) -> GroupResult<GroupView> {
     let (mut record, _) = load_record(store, group_id)?;
+    reject_dissolved(&record)?;
     let snapshot = domain_snapshot(&record)?;
     let group_key = device
         .group_key()
@@ -986,6 +1032,7 @@ pub fn set_muted(
     muted: bool,
 ) -> GroupResult<GroupView> {
     let (mut record, _) = load_record(store, group_id)?;
+    reject_dissolved(&record)?;
     let snapshot = domain_snapshot(&record)?;
     let device = MlsDevice::import_from_store(store, &record.mls_group_key).map_err(|_| {
         GroupError::corrupted("the persisted MLS group state could not be restored")
@@ -1034,6 +1081,7 @@ pub fn remove_member(
     target_credential: &str,
 ) -> GroupResult<GroupView> {
     let (mut record, _) = load_record(store, group_id)?;
+    reject_dissolved(&record)?;
     let snapshot = domain_snapshot(&record)?;
     let group_key = device
         .group_key()
@@ -1091,6 +1139,7 @@ pub fn rename_group(
 ) -> GroupResult<GroupView> {
     validate_name(new_name)?;
     let (mut record, state_version) = load_record(store, group_id)?;
+    reject_dissolved(&record)?;
     let snapshot = domain_snapshot(&record)?;
     let device = MlsDevice::import_from_store(store, &record.mls_group_key).map_err(|_| {
         GroupError::corrupted("the persisted MLS group state could not be restored")
@@ -1198,6 +1247,7 @@ pub fn accept_pending_control(
     group_id: &str,
 ) -> GroupResult<GroupView> {
     let (mut record, _) = load_record(store, group_id)?;
+    reject_dissolved(&record)?;
     let group_key = device
         .group_key()
         .map_err(|_| GroupError::invalid_target("the local device has no MLS group"))?;
@@ -1259,6 +1309,7 @@ pub fn discard_pending_control(
 ) -> GroupResult<GroupView> {
     let detail = validate_reason_detail(reason)?;
     let (mut record, _) = load_record(store, group_id)?;
+    reject_dissolved(&record)?;
     let (mut device, stored_pending) = persisted_pending(store, &record)?;
     let rejection = stored_pending.rejection(rejection_code(reason));
     let discarded = device
@@ -1414,6 +1465,7 @@ pub fn group_process_peer_entry(
     input: &PeerEntryInput,
 ) -> GroupResult<PeerEntryOutcome> {
     let (mut record, state_version) = load_record(store, &input.group_id)?;
+    reject_dissolved(&record)?;
     let group_key = device
         .group_key()
         .map_err(|_| GroupError::invalid_target("the local device has no MLS group"))?;
@@ -1623,11 +1675,175 @@ pub fn group_join_from_welcome(
         pending_members: Vec::new(),
         pending_removed: Vec::new(),
         last_control_cleared: None,
+        dissolved: false,
+        dissolved_at_ms: 0,
+        left_at_ms: 0,
     };
     record.validate()?;
     let _ = domain_snapshot(&record)?;
     let saved = persist_snapshot(store, &record, record.mls_epoch)?;
     Ok(project(&record, joined.epoch, None, saved))
+}
+/// GROUPS-010：转让群主（仅现群主；目标是确认成员且不是自己）。
+///
+/// 顺序（**非法操作在任何写入之前被拒**）：
+/// 1. 读持久快照 → 拒绝已解散的群（`INVALID_STATE_TRANSITION`）；
+/// 2. 本机 MLS 设备必须是同一个群、同一 epoch（`INVALID_TARGET` / `STALE_EPOCH`）；
+/// 3. DOMAIN-007 授权（非群主 / 转给自己 / 目标不是成员 / 目标已撤销 → 冻结码）；
+/// 4. DOMAIN-004 计算新 `policy_version`/`control_head` 并校验**唯一群主**不变量；
+/// 5. CRYPTO-005 `prepare_control(SelfUpdate)` 生成真实 MLS 控制提交并落 pending；
+/// 6. 快照角色互换（目标 = owner，原群主 = member）后写回，返回真实投影。
+///
+/// 注意：MLS 侧把这次转让表达为 `SelfUpdate`（成员叶子不变、只换策略角色）。节点公开元数据
+/// 目前把 `SelfUpdate` 映射为 `set_role`，因此转让/退出的节点元数据需要后续扩展（见 groups.md 限制）。
+pub fn transfer_ownership(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    group_id: &str,
+    actor_credential: &str,
+    target_credential: &str,
+) -> GroupResult<GroupView> {
+    let (mut record, _) = load_record(store, group_id)?;
+    reject_dissolved(&record)?;
+    let snapshot = domain_snapshot(&record)?;
+    let group_key = device
+        .group_key()
+        .map_err(|_| GroupError::invalid_target("the local device has no MLS group"))?;
+    if group_key != record.mls_group_key {
+        return Err(GroupError::invalid_target(
+            "the local device is not in this group",
+        ));
+    }
+    let epoch = device
+        .epoch()
+        .map_err(|_| GroupError::corrupted("MLS group epoch is unavailable"))?;
+    if epoch != snapshot.mls_epoch {
+        return Err(GroupError::new(
+            "STALE_EPOCH",
+            "the local MLS epoch does not match the persisted group",
+        ));
+    }
+    let actor_index = member_index(&record, actor_credential)?;
+    let target_index = member_index(&record, target_credential)?;
+    let actor = actor_of(&record, actor_index);
+    let target_account = account_id_for(&record.members[target_index].credential);
+    let operation = GroupOperation::TransferOwnership {
+        target: target_account,
+    };
+    let authorized =
+        authorize_group_operation(&snapshot, actor, operation).map_err(GroupError::from)?;
+    let proposed: ProposedPolicy =
+        apply_policy_operation(&snapshot, &authorized).map_err(GroupError::from)?;
+    let pending = device
+        .prepare_control(ControlOperation::SelfUpdate, store)
+        .map_err(GroupError::from)?;
+    apply_domain_policy(&mut record, &proposed.policy)?;
+    let saved = persist_snapshot(store, &record, record.mls_epoch)?;
+    Ok(project(&record, record.mls_epoch, Some(&pending), saved))
+}
+
+/// GROUPS-011：退出群（非群主；群主必须先转让，否则 `PERMISSION_DENIED`）。
+///
+/// **本地策略层退出**：把本机从确认成员里移除、记录 `left_at_ms`，此后本机对该群的治理一律
+/// `INVALID_TARGET`（不再是确认成员）。MLS 自移除提交被 CRYPTO-005 的自移除护栏拒绝
+/// （`remove_members` 不允许移除本机设备），因此本函数**不生成** MLS 提交：
+/// 本机 MLS 叶子仍在群里，需要协调者/其他群主发起移除才能彻底离开（见 groups.md 限制）。
+pub fn leave_group(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    group_id: &str,
+    actor_credential: &str,
+) -> GroupResult<GroupView> {
+    let mut record = load_record(store, group_id)?.0;
+    reject_dissolved(&record)?;
+    if record.left_at_ms > 0 {
+        return Err(GroupError::new(
+            "INVALID_STATE_TRANSITION",
+            "the local device has already left this group",
+        ));
+    }
+    let snapshot = domain_snapshot(&record)?;
+    let group_key = device
+        .group_key()
+        .map_err(|_| GroupError::invalid_target("the local device has no MLS group"))?;
+    if group_key != record.mls_group_key {
+        return Err(GroupError::invalid_target(
+            "the local device is not in this group",
+        ));
+    }
+    let epoch = device
+        .epoch()
+        .map_err(|_| GroupError::corrupted("MLS group epoch is unavailable"))?;
+    if epoch != snapshot.mls_epoch {
+        return Err(GroupError::new(
+            "STALE_EPOCH",
+            "the local MLS epoch does not match the persisted group",
+        ));
+    }
+    let actor_index = member_index(&record, actor_credential)?;
+    let actor = actor_of(&record, actor_index);
+    // 群主必须先转让：这里显式给出冻结码 PERMISSION_DENIED（domain 的 OWNER_TRANSFER_REQUIRED
+    // 也会拒绝，但对外契约要求这一个码）。
+    if record.members[actor_index].role == MemberRole::Owner.as_u64() {
+        return Err(GroupError::new(
+            "PERMISSION_DENIED",
+            "the owner must transfer ownership before leaving the group",
+        ));
+    }
+    let operation = GroupOperation::Leave;
+    let authorized =
+        authorize_group_operation(&snapshot, actor, operation).map_err(GroupError::from)?;
+    let proposed: ProposedPolicy =
+        apply_policy_operation(&snapshot, &authorized).map_err(GroupError::from)?;
+    // 本地策略立即生效：本机从确认成员里消失（pending_removed 保留以便审计/恢复）。
+    apply_domain_policy(&mut record, &proposed.policy)?;
+    record.left_at_ms = now_ms();
+    record.validate()?;
+    let saved = persist_snapshot(store, &record, record.mls_epoch)?;
+    Ok(project(&record, record.mls_epoch, None, saved))
+}
+
+/// GROUPS-012：解散群（仅群主；纯策略层，不删本地记录）。
+///
+/// - 只有群主能解散（其他成员 `PERMISSION_DENIED`）；
+/// - 已解散 → `INVALID_STATE_TRANSITION`（幂等调用也显式失败，不谎报"又解散了一次"）；
+/// - 有未决控制提交时拒绝（先用接受/丢弃收口，避免留下悬空提交）；
+/// - DOMAIN-004 计算新 `policy_version`/`control_head`（`dissolve` 操作会把快照标为
+///   dissolved），随后写入 `dissolved = true` 与 `dissolved_at_ms`；
+/// - 记录**保留**（成员、名称、epoch 都还在），只是所有治理从此显式拒绝。
+pub fn dissolve_group(
+    store: &mut Store,
+    group_id: &str,
+    actor_credential: &str,
+) -> GroupResult<GroupView> {
+    let (mut record, _) = load_record(store, group_id)?;
+    reject_dissolved(&record)?;
+    let snapshot = domain_snapshot(&record)?;
+    let device = MlsDevice::import_from_store(store, &record.mls_group_key).map_err(|_| {
+        GroupError::corrupted("the persisted MLS group state could not be restored")
+    })?;
+    if device
+        .pending_control()
+        .map_err(GroupError::from)?
+        .is_some()
+    {
+        return Err(GroupError::new(
+            "INVALID_STATE_TRANSITION",
+            "a control commit is pending; resolve it before dissolving the group",
+        ));
+    }
+    let actor_index = member_index(&record, actor_credential)?;
+    let actor = actor_of(&record, actor_index);
+    let authorized = authorize_group_operation(&snapshot, actor, GroupOperation::Dissolve)
+        .map_err(GroupError::from)?;
+    let proposed: ProposedPolicy =
+        apply_policy_operation(&snapshot, &authorized).map_err(GroupError::from)?;
+    apply_domain_policy(&mut record, &proposed.policy)?;
+    record.dissolved = true;
+    record.dissolved_at_ms = now_ms();
+    record.validate()?;
+    let saved = persist_snapshot(store, &record, record.mls_epoch)?;
+    Ok(project(&record, record.mls_epoch, None, saved))
 }
 
 

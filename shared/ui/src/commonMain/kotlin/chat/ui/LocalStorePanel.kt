@@ -50,6 +50,9 @@ data class StoreHandlers(
     val sendDispatch: () -> Unit = {},
     val sendRetry: () -> Unit = {},
     val sendReconcile: () -> Unit = {},
+    val syncStart: () -> Unit = {},
+    val syncStop: () -> Unit = {},
+    val syncRefresh: () -> Unit = {},
 ) {
     companion object {
         val None = StoreHandlers()
@@ -212,6 +215,45 @@ fun LocalStorePanel(
                             Text(draft.detail, style = MaterialTheme.typography.labelSmall, color = Color(0xFF5F6B63))
                         }
                     }
+                }
+
+                HorizontalDivider(color = Color(0xFFE1E6E1))
+                Text("自动同步（常驻循环）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "start 只在本地循环拉取并验签落库；它不保证对方在线或消息已投递。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF5F6B63),
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    TextButton(
+                        onClick = handlers.syncStart,
+                        enabled = state.ready && !state.busy,
+                        modifier = Modifier.semantics { contentDescription = "启动常驻同步" },
+                    ) { Text("启动同步", style = MaterialTheme.typography.labelMedium) }
+                    TextButton(
+                        onClick = handlers.syncStop,
+                        enabled = state.ready && !state.busy,
+                        modifier = Modifier.semantics { contentDescription = "停止常驻同步" },
+                    ) { Text("停止同步", style = MaterialTheme.typography.labelMedium) }
+                    TextButton(
+                        onClick = handlers.syncRefresh,
+                        enabled = state.ready && !state.busy,
+                        modifier = Modifier.semantics { contentDescription = "刷新同步状态" },
+                    ) { Text("刷新状态", style = MaterialTheme.typography.labelMedium) }
+                }
+                state.syncStatus?.let { status ->
+                    Text(
+                        "状态 " + status.state + " · 已应用 " + status.appliedTotal + " 条 · 轮次 " + status.rounds,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Text(
+                        (status.lastErrorCode?.let { "错误 " + it + " · " } ?: "") +
+                            (status.stoppedReason?.let { "停止原因 " + it } ?: "") +
+                            if (status.resyncRequired) "需要追赶（resync）" else "",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color(0xFF5F6B63),
+                    )
                 }
 
                 HorizontalDivider(color = Color(0xFFE1E6E1))

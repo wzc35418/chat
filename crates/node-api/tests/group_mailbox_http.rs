@@ -1355,3 +1355,176 @@ async fn chunk_body_limit_accepts_client_scale_chunks_but_keeps_dto_routes_bound
     .await;
     assert_eq!(rejected.status, 413);
 }
+// ---------------------------------------------------------------- API-004 能力令牌
+
+/// 申请一个能力令牌（设备鉴权 + 对象级授权都在服务端做）。
+async fn issue_capability(
+    node: &Node,
+    seed: u8,
+    object_id: &str,
+    scope: &str,
+    ttl_seconds: Option<u64>,
+) -> HttpResponse {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "object_id": object_id,
+        "scope": scope,
+        "ttl_seconds": ttl_seconds,
+    }))
+    .expect("capability json");
+    let headers = request_headers(node, seed, "POST", "/v1/capabilities", "", &body).await;
+    http(&node.address, "POST", "/v1/capabilities", &headers, &body).await
+}
+
+/// 带能力令牌的块上传（设备鉴权头 + 令牌头都要）。
+async fn put_chunk_with_capability(
+    node: &Node,
+    seed: u8,
+    upload_id: &str,
+    index: u32,
+    bytes: &[u8],
+    token: &str,
+) -> HttpResponse {
+    let path = format!("/v1/blobs/{upload_id}/chunks/{index}");
+    let mut headers = request_headers(node, seed, "PUT", &path, "", bytes).await;
+    headers.push(("x-chat-capability".to_owned(), token.to_owned()));
+    http_with(
+        &node.address,
+        "PUT",
+        &path,
+        &headers,
+        bytes,
+        "application/octet-stream",
+    )
+    .await
+}
+
+/// 带能力令牌的块读取。
+async fn read_chunk_with_capability(
+    node: &Node,
+    seed: u8,
+    blob_id: &str,
+    index: u32,
+    token: &str,
+) -> HttpResponse {
+    let path = format!("/v1/blobs/{blob_id}/chunks/{index}");
+    let mut headers = request_headers(node, seed, "GET", &path, "", b"").await;
+    headers.push(("x-chat-capability".to_owned(), token.to_owned()));
+    http(&node.address, "GET", &path, &headers, b"").await
+}
+
+#[tokio::test]
+async fn capability_tokens_authorize_blob_chunks_over_http() {
+    let (node, group) = setup(NodeAuthPolicy::default()).await;
+    let source_seq = append_attachment_entry(&node, &group, 21).await;
+    let first: &[u8] = b"head";
+    let second: &[u8] = b"tail";
+    let blob = object_text(141);
+    let begin = begin_blob(&node, 21, &group, &operation_text(241), &blob, source_seq, 8, 4, 2).await;
+    assert_eq!(begin.status, 200);
+    let upload_id = begin.json()["session"]["upload_id"]
+        .as_str()
+        .expect("upload id")
+        .to_owned();
+
+    // 上传令牌：绑定 (上传会话, 设备 21, blob:upload)。
+    let issued = issue_capability(&node, 21, &upload_id, "blob:upload", Some(120)).await;
+    assert_eq!(
+        issued.status,
+        200,
+        "issue: {:?}",
+        String::from_utf8_lossy(&issued.body)
+    );
+    let capability = issued.json()["capability"].clone();
+    let upload_token = capability["token"].as_str().expect("token").to_owned();
+    assert_eq!(capability["object_id"], upload_id);
+    assert_eq!(capability["scope"], "blob:upload");
+    assert_eq!(capability["device_id"], device_text(21));
+
+    // 带令牌写块：通过。
+    let uploaded = put_chunk_with_capability(&node, 21, &upload_id, 0, first, &upload_token).await;
+    assert_eq!(uploaded.status, 200);
+    // 同一个令牌写第二块也通过（同一对象、同一用途）。
+    assert_eq!(
+        put_chunk_with_capability(&node, 21, &upload_id, 1, second, &upload_token).await.status,
+        200
+    );
+    let digest = ciphertext_digest(&[first, second]);
+    assert_eq!(complete_blob(&node, 21, &upload_id, 2, 8, &digest).await.status, 200);
+
+    // 下载令牌：绑定已发布对象与 blob:download。
+    let download = issue_capability(&node, 21, &blob, "blob:download", None).await;
+    assert_eq!(download.status, 200);
+    let download_token = download.json()["capability"]["token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    let chunk = read_chunk_with_capability(&node, 21, &blob, 1, &download_token).await;
+    assert_eq!(chunk.status, 200);
+    assert_eq!(chunk.body, second);
+
+    // 上传令牌不能当下载令牌用（用途不符）。
+    let wrong_scope = read_chunk_with_capability(&node, 21, &blob, 0, &upload_token).await;
+    assert_eq!(wrong_scope.status, 403);
+    assert_eq!(wrong_scope.error_code(), "INVALID_CAPABILITY");
+    // 下载令牌也不能写块。
+    let wrong_scope = put_chunk_with_capability(&node, 21, &upload_id, 0, first, &download_token).await;
+    assert_eq!(wrong_scope.status, 403);
+    assert_eq!(wrong_scope.error_code(), "INVALID_CAPABILITY");
+}
+
+#[tokio::test]
+async fn capability_tokens_are_bound_to_one_object_and_one_device() {
+    let (node, group) = setup(NodeAuthPolicy::default()).await;
+    let source_seq = append_attachment_entry(&node, &group, 21).await;
+    let blob_a = object_text(142);
+    let blob_b = object_text(143);
+    let first: &[u8] = b"abcd";
+    let second: &[u8] = b"efgh";
+    let begin_a = begin_blob(&node, 21, &group, &operation_text(242), &blob_a, source_seq, 8, 4, 2).await;
+    let upload_a = begin_a.json()["session"]["upload_id"].as_str().expect("id").to_owned();
+    let begin_b = begin_blob(&node, 21, &group, &operation_text(243), &blob_b, source_seq, 8, 4, 2).await;
+    let upload_b = begin_b.json()["session"]["upload_id"].as_str().expect("id").to_owned();
+
+    let token_a = issue_capability(&node, 21, &upload_a, "blob:upload", Some(120))
+        .await
+        .json()["capability"]["token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+
+    // 跨对象重放：A 的令牌写 B 的会话 → 拒绝。
+    let replay = put_chunk_with_capability(&node, 21, &upload_b, 0, first, &token_a).await;
+    assert_eq!(replay.status, 403);
+    assert_eq!(replay.error_code(), "INVALID_CAPABILITY");
+    // 正确对象仍然可以。
+    assert_eq!(
+        put_chunk_with_capability(&node, 21, &upload_a, 0, second, &token_a).await.status,
+        200
+    );
+
+    // 篡改令牌（改密文中的一位）→ 签名/编码校验失败。
+    let mut tampered = token_a.clone().into_bytes();
+    let position = tampered.len() - 2;
+    tampered[position] = if tampered[position] == b"a"[0] { b"b"[0] } else { b"a"[0] };
+    let tampered = String::from_utf8(tampered).expect("utf8");
+    let forged = put_chunk_with_capability(&node, 21, &upload_a, 1, first, &tampered).await;
+    assert!(
+        forged.status == 401 || forged.status == 403,
+        "forged token must be rejected, got {}",
+        forged.status
+    );
+
+    // 别人的会话拿不到上传令牌（对象级授权先行）。
+    let denied = issue_capability(&node, 22, &upload_a, "blob:upload", None).await;
+    assert_eq!(denied.status, 403);
+    assert_eq!(denied.error_code(), "PERMISSION_DENIED");
+    // 不存在的对象也不发令牌。
+    let missing = issue_capability(&node, 21, &object_text(144), "blob:download", None).await;
+    assert_eq!(missing.status, 404);
+    assert_eq!(missing.error_code(), "BLOB_NOT_FOUND");
+    // 非法用途文本。
+    let bad_scope = issue_capability(&node, 21, &upload_a, "blob:delete", None).await;
+    assert_eq!(bad_scope.status, 400);
+    assert_eq!(bad_scope.error_code(), "INVALID_REQUEST");
+}

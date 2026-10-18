@@ -44,9 +44,12 @@
 |`PUT /v1/blobs/{upload_id}/chunks/{index}`|按序写入一块密文（NODE-013）|正文是**原始密文字节**（`application/octet-stream`）；顺序/边界/摘要严格校验|
 |`POST /v1/blobs/{upload_id}/complete`|校验清单并发布（NODE-014）|清单块数/总长/整体摘要必须与已上传内容一致；重复完成返回同一回执|
 |`GET /v1/blobs/{blob_id}/chunks/{index}`|取回一块密文（NODE-015）|成员窗口授权；未发布或越权一律拒绝；响应是原始密文字节|
-|`GET /v1/health`|健康检查（API-010）|**匿名、不鉴权、不限流**；只返回 `status/node_id/node_public_key/schema_version`，不含任何秘密与内部状态|
+|GET /v1/health|健康检查（API-010）|**匿名、不鉴权、不限流**；只返回 `status/node_id/node_public_key/schema_version`，不含任何秘密与内部状态|
+|POST /v1/capabilities|签发对象级能力令牌（API-004）|设备鉴权 + **对象级授权**（上传会话归属 / 附件可读性）后才签发；ttl 上限 1 小时|
 
 健康检查的定位：运维/探活用，所以既不能要签名（探活方没有设备凭据），也不能被限流（否则过载时最先失去可观测性）。它不返回库路径、配置、队列长度等内部状态，避免成为信息泄露面。
+
+能力令牌的传输约定：附件块端点（`PUT/GET /v1/blobs/…/chunks/{index}`）在设备鉴权之外**接受**可选的 `x-chat-capability` 请求头。带上时令牌必须与（对象 id、本设备、用途）绑定且未过期——否则 401/403；不带时仍按设备鉴权（会员窗口/上传者）判定。**强制模式尚未开启**（会破坏既有客户端，见 API-004 的限制）。
 
 附件 blob 端点的两点特殊约定：
 
@@ -325,10 +328,25 @@ validate_capability(token: Capability, actor: Actor, resource: Resource, action:
 
 **完成验收**：
 
-- [ ] 联系人邀请 token 不能用于群管理。
-- [ ] 一个 blob token 不能读另一 blob。
+- [x] 联系人邀请 token 不能用于群管理。
+- [x] 一个 blob token 不能读另一 blob。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（NG 包）。源码：[crates/node-services/src/capability.rs](../../crates/node-services/src/capability.rs)（令牌格式/签发/校验），HTTP 在 [crates/node-api/src/handlers.rs](../../crates/node-api/src/handlers.rs) 的 `issue_capability` 与附件块处理。
+
+令牌形状：`cap1.<hex(payload)>.<hex(signature)>`，payload 是域分隔 + 长度前缀的规范编码：
+`domain || object_id || device_id || scope || issued_at(be64) || expires_at(be64) || node_id`。
+
+已实现行为：
+
+1. **签发** `NodeService::issue_capability(object_id, device_id, scope, ttl_seconds, now)`：校验对象标识形状（下载用途必须是 PROTOCOL-001 `obj:1:…` 文本；上传用途是节点生成的会话 id）、TTL `1..=3600` 秒、设备仍有效，然后用节点签名钥签 payload。
+2. **校验** `NodeService::verify_capability(token, object_id, device_id, scope, now)`：限长解析 → payload **重编码并要求逐字节相同**（杜绝可塑编码）→ 验签（节点公钥）→ 绑定（对象/设备/用途）→ 节点身份（`node_id` 必须一致）→ 期限（`issued_at <= now < expires_at`，时钟早于签发也拒绝）。失败码：过期 `AUTH_EXPIRED@、绑定不符 `INVALID_CAPABILITY@、换节点 `NODE_ID_MISMATCH@、签名/编码 `INVALID_SIGNATURE@ / `INVALID_REQUEST@。
+3. **无状态**：不落库、无需清理，过期即失效；撤销通过撤销设备（设备鉴权先失败）或换对象完成——因此没有 `capability_revocations` 依赖。
+4. **对象级授权与令牌分离**：node-api 在签发前先做对象级授权（`authorize_blob_upload`：上传者本人 + 会话仍在 uploading 且未过期；`authorize_blob_read`：上传者本人或“附件存在时已在群内”的当前成员），再签发；令牌本身只证明“节点在 (对象, 设备, 用途, 期限) 上授权过”。
+5. **HTTP 面**：新增 `POST /v1/capabilities`（设备鉴权 + 对象级授权 → 令牌）；附件块 `PUT`/`GET` 接受 **额外**请求头 `x-chat-capability`，带上时令牌必须与 (上传会话/对象, 本设备, blob:upload/blob:download) 绑定且未过期，与设备鉴权**同时满足**。
+
+验证证据（`cargo test --offline -p chat-node-services -p chat-node-api` 全绿）：服务层 `capability::issued_tokens_verify_and_report_their_binding`、`expired_tokens_are_rejected`（边界前一秒通过、到点 `AUTH_EXPIRED@）、`wrong_object_device_or_scope_is_rejected`（跨对象重放 / 换设备 / 换用途都是 `INVALID_CAPABILITY@）、`tampered_or_foreign_tokens_are_rejected`（篡改与畸形令牌）、`tokens_from_another_node_are_rejected`、`ttl_and_object_shape_are_bounded`；单元 `capability::payload_round_trip_binding_and_tamper_are_enforced`；HTTP 端到端 `group_mailbox_http::capability_tokens_authorize_blob_chunks_over_http`（签发→带令牌上下传成功→用途不符 403）、`group_mailbox_http::capability_tokens_are_bound_to_one_object_and_one_device`（跨对象重放 403、篡改 401/403、他人会话拒绝签发 403 `PERMISSION_DENIED@、不存在对象 404、非法用途 400）。
+
+已知限制：令牌**尚未强制**——附件块端点在没有 `x-chat-capability` 头时仍只靠设备鉴权（强制会破坏既有 node-client 调用，客户端改造不在本包作用域）；没有“能力撤销表 / 逐次消费”语义（纯无状态）；ttl 固定上限 1 小时且不可配置；`capability_revocations` 表未被本切片使用。通过本函数用例不自动代表整个模块完成。
 
 <a id="api-005"></a>
 

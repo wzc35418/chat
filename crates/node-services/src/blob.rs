@@ -788,6 +788,7 @@ impl NodeService {
         let expected_digest = manifest.validate_shape()?;
         self.require_active_device(actor)?;
         let policy = self.policy().blob.clone();
+        let published_ttl = self.policy().cleanup.published_blob_ttl_seconds;
         let signer = NodeSigner::take(self);
         let now_sql = to_i64("now", now)?;
         let tx = self
@@ -882,11 +883,15 @@ impl NodeService {
         {
             return Err(NodeError::QuotaExceeded);
         }
+        // 保留期：发布时刻 + CleanupPolicy.published_blob_ttl_seconds（NODE-016 到期回收整对象）。
+        let expires_at = now
+            .checked_add(published_ttl)
+            .ok_or(NodeError::StorageUnavailable)?;
         tx.execute(
             "INSERT INTO blob_objects
                  (blob_id, upload_id, cipher_manifest, owner_device_id, state, group_id,
-                  source_seq, chunk_count, cipher_bytes)
-             VALUES (?1, ?2, ?3, ?4, 'published', ?5, ?6, ?7, ?8)",
+                  source_seq, chunk_count, cipher_bytes, expires_at)
+             VALUES (?1, ?2, ?3, ?4, 'published', ?5, ?6, ?7, ?8, ?9)",
             params![
                 upload.blob_id,
                 upload_id,
@@ -895,7 +900,8 @@ impl NodeService {
                 upload.group_id,
                 to_i64("source seq", upload.source_seq)?,
                 i64::from(upload.chunk_count),
-                to_i64("ciphertext bytes", upload.ciphertext_bytes)?
+                to_i64("ciphertext bytes", upload.ciphertext_bytes)?,
+                to_i64("expires at", expires_at)?
             ],
         )?;
         tx.execute(
@@ -915,6 +921,61 @@ impl NodeService {
         )?;
         tx.commit()?;
         Ok(receipt)
+    }
+
+    /// API-004 签发前的**对象级授权**：这台设备能不能向该上传会话写块。
+    ///
+    /// 规则与 `put_blob_chunk` 一致：上传设备本人、会话仍在 uploading、且未过期。
+    pub fn authorize_blob_upload(
+        &self,
+        upload_id: &str,
+        actor: &AuthenticatedDevice,
+        now: u64,
+    ) -> NodeResult<()> {
+        validate_timestamp("now", now)?;
+        validate_bounded_id("upload id", upload_id, MAX_BLOB_UPLOAD_ID_BYTES)?;
+        self.require_active_device(actor)?;
+        let tx = self.connection().unchecked_transaction()?;
+        let upload = load_upload(&tx, upload_id)?.ok_or(NodeError::UploadNotFound)?;
+        if upload.owner_device_id != actor.device_id {
+            return Err(NodeError::PermissionDenied);
+        }
+        if upload.state != "uploading" || upload.expires_at <= now {
+            return Err(NodeError::UploadExpired);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// API-004 签发前的**对象级授权**：这台设备能不能读该已发布对象的密文块。
+    ///
+    /// 规则与 `read_blob_chunk` 一致（上传者本人恒可读；其余设备必须是“附件存在时已在群内”的当前成员）。
+    pub fn authorize_blob_read(
+        &self,
+        blob_id: &str,
+        actor: &AuthenticatedDevice,
+        now: u64,
+    ) -> NodeResult<()> {
+        validate_timestamp("now", now)?;
+        validate_bounded_id("blob id", blob_id, MAX_BLOB_ID_BYTES)?;
+        ObjectId::parse(blob_id).map_err(|_| NodeError::InvalidRequest("blob id"))?;
+        self.require_active_device(actor)?;
+        let tx = self.connection().unchecked_transaction()?;
+        let blob = load_blob(&tx, blob_id)?.ok_or(NodeError::BlobNotFound)?;
+        if blob.state != "published" {
+            return Err(NodeError::BlobNotFound);
+        }
+        if blob.owner_device_id != actor.device_id {
+            let group_row = load_group(&tx, &blob.group_id)?.ok_or(NodeError::BlobNotFound)?;
+            let membership =
+                load_membership(&tx, &blob.group_id, &actor.device_id, group_row.last_seq)?
+                    .ok_or(NodeError::HistoryNotAuthorized)?;
+            if membership.1.is_some() || membership.0 > blob.source_seq {
+                return Err(NodeError::HistoryNotAuthorized);
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// NODE-015：只向受限持有人返回密文块（未发布/越权/越界都显式拒绝）。

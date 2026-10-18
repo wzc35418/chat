@@ -1,6 +1,6 @@
 # 小群创建、邀请与治理用例
 
-阶段：P3。状态：函数级设计；GROUPS-001 建群与 GROUPS-002 快照已实现（真实 OpenMLS + 正式加密库），成员治理的角色变更（`set_role`）与禁言（`set_muted`）也已实现（DOMAIN-002/004 策略层 + CRYPTO-005 控制提交）；移除成员（`remove_member`）与改名（`rename_group`）也已实现（同一条 DOMAIN-002/004 + CRYPTO-005 流程）；控制提交的**接受合并（`accept_pending_control`）与丢弃回滚（`discard_pending_control`）**也已接线（CRYPTO-007/008）；上述能力已通过 `GroupFfi` 暴露给 Kotlin（`group_create`/`snapshot`/`set_role`/`set_muted`/`remove_member`/`rename`/`accept_pending`/`discard_pending`）；对端条目处理（`group_process_peer_entry`，CRYPTO-006）与 Welcome 加入（`group_join_from_welcome`，CRYPTO-009）也已实现；其余治理函数未开始。目标源码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)。
+阶段：P3。状态：函数级设计；GROUPS-001 建群与 GROUPS-002 快照已实现（真实 OpenMLS + 正式加密库），成员治理的角色变更（`set_role`）与禁言（`set_muted`）也已实现（DOMAIN-002/004 策略层 + CRYPTO-005 控制提交）；移除成员（`remove_member`）与改名（`rename_group`）也已实现（同一条 DOMAIN-002/004 + CRYPTO-005 流程）；控制提交的**接受合并（`accept_pending_control`）与丢弃回滚（`discard_pending_control`）**也已接线（CRYPTO-007/008）；上述能力已通过 `GroupFfi` 暴露给 Kotlin（`group_create`/`snapshot`/`set_role`/`set_muted`/`remove_member`/`rename`/`accept_pending`/`discard_pending`）；对端条目处理（`group_process_peer_entry`，CRYPTO-006）与 Welcome 加入（`group_join_from_welcome`，CRYPTO-009）也已实现；群生命周期（转让群主 `transfer_ownership`、退出 `leave_group`、解散 `dissolve_group`）也已实现（GROUPS-010~012）。目标源码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)。
 
 本章对应 GroupService 的完整业务入口。所有管理操作都是待确认票据；UI 读取正式快照与 pending 列表分别显示。邀请加入分为业务接受、KeyPackage 获取、正式 Commit、Welcome 投递四步。重加入需要当前成员明确授权，不直接从节点读取群密钥。
 
@@ -1159,5 +1159,87 @@ cargo test --offline -p chat-core -p chat-ffi                # 155 + 39 passed�
 5. ~~本地接受证据 ≠ 节点回执~~（本轮的**节点回执路径**已补上）；但 `group_accept_pending`（无回执接受）
    依然只是本地收口，两者不可混用。
 6. `node_public_key_hex` 只影响提交时的端点固定；回执验签用回执自带的 head 公钥（NODE-006 既定语义）。
+
+## 群生命周期实现记录：转让群主 / 退出 / 解散（GROUPS-010~012，2026-10-18，Windows x64）
+
+代码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)（同一文件）；测试：
+[crates/core/tests/groups_lifecycle.rs](../../crates/core/tests/groups_lifecycle.rs)（5 个用例，真 OpenMLS + 真临时库）。
+
+### 公开面
+
+~~~text
+pub fn transfer_ownership(device, store, group_id, actor_credential, target_credential) -> GroupResult<GroupView>
+pub fn leave_group(device, store, group_id, actor_credential) -> GroupResult<GroupView>
+pub fn dissolve_group(store, group_id, actor_credential) -> GroupResult<GroupView>
+~~~
+
+`GroupView` 新增 `dissolved` / `dissolved_at_ms` / `left_at_ms`；持久记录版本 3 → **4**
+（新增 `dissolved`/`dissolved_at_ms`/`left_at_ms` 三个 `serde(default)` 字段）。
+
+### 关键语义
+
+1. **转让群主（GROUPS-010）**：仅现群主可转；目标必须是确认成员且不是自己（DOMAIN-007）。
+   DOMAIN-004 计算新 `policy_version`/`control_head` 并校验**唯一群主**不变量；随后
+   CRYPTO-005 `prepare_control(SelfUpdate)` 生成真实 MLS 控制提交（pending，epoch 不前进）；
+   快照里角色互换（目标 = owner、原群主 = member）。接受后 epoch 前进到 target。
+2. **退出（GROUPS-011）**：群主必须先转让，否则 `PERMISSION_DENIED`；普通成员退出走
+   DOMAIN-002/004 的 `Leave`（把本机从确认成员里移除、策略版本 +1、本机进入 `pending_removed`），
+   并记录 `left_at_ms`。退出后本机对该群的一切治理都 `INVALID_TARGET`（不再是确认成员），
+   重复退出 `INVALID_STATE_TRANSITION`。
+   **本切片不生成 MLS 自移除提交**：CRYPTO-005 的 `remove_members` 明确拒绝移除本机设备
+   （`cannot remove the local device through remove_members`），所以 MLS 叶子仍在群里、epoch 不变，
+   彻底离开需要协调者/新任群主发起移除。这是本轮最实在的缺口（改 crypto 需另开任务）。
+3. **解散（GROUPS-012）**：仅群主；DOMAIN-004 的 `Dissolve` 先把候选快照标为 dissolved，随后写入
+   `dissolved = true` 与 `dissolved_at_ms`。记录**保留**（成员/名称/epoch 都在）；
+   解散后`所有治理`（改角色、禁言、移除、改名、转让、退出、再次解散、接受/丢弃控制提交、
+   对端条目处理）都显式 `INVALID_STATE_TRANSITION`。有未决控制提交时拒绝解散（先收口）。
+
+### 错误码（既有冻结码）
+
+| 情形 | code |
+|---|---|
+| 非群主转让 / 非群主解散 / 群主退出 | `PERMISSION_DENIED` |
+| 转让目标不是成员 / 转给自己 / 目标已不活跃 | `INVALID_TARGET` |
+| 群已解散（任何治理、含再次解散）/ 重复退出 | `INVALID_STATE_TRANSITION` |
+| 有未决控制提交时解散 / 策略层写入 | `INVALID_STATE_TRANSITION` |
+| 本机设备不在该群 / epoch 与快照不符 | `INVALID_TARGET` / `STALE_EPOCH` |
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test groups_lifecycle   # 5 passed
+cargo test --offline -p chat-core                            # 160 passed（既有 155 继续通过）
+~~~
+
+### 证据
+
+- `groups_lifecycle::transfer_swaps_roles_and_advances_policy_version`：群主转让 → bob=owner、alice=member、
+  `policy_version + 1`、控制头变化、epoch 仍 1、pending = self_update（base 1 → target 2）；
+  接受后 **epoch 2**、角色保持、快照与返回值一致；关库重开后一致。
+- `groups_lifecycle::transfer_rejects_non_owner_unknown_target_and_self_without_writing`：非群主转让
+  `PERMISSION_DENIED`、未知目标 `INVALID_TARGET`、转给自己 `INVALID_TARGET`；三次失败后快照完全不变、
+  本机设备仍无 pending。
+- `groups_lifecycle::owner_cannot_leave_and_member_leave_removes_the_local_device`（双库双设备，bob 用
+  Welcome 真入群）：群主退出 `PERMISSION_DENIED` 且状态不变；bob 退出后正式成员只剩 alice、
+  `left_at_ms` 有值、`policy_version + 1`、`pending = None`、本机进入 `pending_removed`；
+  退出后 `set_muted` → `INVALID_TARGET`、重复退出 → `INVALID_STATE_TRANSITION`；
+  关库重开后退出状态保留且 **MLS 叶子仍在**（epoch 仍 1，说明还需协调者移除）。
+- `groups_lifecycle::dissolve_blocks_all_governance_and_keeps_the_record`：解散后 9 条治理路径
+  （改角色/禁言/移除/改名/转让/退出/再次解散/接受/丢弃）全部 `INVALID_STATE_TRANSITION`，
+  快照与解散瞬间完全一致；关库重开仍是 dissolved（记录没被删）。
+- `groups_lifecycle::dissolve_requires_the_owner_and_no_pending_commit`：非群主解散 `PERMISSION_DENIED`；
+  有未决控制提交时解散 `INVALID_STATE_TRANSITION`（状态不变）；接受收口后可正常解散（epoch 2）。
+
+### 已知限制
+
+1. **退出的 MLS 侧未完成**（见上文第 2 条）：本切片只做本地策略退出，MLS 叶子仍在群里；自移除提交被
+   CRYPTO-005 的自移除护栏拒绝，需要 crypto 提供“本机自移除提交”后才能真正离开。
+2. **节点公开元数据映射未扩展**：transfer/leave 在 MLS 侧都是 `SelfUpdate` 之外的语义（transfer 用
+   SelfUpdate、leave 无提交），而 group_node 的 `control_metadata_for` 仍把 SelfUpdate 映射成 `set_role`。
+   接节点回执前必须扩展该映射（属 group_node.rs，本轮不在写域）。
+3. **解散不做 MLS 拆除**：只标本地策略状态，不生成移除全体成员的提交、不改节点日志。
+4. **转让后原群主不再可治理**：转让立即降权（本地策略层），重试会 `PERMISSION_DENIED`。
+5. **凭据身份仍是派生占位**：授权按凭据 → AccountId 的派生映射判定（与本切片既有语义一致）。
 
 

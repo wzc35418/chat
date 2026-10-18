@@ -4,6 +4,7 @@
 //! 传输字段名固定为 snake_case，与签名原文分开（签名原文见 node-services 的规范编码）。
 use axum::http::HeaderMap;
 use chat_node_services::auth::{AuthChallenge, ChallengePurpose, SignedAuth};
+use chat_node_services::capability::{CapabilityGrant, CapabilityScope};
 use chat_node_services::blob::{
     BlobReceipt, ChunkReceipt, CipherManifest, PublicBlobDescriptor, UploadSession,
 };
@@ -467,6 +468,72 @@ impl HealthResponseDto {
             status: "ok",
             node_id,
             node_public_key,
+        }
+    }
+}
+/// POST /v1/capabilities 请求（API-004）。
+#[derive(Clone, Debug, Deserialize)]
+pub struct IssueCapabilityRequestDto {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u16,
+    /// 被授权的对象（上传会话 id 或已发布 blob id）。
+    pub object_id: String,
+    /// 用途文本（`blob:upload` / `blob:download`）。
+    pub scope: String,
+    /// 有效期（秒）；缺省用节点默认值。
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+}
+
+impl IssueCapabilityRequestDto {
+    /// 校验版本并解出 (对象, 用途, 有效期)。
+    pub fn into_parts(self) -> Result<(String, CapabilityScope, u64), ApiError> {
+        check_schema_version(self.schema_version)?;
+        let scope = CapabilityScope::parse(&self.scope).ok_or_else(|| {
+            ApiError::invalid_request("capability scope must be blob:upload or blob:download")
+        })?;
+        let ttl_seconds = self
+            .ttl_seconds
+            .unwrap_or(chat_node_services::capability::DEFAULT_CAPABILITY_TTL_SECONDS);
+        if ttl_seconds == 0 || ttl_seconds > chat_node_services::capability::MAX_CAPABILITY_TTL_SECONDS
+        {
+            return Err(ApiError::invalid_request("capability ttl is out of range"));
+        }
+        Ok((self.object_id, scope, ttl_seconds))
+    }
+}
+
+/// POST /v1/capabilities 响应：节点签名的能力令牌（公开材料，不含密钥）。
+#[derive(Clone, Debug, Serialize)]
+pub struct CapabilityResponseDto {
+    pub schema_version: u16,
+    pub capability: CapabilityDto,
+}
+
+/// 令牌与其公开绑定字段。
+#[derive(Clone, Debug, Serialize)]
+pub struct CapabilityDto {
+    pub token: String,
+    pub object_id: String,
+    pub device_id: String,
+    pub scope: &'static str,
+    pub issued_at: u64,
+    pub expires_at: u64,
+}
+
+impl CapabilityResponseDto {
+    /// 包装已签发的令牌。
+    pub fn new(token: String, grant: CapabilityGrant) -> Self {
+        Self {
+            schema_version: DTO_SCHEMA_VERSION,
+            capability: CapabilityDto {
+                token,
+                object_id: grant.object_id,
+                device_id: grant.device_id,
+                scope: grant.scope.as_str(),
+                issued_at: grant.issued_at,
+                expires_at: grant.expires_at,
+            },
         }
     }
 }

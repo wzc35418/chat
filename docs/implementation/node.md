@@ -708,7 +708,7 @@ read_blob_chunk(blob: BlobId, index: u32, actor: AuthenticatedDevice, capability
 **完成验收**：
 
 - [x] 新设备拿到旧 URL 仍拒绝。
-- [ ] 过期/跨对象能力拒绝。
+- [x] 过期/跨对象能力拒绝。
 
 **实现状态**：已实现（W 包，附件 blob 轮次）。实现签名：`NodeService::read_blob_chunk(&mut self, blob_id: &str, index: u32, actor: &AuthenticatedDevice, now: u64) -> NodeResult<CipherChunk>`，源码 [crates/node-services/src/blob.rs](../../crates/node-services/src/blob.rs)。
 
@@ -721,7 +721,7 @@ read_blob_chunk(blob: BlobId, index: u32, actor: AuthenticatedDevice, capability
 
 验证证据：`blob::upload_round_trip_returns_exact_ciphertext_chunks`（上传者与老成员都能读、字节完全一致）、`blob::source_entry_and_membership_window_gate_uploads_and_reads`（把成员加入点挪到附件之后 → HISTORY_NOT_AUTHORIZED）、`blob::unpublished_blob_is_not_readable_and_owner_is_enforced`、`blob::size_and_count_limits_are_enforced`（越界序号），HTTP/客户端侧 `blob_upload_and_read_round_trip_over_http`、`blob_endpoints_require_bound_authentication`（群外设备 403）、`blob_flow::blob_upload_and_read_round_trip_over_http`（群外设备 HISTORY_NOT_AUTHORIZED）。
 
-已知限制：API-004 的签名下载能力令牌（绑定对象/设备/群消息窗口/期限）**未实现**，本阶段以“成员窗口 + 发布状态”替代，因此“过期/跨对象能力拒绝”仍未勾选；也没有按能力的撤销检查与下载速率限制（API-005）。通过本函数用例不自动代表整个模块完成。
+已知限制：API-004 的对象级能力令牌（绑定对象/设备/用途/期限）**已实现**（见 [api.md](api.md) 的 API-004）：绑定、过期、换节点、篡改都被拒绝，“过期/跨对象能力拒绝”已勾选。但仍没有“逐次消费/撤销表”语义（纯无状态），且附件块端点上令牌**尚未强制**（可选头）；也没有下载速率限制（API-005 只在 HTTP 层按设备/账户计数）。通过本函数用例不自动代表整个模块完成。
 
 <a id="node-016"></a>
 
@@ -751,8 +751,23 @@ expire_node_data(now: Time, budget: GcBudget) -> Result<CleanupReport>
 
 **完成验收**：
 
-- [ ] 消息过期不破坏现存群状态验证。
-- [ ] dedup 过早删不能让旧尝试二次接受。
+- [x] 消息过期不破坏现存群状态验证。
+- [x] dedup 过早删不能让旧尝试二次接受。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（NG 包，过期回收 + 能力令牌轮次）。实现签名：`NodeService::collect_expired(&mut self, now: u64) -> NodeResult<CleanupStats>`，源码 [crates/node-services/src/cleanup.rs](../../crates/node-services/src/cleanup.rs)（策略与默认值在 [limits.rs](../../crates/node-services/src/limits.rs) 的 `CleanupPolicy`）。
+
+已实现行为（全部在**同一个 IMMEDIATE 事务**里完成，要么整轮生效要么整轮回滚）：
+
+1. **过期上传会话**：`blob_uploads.state='uploading' AND expires_at <= now` → 删掉它的临时密文块（`blob_chunks` + `blob_chunk_content`），会话行置 `expired`（保留行做幂等与审计，不删）。
+2. **过期已发布对象**：`blob_objects.state='published' AND expires_at > 0 AND expires_at <= now` → 删回执、删块内容、删对象行；**未过期对象与 `expires_at=0`（未设置保留期）的对象永不被删**。保留期在发布时写入（完成时刻 + `CleanupPolicy.published_blob_ttl_seconds`，默认 30 天、上限 10 年）。
+3. **过期信箱条目**：未 ACK（`state='stored'`）与已 ACK（`state='consumed'`）**分别计数**后删除；先删投递回执（外键依赖），再删条目。
+4. **过期挑战 / 过期公告记录**删除、**过期未领取密钥包**置 `expired`。
+5. **限流桶**在进程内，由 `RateLimiter::collect_expired` 处理；node-api 的 `AppState::collect_expired` 把库内统计与桶统计合并返回。
+6. **每轮有上限**（`CleanupPolicy.max_rows_per_kind`，默认 512，硬上限 8192）：大库需要多轮收敛，**不会长时间持写锁**，也不会“一条 TTL SQL 删光历史”。
+7. **幂等**：同一时刻重复调用只有第一轮有产出（第二轮统计全零），因为过期行已被删除/置态。
+8. 迁移 `0005_retention_capabilities.sql`：补 `blob_objects.expires_at` 与按 `(state, expires_at)` 的清理索引（回执/日志/控制链**不参与** TTL 回收）。
+
+验证证据（`cargo test --offline -p chat-node-services -p chat-node-api` 全绿）：`cleanup::expired_upload_sessions_and_their_chunks_are_collected`（过期会话+临时块被清、未过期会话仍可写块、重复调用归零）、`cleanup::expired_blobs_are_collected_but_fresh_ones_survive`（未到期不动、到期只回收该对象、未过期对象仍可读）、`cleanup::expired_mailbox_items_are_counted_by_ack_state`（未 ACK/已 ACK 分别计数、未过期条目仍在、`expired_items` 归零说明是真删不是隐藏）、`cleanup::per_round_limit_applies_and_repeat_runs_are_idempotent`（上限 1 时三轮收敛 + 第四轮空）、`cleanup::expired_challenges_are_collected`。
+
+已知限制：没有“标回收（collecting）→ 受控路径删除”的两阶段（块内容都在 SQLite 单库单事务里，删除本身是原子的，因此不需要文件系统删除日志）；没有后台定时器（由运维/上层按节奏调用 `collect_expired`）；已 ACK 条目被回收后，迟到的重复 ACK 会得到 `PERMISSION_DENIED` 而不是 `already_consumed`；控制日志/回执/群状态**永不**按 TTL 回收。通过本函数用例不自动代表整个模块完成。
 

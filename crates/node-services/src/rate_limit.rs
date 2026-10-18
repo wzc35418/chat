@@ -62,6 +62,21 @@ impl RateLimiter {
         self.buckets.lock().map(|buckets| buckets.len()).unwrap_or(0)
     }
 
+    /// NODE-016：清掉已经过期的窗口桶，返回删除的桶数。
+    ///
+    /// 只保留最近 2 个窗口的桶：更早的桶不可能再被命中，留着只会让内存随历史设备数增长。
+    pub fn collect_expired(&self, now: u64) -> usize {
+        let window = self.policy.window_seconds.max(1);
+        let current_window = now - now % window;
+        let oldest_kept = current_window.saturating_sub(window);
+        let Ok(mut buckets) = self.buckets.lock() else {
+            return 0;
+        };
+        let before = buckets.len();
+        buckets.retain(|_, bucket| bucket.window_start >= oldest_kept);
+        before.saturating_sub(buckets.len())
+    }
+
     /// 已登记设备的一次请求：设备桶与账户桶必须**同时**通过，才算放行。
     pub fn check_device(
         &self,

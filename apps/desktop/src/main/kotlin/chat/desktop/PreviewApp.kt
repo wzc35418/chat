@@ -14,6 +14,7 @@ import chat.api.IdentityException
 import chat.api.LocalStoreException
 import chat.bridge.createAttachmentService
 import chat.bridge.createGroupService
+import chat.bridge.createSyncService
 import chat.bridge.createIdentityService
 import chat.bridge.createLocalStore
 import chat.presentation.display.presentInviteError
@@ -42,6 +43,7 @@ import chat.presentation.preview.updateSendNodeId
 import chat.presentation.preview.updateSendNodePublicKey
 import chat.presentation.preview.updateSendNodeUrl
 import chat.presentation.preview.withSendStep
+import chat.presentation.preview.withSyncStatus
 import chat.presentation.preview.withCancel
 import chat.presentation.preview.withDraftStatus
 import chat.presentation.preview.withExported
@@ -271,6 +273,56 @@ fun main() = application {
         }
     }
 
+    var syncService by remember { mutableStateOf<chat.api.SyncService?>(null) }
+
+    suspend fun ensureSyncService(): chat.api.SyncService? {
+        syncService?.let { return it }
+        val database = identityDatabase
+        val key = identityKey
+        if (database == null || key == null) return null
+        runCatching { identity?.close() }
+        val created = runCatching {
+            createSyncService(database, key, "http://127.0.0.1:8080", node, "", demoConversation)
+        }.getOrNull()
+        runCatching { identity?.openPersisted(database, key, node) }
+        syncService = created
+        return created
+    }
+
+    val syncHandlers = object {
+        fun start() = scope.launch {
+            val service = ensureSyncService() ?: run {
+                storeState = storeState.withError("INVALID_STATE_TRANSITION", "同步服务不可用（缺少节点或游标未初始化）")
+                return@launch
+            }
+            storeState = storeState.beginBusy()
+            runCatching { service.start() }
+                .onSuccess { storeState = storeState.withSyncStatus(it) }
+                .onFailure { error ->
+                    storeState = storeState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                }
+        }
+
+        fun stop() = scope.launch {
+            val service = syncService ?: return@launch
+            storeState = storeState.beginBusy()
+            runCatching { service.stop() }
+                .onSuccess { storeState = storeState.withSyncStatus(it) }
+                .onFailure { error ->
+                    storeState = storeState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                }
+        }
+
+        fun refresh() = scope.launch {
+            val service = syncService ?: return@launch
+            runCatching { service.status() }
+                .onSuccess { storeState = storeState.withSyncStatus(it) }
+                .onFailure { error ->
+                    storeState = storeState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                }
+        }
+    }
+
     val groupHandlers = GroupHandlers(
         updateCreateName = { value -> groupState = groupState.updateCreateName(value) },
         createGroup = {
@@ -455,6 +507,9 @@ fun main() = application {
                     }
             }
         },
+        syncStart = { syncHandlers.start() },
+        syncStop = { syncHandlers.stop() },
+        syncRefresh = { syncHandlers.refresh() },
         sendReconcile = {
             scope.launch {
                 if (store == null) return@launch

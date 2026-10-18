@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use chat_node_services::auth::{ChallengePurpose, RequestMeta};
 use chat_node_services::services::AuthenticatedDevice;
 use chat_node_services::canonical::{hex_encode, sha256};
+use chat_node_services::capability::CapabilityScope;
 use chat_node_services::limits::{MAX_BLOB_CHUNK_BODY_BYTES, MAX_HTTP_BODY_BYTES};
 use serde::de::DeserializeOwned;
 
@@ -25,8 +26,8 @@ use crate::dto::{
     CompleteBlobUploadRequestDto, DeviceRegistrationResponseDto, GroupHeadResponseDto,
     GroupLogResponseDto, GroupRegistrationResponseDto, MailboxPageResponseDto,
     MailboxReceiptResponseDto, RegisterDeviceRequestDto, RegisterGroupRequestDto,
-    HealthResponseDto, SignedAuthHeaders, StoreMailboxItemRequestDto, UploadSessionResponseDto,
-    parse_chunk_index,
+    CapabilityResponseDto, HealthResponseDto, IssueCapabilityRequestDto, SignedAuthHeaders,
+    StoreMailboxItemRequestDto, UploadSessionResponseDto, parse_chunk_index,
 };
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -53,6 +54,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/mailbox/items", post(store_mailbox_item))
         .route("/v1/mailbox", get(read_mailbox_page))
         .route("/v1/mailbox/ack", post(ack_mailbox_items))
+        .route("/v1/capabilities", post(issue_capability))
         .route("/v1/blobs", post(begin_blob_upload))
         // 同一个 URL 形状承载两个动作：PUT = 写入上传会话的一块，GET = 读取已发布 blob 的一块。
         // 路由参数因此只能有一个名字（axum 不允许同名形状的两种参数命名）。
@@ -329,6 +331,55 @@ pub async fn ack_mailbox_items(
     let summary = state.with_service(|service| service.ack_mailbox_items(&actor, &ids, now))?;
     Ok(Json(AckMailboxItemsResponseDto::new(summary)).into_response())
 }
+/// API-004：能力令牌请求头（与设备鉴权头并存，二者都要满足）。
+const CAPABILITY_HEADER: &str = "x-chat-capability";
+
+/// 取出可选的能力令牌（缺省表示调用方没用令牌，仍走设备鉴权）。
+fn capability_token(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get(CAPABILITY_HEADER) else {
+        return Ok(None);
+    };
+    let text = value
+        .to_str()
+        .map_err(|_| ApiError::invalid_request("capability token is not valid text"))?;
+    if text.is_empty() || text.len() > 2_048 {
+        return Err(ApiError::invalid_request("capability token is out of range"));
+    }
+    Ok(Some(text.to_owned()))
+}
+
+/// POST /v1/capabilities：为本设备签发一个对象级能力令牌（API-004）。
+///
+/// 先做**对象级授权**（上传会话归属 / 附件可读性），再签发；令牌本身只证明“节点在
+/// (对象, 设备, 用途, 期限) 上授权过”，不含密钥也无需落库。
+pub async fn issue_capability(
+    State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    ensure_body_bounded(&state, body.len())?;
+    let request: IssueCapabilityRequestDto = parse_body(&body)?;
+    let (object_id, scope, ttl_seconds) = request.into_parts()?;
+    let now = state.now();
+    let actor = authenticate(&state, &headers, &uri, "POST", &body, now)?;
+    let device_id = actor.device_id.clone();
+    let (token, grant) = state.with_service(|service| {
+        match scope {
+            CapabilityScope::BlobUpload => {
+                service.authorize_blob_upload(&object_id, &actor, now)?;
+            }
+            CapabilityScope::BlobDownload => {
+                service.authorize_blob_read(&object_id, &actor, now)?;
+            }
+        }
+        let token = service.issue_capability(&object_id, &device_id, scope, ttl_seconds, now)?;
+        let grant = service.verify_capability(&token, &object_id, &device_id, scope, now)?;
+        Ok((token, grant))
+    })?;
+    Ok(Json(CapabilityResponseDto::new(token, grant)).into_response())
+}
+
 /// POST /v1/blobs：创建密文附件上传会话（NODE-012）。
 pub async fn begin_blob_upload(
     State(state): State<AppState>,
@@ -364,6 +415,19 @@ pub async fn put_blob_chunk(
     let index = parse_chunk_index(&chunk_index)?;
     let now = state.now();
     let actor = authenticate(&state, &headers, &uri, "PUT", &body, now)?;
+    // API-004：带上能力令牌时，令牌必须与 (上传会话, 本设备, blob:upload) 绑定且未过期。
+    if let Some(token) = capability_token(&headers)? {
+        let device_id = actor.device_id.clone();
+        state.with_service(|service| {
+            service.verify_capability(
+                &token,
+                &upload_id,
+                &device_id,
+                CapabilityScope::BlobUpload,
+                now,
+            )
+        })?;
+    }
     let receipt = state.with_service(|service| {
         service.put_blob_chunk(&upload_id, index, &body, &actor, now)
     })?;
@@ -400,6 +464,19 @@ pub async fn read_blob_chunk(
     let index = parse_chunk_index(&chunk_index)?;
     let now = state.now();
     let actor = authenticate(&state, &headers, &uri, "GET", b"", now)?;
+    // API-004：带上能力令牌时，令牌必须与 (对象, 本设备, blob:download) 绑定且未过期。
+    if let Some(token) = capability_token(&headers)? {
+        let device_id = actor.device_id.clone();
+        state.with_service(|service| {
+            service.verify_capability(
+                &token,
+                &blob_id,
+                &device_id,
+                CapabilityScope::BlobDownload,
+                now,
+            )
+        })?;
+    }
     let chunk = state
         .with_service(|service| service.read_blob_chunk(&blob_id, index, &actor, now))?;
     Ok((
