@@ -397,7 +397,8 @@ fn save_attachment_inner(
     };
     let sealed = seal_metadata(transaction.key, &input.attachment_id, &metadata)?;
     let now = now_ms();
-    let created_at = input.created_at_ms.min(now);
+    // 创建时间按调用方给出的值保存（已校验非负），不静默改写调用方语义。
+    let created_at = input.created_at_ms;
     transaction.transaction.execute(
         "INSERT INTO attachments
              (attachment_id, protected_descriptor, plain_size, chunk_count, state, chunk_size, created_at, updated_at)

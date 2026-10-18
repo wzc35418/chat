@@ -72,6 +72,7 @@ import chat.presentation.display.renderMessageContent
 import chat.presentation.preview.ComposerPresentation
 import chat.presentation.preview.PreviewChatState
 import chat.presentation.preview.PreviewContact
+import chat.presentation.preview.PreviewAttachmentState
 import chat.presentation.preview.PreviewContactState
 import chat.presentation.preview.PreviewIdentityState
 import chat.presentation.preview.PreviewStoreState
@@ -125,11 +126,15 @@ fun PreviewChatScreen(
     storeHandlers: StoreHandlers = StoreHandlers.None,
     storeDraftText: String = "",
     initialStoreOpen: Boolean = false,
+    attachmentState: PreviewAttachmentState = PreviewAttachmentState(),
+    attachmentHandlers: AttachmentHandlers = AttachmentHandlers.None,
+    initialAttachmentOpen: Boolean = false,
 ) {
     var state by remember { mutableStateOf(initialState) }
     // 真实身份面板是独立浮层：默认关闭，由侧栏按钮打开；截图入口可指定初始打开。
     var showIdentity by remember { mutableStateOf(initialIdentityOpen) }
     var showStore by remember { mutableStateOf(initialStoreOpen) }
+    var showAttachments by remember { mutableStateOf(initialAttachmentOpen) }
 
     MaterialTheme(
         colorScheme = lightColorScheme(
@@ -166,6 +171,7 @@ fun PreviewChatScreen(
                                     onOpenInvite = { state = state.openInvite() },
                                     onOpenIdentity = { showIdentity = true },
                                     onOpenStore = { showStore = true },
+                                    onOpenAttachments = { showAttachments = true },
                                 )
                                 Box(Modifier.width(1.dp).fillMaxHeight().background(Color(0xFFE1E6E1)))
                                 ChatPane(
@@ -206,10 +212,26 @@ fun PreviewChatScreen(
                                     onOpenInvite = { state = state.openInvite() },
                                     onOpenIdentity = { showIdentity = true },
                                     onOpenStore = { showStore = true },
+                                    onOpenAttachments = { showAttachments = true },
                                 )
                             }
                         }
                     }
+                }
+            }
+            if (showAttachments) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color(0x66000000))
+                        .pointerInput(Unit) { detectTapGestures(onTap = { showAttachments = false }) }
+                        .semantics { contentDescription = "附件面板遮罩" },
+                ) {
+                    AttachmentPanel(
+                        state = attachmentState,
+                        handlers = attachmentHandlers,
+                        onClose = { showAttachments = false },
+                    )
                 }
             }
             if (showStore) {
@@ -301,6 +323,7 @@ private fun Sidebar(
     onOpenInvite: () -> Unit,
     onOpenIdentity: () -> Unit,
     onOpenStore: () -> Unit,
+    onOpenAttachments: () -> Unit,
 ) {
     Surface(modifier, color = Color.White) {
         Column(
@@ -380,6 +403,15 @@ private fun Sidebar(
                     contentPadding = PaddingValues(vertical = 8.dp, horizontal = 6.dp),
                 ) {
                     Text("本机存储", style = MaterialTheme.typography.labelMedium)
+                }
+                OutlinedButton(
+                    onClick = onOpenAttachments,
+                    modifier = Modifier.weight(1f).semantics {
+                        contentDescription = "打开附件（本机）面板"
+                    },
+                    contentPadding = PaddingValues(vertical = 8.dp, horizontal = 6.dp),
+                ) {
+                    Text("附件", style = MaterialTheme.typography.labelMedium)
                 }
             }
             Surface(color = PreviewCanvas, shape = RoundedCornerShape(10.dp)) {

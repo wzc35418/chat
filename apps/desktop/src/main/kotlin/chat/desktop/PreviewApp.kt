@@ -12,10 +12,12 @@ import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
 import chat.api.IdentityException
 import chat.api.LocalStoreException
+import chat.bridge.createAttachmentService
 import chat.bridge.createIdentityService
 import chat.bridge.createLocalStore
 import chat.presentation.display.presentInviteError
 import chat.presentation.display.presentInvitePreview
+import chat.presentation.preview.PreviewAttachmentState
 import chat.presentation.preview.PreviewIdentityState
 import chat.presentation.preview.PreviewStoreState
 import chat.presentation.preview.beginBusy
@@ -264,8 +266,75 @@ fun main() = application {
         },
     )
 
+    var attachmentState by remember { mutableStateOf(PreviewAttachmentState()) }
+    val attachmentService = remember {
+        runCatching {
+            createAttachmentService(
+                java.io.File("build/preview-attachments").apply { mkdirs() }.absolutePath,
+            )
+        }.getOrNull()
+    }
+
+    LaunchedEffect(Unit) {
+        attachmentState = if (attachmentService == null) {
+            PreviewAttachmentState().withError("INTERNAL_FAILURE", "附件服务未加载")
+        } else {
+            PreviewAttachmentState(ready = true)
+        }
+    }
+
+    val attachmentHandlers = AttachmentHandlers(
+        updateImportPath = { value -> attachmentState = attachmentState.updateImportPath(value) },
+        importFile = {
+            scope.launch {
+                val service = attachmentService ?: return@launch
+                attachmentState = attachmentState.beginBusy()
+                val path = attachmentState.importPath.trim()
+                val displayName = File(path).name.ifEmpty { "附件" }
+                runCatching { service.importFile(path, displayName) }
+                    .onSuccess { attachmentState = attachmentState.withImported(it) }
+                    .onFailure { error ->
+                        attachmentState = attachmentState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+        updateExportPath = { value -> attachmentState = attachmentState.updateExportPath(value) },
+        exportFile = { attachmentId ->
+            scope.launch {
+                val service = attachmentService ?: return@launch
+                attachmentState = attachmentState.beginBusy()
+                val target = attachmentState.exportPath.trim()
+                runCatching { service.exportFile(attachmentId, target) }
+                    .onSuccess { attachmentState = attachmentState.withExported(attachmentId, it, target) }
+                    .onFailure { error ->
+                        attachmentState = attachmentState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+        cancel = { attachmentId ->
+            scope.launch {
+                val service = attachmentService ?: return@launch
+                attachmentState = attachmentState.beginBusy()
+                runCatching { service.cancel(attachmentId) }
+                    .onSuccess { attachmentState = attachmentState.withUpdated(it) }
+                    .onFailure { error ->
+                        attachmentState = attachmentState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+    )
+
     Window(
-        title = "Chat · 交互预览（样例消息 + 真实身份 + 本机存储）",
+        title = "Chat · 交互预览（样例消息 + 真实身份 + 本机存储 + 附件）",
         state = rememberWindowState(width = 1100.dp, height = 800.dp),
         onCloseRequest = {
             kotlinx.coroutines.runBlocking {
@@ -282,6 +351,8 @@ fun main() = application {
             storeState = storeState,
             storeHandlers = storeHandlers,
             storeDraftText = storeDraftText,
+            attachmentState = attachmentState,
+            attachmentHandlers = attachmentHandlers,
         )
     }
 }
