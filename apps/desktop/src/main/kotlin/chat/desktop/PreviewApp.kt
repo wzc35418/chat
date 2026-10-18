@@ -53,6 +53,25 @@ fun main() = application {
     var storeDraftText by remember { mutableStateOf("") }
     var selectedConversation by remember { mutableStateOf<String?>(null) }
     val identity = remember { runCatching { createIdentityService() }.getOrNull() }
+    // 持久身份库：演示用固定目录（build/preview-identity），主密钥首次生成后复用，
+    // 因此重启预览仍显示同一指纹。正式产品应由平台密钥库保护（P0-04 未完成部分）。
+    val identityDir = remember {
+        runCatching { File("build/preview-identity").apply { mkdirs() } }.getOrNull()
+    }
+    val identityDatabase = remember { identityDir?.let { File(it, "identity.db").absolutePath } }
+    val identityKey = remember {
+        identityDir?.let { dir ->
+            val keyFile = File(dir, "demo-master-key.hex")
+            if (keyFile.exists()) {
+                keyFile.readText().trim()
+            } else {
+                val bytes = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+                val hex = bytes.joinToString("") { "%02x".format(it) }
+                keyFile.writeText(hex)
+                hex
+            }
+        }
+    }
     val store = remember { runCatching { createLocalStore() }.getOrNull() }
     val storeDirectory = remember { runCatching { Files.createTempDirectory("chat-preview-store-").toFile() }.getOrNull() }
     val scope = rememberCoroutineScope()
@@ -95,12 +114,15 @@ fun main() = application {
     }
 
     LaunchedEffect(Unit) {
-        if (identity == null) {
+        if (identity == null || identityDatabase == null || identityKey == null) {
             identityState = identityState.unavailable("原生身份服务未加载")
         } else {
-            runCatching { identity.create("本机账户", node) }
+            runCatching { identity.openPersisted(identityDatabase, identityKey, node) }
                 .onSuccess { account ->
                     identityState = identityState.openWith(account)
+                    identityState = identityState.copy(
+                        notice = "已从本机加密库恢复/创建身份；重启预览仍是同一指纹。口令需要人工复制，节点投递未接。",
+                    )
                     refreshContacts()
                 }
                 .onFailure { error ->

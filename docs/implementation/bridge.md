@@ -1,6 +1,6 @@
 # FFI、回调、Flow 包装与资源生命周期
 
-阶段：P0 → P2。状态：函数级设计；BRIDGE-001/002/003/004/005 的通用编排尚未实现，两个竖直切片的 UniFFI 对象已在 Windows x64 编译并实测：本地存储的 `LocalStoreFfi`（见“本地存储竖直切片（LocalStoreFfi）”）与身份/口令加好友的 `IdentityFfi`（见“身份与口令加好友竖直切片（IdentityFfi）”）。目标源码：[crates/ffi/src/bridge.rs](../../crates/ffi/src/bridge.rs)（P0 临时实验对象）、[crates/ffi/src/local_store.rs](../../crates/ffi/src/local_store.rs)（正式存储对象）与 [crates/ffi/src/identity_ffi.rs](../../crates/ffi/src/identity_ffi.rs)（身份/联系人对象）。
+阶段：P0 → P2。状态：函数级设计；BRIDGE-001/002/003/004/005 的通用编排尚未实现，两个竖直切片的 UniFFI 对象已在 Windows x64 编译并实测：本地存储的 `LocalStoreFfi`（见“本地存储竖直切片（LocalStoreFfi）”）与身份/口令加好友的 `IdentityFfi`（见“身份与口令加好友竖直切片（IdentityFfi）”，含持久身份 `open_persisted`）。目标源码：[crates/ffi/src/bridge.rs](../../crates/ffi/src/bridge.rs)（P0 临时实验对象）、[crates/ffi/src/local_store.rs](../../crates/ffi/src/local_store.rs)（正式存储对象）与 [crates/ffi/src/identity_ffi.rs](../../crates/ffi/src/identity_ffi.rs)（身份/联系人对象）。
 
 真实生成绑定必须来自选定框架，P0 前不伪造 ABI。Kotlin 包装代码目标位于 shared/core-bridge/src/jvmMain 及 Android 对应 source set；Flow 只负责 UI 通知。Rust 原生方法不导出 Kotlin coroutine 或 Flow；秘密不作为普通 UI DTO。
 
@@ -333,6 +333,8 @@ cargo build --locked --offline -p chat-ffi   # 成功，Cargo.lock 未变化
 ## 身份与口令加好友竖直切片（IdentityFfi，Windows x64）
 
 实现位置：[crates/ffi/src/identity_ffi.rs](../../crates/ffi/src/identity_ffi.rs)（`uniffi::Object`）。
+两种构造共用同一公开面：进程内身份 `create`（不写库）与持久身份 `open_persisted`
+（打开 [chat-core](../../crates/core/src/service.rs) 的 `ConversationCore`，与 `LocalStoreFfi` 同一个库）。
 与 `P0Core`、`LocalStoreFfi` 互不共享状态，但**复用同一个** `FfiError`（定义在
 [local_store.rs](../../crates/ffi/src/local_store.rs)，UniFFI 允许同一 error 类型服务多个对象），
 因此 Kotlin 侧仍然只 `catch (e: FfiException.Store)` 一处。方法名用 `shutdown`（不是 `close`），
@@ -345,6 +347,13 @@ cargo build --locked --offline -p chat-ffi   # 成功，Cargo.lock 未变化
 
 #[uniffi::constructor]
 IdentityFfi::create(display_name: String, node: String) -> Result<Arc<IdentityFfi>, FfiError>
+
+#[uniffi::constructor]
+IdentityFfi::open_persisted(
+    database_path: String,
+    master_key_hex: String,
+    node: String,
+) -> Result<Arc<IdentityFfi>, FfiError>
 
 IdentityFfi::account() -> AccountView
 IdentityFfi::create_invite(ttl_ms: u64) -> Result<InviteView, FfiError>
@@ -382,6 +391,44 @@ IdentityFfi::shutdown()
    `requested`（`can_send == false`），与 [界面契约](../design/CONTACT_INVITE_DESKTOP.md) 一致：
    输入区只在 `accepted` 时启用。
 
+### 持久身份（open_persisted）与联系人落库
+
+设计（IDENTITY-001/002/006 的持久化部分，复用 core 的既有服务）：
+
+1. `open_persisted(database_path, master_key_hex, node)` 内部调用
+   `ConversationCore::open`（单写者；数据目录必须已存在）。
+2. `open_persisted_identity()` 有记录 → 用从**受保护种子**重建的 `LocalAccount` /
+   `DeviceKeys` / `device_id`（不重新生成账户）。
+3. 没有记录 → `rand` 生成 32 字节账户种子与设备种子，经
+   `save_identity_account` 落库（种子进入受主密钥保护的存储）；种子字节用完即清零。
+4. 回读时以**库为准**：`open_persisted_identity()` + `load_identity_account()` 的投影
+   必须与种子派生的 ID/设备/指纹/显示名完全一致，否则 `STATE_CORRUPTED`
+   （绝不降级成「新身份」、绝不重建空库）。
+5. `list_contacts()` 载入联系人表，逐行恢复 identity 的冻结状态机
+   （`requested` / `accepted` / `declined` / `blocked` / `identity_changed`）。
+6. `accept_invite` / `confirm_identity_change` 先 `upsert_contact` 落库、成功后才提交
+   内存副本（以持久化为准，写失败不会留下「内存成功、库里没有」的状态）。
+7. `shutdown` 释放密钥并 `core.close()`（幂等），单写者锁随之释放——同一目录可以立刻
+   被下一个句柄打开（这也正是「core 真的关闭了」的运行时证据）。
+
+昵称与显示名的边界：
+
+- `open_persisted` 没有昵称入参，首次落库的账户显示名是**账户 ID 缩写**
+  `acct:1:<前 8 位 hex>`（14 字节，符合显示名规则）。这是「还没有昵称」的诚实占位，
+  不是伪造的昵称；改名接口（core 的 `save_identity_account` 支持同账户改显示名）本切片未暴露。
+- 接受口令时若本地备注为空（口令不携带对方昵称），落库显示名同样使用**对端**账户 ID
+  缩写；重新打开时该值被识别为「未知」并还原成空串，因此 `ContactView.display_name == ""`
+  的契约在重开前后保持一致。
+
+持久路径专属错误码（其余同下表）：
+
+| 场景 | code |
+|---|---|
+| 错误主密钥（AEAD 认证失败） | `STATE_CORRUPTED` |
+| 畸形主密钥、数据目录不存在 | `INVALID_INPUT` |
+| 同一目录已有句柄（单写者） | `STORAGE_LOCKED` |
+| 库中身份/联系人记录与种子或状态机不自洽 | `STATE_CORRUPTED` |
+
 错误（复用 `FfiError::Store { code, reason }`；`code` 全部来自 identity 的 PROTOCOL-014 映射表，
 不新增码，见 [identity.md 的错误码映射](identity.md)）：
 
@@ -415,7 +462,7 @@ IdentityFfi::shutdown()
 
 ~~~powershell
 . .\tools\activate.ps1
-cargo test --offline -p chat-ffi            # 12 passed（10 个 IdentityFfi + 2 个既有 LocalStoreFfi）
+cargo test --offline -p chat-ffi            # 17 passed（15 个 IdentityFfi + 2 个既有 LocalStoreFfi）
 cargo build --locked --offline -p chat-ffi  # 成功
 cargo clippy --offline -p chat-ffi --all-targets  # chat-ffi 0 warnings
 ~~~
@@ -450,20 +497,46 @@ cargo clippy --offline -p chat-ffi --all-targets  # chat-ffi 0 warnings
   `create_invite`/`preview_invite`/`accept_invite`/`confirm_identity_change` 全部 `CORE_CLOSED`；
   `account()` 仍返回关闭前的公开快照。
 
+持久身份证据（`identity_ffi::tests::*`，真 SQLite 库 + 真主密钥）：
+
+- `persisted_identity_survives_reopen_with_the_same_account`：首次 `open_persisted` 生成并落库账户，
+  显示名是账户 ID 缩写；同一目录 + 同一主密钥重开后 `AccountView`（`account_id`/`device_id`/
+  `fingerprint`/`display_name`）完全一致；再用 `ConversationCore` 直接读回投影与受保护种子，
+  证明身份真的在库里而不是内存假象。
+- `persisted_contacts_survive_reopen_and_keep_their_state`：接受口令后 `shutdown` 重开，联系人仍在
+  （`state == "requested"`、`can_send == false`、指纹与本地备注不变）；同一口令重复接受仍只有一条；
+  空本地备注落库为对端账户 ID 缩写，重开后还原成 `""`。
+- `wrong_master_key_is_rejected_with_a_stable_code`：错误主密钥 → `STATE_CORRUPTED`，且不重建空库
+  （正确密钥仍读回同一账户）。
+- `persisted_shutdown_closes_the_core_and_rejects_key_work`：`shutdown` 后同一目录立刻可以再开
+  （单写者锁已释放，证明 core 真的关闭）；旧句柄所有需要密钥的调用返回 `CORE_CLOSED`。
+- `restored_identity_change_requires_explicit_reconfirmation`：库里 `identity_changed` 的联系人
+  恢复后 `can_send == false`（阻断发送）；`confirm_identity_change` 重新固定观测指纹 →
+  `accepted` 且 `can_send == true`，重开后仍是 `accepted`。
+
 已知限制：
 
-- **不持久化**：账户、设备密钥、联系人与口令消费状态都只在本次进程内（storage/PLATFORM-001 集成后补）。
-  同一个进程里重启不了账户，也没有「我的口令」列表、撤销或一次性消费状态（identity 层同样未落盘）。
+- **进程内身份不持久化**：`create` 构造的对象只活在本次进程里（账户/设备密钥不落库）。
+  需要重启后仍在的身份请用 `open_persisted`。
+- **持久身份仍缺三块**：① 没有改名接口（首次落库的显示名是账户 ID 缩写，UI 需要昵称时得等
+  core 的 `save_identity_account` 改名路径暴露）；② 没有「我的口令」列表、撤销与一次性消费
+  （`consume_invite` 未接到 FFI）；③ 口令 `preview_invite` 不碰数据库，可在任意对象上调用。
+- **持久身份的主密钥来自调用方**：`open_persisted` 只接受 64 位十六进制主密钥字符串，
+  系统级密钥保护（PLATFORM-001）与密钥派生仍由上层负责；种子本身在库里受主密钥保护。
+- **联系人状态恢复的边界**：`requested`/`accepted`/`declined`/`blocked` 由 identity 的
+  冻结构造器/迁移重建；`identity_changed` 无法用 `Contact` 直接构造，恢复时以 `requested`
+  承载并保留状态用于展示与显式重新确认（两种情况都不能发送，因此没有放宽发送边界）。
+  库中出现未知状态或与种子不自洽的记录一律 `STATE_CORRUPTED`，不静默归一。
 - **节点不接受昵称式字符串**：`node` 必须是 `node:1:<64 位小写 hex>`；两侧必须使用同一字符串，
   否则 `accept_invite` 返回 `INVALID_TARGET`。跨节点接受（设计稿把 node 当「提示」）留给后续
   多节点路由任务。
 - **没有入站身份观测入口**：本切片只能通过口令建立 `requested` 联系人，没有任何入口把联系人推到
-  `accepted` 或 `identity_changed`（那需要 core 的握手/凭据事件）。因此 `confirm_identity_change`
-  当前只在「非法调用」路径上有测试；状态机本身（identity crate）已覆盖完整迁移。
+  `accepted`（除上面「从库中恢复的 identity_changed + 显式确认」外）；`accepted`/`identity_changed`
+  的正式来源是 core 的握手/凭据事件。
 - 没有事件订阅（BRIDGE-003/004/006）、没有 suspend 包装（BRIDGE-007）；`Mutex` 串行化所有调用，
   不要在 UI 线程做长循环。
-- **Cargo.lock 变化**：`chat-ffi` 的依赖列表新增 `chat-identity`（path 依赖，指向已在 lock 中的
-  工作区 crate），没有新增或改版本的外部包；`cargo build --locked` 通过。
+- **Cargo.lock 变化**：`chat-ffi` 的依赖列表新增 `chat-identity` 与 `rand`（均为工作区 path /
+  既有版本 `rand 0.10.3`，无新增或改版本的外部包）；`cargo build --locked` 通过。
 - Kotlin/Android 真机尚未实测（本轮只验证 Rust 侧编译与单元测试）。
 
 

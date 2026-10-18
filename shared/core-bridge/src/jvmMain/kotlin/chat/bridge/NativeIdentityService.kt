@@ -36,6 +36,19 @@ class NativeIdentityService : IdentityService {
         }
     }
 
+    override suspend fun openPersisted(
+        databasePath: String,
+        masterKeyHex: String,
+        node: String,
+    ): IdentityAccount = mutex.withLock {
+        check(native == null) { "身份服务已经创建" }
+        withContext(Dispatchers.IO) {
+            val opened = guard { IdentityFfi.openPersisted(databasePath, masterKeyHex, node) }
+            native = opened
+            opened.account().toAccount()
+        }
+    }
+
     override suspend fun account(): IdentityAccount = withIdentity { it.account().toAccount() }
 
     override suspend fun createInvite(ttlMillis: Long): IdentityInvite = withIdentity { identity ->

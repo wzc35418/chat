@@ -36,6 +36,7 @@
 //!   会话级 OpenMLS 设备；真实 provider 持久化接入后应改为同事务写入。
 //! - 权限校验（DOMAIN-001）、附件依赖、同步补齐（SYNC-008）不在本切片。
 
+use chat_domain::{OperationState, RetryDecision, classify_retry};
 use chat_protocol::{ConversationId, OperationId, SubmissionId};
 use chat_storage::formal::{
     DraftRecord, JobOutcome, JobResult, LeasedJob, MessageContent, MessageOrigin, OUTBOX_LEASE_MS,
@@ -251,6 +252,50 @@ pub enum DispatchOutcome {
         /// 草稿 ID。
         draft_id: String,
     },
+}
+
+/// `cancel_draft` 的结果（CORE-009 三态）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// 取消意图已持久化：草稿字节保留，后续 `dispatch` 不会再提交。
+    CancelRequested {
+        /// 草稿 ID。
+        draft_id: String,
+        /// 关联的最新 SubmissionId（尚无尝试时为 `None`）。
+        submission_id: Option<String>,
+    },
+    /// 已经正式接受：不能撤回，消息也不会被删除。
+    CancelTooLate {
+        /// 草稿 ID。
+        draft_id: String,
+        /// 已接受的 SubmissionId。
+        submission_id: String,
+    },
+    /// 结果未知：只记录取消意图，必须继续按 SubmissionId 对账（绝不乐观删除）。
+    CancelUnknown {
+        /// 草稿 ID。
+        draft_id: String,
+        /// 结果未知的 SubmissionId。
+        submission_id: String,
+    },
+}
+
+/// `reconcile` 的报告：只描述“本次是否修复/是否需要对账”，不做乐观推断。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// 涉及的最新 SubmissionId（尚无尝试时为 `None`）。
+    pub submission_id: Option<String>,
+    /// 本次调用是否把草稿补成 `accepted`（修复“attempt 已接受但草稿仍 queued”的窗口）。
+    pub draft_repaired: bool,
+    /// 结果未知：只能按 SubmissionId 对账，本次没有任何写操作。
+    pub awaiting_reconciliation: bool,
+}
+
+impl ReconcileReport {
+    /// 是否已经一致（无需修复、也不需要额外对账）。
+    pub fn is_consistent(&self) -> bool {
+        !self.draft_repaired && !self.awaiting_reconciliation
+    }
 }
 
 /// 存储侧 attempt 行投影（按草稿枚举，用于推导重建序号）。
@@ -566,6 +611,229 @@ impl<S: NodeSubmitter, C: CryptoEngine, K: Clock> SendOrchestrator<S, C, K> {
             SubmissionPlan::Rebuild { .. } => Err(invalid_state(
                 "rejected attempt must be rebuilt by prepare before it can be submitted",
             )),
+        }
+    }
+
+    /// CORE-008：用户显式重试一条失败/过期的草稿。
+    ///
+    /// 语义（不新增状态机，仍由 SYNC-003/004 决策）：
+    ///
+    /// - 已正式接受 → `AlreadyAccepted`（不再重试，也绝不复用同一 SubmissionId 之外的路径）；
+    /// - 结果未知 → `AwaitingReconciliation`：**只允许对账**，本调用不加密、不提交、不改状态；
+    /// - 已取消/终止 → 显式 `INVALID_STATE_TRANSITION`（RETRY_NOT_ALLOWED 的冻结码投影）；
+    /// - 不可重试的失败（权限/撤销/凭据/损坏）→ 显式错误：会话不再可发按 DOMAIN-010
+    ///   `classify_retry` 判为 `WaitForUser` 并返回 `PERMISSION_DENIED`；
+    ///   存储校验失败（损坏/篡改）原样返回 `STATE_CORRUPTED`；
+    /// - 其余（新草稿、可重试失败、租约过期、被拒绝）→ 重新走 `prepare` 调度：
+    ///   `Resubmit` 复用同一 SubmissionId 与同一密文（不重新加密）、`Rebuild` 用新
+    ///   SubmissionId 重建（序号受 `MAX_ATTEMPT_INDEX` 限制）、`Prepare` 首次加密。
+    pub fn retry_draft(&mut self, draft_id: &str) -> SendResult<PrepareOutcome> {
+        let now = self.now_ms()?;
+        let PlanState { draft, plan, .. } = self.plan_now(draft_id, now)?;
+        match plan {
+            SubmissionPlan::Release { submission_id } => Ok(PrepareOutcome::AlreadyAccepted {
+                submission_id: submission_id.encode(),
+            }),
+            SubmissionPlan::QueryExisting { submission_id } => {
+                Ok(PrepareOutcome::AwaitingReconciliation {
+                    submission_id: submission_id.encode(),
+                })
+            }
+            SubmissionPlan::Abandoned { .. } => Err(invalid_state(
+                "draft is cancelled and cannot be retried",
+            )),
+            _ => {
+                // 权限类不可重试：会话已离开/解散/暂停时重试必然失败，显式拒绝。
+                self.ensure_conversation_sendable(&draft)?;
+                // 复用既有 prepare 路径（同草稿幂等、重建有界），不复制加密逻辑。
+                self.prepare(draft_id)
+            }
+        }
+    }
+
+    /// CORE-009：取消一条尚未正式接受的草稿（三态，绝不乐观删除）。
+    ///
+    /// - 已接受 → `CancelTooLate`：不撤回、不删除消息，只报告事实；
+    /// - 结果未知 → `CancelUnknown`：只把用户意图落到草稿状态，**不写**
+    ///   `cancel_requested`（否则对账窗口结束后该尝试永远无法被重新领取对账）；
+    /// - 其余（排队/已加密待发/租约内/已拒绝）→ `CancelRequested`：草稿字节保留、
+    ///   `drafts.state = 'cancelled'`、准备与发送任务标 `cancel_requested = 1`，
+    ///   后续 `dispatch` 一律走 `Abandoned`（零提交）。
+    pub fn cancel_draft(&mut self, draft_id: &str) -> SendResult<CancelOutcome> {
+        let now = self.now_ms()?;
+        let PlanState {
+            draft,
+            attempts,
+            plan,
+        } = self.plan_now(draft_id, now)?;
+        // 只汇报“已经耐久存在”的 attempt：Prepare 计划里的派生 ID 还不是事实。
+        let attempt_submission = attempts.last().map(|row| row.submission_id.clone());
+        match plan {
+            SubmissionPlan::Release { submission_id } => Ok(CancelOutcome::CancelTooLate {
+                draft_id: draft.draft_id,
+                submission_id: submission_id.encode(),
+            }),
+            SubmissionPlan::QueryExisting { submission_id } => {
+                self.mark_draft_cancelled(&draft)?;
+                Ok(CancelOutcome::CancelUnknown {
+                    draft_id: draft.draft_id,
+                    submission_id: submission_id.encode(),
+                })
+            }
+            _ => {
+                self.mark_draft_cancelled(&draft)?;
+                self.suppress_outbox_jobs(&draft, attempt_submission.as_deref())?;
+                Ok(CancelOutcome::CancelRequested {
+                    draft_id: draft.draft_id,
+                    submission_id: attempt_submission,
+                })
+            }
+        }
+    }
+
+    /// outbox 结果对账：修复“attempt 已接受但草稿仍 queued”的两笔事务窗口。
+    ///
+    /// 幂等：修复后再次调用返回 `draft_repaired = false`；结果未知只报告
+    /// `awaiting_reconciliation` 且**不做任何写操作**；其余状态原样报告一致。
+    pub fn reconcile(&mut self, draft_id: &str) -> SendResult<ReconcileReport> {
+        let now = self.now_ms()?;
+        let PlanState { draft, plan, .. } = self.plan_now(draft_id, now)?;
+        match plan {
+            SubmissionPlan::Release { submission_id } => {
+                // 接受是权威事实：即使草稿被取消/失败过，也以接受为准补齐。
+                let draft_repaired = self.mark_draft_accepted(&draft)?;
+                Ok(ReconcileReport {
+                    submission_id: Some(submission_id.encode()),
+                    draft_repaired,
+                    awaiting_reconciliation: false,
+                })
+            }
+            SubmissionPlan::QueryExisting { submission_id } => Ok(ReconcileReport {
+                submission_id: Some(submission_id.encode()),
+                draft_repaired: false,
+                awaiting_reconciliation: true,
+            }),
+            other => Ok(ReconcileReport {
+                submission_id: other.submission_id().map(|id| id.encode()),
+                draft_repaired: false,
+                awaiting_reconciliation: false,
+            }),
+        }
+    }
+
+    /// 会话是否仍允许发送（DOMAIN-001 的最小持久投影）。
+    ///
+    /// left/dissolved/paused 一律按 DOMAIN-010 `classify_retry` 判为 `WaitForUser`，
+    /// 返回冻结码 `PERMISSION_DENIED`（不可自动重试）。
+    fn ensure_conversation_sendable(&self, draft: &DraftRecord) -> SendResult<()> {
+        let state = self
+            .load_conversation_state(&draft.conversation_id)?
+            .ok_or_else(|| invalid_target("conversation does not exist"))?;
+        let blocked = match state.as_str() {
+            "left" | "dissolved" | "paused" => Some(ErrorCode::PermissionDenied),
+            _ => None,
+        };
+        if let Some(code) = blocked {
+            let decision = classify_retry(code, OperationState::Prepared);
+            if decision != RetryDecision::ResendSameBytes && !decision.requires_sync() {
+                return Err(SyncError::new(
+                    code,
+                    "conversation no longer allows sending",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 读取会话状态（只读投影；无该会话返回 `None`）。
+    fn load_conversation_state(&self, conversation_id: &str) -> SendResult<Option<String>> {
+        let connection = self.store.connection();
+        let mut statement = connection
+            .prepare("SELECT state FROM conversations WHERE conversation_id = ?1")
+            .map_err(sql_failure)?;
+        let rows = statement
+            .query_map([conversation_id], |row| {
+                let value: String = row.get(0)?;
+                Ok(value)
+            })
+            .map_err(sql_failure)?;
+        let mut found = None;
+        for row in rows {
+            found = Some(row.map_err(sql_failure)?);
+        }
+        Ok(found)
+    }
+
+    /// 把草稿置 `cancelled`（保留密文与 attempt 行，幂等）。
+    fn mark_draft_cancelled(&mut self, draft: &DraftRecord) -> SendResult<()> {
+        let transaction = self
+            .store
+            .begin_transaction(WriteScope::intent(&draft.conversation_id))
+            .map_err(storage_failure)?;
+        let updated = transaction
+            .connection()
+            .execute(
+                "UPDATE drafts SET state = 'cancelled'
+                  WHERE draft_id = ?1 AND state IN ('queued','unknown','failed')",
+                [draft.draft_id.as_str()],
+            )
+            .map_err(sql_failure);
+        match updated {
+            Ok(_) => {
+                commit_transaction(transaction).map_err(storage_failure)?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = rollback_transaction(transaction);
+                Err(error)
+            }
+        }
+    }
+
+    /// 标记准备/发送任务不可再被领取（`cancel_requested = 1`，storage 的领取会跳过）。
+    ///
+    /// 只标记仍在 `pending/leased` 的任务；已完成/已失败的任务保持原样。
+    fn suppress_outbox_jobs(
+        &mut self,
+        draft: &DraftRecord,
+        submission_id: Option<&str>,
+    ) -> SendResult<()> {
+        let prepare_key = format!("prepare:{}", draft.draft_id);
+        let send_key = submission_id.map(|id| format!("send:{id}"));
+        let transaction = self
+            .store
+            .begin_transaction(WriteScope::outbox())
+            .map_err(storage_failure)?;
+        let outcome = (|| -> SendResult<()> {
+            transaction
+                .connection()
+                .execute(
+                    "UPDATE outbox_jobs SET cancel_requested = 1
+                      WHERE dedup_key = ?1 AND state IN ('pending','leased')",
+                    [prepare_key.as_str()],
+                )
+                .map_err(sql_failure)?;
+            if let Some(send_key) = send_key.as_deref() {
+                transaction
+                    .connection()
+                    .execute(
+                        "UPDATE outbox_jobs SET cancel_requested = 1
+                          WHERE dedup_key = ?1 AND state IN ('pending','leased')",
+                        [send_key],
+                    )
+                    .map_err(sql_failure)?;
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => {
+                commit_transaction(transaction).map_err(storage_failure)?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = rollback_transaction(transaction);
+                Err(error)
+            }
         }
     }
 
@@ -900,11 +1168,12 @@ impl<S: NodeSubmitter, C: CryptoEngine, K: Clock> SendOrchestrator<S, C, K> {
         }
     }
 
-    /// 正式接受后把草稿置 `accepted`（幂等；已 accepted 直接成功）。
+    /// 正式接受后把草稿置 `accepted`（幂等，并报告本次是否真的修复了草稿）。
     ///
-    /// storage 没有「置草稿 accepted」的正式入口，这里在 intent 事务内更新；
-    /// 先落 outbox 结果再置草稿，第二笔失败时下一次 `dispatch` 的 `Release` 路径会补齐。
-    fn mark_draft_accepted(&mut self, draft: &DraftRecord) -> SendResult<()> {
+    /// **接受是权威事实**：即使草稿曾被取消或标记失败，也以接受为准补齐（两笔事务窗口
+    /// 与取消竞态都靠这里收敛）。storage 没有「置草稿 accepted」的正式入口，这里在
+    /// intent 事务内更新；返回 `true` 表示本次补写，`false` 表示本来就一致。
+    fn mark_draft_accepted(&mut self, draft: &DraftRecord) -> SendResult<bool> {
         // 先读当前状态（事务持有期间不再借用存储句柄）。
         let current = self
             .store
@@ -912,12 +1181,7 @@ impl<S: NodeSubmitter, C: CryptoEngine, K: Clock> SendOrchestrator<S, C, K> {
             .map_err(storage_failure)?
             .ok_or_else(|| corrupted("draft disappeared while marking it accepted"))?;
         if current.state == "accepted" {
-            return Ok(());
-        }
-        if current.state != "queued" && current.state != "unknown" {
-            return Err(invalid_state(
-                "draft is not in a state that can become accepted",
-            ));
+            return Ok(false);
         }
         let transaction = self
             .store
@@ -927,18 +1191,14 @@ impl<S: NodeSubmitter, C: CryptoEngine, K: Clock> SendOrchestrator<S, C, K> {
             .connection()
             .execute(
                 "UPDATE drafts SET state = 'accepted'
-                  WHERE draft_id = ?1 AND state IN ('queued','unknown')",
+                  WHERE draft_id = ?1 AND state != 'accepted'",
                 [draft.draft_id.as_str()],
             )
             .map_err(sql_failure);
         match updated {
-            Ok(rows) if rows == 1 => {
+            Ok(rows) => {
                 commit_transaction(transaction).map_err(storage_failure)?;
-                Ok(())
-            }
-            Ok(_) => {
-                let _ = rollback_transaction(transaction);
-                Err(invalid_state("draft state changed while marking it accepted"))
+                Ok(rows == 1)
             }
             Err(error) => {
                 let _ = rollback_transaction(transaction);

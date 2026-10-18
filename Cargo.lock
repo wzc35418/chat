@@ -627,6 +627,7 @@ dependencies = [
  "chat-core",
  "chat-identity",
  "chat-protocol",
+ "rand 0.10.3",
  "thiserror 2.0.21",
  "uniffi",
 ]

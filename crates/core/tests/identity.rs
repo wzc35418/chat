@@ -388,7 +388,7 @@ fn persisted_identity_seeds_rebuild_the_same_account_after_reopen() {
             .expect("save identity")
     };
 
-    let mut core = fixture.open();
+    let core = fixture.open();
     let identity = core
         .open_persisted_identity()
         .expect("open persisted identity")
@@ -423,7 +423,7 @@ fn persisted_identity_seeds_rebuild_the_same_account_after_reopen() {
 
     // 打开但不写入时也应恢复同一身份（读取路径稳定）。
     drop(core);
-    let mut reopened = fixture.open();
+    let reopened = fixture.open();
     let again = reopened
         .open_persisted_identity()
         .expect("reopen identity")

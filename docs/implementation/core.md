@@ -1,6 +1,6 @@
 # 客户端内核与 Kotlin 业务服务映射
 
-阶段：P1 → P2。状态：函数级设计；竖直切片（`ConversationCore` 的 open / create_draft / draft_status / apply_verified_entry / list_conversations / list_messages / close）与 P1 身份持久化增量（save_identity_account / load_identity_account / upsert_contact / list_contacts / consume_invite）已在 Windows x64 实测通过；CORE-007 的发送编排（[crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)）已把「意图 → 一次真实 MLS 加密 → 提交 → Accepted/Unknown/Rejected 落库」接通（节点端口可注入，未连真实网络），其余 CORE 函数未开始。目标源码：[crates/core/src/service.rs](../../crates/core/src/service.rs) 与 [crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)。
+阶段：P1 → P2。状态：函数级设计；竖直切片（`ConversationCore` 的 open / create_draft / draft_status / apply_verified_entry / list_conversations / list_messages / close）与 P1 身份持久化增量（save_identity_account / load_identity_account / upsert_contact / list_contacts / consume_invite）已在 Windows x64 实测通过；CORE-007 的发送编排（[crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)）已把「意图 → 一次真实 MLS 加密 → 提交 → Accepted/Unknown/Rejected 落库」接通（节点端口可注入，真实节点链路见 `node_submitter` 记录），CORE-008 重试 / CORE-009 取消 / outbox 结果对账 `reconcile` 也已实现（同一文件，只加方法）；其余 CORE 函数未开始。目标源码：[crates/core/src/service.rs](../../crates/core/src/service.rs) 与 [crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)。
 
 本层编排，不把各子模块的事务拆成独立提交。函数名与 Kotlin 的 camelCase 一一对应；底层 TaskId/AttemptId 不必全暴露 UI。start/close 是幂等生命周期，所有查询都来自 Rust 持久真相。身份与群、附件服务分别委托对应章节。
 
@@ -362,10 +362,10 @@ retry_draft(draft: DraftId) -> Result<SendTicket>
 
 **完成验收**：
 
-- [ ] 超时但已接受显示 ACCEPTED。
-- [ ] 禁言后重试拒绝。
+- [x] 超时但已接受显示 ACCEPTED：`send_orchestrator::retry_draft_reports_accepted_and_unknown_without_resending`（unknown 时只报告 `AwaitingReconciliation`；对账获得接受后 `release` 路径返回 `AlreadyAccepted`，重复调用仍为 `AlreadyAccepted`，零重发零重加密）。
+- [x] 禁言后重试拒绝：`send_orchestrator::retry_draft_rejects_cancelled_permission_and_corrupted_drafts`（会话 `left` 时按 DOMAIN-010 `classify_retry` 判为 `WaitForUser` → `PERMISSION_DENIED`；已取消的草稿 `INVALID_STATE_TRANSITION`；被篡改的草稿 `STATE_CORRUPTED`；有效租约属于别的 worker 时 `WaitingForLease` 且零加密零提交）。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（切片，Windows x64 实测）。`SendOrchestrator::retry_draft(draft_id) -> SendResult<PrepareOutcome>`（[send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)）：复用 `chat_sync::send::plan_submission` 决策——已接受 → `AlreadyAccepted`；结果未知 → `AwaitingReconciliation`（不加密、不提交、不改状态）；已取消/终止 → 显式 `INVALID_STATE_TRANSITION`；租约有效 → `WaitingForLease`；其余（新草稿、可重试失败、租约过期、被拒绝）→ 复用 `prepare` 路径：`Resubmit` 复用同 SubmissionId 同密文、`Rebuild` 用新 SubmissionId 重建（受 `MAX_ATTEMPT_INDEX = 64` 限制）、`Prepare` 首次加密。不可重试分类复用 DOMAIN-010 `classify_retry`（本轮用它判权限类为 `WaitForUser`）。证据：`send_orchestrator::retry_draft_reports_accepted_and_unknown_without_resending`、`send_orchestrator::retry_draft_rebuilds_a_rejected_attempt_and_stays_idempotent`、`send_orchestrator::retry_draft_rejects_cancelled_permission_and_corrupted_drafts`。
 
 <a id="core-009"></a>
 
@@ -396,10 +396,10 @@ cancel_queued(draft: DraftId) -> Result<CancelResult>
 
 **完成验收**：
 
-- [ ] 取消与节点提交竞争最终显示真实接受。
-- [ ] 不误删已接受记录。
+- [x] 取消与节点提交竞争最终显示真实接受：`send_orchestrator::cancel_draft_returns_three_states_and_blocks_dispatch`（结果未知时 `CancelUnknown` 不写 `cancel_requested`，对账得到接受后草稿以接受为准落 `accepted`）、`send_orchestrator::reconcile_repairs_the_two_transaction_window_and_stays_idempotent`（取消与接受竞态下 `reconcile` 把草稿收敛回 `accepted`）。
+- [x] 不误删已接受记录：`send_orchestrator::cancel_draft_returns_three_states_and_blocks_dispatch`（已接受 → `CancelTooLate`，草稿 `accepted`、attempt `accepted` 均不变，`cancel_requested` 保持 0）。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（切片，Windows x64 实测）。`SendOrchestrator::cancel_draft(draft_id) -> SendResult<CancelOutcome>`，三态 `CancelRequested { draft_id, submission_id }` / `CancelTooLate { draft_id, submission_id }` / `CancelUnknown { draft_id, submission_id }`：已接受 → `CancelTooLate`（不撤回、不删除消息）；结果未知 → `CancelUnknown`（只把 `drafts.state` 置 `cancelled` 表达用户意图，**不写** `cancel_requested`，否则对账窗口结束后该尝试永远无法再被领取对账）；其余 → `CancelRequested`（草稿字节与 attempt 行保留、`drafts.state = 'cancelled'`、prepare/send 任务标 `cancel_requested = 1`，之后 `dispatch` 一律 `DispatchOutcome::Abandoned` 且零提交）。附件释放（ATTACHMENT）未接入。证据：`send_orchestrator::cancel_draft_returns_three_states_and_blocks_dispatch`。
 
 <a id="core-010"></a>
 
@@ -707,3 +707,70 @@ cargo test --offline -p chat-core   # 14 lib + 6 identity + 5 node_submitter + 2
 7. **无速率限制/退避**：API-005 未实现，限流映射为 `Unknown`，重试节奏完全由上层 worker 决定。
 8. **线程模型**：每个实例一条桥线程 + 一个 current-thread 运行时；同进程多群多实例时需要上层复用（线程池化）而不是无界创建。
 9. **节点信任**：只有 `NodeEndpoint::with_node_public_key` 固定公钥时才会验证挑战与回执签名；本测试按固定公钥运行，未固定的调用方只能依赖 node_id 绑定。
+
+## 发送控制实现记录（CORE-008 / CORE-009 + outbox 对账，2026-10-18，Windows x64）
+
+实现位置：[crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)（在既有 `begin_send`/`prepare`/`dispatch` 上**只加方法**，不改既有公开签名），测试：[crates/core/tests/send_orchestrator.rs](../../crates/core/tests/send_orchestrator.rs)（新增 5 个用例，文件内共 14 个）。决策仍然只来自 `chat_sync::send::plan_submission`（SYNC-003/004）与 `chat_domain::classify_retry`（DOMAIN-010），本层不新增状态机。
+
+新增公开面：
+
+~~~text
+pub enum CancelOutcome {
+    CancelRequested { draft_id: String, submission_id: Option<String> },
+    CancelTooLate   { draft_id: String, submission_id: String },
+    CancelUnknown   { draft_id: String, submission_id: String },
+}
+pub struct ReconcileReport {
+    pub submission_id: Option<String>,
+    pub draft_repaired: bool,
+    pub awaiting_reconciliation: bool,
+}
+impl ReconcileReport { pub fn is_consistent(&self) -> bool; }
+
+impl SendOrchestrator {
+    pub fn retry_draft(&mut self, draft_id: &str)  -> SendResult<PrepareOutcome>;   // CORE-008
+    pub fn cancel_draft(&mut self, draft_id: &str) -> SendResult<CancelOutcome>;    // CORE-009
+    pub fn reconcile(&mut self, draft_id: &str)    -> SendResult<ReconcileReport>;  // outbox 结果对账
+}
+~~~
+
+CORE-008 `retry_draft` 语义（复用 `prepare` 的加密/持久化路径）：
+
+- 已正式接受 → `PrepareOutcome::AlreadyAccepted`（幂等；不再提交、不再加密）；
+- 结果未知 → `AwaitingReconciliation`（**只报告必须对账**：不加密、不提交、不改状态；真正的查询由 `dispatch`/`reconcile` 执行）；
+- 已取消/终止 → 显式 `INVALID_STATE_TRANSITION`（`RETRY_NOT_ALLOWED` 的冻结码投影）；
+- 不可重试的权限类失败：会话 `left/dissolved/paused` 时用 DOMAIN-010 `classify_retry(PERMISSION_DENIED, Prepared)` 判为 `WaitForUser` → 返回 `PERMISSION_DENIED`；被篡改的草稿正文由存储解密直接 `STATE_CORRUPTED`；
+- 其余（新草稿 / 可重试失败 / 租约过期 / 被拒绝）→ 重新走 `prepare`：`Resubmit` 复用同 SubmissionId 同密文（不重新加密）、`Rebuild` 用 `attempt_index + 1` 得到新 SubmissionId 并真实再加密一次（受 `MAX_ATTEMPT_INDEX = 64` 上限）、`Prepare` 首次加密、租约有效则 `WaitingForLease`。
+
+CORE-009 `cancel_draft` 三态：
+
+- 已接受 → `CancelTooLate`：不撤回、不删除消息，草稿与 attempt 保持 `accepted`，`cancel_requested` 不置位；
+- 结果未知 → `CancelUnknown`：只把 `drafts.state` 置 `cancelled`（保留用户意图），**不写** `cancel_requested`——否则 6 小时对账窗口结束后该尝试永远无法再被领取对账，等于用取消把未知结果永久搁置；
+- 其余（排队 / 已加密待发 / 租约内 / 已拒绝）→ `CancelRequested`：草稿字节与 attempt 行全部保留、`drafts.state = 'cancelled'`、prepare 与 send 任务标 `cancel_requested = 1`（STORAGE-014 的领取会跳过），之后 `dispatch` 走 `plan_submission` 的 `Abandoned` 分支，返回 `DispatchOutcome::Abandoned` 且**零提交**。
+
+`reconcile` 语义：修复“outbox 结果已落（attempt accepted）但草稿仍 queued”的两笔事务窗口——接受是权威事实，`mark_draft_accepted` 改成幂等且可覆盖 `cancelled/failed` 的草稿状态并返回“本次是否真的补写”；结果未知只报告 `awaiting_reconciliation` 且不做任何写操作；其余状态报告一致。该路径同时是“取消与接受竞态”的收敛点。
+
+复现命令（全程离线，本轮实测）：
+
+~~~powershell
+. .	oolsactivate.ps1
+cargo test --offline -p chat-core   # 14 lib + 6 identity + 5 node_submitter + 2 p0 + 14 send_orchestrator + 5 service = 46 passed（既有 41 个继续通过）
+~~~
+
+证据（测试名 → 覆盖的契约点）：
+
+- `send_orchestrator::retry_draft_reports_accepted_and_unknown_without_resending`：已接受两次重试都是 `AlreadyAccepted` 且提交/加密次数恒为 1；未知结果两次重试都是 `AwaitingReconciliation`，提交 1 次、查询 0 次、加密 1 次、attempt 保持 `unknown`。
+- `send_orchestrator::retry_draft_rebuilds_a_rejected_attempt_and_stays_idempotent`：被拒绝后重试得到 `attempt_index = 1` 的新 SubmissionId 并再加密一次；再次重试复用同一 ID（`already_prepared = true`）不再加密；重建后的尝试可提交并被接受。
+- `send_orchestrator::retry_draft_rejects_cancelled_permission_and_corrupted_drafts`：已取消 `INVALID_STATE_TRANSITION`、会话 `left` `PERMISSION_DENIED`、篡改草稿 `STATE_CORRUPTED`、未知草稿 `INVALID_TARGET`、别家租约 `WaitingForLease` 且零加密零提交。
+- `send_orchestrator::cancel_draft_returns_three_states_and_blocks_dispatch`：四段场景——排队取消（`CancelRequested { submission_id: None }`、prepare 任务 `cancel_requested = 1`、prepare/dispatch 均 `Abandoned`、加密 0）；已加密待发（保留密文与 attempt、send 任务 `cancel_requested = 1`、dispatch 零提交）；已接受（`CancelTooLate`、状态不回退、`cancel_requested = 0`）；结果未知（`CancelUnknown`、不置 `cancel_requested`、随后对账为 `Accepted` 且草稿 accepted）。
+- `send_orchestrator::reconcile_repairs_the_two_transaction_window_and_stays_idempotent`：一致状态报告 `is_consistent()`；把草稿强制回 `queued` 后 `reconcile` 报 `draft_repaired = true` 并补成 accepted，再次对账不再写；取消后接受竞态同样收敛为 accepted；未知结果只报 `awaiting_reconciliation` 且不改 attempt。
+
+已知限制（本切片不覆盖）：
+
+1. **撤销/凭据类不可重试无法从持久状态判定**：草稿不记录作者设备，本切片也没有设备撤销投影，因此 `DEVICE_REVOKED`/`INVALID_CREDENTIAL` 只能由上游端口原码上抛（`dispatch` 不吞错、不落库）；本层的“不可重试”判定只覆盖会话可见性、草稿/attempt 状态与存储校验（损坏）。
+2. **重建不先同步**：`Rebuild` 直接用本地引擎当前 epoch 重新加密，未接 SYNC-008 `catch_up_group`；若群状态已过期，节点会再次拒绝（由上层继续重试，受 `MAX_ATTEMPT_INDEX = 64` 限制）。
+3. **取消不释放附件**：ATTACHMENT 模块未接线，本轮只保留草稿与 attempt 字节；已接受消息永不删除。
+4. **`retry_draft` 的未知分支不主动查询**：它只报告 `AwaitingReconciliation`，避免在“重试”语义里偷偷产生网络调用；对账仍由 `dispatch`/`reconcile` 完成（`node_submitter` 记录的限制 4 即此入口）。
+5. **`cancel_requested` 仍是原始 SQL 投影**：storage 没有“标记取消”的正式入口（与 STORAGE-014 的 `cancel_requested` 语义一致），本层在 outbox 事务内直接更新；storage 补 API 后应替换。
+6. **两笔事务窗口只能事后收敛**：`Accepted` 仍是“outbox 结果 + 草稿状态”两笔事务，崩溃窗口内的不一致必须由 `reconcile` 或下一次 `dispatch` 的 `Release` 分支修复，本轮无后台恢复任务。
+

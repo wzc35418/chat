@@ -3,6 +3,9 @@
 //! 全部使用真实依赖：真实加密库（临时目录 + 主密钥）、真实 OpenMLS 设备加密
 //! （对端能解密出原文）、真实 T1/T2 与 outbox 租约/结果落库；只有节点提交是可注入
 //! 的脚本端口，且每步都断言"调用次数"证明没有重发/重新加密。
+//!
+//! CORE-008/009 部分（`retry_draft` / `cancel_draft` / `reconcile`）在同一夹具上验证：
+//! 重试三态与幂等、取消三态与"取消后零提交"、未知结果只对账、两笔事务窗口对账修复。
 
 use std::fs;
 use std::path::PathBuf;
@@ -11,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chat_core::send_orchestrator::{
-    CryptoEngine, DispatchOutcome, EncryptedPayload, NodeSubmitter, PrepareOutcome, SendOrchestrator,
-    SendResult, SubmitAttempt, SubmitOutcome,
+    CancelOutcome, CryptoEngine, DispatchOutcome, EncryptedPayload, NodeSubmitter, PrepareOutcome,
+    ReconcileReport, SendOrchestrator, SendResult, SubmitAttempt, SubmitOutcome,
 };
 use chat_crypto::engine::MlsDevice;
 use chat_protocol::{ConversationId, ErrorCode, OperationId, SubmissionId};
@@ -290,6 +293,51 @@ impl Harness {
             .expect("attempt exists");
         attempt.immutable_ciphertext
     }
+
+    /// outbox 任务的 cancel_requested 标记（1 = 已请求取消）。
+    fn cancel_requested(&self, dedup_key: &str) -> Option<i64> {
+        scalar_int(
+            self.orchestrator.store(),
+            "SELECT cancel_requested FROM outbox_jobs WHERE dedup_key = ?1",
+            dedup_key,
+        )
+    }
+
+    /// 直接改草稿状态：用于模拟“第二笔事务失败”等真实窗口。
+    fn force_draft_state(&self, draft_id: &str, state: &str) {
+        self.orchestrator
+            .store()
+            .connection()
+            .execute(
+                "UPDATE drafts SET state = ?2 WHERE draft_id = ?1",
+                (draft_id, state),
+            )
+            .expect("force draft state");
+    }
+
+    /// 直接改会话状态：用于模拟会话已被离开/解散/暂停。
+    fn force_conversation_state(&self, conversation_id: &str, state: &str) {
+        self.orchestrator
+            .store()
+            .connection()
+            .execute(
+                "UPDATE conversations SET state = ?2 WHERE conversation_id = ?1",
+                (conversation_id, state),
+            )
+            .expect("force conversation state");
+    }
+
+    /// 篡改草稿密文：验证损坏显式失败而不是被当成可重试。
+    fn tamper_draft_content(&self, draft_id: &str) {
+        self.orchestrator
+            .store()
+            .connection()
+            .execute(
+                "UPDATE drafts SET protected_content = X'00' WHERE draft_id = ?1",
+                [draft_id],
+            )
+            .expect("tamper draft content");
+    }
 }
 
 fn scalar(store: &Store, sql: &str, param: &str) -> Option<String> {
@@ -322,6 +370,22 @@ fn count(store: &Store, sql: &str) -> i64 {
         total = row.expect("count row");
     }
     total
+}
+
+fn scalar_int(store: &Store, sql: &str, param: &str) -> Option<i64> {
+    let connection = store.connection();
+    let mut statement = connection.prepare(sql).expect("prepare int scalar");
+    let rows = statement
+        .query_map([param], |row| {
+            let value: i64 = row.get(0)?;
+            Ok(value)
+        })
+        .expect("run int scalar");
+    let mut found = None;
+    for row in rows {
+        found = Some(row.expect("int scalar row"));
+    }
+    found
 }
 
 fn accepted() -> SubmitOutcome {
@@ -788,4 +852,405 @@ fn orchestrator_rejects_malformed_worker_id() {
         .begin_send(&conversation(), &operation(9), BODY)
         .expect_err("broken clock");
     assert_eq!(error.code(), ErrorCode::InvalidTarget);
+}
+// ---------------------------------------------------------------- CORE-008 / CORE-009
+
+#[test]
+fn retry_draft_reports_accepted_and_unknown_without_resending() {
+    // 已接受：重试是无操作，绝不再提交/再加密。
+    let mut accepted_harness = Harness::new(vec![Scripted::Outcome(accepted())]);
+    let draft = accepted_harness.begin(20);
+    let PrepareOutcome::Prepared { submission_id, .. } =
+        accepted_harness.orchestrator.prepare(&draft).expect("prepare")
+    else {
+        panic!("expected prepare");
+    };
+    accepted_harness.orchestrator.dispatch(&draft).expect("dispatch");
+    for _ in 0..2 {
+        let retried = accepted_harness
+            .orchestrator
+            .retry_draft(&draft)
+            .expect("retry accepted");
+        assert_eq!(
+            retried,
+            PrepareOutcome::AlreadyAccepted {
+                submission_id: submission_id.clone()
+            }
+        );
+    }
+    assert_eq!(accepted_harness.probe.submit_count(), 1);
+    assert_eq!(accepted_harness.encryptions(), 1);
+    assert_eq!(accepted_harness.draft_state(&draft).as_deref(), Some("accepted"));
+
+    // 结果未知：重试只报告“必须对账”，不提交、不查询、不加密。
+    let mut unknown_harness = Harness::new(vec![
+        Scripted::Outcome(unknown()),
+        Scripted::Outcome(unknown()),
+    ]);
+    let draft = unknown_harness.begin(21);
+    let PrepareOutcome::Prepared { submission_id, .. } =
+        unknown_harness.orchestrator.prepare(&draft).expect("prepare")
+    else {
+        panic!("expected prepare");
+    };
+    unknown_harness.orchestrator.dispatch(&draft).expect("dispatch");
+    for _ in 0..2 {
+        let retried = unknown_harness
+            .orchestrator
+            .retry_draft(&draft)
+            .expect("retry unknown");
+        assert_eq!(
+            retried,
+            PrepareOutcome::AwaitingReconciliation {
+                submission_id: submission_id.clone()
+            }
+        );
+    }
+    assert_eq!(unknown_harness.probe.submit_count(), 1, "unknown is never resent");
+    assert_eq!(
+        unknown_harness.probe.query_count(),
+        0,
+        "retry only reports; reconciliation happens via dispatch/reconcile"
+    );
+    assert_eq!(unknown_harness.encryptions(), 1, "unknown is never re-encrypted");
+    assert_eq!(
+        unknown_harness.attempt_state(&submission_id).as_deref(),
+        Some("unknown")
+    );
+}
+
+#[test]
+fn retry_draft_rebuilds_a_rejected_attempt_and_stays_idempotent() {
+    let mut harness = Harness::new(vec![
+        Scripted::Outcome(rejected()),
+        Scripted::Outcome(accepted()),
+    ]);
+    let draft = harness.begin(22);
+    let PrepareOutcome::Prepared {
+        submission_id: rejected_submission,
+        ..
+    } = harness.orchestrator.prepare(&draft).expect("prepare")
+    else {
+        panic!("expected prepare");
+    };
+    harness.orchestrator.dispatch(&draft).expect("dispatch rejected");
+    assert_eq!(harness.encryptions(), 1);
+
+    // 用户显式重试：被拒绝的尝试用新 SubmissionId 重建（重新加密一次，有界）。
+    let retried = harness.orchestrator.retry_draft(&draft).expect("retry rejected");
+    let PrepareOutcome::Prepared {
+        submission_id: rebuilt_submission,
+        mls_epoch: rebuilt_epoch,
+        attempt_index,
+        already_prepared,
+    } = retried
+    else {
+        panic!("expected rebuilt attempt, got {retried:?}");
+    };
+    assert!(!already_prepared);
+    assert_eq!(attempt_index, 1);
+    assert_ne!(rebuilt_submission, rejected_submission);
+    assert_eq!(harness.encryptions(), 2);
+
+    // 幂等：再次重试复用同一新 SubmissionId，不再加密。
+    let again = harness.orchestrator.retry_draft(&draft).expect("retry again");
+    assert_eq!(
+        again,
+        PrepareOutcome::Prepared {
+            submission_id: rebuilt_submission.clone(),
+            mls_epoch: rebuilt_epoch,
+            attempt_index: 1,
+            already_prepared: true,
+        }
+    );
+    assert_eq!(harness.encryptions(), 2, "a replay must not re-encrypt");
+    assert_eq!(harness.attempt_count(), 2);
+
+    // 重建后的尝试仍然可以正式提交并被接受。
+    let accepted_outcome = harness.orchestrator.dispatch(&draft).expect("dispatch rebuilt");
+    assert_eq!(
+        accepted_outcome,
+        DispatchOutcome::Accepted {
+            submission_id: rebuilt_submission,
+            idempotent: false,
+        }
+    );
+    assert_eq!(harness.draft_state(&draft).as_deref(), Some("accepted"));
+}
+
+#[test]
+fn retry_draft_rejects_cancelled_permission_and_corrupted_drafts() {
+    // 已取消：重试必须是显式拒绝（不是静默重排）。
+    let mut harness = Harness::new(Vec::new());
+    let draft = harness.begin(23);
+    harness.orchestrator.prepare(&draft).expect("prepare");
+    harness.orchestrator.cancel_draft(&draft).expect("cancel");
+    let error = harness
+        .orchestrator
+        .retry_draft(&draft)
+        .expect_err("cancelled drafts cannot be retried");
+    assert_eq!(error.code(), ErrorCode::InvalidStateTransition);
+
+    // 会话已离开：DOMAIN-010 判为 WaitForUser → PERMISSION_DENIED。
+    let mut harness = Harness::new(Vec::new());
+    let draft = harness.begin(24);
+    harness.orchestrator.prepare(&draft).expect("prepare");
+    harness.force_conversation_state(&conversation(), "left");
+    let error = harness
+        .orchestrator
+        .retry_draft(&draft)
+        .expect_err("a left conversation cannot be retried");
+    assert_eq!(error.code(), ErrorCode::PermissionDenied);
+    assert_eq!(harness.encryptions(), 1, "no extra encryption on rejection");
+
+    // 密文被篡改：显式 STATE_CORRUPTED（绝不当作可重试）。
+    let mut harness = Harness::new(Vec::new());
+    let draft = harness.begin(25);
+    harness.orchestrator.prepare(&draft).expect("prepare");
+    harness.tamper_draft_content(&draft);
+    let error = harness
+        .orchestrator
+        .retry_draft(&draft)
+        .expect_err("tampered draft is corrupted");
+    assert_eq!(error.code(), ErrorCode::StateCorrupted);
+
+    // 未知草稿：显式 INVALID_TARGET。
+    let error = harness
+        .orchestrator
+        .retry_draft("draft-00000000000000000000000000000000")
+        .expect_err("unknown draft");
+    assert_eq!(error.code(), ErrorCode::InvalidTarget);
+
+    // 有效租约由别的 worker 持有：等待，不加密不提交。
+    let mut harness = Harness::new(vec![Scripted::Outcome(accepted())]);
+    let draft = harness.begin(26);
+    let PrepareOutcome::Prepared { submission_id, .. } =
+        harness.orchestrator.prepare(&draft).expect("prepare")
+    else {
+        panic!("expected prepare");
+    };
+    harness
+        .orchestrator
+        .store_mut()
+        .claim_outbox_batch(harness.now, 1, "worker-b")
+        .expect("worker-b claims");
+    let retried = harness.orchestrator.retry_draft(&draft).expect("retry waits");
+    assert_eq!(
+        retried,
+        PrepareOutcome::WaitingForLease {
+            submission_id,
+            lease_until_ms: harness.now + OUTBOX_LEASE_MS,
+        }
+    );
+    assert_eq!(harness.encryptions(), 1);
+    assert_eq!(harness.probe.submit_count(), 0);
+}
+
+#[test]
+fn cancel_draft_returns_three_states_and_blocks_dispatch() {
+    // 1) 尚无尝试：CancelRequested，准备任务被标记取消，后续 prepare/dispatch 都不发送。
+    let mut harness = Harness::new(Vec::new());
+    let draft = harness.begin(27);
+    let cancelled = harness.orchestrator.cancel_draft(&draft).expect("cancel queued");
+    assert_eq!(
+        cancelled,
+        CancelOutcome::CancelRequested {
+            draft_id: draft.clone(),
+            submission_id: None,
+        }
+    );
+    assert_eq!(harness.draft_state(&draft).as_deref(), Some("cancelled"));
+    assert_eq!(
+        harness.cancel_requested(&format!("prepare:{draft}")),
+        Some(1)
+    );
+    assert!(matches!(
+        harness.orchestrator.prepare(&draft).expect("prepare cancelled"),
+        PrepareOutcome::Abandoned { .. }
+    ));
+    assert_eq!(harness.encryptions(), 0);
+    let dispatch = harness.orchestrator.dispatch(&draft).expect("dispatch cancelled");
+    assert_eq!(dispatch, DispatchOutcome::Abandoned { draft_id: draft.clone() });
+    assert_eq!(harness.probe.submit_count(), 0, "cancelled drafts never submit");
+    // 重复取消幂等。
+    assert_eq!(
+        harness.orchestrator.cancel_draft(&draft).expect("cancel again"),
+        CancelOutcome::CancelRequested {
+            draft_id: draft.clone(),
+            submission_id: None,
+        }
+    );
+
+    // 2) 已加密待发：CancelRequested 保留字节，发送任务被标记取消，dispatch 零提交。
+    let mut harness = Harness::new(vec![Scripted::Outcome(accepted())]);
+    let draft = harness.begin(28);
+    let PrepareOutcome::Prepared { submission_id, .. } =
+        harness.orchestrator.prepare(&draft).expect("prepare")
+    else {
+        panic!("expected prepare");
+    };
+    let cancelled = harness.orchestrator.cancel_draft(&draft).expect("cancel prepared");
+    assert_eq!(
+        cancelled,
+        CancelOutcome::CancelRequested {
+            draft_id: draft.clone(),
+            submission_id: Some(submission_id.clone()),
+        }
+    );
+    assert_eq!(
+        harness.cancel_requested(&format!("send:{submission_id}")),
+        Some(1)
+    );
+    // 草稿字节与 attempt 行都保留（不删除历史）。
+    assert!(!harness.stored_ciphertext(&submission_id).is_empty());
+    assert_eq!(
+        harness.attempt_state(&submission_id).as_deref(),
+        Some("prepared")
+    );
+    let dispatch = harness.orchestrator.dispatch(&draft).expect("dispatch cancelled");
+    assert_eq!(dispatch, DispatchOutcome::Abandoned { draft_id: draft.clone() });
+    assert_eq!(harness.probe.submit_count(), 0, "cancel must block the submit");
+
+    // 3) 已接受：CancelTooLate，消息与草稿都不被删除或回退。
+    let mut harness = Harness::new(vec![Scripted::Outcome(accepted())]);
+    let draft = harness.begin(29);
+    let PrepareOutcome::Prepared { submission_id, .. } =
+        harness.orchestrator.prepare(&draft).expect("prepare")
+    else {
+        panic!("expected prepare");
+    };
+    harness.orchestrator.dispatch(&draft).expect("dispatch accepted");
+    assert_eq!(
+        harness.orchestrator.cancel_draft(&draft).expect("cancel accepted"),
+        CancelOutcome::CancelTooLate {
+            draft_id: draft.clone(),
+            submission_id: submission_id.clone(),
+        }
+    );
+    assert_eq!(harness.draft_state(&draft).as_deref(), Some("accepted"));
+    assert_eq!(
+        harness.attempt_state(&submission_id).as_deref(),
+        Some("accepted")
+    );
+    assert_eq!(
+        harness.cancel_requested(&format!("send:{submission_id}")),
+        Some(0),
+        "an accepted attempt must not be marked cancelled"
+    );
+
+    // 4) 结果未知：CancelUnknown 只记录意图，不阻断必须的对账。
+    let mut harness = Harness::new(vec![
+        Scripted::Outcome(unknown()),
+        Scripted::Outcome(accepted()),
+    ]);
+    let draft = harness.begin(30);
+    let PrepareOutcome::Prepared { submission_id, .. } =
+        harness.orchestrator.prepare(&draft).expect("prepare")
+    else {
+        panic!("expected prepare");
+    };
+    harness.orchestrator.dispatch(&draft).expect("dispatch unknown");
+    assert_eq!(
+        harness.orchestrator.cancel_draft(&draft).expect("cancel unknown"),
+        CancelOutcome::CancelUnknown {
+            draft_id: draft.clone(),
+            submission_id: submission_id.clone(),
+        }
+    );
+    assert_eq!(harness.draft_state(&draft).as_deref(), Some("cancelled"));
+    assert_eq!(
+        harness.cancel_requested(&format!("send:{submission_id}")),
+        Some(0),
+        "unknown attempts must stay reconcilable"
+    );
+    // 对账仍然可用：只查询、不重发，得到接受后草稿以接受为准。
+    let reconciled = harness.orchestrator.dispatch(&draft).expect("reconcile unknown");
+    assert_eq!(
+        reconciled,
+        DispatchOutcome::Accepted {
+            submission_id: submission_id.clone(),
+            idempotent: false,
+        }
+    );
+    assert_eq!(harness.probe.submit_count(), 1);
+    assert_eq!(harness.probe.query_count(), 1);
+    assert_eq!(harness.draft_state(&draft).as_deref(), Some("accepted"));
+}
+
+#[test]
+fn reconcile_repairs_the_two_transaction_window_and_stays_idempotent() {
+    // 一致状态：无需修复。
+    let mut harness = Harness::new(vec![Scripted::Outcome(accepted())]);
+    let draft = harness.begin(31);
+    let PrepareOutcome::Prepared { submission_id, .. } =
+        harness.orchestrator.prepare(&draft).expect("prepare")
+    else {
+        panic!("expected prepare");
+    };
+    harness.orchestrator.dispatch(&draft).expect("dispatch");
+    let report: ReconcileReport = harness.orchestrator.reconcile(&draft).expect("reconcile");
+    assert_eq!(
+        report,
+        ReconcileReport {
+            submission_id: Some(submission_id.clone()),
+            draft_repaired: false,
+            awaiting_reconciliation: false,
+        }
+    );
+    assert!(report.is_consistent());
+
+    // 模拟第二笔事务失败：attempt 已 accepted 但草稿仍 queued。
+    harness.force_draft_state(&draft, "queued");
+    let repaired = harness.orchestrator.reconcile(&draft).expect("reconcile window");
+    assert!(repaired.draft_repaired, "the window must be repaired");
+    assert_eq!(harness.draft_state(&draft).as_deref(), Some("accepted"));
+    // 幂等：再对账一次不再写。
+    let consistent = harness.orchestrator.reconcile(&draft).expect("reconcile again");
+    assert!(!consistent.draft_repaired);
+    assert!(consistent.is_consistent());
+    assert_eq!(harness.probe.submit_count(), 1);
+    assert_eq!(harness.encryptions(), 1);
+
+    // 取消与接受的竞态：接受是权威事实，对账把草稿收敛回 accepted。
+    harness.force_draft_state(&draft, "cancelled");
+    let repaired = harness.orchestrator.reconcile(&draft).expect("reconcile cancelled");
+    assert!(repaired.draft_repaired);
+    assert_eq!(harness.draft_state(&draft).as_deref(), Some("accepted"));
+
+    // 结果未知：只报告待对账，不做写操作。
+    let mut harness = Harness::new(vec![
+        Scripted::Outcome(unknown()),
+        Scripted::Outcome(unknown()),
+    ]);
+    let draft = harness.begin(32);
+    let PrepareOutcome::Prepared { submission_id, .. } =
+        harness.orchestrator.prepare(&draft).expect("prepare")
+    else {
+        panic!("expected prepare");
+    };
+    harness.orchestrator.dispatch(&draft).expect("dispatch unknown");
+    let report = harness.orchestrator.reconcile(&draft).expect("reconcile unknown");
+    assert_eq!(
+        report,
+        ReconcileReport {
+            submission_id: Some(submission_id.clone()),
+            draft_repaired: false,
+            awaiting_reconciliation: true,
+        }
+    );
+    assert_eq!(
+        harness.attempt_state(&submission_id).as_deref(),
+        Some("unknown"),
+        "reconcile must not touch an unknown attempt"
+    );
+    assert_eq!(harness.probe.query_count(), 0);
+    assert_eq!(harness.probe.submit_count(), 1);
+
+    // 尚未接受的普通草稿：报告一致，不写任何状态。
+    let mut harness = Harness::new(Vec::new());
+    let draft = harness.begin(33);
+    harness.orchestrator.prepare(&draft).expect("prepare");
+    let report = harness.orchestrator.reconcile(&draft).expect("reconcile prepared");
+    assert!(report.is_consistent());
+    assert_eq!(harness.draft_state(&draft).as_deref(), Some("queued"));
 }

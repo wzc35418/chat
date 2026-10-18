@@ -95,6 +95,17 @@ tasks.register<JavaExec>("identitySmoke") {
     systemProperty("stdout.encoding", "UTF-8")
 }
 
+tasks.register<JavaExec>("identityPersistSmoke") {
+    group = "verification"
+    description = "P1-02 身份持久化冒烟：重开后账户/设备/指纹与联系人均保留，错误主密钥拒绝。"
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.IdentityPersistSmokeKt")
+    systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+}
+
 tasks.register<JavaExec>("previewApp") {
     group = "application"
     dependsOn("classes")

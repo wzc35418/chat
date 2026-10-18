@@ -1,13 +1,21 @@
 //! 身份层的 UniFFI 对象：Kotlin 侧「口令加好友」竖直切片。
 //!
 //! 本对象把 [chat_identity] 的账户、邀请口令与联系人状态机投影成 UniFFI 对象，
-//! 严格按 UI 约定暴露 `create / account / create_invite / preview_invite /
-//! accept_invite / contacts / confirm_identity_change / shutdown` 八个入口。
+//! 按 UI 约定暴露两类入口：
 //!
-//! 与既有 `local_store.rs`（正式加密存储）不共享任何状态，但**复用同一个**
-//! [`FfiError`]：`code` 直接取 identity 映射出的 PROTOCOL-014 冻结码
-//! （INVALID_TARGET / INVALID_SIGNATURE / CURSOR_EXPIRED / INVALID_STATE_TRANSITION /
-//! CONTENT_TOO_LARGE …），Kotlin 侧只需要 `catch (e: FfiException.Store)` 一处。
+//! - **进程内身份**（`create`）：只在内存里生成账户/设备密钥，不碰数据库；
+//! - **持久身份**（`open_persisted`）：打开正式加密存储（chat-core 的
+//!   `ConversationCore`，与 LocalStoreFfi 同一个库），恢复账户/设备种子并载入联系人；
+//!   首次打开时生成新账户并落库；`accept_invite`/`confirm_identity_change` 通过
+//!   `ConversationCore::upsert_contact` 把联系人写回；`shutdown` 关闭 core（幂等）。
+//!
+//! 两种构造共用一个公开面：`account / create_invite / preview_invite / accept_invite /
+//! contacts / confirm_identity_change / shutdown`。
+//!
+//! 与既有 `local_store.rs`（正式加密存储对象）不共享状态，但**复用同一个**
+//! [`FfiError`]：`code` 直接取 identity / core 的稳定错误码（INVALID_TARGET /
+//! INVALID_SIGNATURE / CURSOR_EXPIRED / INVALID_STATE_TRANSITION / CONTENT_TOO_LARGE /
+//! STATE_CORRUPTED …），Kotlin 侧只需要 `catch (e: FfiException.Store)` 一处。
 //!
 //! 安全边界（与 docs/implementation/identity.md 的 IDENTITY-001/004/005/006/007 对应）：
 //!
@@ -15,24 +23,27 @@
 //!   的第二套入口，`preview_invite` 与 `accept_invite` 共用同一条校验链；
 //! - 自己签发的口令不能当成联系人：目标账户等于本机账户时显式 INVALID_TARGET；
 //! - `accept_invite` 要求口令绑定的节点与本对象创建时传入的节点一致，否则
-//!   INVALID_TARGET（见模块文档的「已知限制」：`preview_invite` 只把节点当提示展示）；
+//!   INVALID_TARGET（`preview_invite` 只把节点当提示展示）；
 //! - 接受邀请只产生 `requested` 联系人（`can_send == false`），绝不自动信任；
 //! - `identity_changed` 只能由显式 `confirm_identity_change` 复位，普通接受无法绕过；
-//! - 时间由内部时钟提供（生产 = 系统 UTC 毫秒；测试注入固定时钟），本层不做时钟
-//!   漂移策略；
-//! - 不写数据库、不发网络请求：一次性消费、outbox 与事件流由后续 core 集成补齐，
-//!   本层不假装已完成持久化。
+//! - 持久路径以**库为准**：种子从受保护存储读回，派生结果与库中投影不一致时显式
+//!   STATE_CORRUPTED，绝不降级成「新身份」；联系人先落库、成功后才提交到内存；
+//! - 时间由内部时钟提供（生产 = 系统 UTC 毫秒；测试注入固定时钟）；
+//! - 不发网络请求：一次性消费、outbox 与事件流由后续 core 集成补齐。
 //!
 //! 线程安全：UniFFI 要求对象可跨线程共享，因此内部状态用 `std::sync::Mutex`
 //! 串行化；锁中毒时带返回值的调用显式返回 `CORE_PANICKED`。
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use chat_identity::{
-    Contact, DeviceKeys, IdentityError, InviteExpectations, InviteScope, LocalAccount,
-    MAX_DISPLAY_NAME_BYTES,
+use chat_core::service::{
+    ContactUpsertRequest, ContactView as CoreContactView, ConversationCore, IdentityAccountInput,
 };
-use chat_protocol::{AccountId, CoordinatorId, ErrorCode};
+use chat_identity::{
+    AccountKeys, Contact, ContactState, DeviceKeys, Fingerprint, IdentityError, InviteExpectations,
+    InviteScope, KEY_SEED_BYTES, LocalAccount, MAX_DISPLAY_NAME_BYTES,
+};
+use chat_protocol::{AccountId, CoordinatorId, DeviceId, ErrorCode};
 
 use crate::local_store::FfiError;
 
@@ -59,6 +70,18 @@ fn state_error(code: &str, reason: &str) -> FfiError {
         code: code.to_owned(),
         reason: sanitize(reason),
     }
+}
+
+/// 把 core 的 `anyhow::Error` 投影成 FFI 错误；本 crate 不需要依赖 `anyhow`，
+/// 由宏在调用点按类型推断完成（与 local_store.rs 的 failure! 同一做法）。
+macro_rules! core_failure {
+    ($error:expr) => {{
+        let (code, reason) = chat_core::service::error_projection(&$error);
+        FfiError::Store {
+            code: code.to_owned(),
+            reason: sanitize(&reason),
+        }
+    }};
 }
 
 impl From<IdentityError> for FfiError {
@@ -147,12 +170,32 @@ fn system_now_ms() -> u64 {
 }
 
 /// 一条本地联系人记录：状态机 + 本地备注。
+#[derive(Clone)]
 struct ContactRecord {
     contact: Contact,
     display_name: String,
+    /// 从库中恢复、但 identity 的 `Contact` 无法直接表达的状态（目前只有
+    /// `identity_changed`）：只用于上报给 UI 和「显式重新确认」；发送判定仍取
+    /// `Contact::can_send()`（该状态恒为 false）。
+    restored_state: Option<ContactState>,
 }
 
-/// 对象内部状态。`account`/`device` 持有密钥材料，`shutdown` 后置空。
+impl ContactRecord {
+    fn fresh(contact: Contact, display_name: String) -> Self {
+        Self {
+            contact,
+            display_name,
+            restored_state: None,
+        }
+    }
+
+    /// 上报给 UI 的状态：库中恢复的状态优先，其余取状态机当前值。
+    fn effective_state(&self) -> ContactState {
+        self.restored_state.unwrap_or_else(|| self.contact.state())
+    }
+}
+
+/// 对象内部状态。`account`/`device`/`core` 持有密钥与存储句柄，`shutdown` 后置空。
 struct IdentityState {
     account: Option<LocalAccount>,
     device: Option<DeviceKeys>,
@@ -161,6 +204,8 @@ struct IdentityState {
     /// 公开投影快照（不含密钥，`shutdown` 后仍可读）。
     view: AccountView,
     contacts: Vec<ContactRecord>,
+    /// 正式加密存储句柄；只有 `open_persisted` 构造的对象才有。
+    core: Option<ConversationCore>,
     clock: Clock,
     closed: bool,
 }
@@ -188,7 +233,7 @@ impl IdentityState {
         }
     }
 
-    /// 关闭：立即释放账户与设备密钥（`SigningKey` 在 drop 时自行清零）。
+    /// 关闭：释放账户/设备密钥并关闭正式存储句柄（core.close 自身幂等）。
     ///
     /// `account()`/`contacts()` 没有 `Result` 可返回，因此公开投影保留为关闭前快照；
     /// 需要密钥的操作一律返回 `CORE_CLOSED`。
@@ -196,6 +241,9 @@ impl IdentityState {
         self.closed = true;
         self.account = None;
         self.device = None;
+        if let Some(core) = self.core.take() {
+            core.close();
+        }
     }
 }
 
@@ -228,18 +276,13 @@ impl IdentityFfi {
         node: CoordinatorId,
         account: LocalAccount,
         device: DeviceKeys,
+        device_id: DeviceId,
+        contacts: Vec<ContactRecord>,
+        core: Option<ConversationCore>,
         clock: Clock,
     ) -> Self {
         let account_id = account.account_id();
-        let device_id = device.device_id(account_id);
-        // 本切片只有初始设备一台，不声称多设备注册表（IDENTITY-011 未实现）。
-        let projected = account.view(1);
-        let view = AccountView {
-            account_id: projected.account_id().encode(),
-            device_id: device_id.encode(),
-            display_name: projected.display_name().to_owned(),
-            fingerprint: projected.fingerprint_text(),
-        };
+        let view = account_view_of(&account, device_id);
         Self {
             state: Mutex::new(IdentityState {
                 account: Some(account),
@@ -247,14 +290,15 @@ impl IdentityFfi {
                 account_id,
                 node,
                 view,
-                contacts: Vec::new(),
+                contacts,
+                core,
                 clock,
                 closed: false,
             }),
         }
     }
 
-    /// 时钟注入点（生产传 `system_now_ms`，测试传固定时钟）。
+    /// 进程内身份：随机密钥 + 无数据库（`create`）。
     fn create_with_clock(
         display_name: String,
         node: String,
@@ -264,7 +308,16 @@ impl IdentityFfi {
         let now_ms = clock();
         let account = LocalAccount::create(&display_name, now_ms).map_err(FfiError::from)?;
         let device = DeviceKeys::generate();
-        Ok(Arc::new(Self::assemble(node, account, device, clock)))
+        let device_id = device.device_id(account.account_id());
+        Ok(Arc::new(Self::assemble(
+            node,
+            account,
+            device,
+            device_id,
+            Vec::new(),
+            None,
+            clock,
+        )))
     }
 
     /// 由固定种子建立身份（只用于测试，用来核对 identity 的冻结派生向量）。
@@ -276,14 +329,86 @@ impl IdentityFfi {
         device_seed: u8,
         clock: Clock,
     ) -> Result<Arc<Self>, FfiError> {
-        use chat_identity::KEY_SEED_BYTES;
         let node = parse_node(node)?;
         let now_ms = clock();
         let account =
             LocalAccount::from_seed(display_name, now_ms, &[account_seed; KEY_SEED_BYTES])
                 .map_err(FfiError::from)?;
         let device = DeviceKeys::from_seed(&[device_seed; KEY_SEED_BYTES]);
-        Ok(Arc::new(Self::assemble(node, account, device, clock)))
+        let device_id = device.device_id(account.account_id());
+        Ok(Arc::new(Self::assemble(
+            node,
+            account,
+            device,
+            device_id,
+            Vec::new(),
+            None,
+            clock,
+        )))
+    }
+
+    /// 持久身份：打开正式加密存储，恢复或首次生成账户，并载入联系人。
+    fn open_persisted_with_clock(
+        database_path: String,
+        master_key_hex: String,
+        node: String,
+        clock: Clock,
+    ) -> Result<Arc<Self>, FfiError> {
+        let node = parse_node(&node)?;
+        let mut core = ConversationCore::open(&database_path, &master_key_hex)
+            .map_err(|error| core_failure!(error))?;
+        let existing = core
+            .open_persisted_identity()
+            .map_err(|error| core_failure!(error))?;
+        if existing.is_none() {
+            save_fresh_account(&mut core, clock)?;
+        }
+        // 回读：账户句柄与公开投影都以库为准，不用内存里的临时值。
+        let persisted = core
+            .open_persisted_identity()
+            .map_err(|error| core_failure!(error))?
+            .ok_or_else(|| {
+                state_error(
+                    "STATE_CORRUPTED",
+                    "identity account is missing after it was saved",
+                )
+            })?;
+        let projection = core
+            .load_identity_account()
+            .map_err(|error| core_failure!(error))?
+            .ok_or_else(|| {
+                state_error(
+                    "STATE_CORRUPTED",
+                    "identity projection is missing after it was saved",
+                )
+            })?;
+        let derived = account_view_of(&persisted.account, persisted.device_id);
+        let stored = AccountView {
+            account_id: projection.account_id,
+            device_id: projection.device_id,
+            display_name: projection.display_name,
+            fingerprint: projection.fingerprint,
+        };
+        if derived != stored {
+            return Err(state_error(
+                "STATE_CORRUPTED",
+                "stored identity projection does not match the protected seeds",
+            ));
+        }
+        let listed = core.list_contacts().map_err(|error| core_failure!(error))?;
+        let mut contacts = Vec::with_capacity(listed.len());
+        for item in listed {
+            contacts.push(restore_contact(item)?);
+        }
+        Ok(Arc::new(Self::assemble(
+            node,
+            persisted.account,
+            persisted.device,
+            persisted.device_id,
+            contacts,
+            Some(core),
+            clock,
+        )))
     }
 }
 
@@ -315,6 +440,142 @@ fn contact_label(display_name: &str) -> Result<String, FfiError> {
     Ok(trimmed.to_owned())
 }
 
+/// 无昵称时的展示/落库回退：账户 ID 缩写 `acct:1:<前 8 位 hex>`（14 字节，符合显示名边界）。
+///
+/// 这是「还没有昵称」的诚实占位（与 UI 展示账户 ID 缩写的回退一致），
+/// 不是对端自述或伪造的昵称。
+fn short_account_label(account_id: AccountId) -> String {
+    let full = account_id.encode();
+    let payload = full.strip_prefix("acct:1:").unwrap_or(&full);
+    let short: String = payload.chars().take(8).collect();
+    format!("acct:1:{short}")
+}
+
+/// 小写十六进制编码（种子交给 core 时使用）。
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(char::from(HEX[usize::from(byte >> 4)]));
+        text.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    text
+}
+
+/// 生成账户/设备种子（系统安全随机源）。
+fn fresh_seeds() -> ([u8; KEY_SEED_BYTES], [u8; KEY_SEED_BYTES]) {
+    let mut account_seed = [0u8; KEY_SEED_BYTES];
+    let mut device_seed = [0u8; KEY_SEED_BYTES];
+    rand::fill(&mut account_seed);
+    rand::fill(&mut device_seed);
+    (account_seed, device_seed)
+}
+
+/// 账户投影：由账户密钥与设备 ID 派生（ID/指纹/显示名全部来自真实密钥）。
+fn account_view_of(account: &LocalAccount, device_id: DeviceId) -> AccountView {
+    // 本切片只有初始设备一台，不声称多设备注册表（IDENTITY-011 未实现）。
+    let projected = account.view(1);
+    AccountView {
+        account_id: projected.account_id().encode(),
+        device_id: device_id.encode(),
+        display_name: projected.display_name().to_owned(),
+        fingerprint: projected.fingerprint_text(),
+    }
+}
+
+/// 首次打开持久库：生成种子并落库（没有昵称输入，显示名用账户 ID 缩写）。
+fn save_fresh_account(core: &mut ConversationCore, clock: Clock) -> Result<(), FfiError> {
+    let now_ms = clock();
+    let (mut account_seed, mut device_seed) = fresh_seeds();
+    let account_id = AccountKeys::from_seed(&account_seed).account_id();
+    let input = IdentityAccountInput {
+        display_name: short_account_label(account_id),
+        account_seed_hex: hex_lower(&account_seed),
+        device_seed_hex: hex_lower(&device_seed),
+        created_at_ms: now_ms,
+    };
+    // 种子字节用完即清零；十六进制串交给 core（其解码缓冲由 core 用 Zeroizing 清理）。
+    account_seed.fill(0);
+    device_seed.fill(0);
+    core.save_identity_account(input)
+        .map_err(|error| core_failure!(error))?;
+    Ok(())
+}
+
+/// 把库里的联系人行恢复成本地状态机记录（绝不把未知状态静默归一）。
+fn restore_contact(view: CoreContactView) -> Result<ContactRecord, FfiError> {
+    let peer = AccountId::parse(&view.account_id).map_err(|error| {
+        state_error(
+            "STATE_CORRUPTED",
+            &format!("stored contact has an invalid account id: {error}"),
+        )
+    })?;
+    let fingerprint = Fingerprint::parse(&view.fingerprint).map_err(|error| {
+        state_error(
+            "STATE_CORRUPTED",
+            &format!("stored contact has an invalid fingerprint: {error}"),
+        )
+    })?;
+    let mut contact = Contact::requested(peer, fingerprint);
+    let mut restored_state = None;
+    match view.state.as_str() {
+        "requested" => {}
+        "accepted" => contact = Contact::trusted(peer, fingerprint),
+        "declined" => contact.decline().map_err(FfiError::from)?,
+        "blocked" => contact.block().map_err(FfiError::from)?,
+        // identity 的 Contact 没有「直接构造 identity_changed」的入口：用 requested
+        // 承载（同样禁止发送），并保留状态供 UI 显示与显式重新确认。
+        "identity_changed" => restored_state = Some(ContactState::IdentityChanged),
+        other => {
+            return Err(state_error(
+                "STATE_CORRUPTED",
+                &format!("unknown stored contact state {other}"),
+            ));
+        }
+    }
+    // 库里的 display_name 是本地标注：等于账户 ID 缩写时还原成「未知」。
+    let display_name = if view.display_name == short_account_label(peer) {
+        String::new()
+    } else {
+        view.display_name
+    };
+    Ok(ContactRecord {
+        contact,
+        display_name,
+        restored_state,
+    })
+}
+
+/// 落库用的显示名：本地备注为空（未知昵称）时用账户 ID 缩写，避免伪造昵称。
+fn persisted_label(record: &ContactRecord) -> String {
+    if record.display_name.is_empty() {
+        short_account_label(record.contact.peer())
+    } else {
+        record.display_name.clone()
+    }
+}
+
+/// 把联系人记录投影成 core 的写入请求（状态/指纹/标注与内存记录一致）。
+fn upsert_request(record: &ContactRecord, at_ms: u64) -> Result<ContactUpsertRequest, FfiError> {
+    let fingerprint = record
+        .contact
+        .pinned_fingerprint()
+        .or_else(|| record.contact.observed_fingerprint())
+        .ok_or_else(|| {
+            state_error(
+                "STATE_CORRUPTED",
+                "contact has no observed identity fingerprint",
+            )
+        })?;
+    Ok(ContactUpsertRequest {
+        account_id: record.contact.peer().encode(),
+        display_name: persisted_label(record),
+        fingerprint: fingerprint.grouped(),
+        state: record.effective_state().as_str().to_owned(),
+        updated_at_ms: at_ms,
+    })
+}
+
 /// 把本地联系人记录投影成视图。
 fn contact_view(record: &ContactRecord) -> ContactView {
     let contact = &record.contact;
@@ -329,22 +590,39 @@ fn contact_view(record: &ContactRecord) -> ContactView {
             .or_else(|| contact.observed_fingerprint())
             .map(|fingerprint| fingerprint.grouped())
             .unwrap_or_default(),
-        state: contact.state().as_str().to_owned(),
+        state: record.effective_state().as_str().to_owned(),
         can_send: contact.can_send(),
     }
 }
 
 #[uniffi::export]
 impl IdentityFfi {
-    /// 建立本机账户（长期账户密钥在本进程内生成）并绑定一个协调节点。
+    /// 建立**进程内**身份（不写数据库）：长期账户密钥在本进程内生成并绑定一个协调节点。
     ///
     /// - `display_name`：1..=64 字节、非空白、无控制字符；
     /// - `node`：PROTOCOL-001 规范文本 `node:1:<64 位小写 hex>`；
     /// - 失败一律 `FfiError.Store`：`INVALID_TARGET`（显示名）/ `INVALID_ID`（节点）。
-    /// - 不写数据库、不做密钥保护：账户只活在本次进程里（见模块文档的已知限制）。
+    /// - 需要重启后仍在的身份请用 `open_persisted`。
     #[uniffi::constructor]
     pub fn create(display_name: String, node: String) -> Result<Arc<Self>, FfiError> {
         Self::create_with_clock(display_name, node, system_now_ms)
+    }
+
+    /// 打开正式加密存储并恢复/建立持久身份。
+    ///
+    /// - 数据目录必须已存在；`master_key_hex` 是 64 位十六进制（32 字节）；
+    /// - 库中已有身份 → 从受保护种子恢复账户与设备（不重新生成）；
+    /// - 首次打开 → 生成新账户/设备并落库（显示名用账户 ID 缩写，之后可由上层改名）；
+    /// - 同时载入库中全部联系人；
+    /// - 单写者：同一目录同一时刻只能有一个句柄，第二个句柄返回 `STORAGE_LOCKED`；
+    ///   错误主密钥返回 `STATE_CORRUPTED`（绝不重建空库），畸形密钥返回 `INVALID_INPUT`。
+    #[uniffi::constructor]
+    pub fn open_persisted(
+        database_path: String,
+        master_key_hex: String,
+        node: String,
+    ) -> Result<Arc<Self>, FfiError> {
+        Self::open_persisted_with_clock(database_path, master_key_hex, node, system_now_ms)
     }
 
     /// 本机账户的脱敏视图。账户在构造时就已建立，因此不会失败。
@@ -414,7 +692,8 @@ impl IdentityFfi {
     /// - 同一账户重复粘贴返回同一条记录，不产生重复申请；
     /// - `display_name` 是本地备注（口令不携带对方昵称）：空串表示未知、保持已有备注；
     /// - 自己的口令、以及节点与本对象不一致的口令返回 `INVALID_TARGET`；
-    /// - 已存在的联系人不会被静默覆盖信任锚：指纹变化通过 `identity_changed` 状态报告。
+    /// - 已存在的联系人不会被静默覆盖信任锚：指纹变化通过 `identity_changed` 状态报告；
+    /// - 持久对象先在 core 落库、成功后才提交内存（以持久化为准）。
     pub fn accept_invite(
         &self,
         token: String,
@@ -441,26 +720,35 @@ impl IdentityFfi {
             .contacts
             .iter()
             .position(|record| record.contact.peer() == peer);
-        let index = match existing {
-            Some(index) => index,
-            None => {
-                let index = state.contacts.len();
-                state.contacts.push(ContactRecord {
-                    contact: Contact::requested(peer, observed),
-                    display_name: String::new(),
-                });
-                index
-            }
+        // 先在副本上推进状态机，落库成功后才提交到内存。
+        let mut updated = match existing {
+            Some(index) => state.contacts[index].clone(),
+            None => ContactRecord::fresh(Contact::requested(peer, observed), String::new()),
         };
-        let record = &mut state.contacts[index];
         if !label.is_empty() {
-            record.display_name = label;
+            updated.display_name = label;
         }
         // 既有联系人再观测到新指纹时由状态机转 identity_changed（不静默覆盖信任锚）。
-        record
+        updated
             .contact
             .record_identity(observed)
             .map_err(FfiError::from)?;
+        let request = upsert_request(&updated, now_ms)?;
+        if let Some(core) = state.core.as_mut() {
+            core.upsert_contact(request)
+                .map_err(|error| core_failure!(error))?;
+        }
+        match existing {
+            Some(index) => state.contacts[index] = updated,
+            None => state.contacts.push(updated),
+        }
+        let record = match existing {
+            Some(index) => &state.contacts[index],
+            None => state
+                .contacts
+                .last()
+                .ok_or_else(|| state_error("STATE_CORRUPTED", "accepted contact is missing"))?,
+        };
         Ok(contact_view(record))
     }
 
@@ -475,9 +763,11 @@ impl IdentityFfi {
     /// `contact_id` 必须原样使用 `ContactView.contact_id`。未知/畸形句柄返回
     /// `INVALID_TARGET`；当前状态不是 `identity_changed` 时返回
     /// `INVALID_STATE_TRANSITION`（普通确认不能绕过身份变化）。
+    /// 持久对象同样先落库（`accepted`）再提交内存。
     pub fn confirm_identity_change(&self, contact_id: String) -> Result<ContactView, FfiError> {
         let mut state = self.lock()?;
         state.require_open()?;
+        let now_ms = (state.clock)();
         let peer = AccountId::parse(&contact_id).map_err(|error| {
             store_error(
                 ErrorCode::InvalidTarget,
@@ -494,15 +784,34 @@ impl IdentityFfi {
                     "unknown contact id: no local record",
                 )
             })?;
-        let record = &mut state.contacts[index];
-        record
-            .contact
-            .confirm_identity_change()
-            .map_err(FfiError::from)?;
-        Ok(contact_view(record))
+        let mut updated = state.contacts[index].clone();
+        if updated.restored_state == Some(ContactState::IdentityChanged) {
+            // 从库中恢复的 identity_changed：用户已核对新指纹 → 用观测指纹重新固定信任锚
+            // （与 identity 的 confirm_identity_change 同义，因为旧信任锚不在联系人行里）。
+            let observed = updated.contact.observed_fingerprint().ok_or_else(|| {
+                store_error(
+                    ErrorCode::InvalidCredential,
+                    "contact has no observed identity fingerprint",
+                )
+            })?;
+            updated.contact = Contact::trusted(peer, observed);
+            updated.restored_state = None;
+        } else {
+            updated
+                .contact
+                .confirm_identity_change()
+                .map_err(FfiError::from)?;
+        }
+        let request = upsert_request(&updated, now_ms)?;
+        if let Some(core) = state.core.as_mut() {
+            core.upsert_contact(request)
+                .map_err(|error| core_failure!(error))?;
+        }
+        state.contacts[index] = updated;
+        Ok(contact_view(&state.contacts[index]))
     }
 
-    /// 释放账户/设备密钥；重复调用幂等。
+    /// 释放账户/设备密钥并关闭正式存储句柄；重复调用幂等。
     ///
     /// 方法名用 `shutdown` 而不是 `close`：UniFFI 会为每个对象生成
     /// `AutoCloseable.close()`，同名会与生成代码产生 JVM 签名冲突。
@@ -518,7 +827,10 @@ impl IdentityFfi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// 冻结的“现在”：2023-11-14T22:13:20Z（与 identity 的测试向量同一时刻）。
     const NOW_MS: u64 = 1_700_000_000_000;
@@ -526,6 +838,9 @@ mod tests {
     const MINUTE_MS: u64 = 60_000;
     const MAX_TTL_MS: u64 = 7 * DAY_MS;
     const NODE_HEX: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    const MASTER_KEY_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    const WRONG_MASTER_KEY_HEX: &str =
+        "ff112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     fn node_text() -> String {
         format!("node:1:{NODE_HEX}")
@@ -554,6 +869,58 @@ mod tests {
                 assert_eq!(code, expected, "reason: {reason}");
             }
         }
+    }
+
+    /// 临时数据目录（每个测试独立，Drop 时删除）。
+    struct Temp {
+        dir: PathBuf,
+    }
+
+    impl Temp {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "chat-ffi-identity-{tag}-{}-{nanos}-{counter}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).expect("create temp dir");
+            Self { dir }
+        }
+
+        fn database(&self) -> String {
+            self.dir.join("chat.db").to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// 打开（首次会创建）持久身份。
+    fn open_persisted_at(dir: &Temp) -> Arc<IdentityFfi> {
+        IdentityFfi::open_persisted_with_clock(
+            dir.database(),
+            MASTER_KEY_HEX.to_owned(),
+            node_text(),
+            fixed_clock,
+        )
+        .expect("open persisted identity")
+    }
+
+    /// 与 core 测试相同的种子十六进制生成方式。
+    fn seed_hex(start: u8) -> String {
+        let mut text = String::with_capacity(64);
+        for offset in 0..32u8 {
+            text.push_str(&format!("{:02x}", start.wrapping_add(offset)));
+        }
+        text
     }
 
     #[test]
@@ -822,5 +1189,192 @@ mod tests {
         // 公开投影仍可读（这两个方法的签名没有 Result 可返回）。
         assert_eq!(alice.account(), before);
         assert!(alice.contacts().is_empty());
+    }
+
+    // ---- 持久身份（open_persisted） ----
+
+    #[test]
+    fn persisted_identity_survives_reopen_with_the_same_account() {
+        let temp = Temp::new("reopen");
+        let first = open_persisted_at(&temp);
+        let account = first.account();
+        // 首次打开没有昵称输入：落库的显示名是账户 ID 缩写（诚实占位，不是伪造昵称）。
+        let account_id = AccountId::parse(&account.account_id).expect("account id");
+        assert_eq!(account.display_name, short_account_label(account_id));
+        assert!(account.account_id.starts_with("acct:1:"));
+        assert!(account.device_id.starts_with("dev:1:"));
+        assert_eq!(account.fingerprint.len(), 79);
+        assert!(first.contacts().is_empty());
+
+        // 同一目录 + 同一主密钥重开：ID/设备/指纹/显示名完全一致（没有重新生成账户）。
+        first.shutdown();
+        let second = open_persisted_at(&temp);
+        assert_eq!(second.account(), account);
+        assert!(second.contacts().is_empty());
+
+        // 身份确实在库里（不是内存假象）：直接用 core 读回投影与种子。
+        second.shutdown();
+        let core = ConversationCore::open(&temp.database(), MASTER_KEY_HEX).expect("open core");
+        let stored = core
+            .load_identity_account()
+            .expect("load projection")
+            .expect("persisted account is present");
+        assert_eq!(stored.account_id, account.account_id);
+        assert_eq!(stored.device_id, account.device_id);
+        assert_eq!(stored.fingerprint, account.fingerprint);
+        assert_eq!(stored.display_name, account.display_name);
+        assert!(
+            core.open_persisted_identity()
+                .expect("restore keys")
+                .is_some(),
+            "受保护种子必须已经落库"
+        );
+        core.close();
+    }
+
+    #[test]
+    fn persisted_contacts_survive_reopen_and_keep_their_state() {
+        let alice_dir = Temp::new("contacts-alice");
+        let bob_dir = Temp::new("contacts-bob");
+        let alice = open_persisted_at(&alice_dir);
+        let bob = open_persisted_at(&bob_dir);
+        let invite = alice.create_invite(DAY_MS).expect("create invite");
+        let contact = bob
+            .accept_invite(invite.token.clone(), "Alice（备注）".to_owned())
+            .expect("accept invite");
+        assert_eq!(contact.state, "requested");
+        assert!(!contact.can_send);
+
+        // 联系人已落库：重开后仍在，状态/指纹/标注不变。
+        bob.shutdown();
+        let reopened = open_persisted_at(&bob_dir);
+        let listed = reopened.contacts();
+        assert_eq!(listed, vec![contact.clone()]);
+        assert_eq!(listed[0].contact_id, alice.account().account_id);
+        assert_eq!(listed[0].state, "requested");
+        assert_eq!(listed[0].fingerprint, alice.account().fingerprint);
+        assert_eq!(listed[0].display_name, "Alice（备注）");
+        assert!(!listed[0].can_send, "重开后仍不允许发送");
+
+        // 同一口令重复粘贴仍是同一条（落库幂等）。
+        let again = reopened
+            .accept_invite(invite.token, String::new())
+            .expect("idempotent accept");
+        assert_eq!(again, contact);
+        assert_eq!(reopened.contacts().len(), 1);
+
+        // 未知昵称（空串）落库为账户 ID 缩写，重开后还原成空串（契约稳定）。
+        let carol_dir = Temp::new("contacts-carol");
+        let carol = open_persisted_at(&carol_dir);
+        let unnamed = carol
+            .accept_invite(
+                alice.create_invite(DAY_MS).expect("create invite").token,
+                String::new(),
+            )
+            .expect("accept without a local label");
+        assert_eq!(unnamed.display_name, "", "空串表示未知本地备注");
+        carol.shutdown();
+        let carol_reopened = open_persisted_at(&carol_dir);
+        assert_eq!(carol_reopened.contacts()[0].display_name, "");
+        assert_eq!(carol_reopened.contacts()[0].state, "requested");
+        assert!(!carol_reopened.contacts()[0].can_send);
+    }
+
+    #[test]
+    fn wrong_master_key_is_rejected_with_a_stable_code() {
+        let temp = Temp::new("wrong-key");
+        let identity = open_persisted_at(&temp);
+        let account = identity.account();
+        identity.shutdown();
+
+        expect_code(
+            IdentityFfi::open_persisted_with_clock(
+                temp.database(),
+                WRONG_MASTER_KEY_HEX.to_owned(),
+                node_text(),
+                fixed_clock,
+            ),
+            "STATE_CORRUPTED",
+        );
+        // 错误密钥不会重建空库：正确密钥仍能读回同一账户。
+        let recovered = open_persisted_at(&temp);
+        assert_eq!(recovered.account(), account);
+    }
+
+    #[test]
+    fn persisted_shutdown_closes_the_core_and_rejects_key_work() {
+        let temp = Temp::new("persisted-shutdown");
+        let identity = open_persisted_at(&temp);
+        let before = identity.account();
+        let invite = identity.create_invite(DAY_MS).expect("create invite");
+        identity.shutdown();
+        identity.shutdown(); // 幂等
+
+        // core 真的关闭了：单写者锁已释放，同一目录可以立刻再开一个句柄。
+        let reopened = open_persisted_at(&temp);
+        assert_eq!(reopened.account(), before);
+
+        for error in [
+            identity.create_invite(DAY_MS).unwrap_err(),
+            identity.preview_invite(invite.token.clone()).unwrap_err(),
+            identity
+                .accept_invite(invite.token, String::new())
+                .unwrap_err(),
+            identity
+                .confirm_identity_change(before.account_id.clone())
+                .unwrap_err(),
+        ] {
+            match error {
+                FfiError::Store { code, .. } => assert_eq!(code, "CORE_CLOSED"),
+            }
+        }
+        assert_eq!(identity.account(), before);
+        assert!(identity.contacts().is_empty());
+    }
+
+    #[test]
+    fn restored_identity_change_requires_explicit_reconfirmation() {
+        let temp = Temp::new("identity-change");
+        let peer = AccountId::from_bytes([0x77; 32]);
+        let fingerprint = Fingerprint::from_bytes([0x41; 32]);
+        // 先用 core 直接写入一个 identity_changed 联系人（模拟后续 core 的入站身份观测）。
+        {
+            let mut core =
+                ConversationCore::open(&temp.database(), MASTER_KEY_HEX).expect("open core");
+            core.save_identity_account(IdentityAccountInput {
+                display_name: "Alice".to_owned(),
+                account_seed_hex: seed_hex(1),
+                device_seed_hex: seed_hex(101),
+                created_at_ms: NOW_MS,
+            })
+            .expect("save identity");
+            core.upsert_contact(ContactUpsertRequest {
+                account_id: peer.encode(),
+                display_name: "Bob".to_owned(),
+                fingerprint: fingerprint.grouped(),
+                state: "identity_changed".to_owned(),
+                updated_at_ms: NOW_MS,
+            })
+            .expect("seed identity_changed contact");
+            core.close();
+        }
+
+        let identity = open_persisted_at(&temp);
+        let listed = identity.contacts();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].display_name, "Bob");
+        assert_eq!(listed[0].state, "identity_changed");
+        assert!(!listed[0].can_send, "身份变化必须阻断发送");
+
+        // 用户重新核对后确认：状态机把观测指纹重新固定为信任锚，并落库。
+        let confirmed = identity
+            .confirm_identity_change(listed[0].contact_id.clone())
+            .expect("confirm after re-verification");
+        assert_eq!(confirmed.state, "accepted");
+        assert!(confirmed.can_send);
+
+        identity.shutdown();
+        let reopened = open_persisted_at(&temp);
+        assert_eq!(reopened.contacts(), vec![confirmed]);
     }
 }

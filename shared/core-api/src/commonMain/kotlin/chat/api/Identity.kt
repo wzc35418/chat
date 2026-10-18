@@ -53,6 +53,16 @@ class IdentityException(
 interface IdentityService {
     suspend fun create(displayName: String, node: String): IdentityAccount
 
+    /**
+     * 持久身份：打开（或首次创建）受主密钥保护的本地身份库。
+     *
+     * - 已有记录 → 用恢复出的账户/设备密钥（重启后指纹不变）；
+     * - 没有记录 → 生成新账户并写入；
+     * - 错误主密钥 → 抛出 [IdentityException]（不会静默新建身份）；
+     * - 联系人随 accept/confirm 落库，重开后仍在。
+     */
+    suspend fun openPersisted(databasePath: String, masterKeyHex: String, node: String): IdentityAccount
+
     suspend fun account(): IdentityAccount
 
     suspend fun createInvite(ttlMillis: Long): IdentityInvite
