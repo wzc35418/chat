@@ -1,6 +1,6 @@
 # 设备直连、中继与节点客户端
 
-阶段：P0 → P1。状态：Rust **纯逻辑传输核心**已实现于 [crates/transport](../../crates/transport/src)（会话建立、连接状态机、帧编解码/分片重组、确定性重试退避，见下方「Rust 纯逻辑传输核心」章节）；P0 仅 loopback 的 iroh/QUIC 实验仍在 [network.rs](../../crates/transport/src/network.rs)。真正的直连/穿透/中继与节点客户端（TRANSPORT-006~012）尚未实现。目标源码：[crates/transport/src/network.rs](../../crates/transport/src/network.rs)。
+阶段：P0 → P1。状态：Rust **纯逻辑传输核心 + 对端收发管线**已实现于 [crates/transport](../../crates/transport/src)（会话建立、连接状态机、帧编解码/分片重组、确定性重试退避，以及可注入 wire 端口的发送/接收管线与 Pull 计划映射，见下方「Rust 纯逻辑传输核心」章节）；P0 仅 loopback 的 iroh/QUIC 实验仍在 [network.rs](../../crates/transport/src/network.rs)。真正的直连/穿透/中继与节点客户端（TRANSPORT-006、008~012）尚未实现。目标源码：[crates/transport/src/network.rs](../../crates/transport/src/network.rs)。
 
 网络层传送相同不可变协议帧，不负责判断已送达。节点公钥与 HTTPS 身份均验证；用户配置明确替换公共发现/中继。连接句柄不可给 UI 或插件。认证细节在 node-api 的函数计划中定义。
 
@@ -77,6 +77,40 @@ TRANSPORT-002（verify_discovery_record）与 TRANSPORT-006~012（节点 append/
 - 预算：连续失败超过 `max_attempts`（默认 8，上限 100）返回 `RetryOutcome::Stop { BudgetExhausted }`，不无限重试；成功后可 `reset()`；`next_attempt_at_ms` 饱和。
 - 本模块不 sleep：只返回延迟与下一次尝试时间，由宿主执行等待。
 
+### 对端收发管线（TRANSPORT-005~007，本轮）
+
+在上面的纯逻辑核心之上，用**可注入 wire 端口**实现对端收发管线；仍不引入真实 IO、不 sleep、无 `unsafe`。
+
+| 本轮交付（任务 ID） | API | 与文档契约的关系 |
+|---|---|---|
+| TRANSPORT-005 send_peer_frame | `send::send_peer_frame`、`SendBudget`、`SendOutcome` | 文档 TRANSPORT-004 `send_peer_frame` 的发送路径子集：编码→分片→逐片写 `WireSink`，带预算与可重试/致命判定；ACK 等待与连接关联未实现 |
+| TRANSPORT-006 receive_peer_frame | `receive::receive_peer_frame`、`PeerFrameReceiver`、`ReceiveBudget` | 文档 TRANSPORT-005 `read_peer_frame` 的接收路径子集：逐片喂重组器并绑定会话/端点；入站队列与背压未实现 |
+| TRANSPORT-007 Pull 映射层 | `pull_map::plan_pull_requests`、`PullRange`、`ResponseValidator` | 文档 TRANSPORT-007 `fetch_group_entries` 的请求计划与响应校验子集（分页/序号绑定/去重）；HTTP、请求签名与页正文解析未实现 |
+
+**wire 端口**（`wire.rs`）：`WireSink::write_record`（写一条长度前缀分片记录，`queued_records()` 提供队列深度）与 `WireSource::next_record`（逐条读取，`peer_endpoint()` 提供连接认证的对端端点）。端口失败只有 `WireFailure::Unavailable`（可重试）与 `WireFailure::Closed`（致命）两类；真实实现由 QUIC/WS 适配器提供，测试用内存队列。
+
+**发送（TRANSPORT-005）**：
+
+- 会话必须 `Connected`/`Degraded`（否则 `SESSION_NOT_USABLE`）；负载为空 `MALFORMED_FRAME`，超过会话帧上限 `CONTENT_TOO_LARGE`。
+- 分片大小 = min(`SendBudget::max_fragment_bytes`, 会话帧上限)；`max_records_per_send` 必须能覆盖最大帧，否则 `SEND_BUDGET_EXCEEDED`；发送前检查 `queued_records + fragments ≤ max_queue_depth`，超限显式拒绝、不排队等待。
+- 可重试 wire 失败交给 `RetryTracker`：返回 `RetryableFailure { delay_ms, next_attempt_at_ms, sent_records }`；重试预算耗尽转 `FatalFailure { RetryBudgetExhausted }`；`WireFailure::Closed` 直接致命且不消耗预算；成功写完后 `retry.reset()`。
+- 部分写入语义：已写记录数在结果中返回；上层必须按连接级失败重建会话（对端重组器随之重置），不得在旧连接上从中间分片续传。
+
+**接收（TRANSPORT-006）**：
+
+- `PeerFrameReceiver` 创建时绑定会话（本机/对端端点与设备）并持有与发送方一致的 `FrameLimits`（分片大小必须协商一致；超过会话帧上限的配置显式拒绝）。
+- 每次调用先校验：会话可用、接收器绑定同一会话、`WireSource::peer_endpoint()` 等于会话对端端点（返回 `None` 同样拒绝，绝不把未认证来源当会话）→ `SESSION_MISMATCH`。
+- 单次最多消费 `ReceiveBudget::max_records_per_call` 条记录；未收齐返回 `Pending { budget_exhausted }`，无数据 `Pending`，来源失败 `Unavailable`/`Closed`。
+- 乱序/重复/旧帧/未收齐/超限沿用帧层错误码（`OUT_OF_ORDER_FRAGMENT`/`DUPLICATE_FRAGMENT`/`STALE_FRAME`/`INCOMPLETE_FRAME`/`CONTENT_TOO_LARGE`/`MALFORMED_FRAME`）。
+
+**Pull 映射（TRANSPORT-007）**：
+
+- 为保持 transport 在 sync 之下的依赖方向，**不依赖 `chat-sync`**：本地 `PullRange { from, to }` 与 sync 的 `PullAction::Pull { from, to }` 字段一一对应，由 core 层转换。
+- `plan_pull_requests(range, page_items, base_frame_id, max_requests)`：闭区间按 `page_items`（1–500）分页；请求 0 起编号，帧号 = `base_frame_id + request_index`（溢出拒绝）；请求数不得超过 `max_requests`（≤256）；非法范围/分页/数量 `PULL_PLAN_INVALID`。
+- 计划有确定性摘要（SHA-256，绑定范围/分页/帧号），相同输入同摘要，可用于幂等去重。
+- `ResponseValidator` 要求按序响应：请求索引越界/乱序/范围不符/条目数不符 `RESPONSE_MISMATCH`，重复响应 `DUPLICATE_RESPONSE`；失败不改变校验器状态。
+- 请求正文编码属于 node-api 职责（本层不含 HTTP）。
+
 ### 传输层稳定错误码（登记）
 
 | 码 | 触发 | 可重试 | 与 PROTOCOL-014 关系 |
@@ -93,18 +127,26 @@ TRANSPORT-002（verify_discovery_record）与 TRANSPORT-006~012（节点 append/
 | `STALE_FRAME` | 旧帧迟到 | 否 | 本层新增码 |
 | `INCOMPLETE_FRAME` | 未收齐换帧/总长不一致 | 否 | 本层新增码 |
 | `INVALID_RETRY_POLICY` | 退避参数非法 | 否 | 本层新增码 |
+| `SESSION_NOT_USABLE` | 会话未连接/已关闭却收发 | 否 | 本层新增码 |
+| `SESSION_MISMATCH` | 跨会话复用接收器或来源端点不匹配/未认证 | 否 | 本层新增码 |
+| `SEND_BUDGET_EXCEEDED` | 发送队列深度/记录数预算超限 | 否 | 本层新增码 |
+| `PULL_PLAN_INVALID` | 拉取范围/分页/请求数/帧号非法 | 否 | 本层新增码 |
+| `DUPLICATE_RESPONSE` | 同一请求索引的响应重复 | 否 | 本层新增码 |
+| `RESPONSE_MISMATCH` | 响应索引/范围/条目数与计划不符 | 否 | 本层新增码 |
 
 映射约定：本层错误一律不可自动重试；跨 FFI 暴露时冻结码可直接进入 `chat_protocol::map_error`，新增码在协议层登记前映射为 `INTERNAL_FAILURE` 并保留本层码做诊断。
 
 ### 验证证据
 
-`cargo test --offline -p chat-transport`（2026-10-18）→ **33 passed / 0 failed**（lib 25 + `tests/transport_core.rs` 8），`cargo clippy --offline -p chat-transport --all-targets` 0 警告。
+`cargo test --offline -p chat-transport`（2026-10-18）→ **53 passed / 0 failed**（lib 39 + `tests/transport_core.rs` 8 + `tests/peer_pipeline.rs` 6），`cargo clippy --offline -p chat-transport --all-targets` 0 警告。
 
 - 状态机：`state::tests::transition_table_matches_the_full_matrix`（5×6 逐格）、`repeated_events_are_idempotent`、`closed_is_terminal_except_repeated_close`、`illegal_transitions_are_explicit`，以及 `transport_core::transition_matrix_is_complete_and_unique`。
 - 会话：`session::tests::opens_session_in_disconnected_state`、`rejects_invalid_session_inputs`、`session_limits_are_bounded`、`negotiated_frame_limit_cannot_be_enlarged`、`session_lifecycle_uses_the_state_machine`、`transport_core::sessions_cannot_connect_without_negotiation_or_enlarge_limits`。
 - 帧：`frame::tests::round_trip_single_and_multi_fragment`、`wire_format_round_trip_and_byte_vectors`、`frame_and_fragment_boundaries_are_enforced`、`malformed_wire_is_rejected_before_allocation`、`assembler_rejects_duplicate_out_of_order_stale_and_incomplete`、`random_wire_input_never_panics`、`transport_core::frame_*_rejects_*`。
 - 退避：`retry::tests::exponential_base_delay_is_capped`、`jitter_is_bounded_deterministic_and_capped`、`budget_exhaustion_stops_retrying`、`next_attempt_time_is_saturating`、`invalid_policies_are_rejected`、`transport_core::retry_sequence_is_deterministic_and_bounded`。
 - 端到端纯逻辑闭环：`transport_core::session_frame_retry_flow_is_closed_loop`（建立会话 → 连接 → 分片/重组 → 降级/恢复 → 退避预算 → 关闭）。
+- 收发管线：`peer_pipeline::send_receive_round_trip_across_fragments`（分片-重组往返、连续帧）、`injected_loss_duplication_and_reordering_are_rejected`（丢片→乱序、重复、尾片丢失换帧→未收齐）、`send_budgets_and_retry_budget_are_explicit`（队列/记录预算、可重试→预算耗尽→致命、Closed 不消耗预算）、`cross_session_and_unauthenticated_sources_are_rejected`（跨会话/未认证/未连接）、`pull_plan_maps_paginated_ranges_to_frame_requests`（分页映射、帧号绑定、摘要稳定、响应去重与校验）、`pull_plan_boundaries_are_explicit`（单条/整除/最大页/非法范围）。
+- 管线单元用例：`send::tests::sends_single_and_multi_fragment_frames`、`wire_failures_map_to_retry_or_fatal`、`queue_and_record_budgets_are_enforced`；`receive::tests::reassembles_frames_from_sent_records`、`partial_data_returns_pending_and_budget_flag`、`rejects_out_of_order_duplicate_and_stale_records`、`rejects_cross_session_and_unauthenticated_sources`、`source_failures_map_to_unavailable_or_closed`；`pull_map::tests::paginates_inclusive_ranges`、`plan_digest_is_deterministic_and_bound`（固定摘要向量）、`responses_are_validated_in_order_without_duplicates`、`rejects_invalid_ranges_pages_and_request_counts`。
 
 <a id="transport-001"></a>
 
@@ -238,7 +280,7 @@ send_peer_frame(connection: Connection, frame: ImmutableFrame) -> Result<Transpo
 - [ ] ACK 丢失后重发相同 bytes。
 - [ ] P2P 待确认消息不触发正式插件行为。
 
-**实现状态**：部分实现（Rust 纯逻辑子集：帧长度/分片/线格式编码与上限检查，见上方章节；证据 `frame::tests::wire_format_round_trip_and_byte_vectors`、`frame_and_fragment_boundaries_are_enforced`、`transport_core::frame_decode_rejects_oversize_without_allocation`）。连接关联校验、有限 ACK 等待、超时错误与同字节重发（重试策略已就绪）未实现，两项验收未勾选。
+**实现状态**：部分实现（Rust 纯逻辑子集：帧长度/分片/线格式编码与上限检查 + 对端发送管线 `send_peer_frame`：编码→分片→逐片写 `WireSink`、发送队列/记录预算、可重试/致命判定与退避，见上方章节；证据 `send::tests::sends_single_and_multi_fragment_frames`、`wire_failures_map_to_retry_or_fatal`、`queue_and_record_budgets_are_enforced`、`peer_pipeline::send_receive_round_trip_across_fragments`、`send_budgets_and_retry_budget_are_explicit`）。连接关联校验、有限 ACK 等待、超时错误与同字节重发（重试策略已就绪）未实现，两项验收未勾选。
 
 <a id="transport-005"></a>
 
@@ -272,7 +314,7 @@ read_peer_frame(connection: Connection, limits: FrameLimits) -> Result<Unverifie
 - [ ] 超大长度声明不分配巨内存。
 - [ ] 伪造 EventId 不被提前去重。
 
-**实现状态**：部分实现（Rust 纯逻辑子集：有界解码 `FrameCodec::decode_wire` 与严格有序分片重组 `FragmentAssembler`，长度先检查后分配；证据 `frame::tests::malformed_wire_is_rejected_before_allocation`、`assembler_rejects_duplicate_out_of_order_stale_and_incomplete`、`random_wire_input_never_panics`）。连接读循环、入站队列投递与背压未实现；内层去重仍归 protocol/sync（伪造 EventId 不会被本层提前去重），两项验收未勾选。
+**实现状态**：部分实现（Rust 纯逻辑子集：有界解码 `FrameCodec::decode_wire`、严格有序分片重组 `FragmentAssembler`，以及接收管线 `receive_peer_frame`：逐片喂入、会话/端点绑定、跨会话/未认证拒绝、单次记录预算，见上方章节；证据 `receive::tests::reassembles_frames_from_sent_records`、`partial_data_returns_pending_and_budget_flag`、`rejects_out_of_order_duplicate_and_stale_records`、`rejects_cross_session_and_unauthenticated_sources`、`source_failures_map_to_unavailable_or_closed`、`peer_pipeline::cross_session_and_unauthenticated_sources_are_rejected`）。连接读循环、入站队列投递与背压未实现；内层去重仍归 protocol/sync（伪造 EventId 不会被本层提前去重），两项验收未勾选。
 
 <a id="transport-006"></a>
 
@@ -338,7 +380,7 @@ fetch_group_entries(node: VerifiedNode, group: GroupId, after: u64, limit: u32) 
 - [ ] 节点跳号返回给 sync 检测。
 - [ ] 巨响应截断为错误。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（Rust 纯逻辑子集：Pull 计划映射与响应校验层，见上方「对端收发管线」；证据 `pull_map::tests::paginates_inclusive_ranges`、`plan_digest_is_deterministic_and_bound`、`responses_are_validated_in_order_without_duplicates`、`peer_pipeline::pull_plan_maps_paginated_ranges_to_frame_requests`、`pull_plan_boundaries_are_explicit`）。真实节点请求签名、HTTP 传输、页正文解析与响应字节上限截断未实现（跳号与巨响应检测需节点响应解码后才能落地），两项验收未勾选。
 
 <a id="transport-008"></a>
 

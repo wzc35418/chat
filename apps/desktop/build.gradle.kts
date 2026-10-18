@@ -9,6 +9,7 @@ dependencies {
     implementation(project(":shared:presentation"))
     implementation(project(":shared:core-api"))
     implementation(project(":shared:core-bridge"))
+    implementation(project(":shared:platform-api"))
     implementation(project(":desktop:platform"))
     implementation(project(":desktop:plugin-host"))
     implementation(compose.desktop.currentOs)
@@ -113,6 +114,16 @@ tasks.register<JavaExec>("attachmentSmoke") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("chat.desktop.AttachmentSmokeKt")
     systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+}
+
+tasks.register<JavaExec>("keySlotSmoke") {
+    group = "verification"
+    description = "PLATFORM-001/002/003 桌面竖切：口令派生主密钥封装、无明文落盘、失败锁定。"
+    dependsOn("classes")
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.KeySlotSmokeKt")
     systemProperty("file.encoding", "UTF-8")
     systemProperty("stdout.encoding", "UTF-8")
 }

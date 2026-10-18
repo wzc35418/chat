@@ -43,6 +43,18 @@ pub enum TransportError {
     IncompleteFrame,
     /// 重试策略参数非法。
     InvalidRetryPolicy { detail: &'static str },
+    /// 会话当前状态不可收发（未连接/已关闭）。
+    SessionNotUsable,
+    /// 对端会话/端点绑定不一致（跨会话复用或未认证来源）。
+    SessionMismatch { detail: &'static str },
+    /// 发送队列/分片预算超限。
+    SendBudgetExceeded { detail: &'static str },
+    /// Pull 计划参数非法（范围/分页/请求数）。
+    PullPlanInvalid { detail: &'static str },
+    /// 同一请求索引的响应重复到达。
+    DuplicateResponse,
+    /// 响应与请求计划不一致（索引/范围/条目数）。
+    ResponseMismatch { detail: &'static str },
 }
 
 impl TransportError {
@@ -61,6 +73,12 @@ impl TransportError {
             TransportError::StaleFrame => "STALE_FRAME",
             TransportError::IncompleteFrame => "INCOMPLETE_FRAME",
             TransportError::InvalidRetryPolicy { .. } => "INVALID_RETRY_POLICY",
+            TransportError::SessionNotUsable => "SESSION_NOT_USABLE",
+            TransportError::SessionMismatch { .. } => "SESSION_MISMATCH",
+            TransportError::SendBudgetExceeded { .. } => "SEND_BUDGET_EXCEEDED",
+            TransportError::PullPlanInvalid { .. } => "PULL_PLAN_INVALID",
+            TransportError::DuplicateResponse => "DUPLICATE_RESPONSE",
+            TransportError::ResponseMismatch { .. } => "RESPONSE_MISMATCH",
         }
     }
 
@@ -113,6 +131,22 @@ impl fmt::Display for TransportError {
             TransportError::InvalidRetryPolicy { detail } => {
                 write!(formatter, "invalid retry policy: {detail}")
             }
+            TransportError::SessionNotUsable => {
+                formatter.write_str("session is not usable for peer traffic")
+            }
+            TransportError::SessionMismatch { detail } => {
+                write!(formatter, "session mismatch: {detail}")
+            }
+            TransportError::SendBudgetExceeded { detail } => {
+                write!(formatter, "send budget exceeded: {detail}")
+            }
+            TransportError::PullPlanInvalid { detail } => {
+                write!(formatter, "invalid pull plan: {detail}")
+            }
+            TransportError::DuplicateResponse => formatter.write_str("duplicate pull response"),
+            TransportError::ResponseMismatch { detail } => {
+                write!(formatter, "pull response mismatch: {detail}")
+            }
         }
     }
 }
@@ -123,7 +157,7 @@ impl std::error::Error for TransportError {}
 pub type Result<T> = core::result::Result<T, TransportError>;
 
 /// 传输层稳定码全量，供唯一性测试与文档码表使用。
-pub const CODE_TABLE: [&str; 12] = [
+pub const CODE_TABLE: [&str; 18] = [
     "INVALID_TRANSPORT_CONFIG",
     "INVALID_TRANSITION",
     "CAPABILITY_MISMATCH",
@@ -136,6 +170,12 @@ pub const CODE_TABLE: [&str; 12] = [
     "STALE_FRAME",
     "INCOMPLETE_FRAME",
     "INVALID_RETRY_POLICY",
+    "SESSION_NOT_USABLE",
+    "SESSION_MISMATCH",
+    "SEND_BUDGET_EXCEEDED",
+    "PULL_PLAN_INVALID",
+    "DUPLICATE_RESPONSE",
+    "RESPONSE_MISMATCH",
 ];
 
 #[cfg(test)]
@@ -171,5 +211,17 @@ mod tests {
         assert_eq!(TransportError::StaleFrame.frozen_code(), None);
         assert!(!TransportError::StaleFrame.retryable());
         assert!(!TransportError::InvalidTransition.retryable());
+        for error in [
+            TransportError::SessionNotUsable,
+            TransportError::SessionMismatch { detail: "x" },
+            TransportError::SendBudgetExceeded { detail: "x" },
+            TransportError::PullPlanInvalid { detail: "x" },
+            TransportError::DuplicateResponse,
+            TransportError::ResponseMismatch { detail: "x" },
+        ] {
+            assert_eq!(error.frozen_code(), None);
+            assert!(!error.retryable());
+            assert!(!error.code().is_empty());
+        }
     }
 }

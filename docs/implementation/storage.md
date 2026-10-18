@@ -1,6 +1,6 @@
 # SQLite、统一事务、数据表与崩溃恢复
 
-阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/008/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过；P1 身份/联系人持久化与邀请一次性消费（迁移 0003，无计划书编号）、P1 MLS 群状态/provider 记录持久化（迁移 0004，CRYPTO-004/010 的持久化切片）与 P1 设备凭据/撤销集合持久化（迁移 0006，IDENTITY-008~012 的存储侧）、P1 附件 FileKey 持久化（迁移 0007，attachment_secrets + 外键级联）也已实测通过；STORAGE-004/005 的正式语义（与加密层同事务的 provider 写入）仍未接入。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
+阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/008/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过；P1 身份/联系人持久化与邀请一次性消费（迁移 0003，无计划书编号）、P1 MLS 群状态/provider 记录持久化（迁移 0004，CRYPTO-004/010 的持久化切片）与 P1 设备凭据/撤销集合持久化（迁移 0006，IDENTITY-008~012 的存储侧）、P1 附件 FileKey 持久化（迁移 0007，attachment_secrets + 外键级联）、P1 附件传输进度持久化（迁移 0008，断点续传位图 + 外键级联）也已实测通过；STORAGE-004/005 的正式语义（与加密层同事务的 provider 写入）仍未接入。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
 
 状态补充（2026-10-18）：`store.rs` 已有独立的未加密 P0 事务试验表，覆盖 T1/C01 意图与准备任务和 T2 MLS/attempt/outbox 崩溃断点，局部证据见 [P0-03 报告](../P0_PERSISTENCE.md)。`crates/storage/src/formal/` 新增正式加密存储路径，实现 STORAGE-001/003/006/007/009/010/011 与 002 的迁移器，证据见下文“P0-04 正式存储路径实现记录”；其余 STORAGE-004/005/008 仍未实现，MLS 加密语义（CRYPTO-004 等）也未接入。
 
@@ -361,6 +361,36 @@ cargo test --offline -p chat-storage --test attachment_secrets   # 5 passed
 
 已知限制：没有密钥轮换/重封（换主密钥需要整表重加密，属 PLATFORM 密钥槽设计）；没有按账户的
 密钥隔离（单账户本地库）；attachment_secrets 不做独立备份/导出。
+
+## 附件传输进度（断点续传）实现记录（2026-10-18，Windows x64）
+
+迁移 [0008_attachment_transfer_progress.sql](../../crates/storage/migrations/0008_attachment_transfer_progress.sql)
+（schema v8，不改写 0001~0007）新增 attachment_transfer_progress 表：主键
+(attachment_id, direction)，direction 只允许 upload/download（应用层白名单 + 列 CHECK），
+外键到 attachments 并 ON DELETE CASCADE（删除附件记录时两个方向的进度一并清除）。
+实现位于 [crates/storage/src/formal/attachments.rs](../../crates/storage/src/formal/attachments.rs)。
+
+- 密封内容：version || chunk_count || 已确认块位图（按位打包）|| 上传会话 ID || blob 标识 ||
+  下载前缀摘要；用用途 `attachment-transfer-progress` 密封，AAD 绑定 attachment_id + direction。
+  位图与 session 不落明文；换附件、换方向、换主密钥都会 STATE_CORRUPTED。
+- API（`Store` 上，走 `WriteScope::attachments()` 短事务）：`save_attachment_progress`
+  （UPSERT，幂等覆盖；chunk_count 必须等于 attachments.chunk_count；位图长度必须等于
+  chunk_count；方向白名单；会话/blob ≤256 字节；缺附件记录 → ATTACHMENT_NOT_FOUND）、
+  `load_attachment_progress`（读取时再校验 chunk_count 与附件记录一致、位图填充位为 0）、
+  `clear_attachment_progress`。
+- 错误语义：位图长度/填充位/记录版本/chunk_count 与附件记录不一致都返回 STATE_CORRUPTED，
+  绝不接受“半截位图”继续传输；输入越界一律 INVALID_INPUT。
+
+复现命令（全程离线）：
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-storage --test attachment_progress   # 5 passed
+```
+
+已知限制：进度条数继承附件条数上限（每个附件最多 2 条）；位图是“已确认前缀”的权威来源，
+但下载续传还额外依赖本地临时文件（本地文件被删/被改会从头重下，见 attachments.md）；
+没有进度 TTL/清理任务（完成时由 core 显式清除，删除附件时由外键级联清除）。
 
 ## 函数导航
 

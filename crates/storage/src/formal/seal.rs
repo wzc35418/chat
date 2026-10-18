@@ -63,6 +63,8 @@ pub enum SealPurpose {
     AttachmentRecord,
     /// `attachment_secrets.protected_secret`：附件的 file_id 与 FileKey（内容密钥）。
     AttachmentSecret,
+    /// `attachment_transfer_progress.protected_progress`：断点续传进度（位图 + 会话/blob + 前缀摘要）。
+    AttachmentTransferProgress,
 }
 
 impl SealPurpose {
@@ -82,6 +84,7 @@ impl SealPurpose {
             Self::MlsRecord => b"mls-record",
             Self::AttachmentRecord => b"attachment-record",
             Self::AttachmentSecret => b"attachment-secret",
+            Self::AttachmentTransferProgress => b"attachment-transfer-progress",
         }
     }
 }

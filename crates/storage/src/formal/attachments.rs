@@ -875,3 +875,425 @@ impl Store {
         }
     }
 }
+
+// ==== 附件传输进度（断点续传，迁移 0008_attachment_transfer_progress.sql） ====
+
+/// 允许的传输方向（白名单，与列 CHECK 一致）。
+pub const ATTACHMENT_DIRECTIONS: [&str; 2] = ["upload", "download"];
+/// 上传会话 / blob 标识的文本上限（字节）。
+pub const MAX_ATTACHMENT_PROGRESS_ID_BYTES: usize = 256;
+/// 进度记录格式版本（进入密封明文）。
+const ATTACHMENT_PROGRESS_RECORD_VERSION: u8 = 1;
+/// 进度密封记录的 AAD 版本。
+const ATTACHMENT_PROGRESS_AAD_VERSION: &[u8] = b"attachment-transfer-progress-v1";
+
+/// 附件传输进度写入输入。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentProgressInput {
+    /// 本地附件 ID（必须已存在对应 attachments 记录）。
+    pub attachment_id: String,
+    /// 方向（upload/download）。
+    pub direction: String,
+    /// 声明的分块总数（必须与 attachments.chunk_count 一致）。
+    pub chunk_count: u32,
+    /// 已确认块位图（长度必须等于 chunk_count）。
+    pub confirmed: Vec<bool>,
+    /// 节点上传会话 ID（下载方向为 None）。
+    pub session_id: Option<String>,
+    /// 节点 blob 标识（可为 None）。
+    pub blob_id: Option<String>,
+    /// 下载方向：已写前缀的明文 SHA-256（小写 hex），用于续传时校验本地临时文件。
+    pub prefix_digest: Option<String>,
+}
+
+impl AttachmentProgressInput {
+    /// 有界结构校验（chunk_count 与附件记录的一致性在 Store::save_attachment_progress 校验）。
+    pub fn validate(&self) -> Result<()> {
+        validate_attachment_id(&self.attachment_id)?;
+        validate_direction(&self.direction)?;
+        if self.chunk_count == 0 || self.chunk_count > MAX_ATTACHMENT_CHUNKS {
+            return Err(StorageError::InvalidInput(format!(
+                "attachment progress chunk count must be 1..={MAX_ATTACHMENT_CHUNKS}"
+            )));
+        }
+        if self.confirmed.len() != self.chunk_count as usize {
+            return Err(StorageError::InvalidInput(
+                "attachment progress bitmap length must equal chunk_count".to_owned(),
+            ));
+        }
+        for (label, value) in [
+            ("session_id", self.session_id.as_deref()),
+            ("blob_id", self.blob_id.as_deref()),
+        ] {
+            if let Some(value) = value
+                && (value.is_empty() || value.len() > MAX_ATTACHMENT_PROGRESS_ID_BYTES)
+            {
+                return Err(StorageError::InvalidInput(format!(
+                    "attachment progress {label} must be 1..={MAX_ATTACHMENT_PROGRESS_ID_BYTES} bytes"
+                )));
+            }
+        }
+        if let Some(digest) = &self.prefix_digest {
+            validate_digest("attachment progress prefix digest", digest)?;
+        }
+        Ok(())
+    }
+}
+
+/// 附件传输进度投影（密封字段已解密）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentProgress {
+    /// 本地附件 ID。
+    pub attachment_id: String,
+    /// 方向。
+    pub direction: String,
+    /// 分块总数。
+    pub chunk_count: u32,
+    /// 已确认块位图。
+    pub confirmed: Vec<bool>,
+    /// 节点上传会话 ID。
+    pub session_id: Option<String>,
+    /// 节点 blob 标识。
+    pub blob_id: Option<String>,
+    /// 下载方向：已写前缀的明文摘要。
+    pub prefix_digest: Option<String>,
+    /// 最近更新时间。
+    pub updated_at_ms: i64,
+    /// 本次调用是否命中既有记录（读取路径恒为 true）。
+    pub already_existed: bool,
+}
+
+impl AttachmentProgress {
+    /// 已确认块数。
+    pub fn confirmed_count(&self) -> u32 {
+        self.confirmed.iter().filter(|confirmed| **confirmed).count() as u32
+    }
+
+    /// 连续的已确认前缀长度（顺序传输的续传起点）。
+    pub fn contiguous_prefix(&self) -> u32 {
+        self.confirmed
+            .iter()
+            .take_while(|confirmed| **confirmed)
+            .count() as u32
+    }
+
+    /// 是否全部块都已确认。
+    pub fn is_complete(&self) -> bool {
+        self.confirmed.iter().all(|confirmed| *confirmed)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredProgress {
+    version: u8,
+    chunk_count: u32,
+    confirmed: Vec<u8>,
+    session_id: Option<String>,
+    blob_id: Option<String>,
+    prefix_digest: Option<String>,
+}
+
+fn validate_direction(direction: &str) -> Result<()> {
+    if !ATTACHMENT_DIRECTIONS.contains(&direction) {
+        return Err(StorageError::InvalidInput(
+            "attachment progress direction must be upload or download".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn pack_bits(bits: &[bool]) -> Vec<u8> {
+    let mut packed = vec![0u8; bits.len().div_ceil(8)];
+    for (index, bit) in bits.iter().enumerate() {
+        if *bit {
+            packed[index / 8] |= 1 << (index % 8);
+        }
+    }
+    packed
+}
+
+fn unpack_bits(packed: &[u8], chunk_count: u32) -> Result<Vec<bool>> {
+    let expected = (chunk_count as usize).div_ceil(8);
+    if packed.len() != expected {
+        return Err(StorageError::StateCorrupted(
+            "stored attachment progress bitmap has an invalid length".to_owned(),
+        ));
+    }
+    let mut bits = Vec::with_capacity(chunk_count as usize);
+    for index in 0..chunk_count as usize {
+        bits.push(packed[index / 8] & (1 << (index % 8)) != 0);
+    }
+    // 尾部填充位必须为 0，否则位图不是本实现写出的。
+    let used = chunk_count as usize % 8;
+    if used != 0
+        && let Some(last) = packed.last()
+        && (last >> used) != 0
+    {
+        return Err(StorageError::StateCorrupted(
+            "stored attachment progress bitmap has non-zero padding bits".to_owned(),
+        ));
+    }
+    Ok(bits)
+}
+
+fn attachment_progress_aad<'a>(attachment_id: &'a str, direction: &'a str) -> [&'a [u8]; 3] {
+    [
+        attachment_id.as_bytes(),
+        direction.as_bytes(),
+        ATTACHMENT_PROGRESS_AAD_VERSION,
+    ]
+}
+
+fn seal_progress(
+    key: &ProtectedStorageKey,
+    attachment_id: &str,
+    direction: &str,
+    stored: &StoredProgress,
+) -> Result<Vec<u8>> {
+    let plaintext = serde_json::to_vec(stored).map_err(|error| {
+        StorageError::Failure(format!("cannot encode attachment progress: {error}"))
+    })?;
+    let plaintext = Zeroizing::new(plaintext);
+    let sealer = RecordSealer::new(key, SealPurpose::AttachmentTransferProgress);
+    sealer.seal(
+        &attachment_progress_aad(attachment_id, direction),
+        plaintext.as_slice(),
+    )
+}
+
+fn open_progress(
+    key: &ProtectedStorageKey,
+    attachment_id: &str,
+    direction: &str,
+    chunk_count: u32,
+    sealed: &[u8],
+) -> Result<AttachmentProgress> {
+    let sealer = RecordSealer::new(key, SealPurpose::AttachmentTransferProgress);
+    let plaintext = sealer.open(&attachment_progress_aad(attachment_id, direction), sealed)?;
+    let stored: StoredProgress = serde_json::from_slice(plaintext.as_slice()).map_err(|_| {
+        StorageError::StateCorrupted("stored attachment progress is not readable".to_owned())
+    })?;
+    if stored.version != ATTACHMENT_PROGRESS_RECORD_VERSION {
+        return Err(StorageError::StateCorrupted(
+            "stored attachment progress has an unsupported record version".to_owned(),
+        ));
+    }
+    if stored.chunk_count != chunk_count {
+        return Err(StorageError::StateCorrupted(
+            "stored attachment progress chunk count does not match its column".to_owned(),
+        ));
+    }
+    let confirmed = unpack_bits(&stored.confirmed, chunk_count)?;
+    if let Some(digest) = &stored.prefix_digest {
+        validate_digest("stored attachment progress prefix digest", digest).map_err(|_| {
+            StorageError::StateCorrupted(
+                "stored attachment progress prefix digest is invalid".to_owned(),
+            )
+        })?;
+    }
+    Ok(AttachmentProgress {
+        attachment_id: attachment_id.to_owned(),
+        direction: direction.to_owned(),
+        chunk_count,
+        confirmed,
+        session_id: stored.session_id,
+        blob_id: stored.blob_id,
+        prefix_digest: stored.prefix_digest,
+        updated_at_ms: 0,
+        already_existed: true,
+    })
+}
+
+fn attachment_chunk_count(connection: &Connection, attachment_id: &str) -> Result<Option<u32>> {
+    let row: Option<i64> = connection
+        .query_row(
+            "SELECT chunk_count FROM attachments WHERE attachment_id = ?1",
+            [attachment_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some(chunk_count) if chunk_count > 0 && chunk_count <= i64::from(MAX_ATTACHMENT_CHUNKS) => {
+            Ok(Some(chunk_count as u32))
+        }
+        Some(_) => Err(StorageError::StateCorrupted(
+            "attachment record has an invalid chunk count".to_owned(),
+        )),
+    }
+}
+
+fn load_progress_row(
+    connection: &Connection,
+    key: &ProtectedStorageKey,
+    attachment_id: &str,
+    direction: &str,
+) -> Result<Option<AttachmentProgress>> {
+    let row: Option<(i64, Vec<u8>, i64)> = connection
+        .query_row(
+            "SELECT chunk_count, protected_progress, updated_at
+               FROM attachment_transfer_progress
+              WHERE attachment_id = ?1 AND direction = ?2",
+            params![attachment_id, direction],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((chunk_count, sealed, updated_at)) = row else {
+        return Ok(None);
+    };
+    if chunk_count <= 0 || chunk_count > i64::from(MAX_ATTACHMENT_CHUNKS) || updated_at < 0 {
+        return Err(StorageError::StateCorrupted(
+            "stored attachment progress has invalid numeric columns".to_owned(),
+        ));
+    }
+    let chunk_count = chunk_count as u32;
+    // 位图长度必须与当前附件记录一致，否则不接受该进度。
+    let current = attachment_chunk_count(connection, attachment_id)?
+        .ok_or_else(|| StorageError::AttachmentNotFound(attachment_id.to_owned()))?;
+    if current != chunk_count {
+        return Err(StorageError::StateCorrupted(
+            "stored attachment progress does not match the attachment chunk count".to_owned(),
+        ));
+    }
+    let mut progress = open_progress(key, attachment_id, direction, chunk_count, &sealed)?;
+    progress.updated_at_ms = updated_at;
+    Ok(Some(progress))
+}
+
+fn save_progress_inner(
+    transaction: &mut CoreTransaction<'_>,
+    input: &AttachmentProgressInput,
+) -> Result<AttachmentProgress> {
+    let current = attachment_chunk_count(transaction.connection(), &input.attachment_id)?
+        .ok_or_else(|| StorageError::AttachmentNotFound(input.attachment_id.clone()))?;
+    if current != input.chunk_count {
+        return Err(StorageError::InvalidInput(
+            "attachment progress chunk count must match the attachment record".to_owned(),
+        ));
+    }
+    let stored = StoredProgress {
+        version: ATTACHMENT_PROGRESS_RECORD_VERSION,
+        chunk_count: input.chunk_count,
+        confirmed: pack_bits(&input.confirmed),
+        session_id: input.session_id.clone(),
+        blob_id: input.blob_id.clone(),
+        prefix_digest: input.prefix_digest.clone(),
+    };
+    let sealed = seal_progress(
+        transaction.key,
+        &input.attachment_id,
+        &input.direction,
+        &stored,
+    )?;
+    let now = now_ms();
+    let existed: Option<i64> = transaction
+        .connection()
+        .query_row(
+            "SELECT 1 FROM attachment_transfer_progress
+              WHERE attachment_id = ?1 AND direction = ?2",
+            params![input.attachment_id, input.direction],
+            |row| row.get(0),
+        )
+        .optional()?;
+    transaction.transaction.execute(
+        "INSERT INTO attachment_transfer_progress
+             (attachment_id, direction, chunk_count, protected_progress, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(attachment_id, direction) DO UPDATE SET
+             chunk_count = excluded.chunk_count,
+             protected_progress = excluded.protected_progress,
+             updated_at = excluded.updated_at",
+        params![
+            input.attachment_id,
+            input.direction,
+            i64::from(input.chunk_count),
+            sealed,
+            now
+        ],
+    )?;
+    transaction.note(1);
+    Ok(AttachmentProgress {
+        attachment_id: input.attachment_id.clone(),
+        direction: input.direction.clone(),
+        chunk_count: input.chunk_count,
+        confirmed: input.confirmed.clone(),
+        session_id: input.session_id.clone(),
+        blob_id: input.blob_id.clone(),
+        prefix_digest: input.prefix_digest.clone(),
+        updated_at_ms: now,
+        already_existed: existed.is_some(),
+    })
+}
+
+impl Store {
+    /// 保存（或覆盖）附件传输进度快照。
+    ///
+    /// 幂等：进度是“可推进的快照”，重复保存同一份内容不报错；chunk_count 必须与
+    /// attachments.chunk_count 一致，位图长度必须等于 chunk_count，方向必须在白名单内。
+    pub fn save_attachment_progress(
+        &mut self,
+        input: AttachmentProgressInput,
+    ) -> Result<AttachmentProgress> {
+        self.ensure_ready()?;
+        input.validate()?;
+        let mut transaction = self.begin_transaction(WriteScope::attachments())?;
+        match save_progress_inner(&mut transaction, &input) {
+            Ok(progress) => {
+                commit_transaction(transaction)?;
+                Ok(progress)
+            }
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                Err(error)
+            }
+        }
+    }
+
+    /// 读取附件传输进度；不存在返回 None，损坏返回 STATE_CORRUPTED。
+    pub fn load_attachment_progress(
+        &self,
+        attachment_id: &str,
+        direction: &str,
+    ) -> Result<Option<AttachmentProgress>> {
+        self.ensure_ready()?;
+        validate_attachment_id(attachment_id)?;
+        validate_direction(direction)?;
+        load_progress_row(self.connection(), &self.key, attachment_id, direction)
+    }
+
+    /// 清除某个方向的传输进度；返回是否真的删除了记录。
+    pub fn clear_attachment_progress(
+        &mut self,
+        attachment_id: &str,
+        direction: &str,
+    ) -> Result<bool> {
+        self.ensure_ready()?;
+        validate_attachment_id(attachment_id)?;
+        validate_direction(direction)?;
+        let mut transaction = self.begin_transaction(WriteScope::attachments())?;
+        let outcome = (|| -> Result<bool> {
+            let deleted = transaction.transaction.execute(
+                "DELETE FROM attachment_transfer_progress
+                  WHERE attachment_id = ?1 AND direction = ?2",
+                params![attachment_id, direction],
+            )?;
+            if deleted > 0 {
+                transaction.note(deleted);
+            }
+            Ok(deleted > 0)
+        })();
+        match outcome {
+            Ok(deleted) => {
+                commit_transaction(transaction)?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                Err(error)
+            }
+        }
+    }
+}
+

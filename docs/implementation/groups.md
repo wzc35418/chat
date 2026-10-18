@@ -1,6 +1,6 @@
 # 小群创建、邀请与治理用例
 
-阶段：P3。状态：函数级设计；GROUPS-001 建群与 GROUPS-002 快照已实现（真实 OpenMLS + 正式加密库），其余治理函数未开始。目标源码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)。
+阶段：P3。状态：函数级设计；GROUPS-001 建群与 GROUPS-002 快照已实现（真实 OpenMLS + 正式加密库），成员治理的角色变更（`set_role`）与禁言（`set_muted`）也已实现（DOMAIN-002/004 策略层 + CRYPTO-005 控制提交）；其余治理函数未开始。目标源码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)。
 
 本章对应 GroupService 的完整业务入口。所有管理操作都是待确认票据；UI 读取正式快照与 pending 列表分别显示。邀请加入分为业务接受、KeyPackage 获取、正式 Commit、Welcome 投递四步。重加入需要当前成员明确授权，不直接从节点读取群密钥。
 
@@ -129,10 +129,13 @@ propose_group_operation(group: GroupId, expected: ControlHead, op: GroupOperatio
 
 **完成验收**：
 
-- [ ] 旧 UI 任免按最新角色重新校验。
-- [ ] 同 ID 不同 op 拒绝。
+- [x] 旧 UI 任免按最新角色重新校验：`groups_governance::non_owner_cannot_govern` / `changing_the_owner_or_self_is_rejected`（每次治理都从**持久快照**重建 DOMAIN-001 快照并重新授权，普通成员/自我改角色/改群主全部 `PERMISSION_DENIED`）。
+- [ ] 同 ID 不同 op 拒绝。（未实现：本切片没有 operation id 的幂等票据，只有具体的 `set_role`/`set_muted` 直接入口）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现。**角色变更（`set_role`）与禁言（`set_muted`）已实现**，见文末“成员治理实现记录”：
+DOMAIN-002 授权 + DOMAIN-004 计算 `policy_version`/`control_head`，角色变更再经 CRYPTO-005
+`prepare_control(SelfUpdate)` 生成真实控制提交；通用“治理意图票据”（expected head CAS、operation id 幂等、
+邀请投递）仍未实现。
 
 <a id="groups-004"></a>
 
@@ -511,7 +514,107 @@ cargo test --offline -p chat-core                          # 87 passed（既有 
 2. **不联网**：本切片不创建节点群（NODE-005 register_group）、不投递 Commit/Welcome；创建回执幂等复用未实现。
 3. **群元数据的临时载体**：快照存在 `mls_group_state` 的独立命名空间里；storage 提供正式 groups 表与“列出本机群”后应迁移。
 4. **GroupView 不含 head/seq/coordinator/故障状态**：这些字段要等节点同步（NODE-006/007）接入后才有真实来源，本切片不臆造。
-5. **角色只区分 Owner/Member**：Admin 与治理操作属 GROUPS-003~012（未开始）。
+5. **治理范围**：角色变更（Owner/Admin/Member）与禁言已实现（见“成员治理实现记录”）；移除成员、改名、转让群主、退出、解散属 GROUPS-005~012（未开始）。
 6. **成员身份是调用方声明的凭据文本**：MLS 侧真实凭据校验在 `prepare_control` 内部完成；本层不做跨账户目录核对。
+
+## 成员治理实现记录（角色变更 set_role / 禁言 set_muted，2026-10-18，Windows x64）
+
+代码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)（同一文件，无新依赖）；测试：
+[crates/core/tests/groups_governance.rs](../../crates/core/tests/groups_governance.rs)（7 个用例，真实 OpenMLS + 临时正式加密库）。
+
+> 编号说明：本轮任务的 GROUPS-003/004 指“角色变更 / 禁言”，对应本文档 GROUPS-003（治理意图）里的
+> 角色/禁言子集；本文档 GROUPS-004 `accept_group_invite`（邀请加入）仍**未实现**。
+
+### 公开面
+
+~~~text
+pub fn set_role(
+    device: &mut MlsDevice,      // 本机真实 MLS 设备（生成控制提交）
+    store: &mut Store,
+    group_id: &str,              // PROTOCOL-001 grp:1:<hex>
+    actor_credential: &str,      // 操作者（快照里的凭据身份）
+    target_credential: &str,     // 目标成员（必须是已确认成员）
+    role: MemberRole,            // Admin / Member（Owner 只能走转让）
+) -> GroupResult<GroupView>
+
+pub fn set_muted(
+    store: &mut Store,
+    group_id: &str,
+    actor_credential: &str,
+    target_credential: &str,
+    muted: bool,
+) -> GroupResult<GroupView>
+~~~
+
+`GroupView` 新增 `control_head`（小写 hex，下一次治理的 CAS 前置值）与 `policy_version: u64`；
+`GroupMemberView` 新增 `muted**`——两者都来自**持久快照**，不是调用方自报。
+
+### 关键语义
+
+1. **顺序 = 先判权限、再算策略、最后才写**：读持久快照 → 构造 DOMAIN-001 正式快照（不变量校验）→
+   DOMAIN-002 `authorize_group_operation` 判权限 → DOMAIN-004 `apply_policy_operation` 计算
+   新的 `policy_version` 与 `control_head`（**不本地臆造**）→ （角色变更）CRYPTO-005
+   `prepare_control(SelfUpdate)` 生成真实 MLS 控制提交并写 pending → 快照写回。任何一步失败都发生在
+   写入之前（例外：`prepare_control` 已经成功后快照写库失败会留下未匹配的 pending，函数返回
+   `STORAGE_*`，重试即可补齐——已文档化）。
+2. **权限**（DOMAIN-002，不重复实现）：改角色**只有群主**；不能改群主角色（只能转让）；不能改自己；
+   禁言需要群主或管理员、不能禁言自己；目标必须是已确认成员（pending 成员不可治理）。
+3. **角色白名单**：`role` 只接受 `Admin`/`Member`；传 `Owner` → `PERMISSION_DENIED`。
+4. **控制提交**：角色变更必须携带真实 MLS 提交（`SelfUpdate`，epoch 只在下一次接受合并时推进），
+   因此快照里 `epoch` 不变、`pending` 非空；禁言是**纯策略层**操作（无 MLS 提交、无 pending），
+   但有未决控制提交时**显式拒绝**（避免策略头与提交顺序不一致）。
+5. **账户/设备标识**：正式快照需要的 `AccountId`/`DeviceId` 由成员凭据**确定性派生**
+   （`sha256("chat/groups/account-id/v1" || credential)` 与 `.../device-id/v1`），同一凭据恒得同一标识；
+   协调节点标识同样由 MLS 群键派生占位。**这不是真实账户 ID**，接入 IDENTITY 后应替换。
+
+### 错误码（全部既有冻结码）
+
+| 情形 | code |
+|---|---|
+| 非群主改角色 / 改群主 / 改自己 / 非管理员禁言 / 禁言自己 | `PERMISSION_DENIED` |
+| 目标不是已确认成员 / 操作者不在群 / 群 ID 不属于本机设备 | `INVALID_TARGET` |
+| 群 ID 不是 PROTOCOL-001 文本 | `INVALID_ID` |
+| 未决控制提交期间的策略写入 / 第二个控制提交 | `INVALID_STATE_TRANSITION` |
+| 本机 MLS epoch 与持久快照不一致 | `STALE_EPOCH` |
+| 快照损坏/不变量被破坏 | `STATE_CORRUPTED` |
+| 存储失败 | storage 冻结码 |
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test groups_governance   # 7 passed
+cargo test --offline -p chat-core                            # 97 passed（既有 87 全部继续通过；lib 内另有 3 个并行任务新增用例）
+~~~
+
+### 证据（测试名 → 覆盖点）
+
+- `groups_governance::owner_changes_a_role_and_policy_version_advances`：群主把 bob 改成 Admin →
+  `policy_version 1→2`、`control_head` 由全零变成派生的 64 位 hex、`epoch` 仍为 1、
+  `pending.operation == "self_update"`（base 1→target 2），设备侧 `pending_control()` 也是 self_update；
+  快照与返回值一致。
+- `groups_governance::non_owner_cannot_govern`：普通成员改角色/禁言 → `PERMISSION_DENIED`，且
+  `policy_version`/`control_head`/pending 全部不变（拒绝不留写入）。
+- `groups_governance::changing_the_owner_or_self_is_rejected`：群主改自己、把别人升为 Owner、禁言自己 →
+  `PERMISSION_DENIED`；快照完全不变。
+- `groups_governance::mute_roundtrip_updates_the_policy_snapshot`：禁言/解除禁言往返（`policy_version 2→3`，
+  control_head 每次都变化，无 MLS pending），正式库快照与返回值一致。
+- `groups_governance::unknown_members_and_illegal_transitions_are_rejected`：未知目标/未知操作者 `INVALID_TARGET`、
+  畸形群 ID `INVALID_ID`，且不留写入。
+- `groups_governance::pending_control_commit_blocks_further_governance`：角色变更后（pending self_update），
+  禁言被拒（`INVALID_STATE_TRANSITION`）、第二个角色变更被 crypto 拒绝；第一次的结果保持一致。
+- `groups_governance::governance_snapshot_survives_reopen`：禁言往返 + 改角色后**关闭库重新打开**，
+  `policy_version/control_head/成员角色/禁言态/pending/epoch` 全部一致。
+
+### 已知限制
+
+1. **控制提交未接受**：`merge_accepted_pending` / 节点回执未接线，本轮把“策略快照已写入”视为本地生效，
+   pending 如实报告；接节点后需要“接受→合并→再写快照”的顺序。
+2. **没有 expected head 入参**：DOMAIN-004 会派生新头，但调用方还不能传“我看到的头”做 CAS；
+   并发 UI/多设备场景需要补 `expected_control_head` 入参（STALE_CONTROL_HEAD 已经在域层就绪）。
+3. **账户/设备标识是派生占位**（见上文第 5 条），接入真实账户目录后要替换；成员仍以凭据文本定位。
+4. **有未决控制提交时策略层整体冻结**：一次只有一个治理操作在飞；批量治理需要先接接受/合并。
+5. 待实现：移除成员、改名、转让群主、退出、解散（GROUPS-005~012）。
+
 
 

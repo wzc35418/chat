@@ -133,9 +133,9 @@ upload_attachment(id: AttachmentId) -> Result<UploadResult>
 **完成验收**：
 
 - [x] 响应丢失重复块不会加倍计配额：`attachments::tests::upload_sends_the_cached_ciphertext_chunks_verbatim`（重复上传已 available 的附件是幂等无操作：不建会话、不发块、不重复 complete）与 `upload_failure_keeps_progress_and_retry_is_idempotent`（重试按同一序号重发同一密文字节；端口契约要求同会话同序号幂等）。节点侧“同块只计一次配额”的记账属 NODE-013，不在本 crate。
-- [ ] 重启从位图续传。（未实现：进度只在进程内，附件表没有进度列；重启后重试会新建会话并从第 0 块重发——同序号同字节，节点侧仍幂等）
+- [x] 重启从位图续传：`attachments::tests::upload_resumes_after_restart_and_sends_only_missing_chunks`（第 3 块失败 → 重开 store → 复用持久会话、跳过已确认的 2 块、只补发剩余 1 块：`put 增量 == 1`，完成后进度清零；节点侧同序号幂等仍由 blob 端口契约保证）。
 
-**实现状态**：已实现（编排 + 状态机，Windows x64 实测）。`PersistedAttachmentStore::upload_attachment(attachment_id, &mut transport)`：按 storage 白名单 imported → uploading → available 迁移；从本地加密缓存按序读取**密文块**（不重新加密、不发明文）→ `BlobTransport::begin_upload` →逐块 `put_chunk` → `complete(整文件密文摘要)` → 标 available；已 available 时重复调用是幂等无操作；中途失败保留缓存与已发送块计数、状态停在 uploading 可重试；任何网络失败都不会把记录标成 available。证据：`attachments::tests::upload_sends_the_cached_ciphertext_chunks_verbatim`（节点收到的每块与本地缓存密文逐字节一致、节点永不收到明文、请求字段与公开清单一致、重复上传零发送）、`upload_failure_keeps_progress_and_retry_is_idempotent`（第 3 块失败时已发 2 块、缓存与进度保留、状态 uploading、重试用同一密文成功）。限制：位图续传、持久化进度未实现（见“上传/下载接块传输端口实现记录”）；节点配额/回执验证由 `NodeBlobTransport` 适配层完成（见“节点块传输适配实现记录”）。
+**实现状态**：已实现（编排 + 状态机，Windows x64 实测）。`PersistedAttachmentStore::upload_attachment(attachment_id, &mut transport)`：按 storage 白名单 imported → uploading → available 迁移；从本地加密缓存按序读取**密文块**（不重新加密、不发明文）→ `BlobTransport::begin_upload` →逐块 `put_chunk` → `complete(整文件密文摘要)` → 标 available；已 available 时重复调用是幂等无操作；中途失败保留缓存与已发送块计数、状态停在 uploading 可重试；任何网络失败都不会把记录标成 available。证据：`attachments::tests::upload_sends_the_cached_ciphertext_chunks_verbatim`（节点收到的每块与本地缓存密文逐字节一致、节点永不收到明文、请求字段与公开清单一致、重复上传零发送）、`upload_failure_keeps_progress_and_retry_is_idempotent`（第 3 块失败时已发 2 块、缓存与进度保留、状态 uploading、重试用同一密文成功）。断点续传（迁移 0008）：每成功一块把“已确认位图 + 节点会话”写入正式库（单事务提交），重开进程后复用会话并只补发剩余块；节点会话失效（UPLOAD_EXPIRED）时重新 begin、位图清零后重发一次，避免本地与节点长期不一致。证据：`upload_resumes_after_restart_and_sends_only_missing_chunks`、`transfer_progress_corruption_is_state_corrupted`（位图被篡改 → STATE_CORRUPTED）、`cargo test --offline -p chat-storage --test attachment_progress`。限制：进度按“已确认前缀”推进，不做并行块；节点配额/回执验证由 `NodeBlobTransport` 适配层完成（见“节点块传输适配实现记录”）。
 
 <a id="attachments-004"></a>
 
@@ -200,10 +200,10 @@ download_attachment(id: AttachmentId) -> Result<TransferTicket>
 
 **完成验收**：
 
-- [x] 重排/替换/缺最后块失败：`attachments::tests::download_rejects_tampered_chunks_and_leaves_no_partial_file`（替换第 2 块 → 分块 AAD 认证失败 → ATTACHMENT_CORRUPTED，不产生目标文件与临时文件）、`download_rejects_unknown_blobs_and_missing_keys`（节点缺块/未知 blob → ATTACHMENT_NOT_FOUND）、`download_rejects_a_wrong_manifest_before_reading_any_chunk`（与本地记录不一致的 manifest 在任何网络读取前被拒）。
-- [ ] 取消下载保留可恢复进度。（未实现：下载没有取消入口；失败时状态保留在 downloading 且不写任何文件，可重新调用重试）
+- [x] 重排/替换/缺最后块失败：`attachments::tests::download_rejects_tampered_chunks_and_leaves_no_partial_file`（替换第 2 块 → 分块 AAD 认证失败 → ATTACHMENT_CORRUPTED，删除半成品、不产生目标文件与临时文件）、`download_works_after_restart_and_rejects_unknown_blobs`（节点缺块/未知 blob → ATTACHMENT_NOT_FOUND）、`download_rejects_a_wrong_manifest_before_reading_any_chunk`（与本地记录不一致的 manifest 在任何网络读取前被拒）。
+- [x] 断点续传（重启后只拉缺块）：`attachments::tests::download_resumes_after_restart_and_reads_only_missing_chunks`（第 3 块读取失败 → 前 2 块已解密写出并持久化前缀摘要 → 重开 store → 只读剩余 1 块、输出与原文字节一致、进度与半成品清理；半成品被篡改时拒绝续传并从头重下）。取消下载仍没有单独入口（取消走 ATTACHMENTS-007）。
 
-**实现状态**：已实现（编排 + 状态机，Windows x64 实测）。`PersistedAttachmentStore::download_attachment(blob_id, expected_manifest, destination, &mut transport)`：只接受 available/downloading 记录；先用 expected_manifest 与本地持久化记录（块数/块大小/明文大小/密文摘要）比对，不一致在任何网络读取前 `ATTACHMENT_CORRUPTED`；逐块 `read_chunk` → 分块 AAD 认证解密 → 同目录临时文件 → 校验**密文整文件摘要 + 明文大小 + 明文 SHA-256** 后 rename；任何失败删除临时文件、绝不写出未验证文件；解密需要进程内 FileKey（重启后显式 `ATTACHMENT_KEY_UNAVAILABLE`）。证据：`download_roundtrip_matches_the_original_plaintext`（下载得到的明文与原始正文逐字节一致、回执摘要一致）、上面三条拒绝用例。限制：不写本地加密缓存（本轮直接写出目标路径）、无“只拉缺块”的位图、无 CAPABILITY_EXPIRED（下载能力令牌属 E2EE SecretDescriptor）；节点读取授权由 `NodeBlobTransport` 适配层承载（NODE-015：上传设备本人恒可读）。
+**实现状态**：已实现（编排 + 状态机 + 断点续传，Windows x64 实测）。`PersistedAttachmentStore::download_attachment(blob_id, expected_manifest, destination, &mut transport)`：只接受 available/downloading 记录；先用 expected_manifest 与本地持久化记录（块数/块大小/明文大小/密文摘要）比对，不一致在任何网络读取前 `ATTACHMENT_CORRUPTED`；按迁移 0008 的进度位图续传：跳过已确认块、追加写同目录半成品、每块成功后持久化“已确认位图 + 已写前缀的明文摘要”，续传前重新读取本地前缀并核对摘要（不符则丢弃进度从头重下）；全部块认证通过后校验**明文大小 + 明文 SHA-256**（从头开始的完整下载额外校验密文整文件摘要）再 rename；损坏类错误删除半成品与进度，传输类错误保留两者供续传；解密用进程内 FileKey，缺失时先从 `attachment_secrets` 恢复（重启后仍可下载），密钥记录确实缺失才 `ATTACHMENT_KEY_UNAVAILABLE`。证据：`download_roundtrip_matches_the_original_plaintext`、`download_works_after_restart_and_rejects_unknown_blobs`、`download_resumes_after_restart_and_reads_only_missing_chunks`、上面三条拒绝用例。限制：不写本地加密缓存（本轮直接写出目标路径）；下载进度与半成品绑定同一目标路径（换目标目录视为新下载）；无 CAPABILITY_EXPIRED（下载能力令牌属 E2EE SecretDescriptor）；节点读取授权由 `NodeBlobTransport` 适配层承载（NODE-015：上传设备本人恒可读）。
 
 <a id="attachments-006"></a>
 
@@ -552,6 +552,69 @@ cargo test --offline -p chat-core --lib                          # 29 passed
 3. `crates/ffi/tests/attachment_node.rs` 里“另一实例下载 → `ATTACHMENT_KEY_UNAVAILABLE`”的断言
    反映的是本轮之前的边界；现在同一库同一主密钥的第二实例可以真实下载，该断言需由 FFI 任务同步更新
    （本轮不在 crates/ffi 写范围）。
+
+## 断点续传实现记录（迁移 0008，R-38，2026-10-18，Windows x64）
+
+目标：上传/下载在进程重启后**不从头重发/重拉**，只补剩余块。存储侧见
+[storage.md 的附件传输进度实现记录](storage.md)；core 编排在
+[crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)。
+
+### 存储层（迁移 0008）
+
+`attachment_transfer_progress`：主键 (attachment_id, direction)，外键 `ON DELETE CASCADE`；
+密封内容 = 已确认块位图 + 上传会话 ID + blob 标识 + 下载前缀摘要（用途
+`attachment-transfer-progress`，AAD 绑 attachment_id + direction）；明文列只有
+attachment_id/direction/chunk_count/updated_at。API：`save_attachment_progress`（UPSERT 幂等）、
+`load_attachment_progress`、`clear_attachment_progress`；位图长度 ≠ chunk_count、填充位非 0、
+chunk_count 与附件记录不一致都显式 `STATE_CORRUPTED`。
+
+### 上传（ATTACHMENTS-003）
+
+1. 开始前读持久进度：有会话就复用、有位图就跳过已确认块（不重发）；
+2. 每成功一块把“位图 + 会话”写入正式库（单事务提交），崩溃最多丢正在传的那一块；
+3. 节点会话失效（`UPLOAD_EXPIRED`）时重新 begin 并把位图清零后整份重发一次，避免本地
+   位图与节点实际状态长期不一致；
+4. complete 成功 → **先清进度再标 available**（残留进度不影响幂等，但清掉更干净）。
+
+### 下载（ATTACHMENTS-005）
+
+1. 开始前读持久进度，取“连续已确认前缀”作为续传起点；
+2. 半成品文件存在且长度/前缀明文摘要与进度一致 → 追加写、跳过已确认块；不一致（被删/被改）
+   → 丢弃进度与半成品，从头重下（不静默接受坏前缀）；
+3. 每成功一块 `sync_data` 后持久化“位图 + 已写前缀的明文 SHA-256”；
+4. 全部块写完 → 校验明文大小与整文件明文摘要（从头开始的完整下载额外校验整段密文摘要），
+   通过才 rename 成目标文件；损坏类错误删除半成品与进度，传输类错误保留两者供续传。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-storage --test attachment_progress   # 5 passed
+cargo test --offline -p chat-core --lib                          # 32 passed
+cargo test --offline -p chat-storage -p chat-core                # 89 + 100 全绿
+~~~
+
+### 证据
+
+- storage `attachment_progress`：往返/方向隔离/幂等、位图与 chunk_count 不一致拒绝、
+  方向白名单、会话/blob 有界、密封列篡改与挪方向 → `STATE_CORRUPTED`、删除附件级联清进度。
+- `attachments::tests::upload_resumes_after_restart_and_sends_only_missing_chunks`：第 3 块失败
+  → 重开 store → 复用持久会话、只补发剩余 1 块（`put 增量 == 1`）、完成后进度清零、重复上传零发送。
+- `attachments::tests::download_resumes_after_restart_and_reads_only_missing_chunks`：第 3 块读取
+  失败 → 重开 → 只读剩余 1 块且输出与原文字节一致、进度与半成品清理；半成品被篡改 → 从头重下。
+- `attachments::tests::transfer_progress_corruption_is_state_corrupted`：位图密封列被篡改 →
+  下一次上传显式 `STATE_CORRUPTED`（fail-closed）。
+
+### 已知限制
+
+1. 上传续传依赖节点会话仍有效；会话失效会整份重发一次（`UPLOAD_EXPIRED` 的恢复策略）。
+2. 下载续传绑定同一目标路径的半成品；换目标目录等于新下载（进度仍按 attachment_id 记录，
+   前缀校验会因路径不同而不匹配 → 从头重下）。
+3. 续传路径不重复校验整段密文摘要（本地已无前缀密文），安全性由每块 AEAD + 明文整文件摘要
+   + 本地前缀摘要重算保证；从头下载仍校验密文摘要。
+4. 进度没有 TTL/后台清理：完成时 core 清除、删除附件时外键级联清除，异常中断的残留进度
+   会在下次续传时被覆盖或清除。
+
 
 
 
