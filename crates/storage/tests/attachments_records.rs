@@ -105,8 +105,8 @@ fn attachment_record_roundtrip_is_idempotent_and_ordered() {
     let mut store = fixture.open();
     assert_eq!(
         store.schema_version(),
-        8,
-        "0005 attachments, 0006 device credentials, 0007 secrets, 0008 transfer progress"
+        9,
+        "0005 attachments, 0006 device credentials, 0007 secrets, 0008 progress, 0009 refs"
     );
 
     let saved = store.save_attachment(input("att-1234", "staging")).expect("save");
@@ -405,11 +405,11 @@ fn attachment_migration_is_applied_once_and_keeps_previous_tables() {
     let fixture = Fixture::new("migration");
     {
         let store = fixture.open();
-        assert_eq!(store.schema_version(), 8);
+        assert_eq!(store.schema_version(), 9);
     }
     let store = fixture.open();
-    assert_eq!(store.schema_version(), 8);
-    assert_eq!(rows(&store, "schema_migrations"), 8);
+    assert_eq!(store.schema_version(), 9);
+    assert_eq!(rows(&store, "schema_migrations"), 9);
     // 0001~0004 的既有表仍可用（这里抽查 0004 的 MLS 状态表与 0002 的密钥校验表）。
     assert_eq!(rows(&store, "mls_group_state"), 0);
     assert_eq!(rows(&store, "store_key_check"), 1);

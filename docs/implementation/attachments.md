@@ -300,11 +300,11 @@ collect_unreferenced_attachments(now: Time, budget: GcBudget) -> Result<GcReport
 
 **完成验收**：
 
-- [x] 有附件记录引用的缓存不删：`attachments::tests::collect_removes_only_unreferenced_cache_directories`（两条有记录的附件缓存目录原样保留，含其分块文件）。
-- [ ] 活跃上传/已接受消息引用不能删除。（本层只按附件记录引用判断；消息/任务级引用计数与"两阶段 GC 标记"未实现）
+- [x] 有附件记录引用的缓存不删：`attachments::tests::collect_removes_only_unreferenced_cache_directories` 与 `collect_keeps_record_referenced_directories_even_without_grace`（有记录的缓存目录原样保留，含其分块文件）。
+- [x] 活跃上传/已接受消息引用不能删除（消息引用部分）：`attachments::tests::collect_keeps_message_referenced_staging_records_until_detached`（staging 记录 + 过期 + 被消息引用 → 记录与缓存都保留；解除引用后 → 记录与缓存一起回收）。任务/上传队列引用（outbox job 级）仍未接入。
 - [ ] crash 后能继续回收。
 
-**实现状态**：本地缓存回收部分已实现（Windows x64 实测）。`PersistedAttachmentStore::collect_unreferenced_attachments() -> CollectReport`：先短事务读出有记录引用的附件 ID 集合（storage 新增 `attachment_ids()`，只读 ID、不解密记录），再扫描缓存根下的目录——只处理名字符合 `att-<32hex>` 的目录，无引用才删除并统计释放字节；名字异常的目录/散落文件一律不动；扫描项数有界（`MAX_COLLECT_SCAN_ENTRIES = 10_000`）；返回 `{ removed_directories, freed_bytes, scanned_entries }`。幂等：无孤儿时返回 0。证据：`collect_removes_only_unreferenced_cache_directories`（只删孤儿、保留有引用目录、异常名字与文件不动、重复调用 0、删除记录后其目录变为孤儿可回收）。限制：不做 staging/取消/过期宽限期，不做消息引用计数，不记录两阶段 GC 标记；文件系统与 DB 不是原子的（先删文件再返回，失败下次幂等重做）。通过本函数用例不自动代表整个模块完成。
+**实现状态**：本地缓存回收已实现（记录 + 消息引用计数 + 宽限期，Windows x64 实测）。`PersistedAttachmentStore::collect_unreferenced_attachments() -> CollectReport` 使用默认宽限期 `DEFAULT_COLLECT_GRACE_MS = 24h`，`collect_unreferenced_attachments_with_grace(grace_ms)` 可配置（负数 `INVALID_INPUT`）。流程：短事务读「有记录引用的附件 ID」与「被消息引用的附件 ID」（storage 迁移 0009 的 `message_referenced_attachment_ids`/`attachment_ids`），再：① 清 staging 残留（state=staging、created_at 早于 now-grace、无消息引用 → 删记录连带缓存，计入 `removed_records`）；② 扫缓存根目录，只删名字符合 `att-<32hex>`、无记录/消息引用、且目录 mtime 早于 now-grace 的目录，计入 `removed_directories/freed_bytes`；名字异常的目录与散落文件不动；扫描项数有界（`MAX_COLLECT_SCAN_ENTRIES = 10_000`）。返回 `{ removed_directories, removed_records, freed_bytes, scanned_entries }`；幂等（无孤儿时 0）。证据：`collect_removes_only_unreferenced_cache_directories`、`collect_keeps_message_referenced_staging_records_until_detached`、`collect_respects_the_grace_period_and_is_idempotent`、`collect_keeps_record_referenced_directories_even_without_grace`；storage `message_attachments` 4 个用例（幂等引用/级联删除/未知行拒绝/引用集合与 staging 候选）。限制：任务/上传队列（outbox job）级引用未接入；没有“两阶段 GC 标记”，文件系统与 DB 不是原子的（失败下次幂等重做）；staging 记录来源（导入中断）当前实现不会产生，用例用 storage API 直接构造。通过本函数用例不自动代表整个模块完成。
 
 ## 上传/下载接块传输端口实现记录（ATTACHMENTS-003 / 005，2026-10-18，Windows x64）
 

@@ -20,8 +20,8 @@ use zeroize::Zeroizing;
 use super::error::StorageError;
 use super::seal::{ProtectedStorageKey, RecordSealer, SealPurpose};
 use super::{
-    CoreTransaction, Result, Store, WriteScope, commit_transaction, ensure_id, hex, now_ms,
-    rollback_transaction,
+    CoreTransaction, MAX_ID_BYTES, Result, Store, WriteScope, commit_transaction, ensure_id, hex,
+    now_ms, rollback_transaction,
 };
 
 /// 附件 ID 文本上限（字节）。
@@ -890,6 +890,222 @@ impl Store {
                 Err(error)
             }
         }
+    }
+}
+
+// ==== 消息对附件的引用（迁移 0009_message_attachments.sql） ====
+
+/// 单个附件的消息引用列表上限。
+pub const MAX_MESSAGE_ATTACHMENT_LIST: u32 = 512;
+
+fn validate_message_id(message_id: &str) -> Result<()> {
+    ensure_id("message", message_id)?;
+    if message_id.len() > MAX_ID_BYTES {
+        return Err(StorageError::InvalidInput(format!(
+            "message ID exceeds {MAX_ID_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn message_exists(connection: &Connection, message_id: &str) -> Result<bool> {
+    let row: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM messages WHERE message_id = ?1",
+            [message_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(row.is_some())
+}
+
+impl Store {
+    /// 记录一条消息对附件的引用；同 (message, attachment) 重复调用幂等。
+    ///
+    /// 附件记录必须存在（ATTACHMENT_NOT_FOUND）；消息必须存在（INVALID_INPUT），
+    /// 因此不会留下悬空引用。外键同时保证删除消息/附件记录时关联级联消失。
+    pub fn attach_message_attachment(&mut self, message_id: &str, attachment_id: &str) -> Result<()> {
+        self.ensure_ready()?;
+        validate_message_id(message_id)?;
+        validate_attachment_id(attachment_id)?;
+        let mut transaction = self.begin_transaction(WriteScope::attachments())?;
+        let outcome = (|| -> Result<()> {
+            let attachment_exists =
+                attachment_chunk_count(transaction.connection(), attachment_id)?.is_some();
+            if !attachment_exists {
+                return Err(StorageError::AttachmentNotFound(attachment_id.to_owned()));
+            }
+            if !message_exists(transaction.connection(), message_id)? {
+                return Err(StorageError::InvalidInput(
+                    "message does not exist".to_owned(),
+                ));
+            }
+            let inserted = transaction.transaction.execute(
+                "INSERT OR IGNORE INTO message_attachments
+                     (message_id, attachment_id, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params![message_id, attachment_id, now_ms()],
+            )?;
+            if inserted > 0 {
+                transaction.note(inserted);
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => {
+                commit_transaction(transaction)?;
+                Ok(())
+            }
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                Err(error)
+            }
+        }
+    }
+
+    /// 解除一条消息对某个附件的引用；返回是否真的删除（幂等）。
+    pub fn detach_message_attachment(
+        &mut self,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<bool> {
+        self.ensure_ready()?;
+        validate_message_id(message_id)?;
+        validate_attachment_id(attachment_id)?;
+        let mut transaction = self.begin_transaction(WriteScope::attachments())?;
+        let outcome = (|| -> Result<bool> {
+            let deleted = transaction.transaction.execute(
+                "DELETE FROM message_attachments
+                  WHERE message_id = ?1 AND attachment_id = ?2",
+                params![message_id, attachment_id],
+            )?;
+            if deleted > 0 {
+                transaction.note(deleted);
+            }
+            Ok(deleted > 0)
+        })();
+        match outcome {
+            Ok(deleted) => {
+                commit_transaction(transaction)?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                Err(error)
+            }
+        }
+    }
+
+    /// 解除一条消息的全部附件引用；返回删除条数。
+    pub fn detach_message_attachments(&mut self, message_id: &str) -> Result<u64> {
+        self.ensure_ready()?;
+        validate_message_id(message_id)?;
+        let mut transaction = self.begin_transaction(WriteScope::attachments())?;
+        let outcome = (|| -> Result<u64> {
+            let deleted = transaction.transaction.execute(
+                "DELETE FROM message_attachments WHERE message_id = ?1",
+                [message_id],
+            )?;
+            if deleted > 0 {
+                transaction.note(deleted);
+            }
+            Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
+        })();
+        match outcome {
+            Ok(deleted) => {
+                commit_transaction(transaction)?;
+                Ok(deleted)
+            }
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                Err(error)
+            }
+        }
+    }
+
+    /// 引用某附件的消息数（ATTACHMENTS-008 引用计数）。
+    pub fn message_attachment_count(&self, attachment_id: &str) -> Result<u64> {
+        self.ensure_ready()?;
+        validate_attachment_id(attachment_id)?;
+        let count: i64 = self.connection().query_row(
+            "SELECT COUNT(*) FROM message_attachments WHERE attachment_id = ?1",
+            [attachment_id],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
+    }
+
+    /// 引用某附件的消息 ID 列表（按消息 ID 升序，上限 MAX_MESSAGE_ATTACHMENT_LIST）。
+    pub fn message_attachment_ids(&self, attachment_id: &str) -> Result<Vec<String>> {
+        self.ensure_ready()?;
+        validate_attachment_id(attachment_id)?;
+        let mut statement = self.connection().prepare(
+            "SELECT message_id FROM message_attachments
+              WHERE attachment_id = ?1 ORDER BY message_id ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![attachment_id, i64::from(MAX_MESSAGE_ATTACHMENT_LIST)],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
+    }
+
+    /// 全部被消息引用的附件 ID（去重、升序、有界）；缓存回收一次性取用。
+    pub fn message_referenced_attachment_ids(&self) -> Result<Vec<String>> {
+        self.ensure_ready()?;
+        let mut statement = self.connection().prepare(
+            "SELECT DISTINCT attachment_id FROM message_attachments
+              ORDER BY attachment_id ASC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([i64::from(MAX_ATTACHMENTS)], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
+    }
+
+    /// GC 用：状态为 state 且 created_at 早于 cutoff 的附件 ID（升序、有界）。
+    pub fn attachment_ids_with_state_before(
+        &self,
+        state: &str,
+        cutoff_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<String>> {
+        self.ensure_ready()?;
+        validate_state(state)?;
+        if cutoff_ms < 0 {
+            return Err(StorageError::InvalidInput(
+                "attachment cutoff must be a non-negative timestamp".to_owned(),
+            ));
+        }
+        if limit == 0 || limit > MAX_ATTACHMENT_LIST {
+            return Err(StorageError::InvalidInput(format!(
+                "attachment list limit must be 1..={MAX_ATTACHMENT_LIST}"
+            )));
+        }
+        let mut statement = self.connection().prepare(
+            "SELECT attachment_id FROM attachments
+              WHERE state = ?1 AND created_at < ?2
+              ORDER BY created_at ASC, attachment_id ASC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![state, cutoff_ms, i64::from(limit)], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
     }
 }
 

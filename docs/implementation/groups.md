@@ -20,6 +20,7 @@
 - [GROUPS-010 transfer_ownership](groups.md#groups-010)
 - [GROUPS-011 leave_group](groups.md#groups-011)
 - [GROUPS-012 dissolve_group](groups.md#groups-012)
+- [GN 包：控制提交经节点回执再接受](groups.md#group-node)
 
 <a id="groups-001"></a>
 
@@ -758,10 +759,12 @@ pub fn load_group_device(store: &Store, group_id: &str) -> GroupResult<MlsDevice
 
 ### 语义边界（重要）
 
-**本地接受证据 ≠ 节点回执**：本轮把“本地持久 pending 记录”当作接受证据，用于把本地状态收口
-（epoch/成员/pending 一致）。它**不证明**节点已接受该 Commit，也没有按节点日志对账。真实部署必须先拿到
-节点/协调者回执（NODE-006/007 + 日志验证），再由上层调用本函数；否则本地 epoch 可能与节点日志不一致。
-“节点离线永不 Accepted”在本轮只做到“本地不伪造节点状态”。
+**本地接受证据 ≠ 节点回执**：本函数把“本地持久 pending 记录”当作接受证据，用于把本地状态收口
+（epoch/成员/pending 一致）。它**不证明**节点已接受该 Commit，也没有按节点日志对账。
+真实部署必须先拿到节点回执，再走 [group_node::accept_pending_control_with_receipt](../../crates/core/src/group_node.rs)
+（GN 包，见下文“控制提交经节点回执再接受”）：那里会先校验回执绑定的 group/submission/kind/密文摘要/seq/log_hash/节点签名，
+通过后才调用本函数；否则本地 epoch 可能与节点日志不一致。“节点离线永不 Accepted”的本轮做到的是“本地不伪造节点状态”，
+GN 包进一步做到“没有节点回执就不推进 epoch”。
 
 ### 错误码（既有冻结码）
 
@@ -780,7 +783,7 @@ pub fn load_group_device(store: &Store, group_id: &str) -> GroupResult<MlsDevice
 ~~~powershell
 . .\tools\activate.ps1
 cargo test --offline -p chat-core --test groups_commit   # 7 passed
-cargo test --offline -p chat-core                        # 118 passed（既有 109 全部继续通过；lib 内 36 个用例含并行任务新增）
+cargo test --offline -p chat-core                        # 128 passed（本记录写下时为 118；其后 lib 侧另有并行任务新增用例，GN 包新增 5 + 2）
 ~~~
 
 ### 证据（测试名 → 覆盖点）
@@ -804,11 +807,121 @@ cargo test --offline -p chat-core                        # 118 passed（既有 1
 
 ### 已知限制
 
-1. **本地接受 ≠ 节点接受**（见上文语义边界）：没有节点回执校验、没有日志对账；这是本轮最大的语义缺口。
+1. **本函数本身不做回执校验**（见上文语义边界）：需要节点回执的调用方必须走 GN 包的
+   `accept_pending_control_with_receipt`（已验证回执绑定后才调用本函数）；直接调用本函数只代表“本地接受”。
 2. **丢弃后必须重新装载设备**（`load_group_device`），因为丢弃只改库与库恢复出的设备。
 3. **policy_version 不回退**：丢弃只回滚 MLS 提交与成员集合，策略版本按任务约定保留（审计需要）。
 4. **一次只有一个治理操作在飞**：接受或丢弃之后才能准备下一个提交。
 5. **不联网**：不接受对端 Commit（CRYPTO-006 `process_verified_entry` 未接线到 groups）、不投递 Welcome。
+
+<a id="group-node"></a>
+
+## 控制提交经节点回执再接受（GN 包，2026-10-19，Windows x64）
+
+代码：[crates/core/src/group_node.rs](../../crates/core/src/group_node.rs)（新模块，`lib.rs` 加一行 `pub mod group_node;`，**不改** groups.rs/service.rs/attachments.rs/send_orchestrator.rs）；
+测试：[crates/core/tests/group_node.rs](../../crates/core/tests/group_node.rs)（5 个用例，真 axum 节点 + 真 OpenMLS + 真设备签名）+ 模块内 2 个单元用例（提交标识确定性、错误码）。
+
+### 公开面
+
+```text
+pub struct ControlReceipt { pub receipt: AppendResult, pub candidate: GroupCandidate, pub head: SignedLogHead }
+pub struct ControlReceiptError { /* code: 'static str, detail: String */ }
+pub type ControlReceiptResult<T> = Result<T, ControlReceiptError>;
+
+pub fn submit_pending_control(device: &MlsDevice, store: &Store, group_id: &str, client: &NodeClient) -> ControlReceiptResult<ControlReceipt>
+pub fn accept_pending_control_with_receipt(device: &mut MlsDevice, store: &mut Store, group_id: &str, receipt: &ControlReceipt) -> ControlReceiptResult<GroupView>
+```
+
+`ControlReceipt` 把“回执 + 被提交的候选原文 + 提交时的节点 head”**绑在一起**：只看回执字段无法排除
+“拿 A 的回执去接受 B 的提交”，必须同时带上候选原文与 head 快照才能复核。
+
+### 关键语义
+
+1. **候选怎么构造**：正文是 pending 的序列化 MLS Commit（`PendingControl.commit`，小写 hex），`kind = control`；
+   CAS 字段（`expected_control_head` / `policy_version` / `mls_epoch`）**只取自节点 head**（`get_head`），不做本地推断；
+   作者是节点客户端绑定的设备（签名由 `NodeClient::append_entry` 用设备钥完成，本模块不碰私钥）。
+2. **提交标识确定性**：`submission_id = SubmissionId(sha256(域 || group_id || base_epoch || target_epoch || commit_digest))`，
+   同一个 pending 重试恒得同一个 SubmissionId —— 节点按 `(group, submission)` 去重，因此重试不会产生第二条日志。
+3. **重试的对账路径**：控制候选的 CAS 字段依赖节点 head，而**我们自己的条目会让节点 control head 前进**，
+   所以第二次提交的候选字节必然不同（节点回 `SUBMISSION_ID_CONFLICT`）。本模块此时**按 submission 翻节点日志对账**，
+   取回原候选与原回执（并再用新 head 复核绑定）后返回，而不是伪造成“又提交成功了一次”。
+4. **控制元数据（PROTOCOL-004 强要求）**：控制候选必须带 `control_metadata`（缺了协议层直接判非法候选）。
+   `operation` 按本切片产生 pending 的治理操作映射：`add_members → invite`、`remove_members → remove`、
+   `self_update → set_role`（本切片里 `SelfUpdate` 只由 GROUPS-003 改角色产生；`set_muted`/`rename_group` 是纯策略层，不产生 MLS 提交）；
+   `target_digest` 用 pending 自带的提交摘要（已公开可算，不泄露目标身份）。
+5. **接受前的绑定校验**（任一不满足 → 显式错误，**不推进 epoch、不清空 pending**）：
+   ① 本地仍有 pending 且快照 epoch 停在 base_epoch、MLS 群键一致；② `receipt.group_id`/`candidate.group_id` 都等于本群；
+   ③ `receipt.submission_id` 等于候选的；④ `candidate.kind == control` 且候选正文**逐字节等于**本 pending 的 Commit（密文摘要一致）；
+   ⑤ `receipt.author_device_id` 等于候选作者；⑥ 回执自洽：节点身份与 head 一致、回执签名在 head 公钥下可验证、
+   `candidate_hash` 由本地候选重算、`log_hash` 按 `log_chain_hash(group, seq, previous_hash, candidate_hash)` 重算 —— 都与回执一致。
+   （节点侧 `AppendResult::verify` 本身也复核签名与日志链；本模块再按本地候选独立复算一遍，不依赖“客户端已经验过一次”。）
+6. **通过之后才合并**：调用既有 `groups::accept_pending_control`（epoch 前进到 target_epoch、pending 清空、
+   add 的 pending 成员入群 / remove 的待移除成员彻底删除、策略快照落库）；合并后复核 `epoch == target_epoch` 且 pending 已清空，
+   否则按 `STATE_CORRUPTED` 失败（不回滚已提交的合并）。
+7. **同步 API**：本 crate 的公开面是同步的，节点调用用 `std::thread::scope` + 独立 current-thread 运行时桥成同步
+   （每次治理提交一个短命线程；即使调用方本身在 tokio 运行时里也不会嵌套 panic）。
+
+### 语义边界（本轮仍然不等于“节点已验证 MLS 内容”）
+
+- 回执证明的是：**节点接受了这条候选条目**（绑定 group/submission/kind/密文摘要/seq/log_hash 且节点签名有效）。
+  它**不证明**节点或其它成员验证过 Commit 的 MLS 语义（MLS 内层验证仍需 CRYPTO-006 `process_verified_entry`，本轮未接线）。
+- 本地策略控制头（DOMAIN-004 摘要）与节点可观察控制头（日志链摘要）**仍是两套值**：候选的 CAS 字段取节点 head，
+  本地 `policy_version`/`control_head` 不参与节点校验。统一这两套头属于后续控制面切片。
+- MLS 凭据（`alice`/`bob`）与节点设备标识（`dev:1:...`）在本切片是两套命名空间；映射属 IDENTITY/DOMAIN 后续切片。
+- 只处理本机自己准备的 pending 提交；处理**对端** Commit（含 Welcome）仍未接线。
+
+### 错误码（全部既有冻结码，不新造协议码）
+
+| 情形 | code |
+|---|---|
+| 群 ID 不是 PROTOCOL-001 文本 | `INVALID_ID` |
+| 没有 pending 提交 | `PENDING_MISMATCH` |
+| 快照 epoch 与 pending 的 base_epoch 不一致 | `STALE_EPOCH` |
+| pending 与该群的 MLS 群键不一致 / 合并后 epoch 不符 | `STATE_CORRUPTED` |
+| 控制提交超过节点单条候选密文上限 | `CONTENT_TOO_LARGE` |
+| 候选不是控制条目 / 正文与 pending Commit 不一致 / 候选非法 | `INVALID_CANDIDATE` |
+| 回执绑定到别的群 / 别的 submission / 别的候选 / 别的节点 | `INVALID_RECEIPT_SCOPE` |
+| 回执签名或日志链摘要不成立（含篡改 seq / log_hash） | `INVALID_SIGNATURE` |
+| 回执是发给别的作者设备的 | `PERMISSION_DENIED` |
+| 节点不可达 / 超时 | `NODE_UNAVAILABLE` |
+| 其它节点拒绝（权限、配额、非法请求等） | 客户端已分类的稳定码（如 `INVALID_REQUEST`） |
+
+### 复现命令（全程离线）
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test group_node   # 5 passed
+cargo test --offline -p chat-core                     # 128 passed（0 警告）
+```
+
+### 证据（测试名 → 覆盖点）
+
+- `group_node::control_commit_is_submitted_then_accepted_with_a_real_node_receipt`：建真群（真 OpenMLS，2 成员）→ 群主改
+  bob 角色产生 pending（base 1 → target 2，epoch 不动）→ 提交到真节点拿到回执（seq 1、kind=control、正文与 pending Commit
+  逐字节一致）→ **节点日志确实有这条控制条目**（submission/seq/log_hash 与回执一致，head 同步前进）→ 用回执接受后
+  **epoch 2**、pending 清空、bob 变 Admin、持久快照同步前进、节点日志**仍只有 1 条**。
+- `group_node::duplicate_submit_is_idempotent_and_appends_once`：连续两次提交拿到**同一个** SubmissionId / seq / log_hash /
+  candidate_hash（第二次走“按 submission 对账”路径，因为节点 head 已被自己的条目前进），节点日志仍只有 1 条，任一份回执都能接受。
+- `group_node::misbound_or_forged_receipts_are_rejected_without_advancing_epoch`：7 种伪造（改 seq、改 log_hash、换密文、
+  换群、换作者设备、换节点公钥、把 kind 改成 application）逐个被拒（`INVALID_SIGNATURE` / `INVALID_RECEIPT_SCOPE` /
+  `INVALID_CANDIDATE` / `PERMISSION_DENIED`），**每次拒绝后 epoch 仍为 1、pending 仍在**；最后真回执仍然能推进到 2。
+- `group_node::unreachable_node_fails_explicitly_and_leaves_local_state_unchanged`：同设备身份指向一个必然连不上的端口 →
+  `NODE_UNAVAILABLE`，本地 epoch/pending 不变、节点日志为空；随后换真节点提交 + 接受成功（失败不是破坏性的）。
+- `group_node::submit_without_pending_control_fails_explicitly`：没有 pending → `PENDING_MISMATCH`；非规范群 ID →
+  `INVALID_ID`（在触网之前拒绝）。
+- 模块内单测 `group_node::tests::submission_ids_are_deterministic_and_bound_to_the_commit`（同 pending 恒同 id、
+  换群/换 epoch/换摘要都换 id、结果是合法 PROTOCOL-001 submission 文本）与 `pending_errors_carry_frozen_codes`。
+
+### 已知限制
+
+1. **只证明节点接受了条目**：没有 MLS 内层验证（CRYPTO-006 `process_verified_entry`），也不校验其它成员是否看到该 Commit。
+2. **两套控制头未统一**（本地 DOMAIN-004 摘要 vs 节点日志链摘要）；候选 CAS 只取节点 head。
+3. **元数据映射是本切片特化**：`SelfUpdate → set_role` 只在“本切片里 SelfUpdate 只由改角色产生”时成立；新增会产生 SelfUpdate 的
+   治理操作时必须同步扩展映射（否则公开元数据会说错操作种类）。`target_digest` 用提交摘要而非“操作目标的摘要”，
+   因为当前 `GroupView` 不暴露被操作的目标身份。
+4. **对账是 O(日志页)**：重试路径最多翻 20 页（每页 50 条）；超大群日志下应改为按 submission 的服务端查询端点。
+5. **每次提交一个短命线程**：治理提交是低频操作，用同步桥避免把 async 传染到 FFI 侧；高频场景需要常驻桥（如 node_submitter 的做法）。
+6. **不接受对端 Commit、不投递 Welcome**：本轮只做本机 pending 的提交与接受。
 
 ## 群治理接 FFI 与服务方法（GroupFfi，2026-10-18，Windows x64）
 
@@ -832,45 +945,3 @@ cargo test --offline -p chat-core                        # 118 passed（既有 1
 设备统一用 `MlsDevice::import_from_store` 从持久库恢复（建群除外：群还不存在，设备是新建的）；
 禁用闭包 `with_group_device` 保证「先恢复、再执行、失败不留半状态」。
 为了让 FFI 拿到冻结码，`service::error_code` 增加了 `GroupError` 的 downcast 分支（方法体 3 行改动，
-不改任何既有语义）；角色 → 文本的映射以 `group_role_code` / `group_role_from_code` 暴露（FFI 不需要
-依赖 chat-domain）。
-
-### GroupFfi（Kotlin 可见）
-
-`open(database_path, master_key_hex, node)` + 上表 8 个方法，返回 `GroupViewFfi`（成员/角色/禁言/pending/
-pending_removed/last_control_cleared 全是纯数据，不含密钥）。`node` 只保存不联网。
-
-### 复现命令（全程离线）
-
-~~~powershell
-. .\tools\activate.ps1
-cargo test --offline -p chat-ffi --test groups_ffi   # 6 passed
-cargo test --offline -p chat-core -p chat-ffi        # 118 + 36 passed
-~~~
-
-### 证据
-
-- `groups_ffi::create_snapshot_rename_mute_and_remove_through_ffi`：建群 → 快照一致 → 改名（pv2，同名幂等）→
-  禁言（pv3）→ 移除（pv4，pending_removed=[bob]）→ 接受（epoch2、pending 清空、pv 不变）→ 快照一致。
-- `groups_ffi::role_change_accept_and_discard_through_ffi`：改角色（pending self_update）→ 丢弃（epoch 不变、
-  pv 不回退、审计 self_update/node_rejected）→ 改回并接受（epoch2）。
-- `groups_ffi::error_codes_are_frozen_and_failures_leave_no_state`：`INVALID_TARGET`/`INVALID_ID`/
-  `INVALID_INPUT`/`PERMISSION_DENIED`/`PENDING_MISMATCH` 逐条断言，失败后快照与建群结果完全一致。
-- `groups_ffi::empty_local_credential_uses_the_persisted_identity_device`：持久身份建立后，空凭据建群的本地成员
-  凭据 == 身份设备 ID。
-- `groups_ffi::create_without_identity_and_empty_credential_fails`：`INVALID_STATE_TRANSITION` / `INVALID_CANDIDATE`。
-- `groups_ffi::closed_object_reports_core_closed`：`shutdown` 后 `CORE_CLOSED`。
-
-### 已知限制
-
-1. **本地接受 ≠ 节点接受**（同上节）：`group_accept_pending` 只收口本地状态。
-2. **引导成员设备由本进程临时创建**：真实邀请加入（GROUPS-004）仍未实现，因此“首个成员”目前不能是真实远端设备。
-3. **独占单写者**：`GroupFfi` 与 `LocalStoreFfi` / `AttachmentFfi` 互斥；需要身份数据时先关闭 `IdentityFfi`。
-4. **同步阻塞**：FFI 的 `Mutex` 串行执行（含 MLS 提交生成）。
-5. `node` 只保存；群治理当前不访问网络。
-
-
-
-
-
-

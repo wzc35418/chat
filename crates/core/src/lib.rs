@@ -6,6 +6,7 @@ pub mod attachment_transport;
 pub mod attachments;
 pub mod core_events;
 pub mod group_actions;
+pub mod group_node;
 pub mod groups;
 pub mod node_submitter;
 pub mod p0;

@@ -1,6 +1,6 @@
 # SQLite、统一事务、数据表与崩溃恢复
 
-阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/008/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过；P1 身份/联系人持久化与邀请一次性消费（迁移 0003，无计划书编号）、P1 MLS 群状态/provider 记录持久化（迁移 0004，CRYPTO-004/010 的持久化切片）与 P1 设备凭据/撤销集合持久化（迁移 0006，IDENTITY-008~012 的存储侧）、P1 附件 FileKey 持久化（迁移 0007，attachment_secrets + 外键级联）、P1 附件传输进度持久化（迁移 0008，断点续传位图 + 外键级联）也已实测通过；STORAGE-004/005 的正式语义（与加密层同事务的 provider 写入）仍未接入。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
+阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/008/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过；P1 身份/联系人持久化与邀请一次性消费（迁移 0003，无计划书编号）、P1 MLS 群状态/provider 记录持久化（迁移 0004，CRYPTO-004/010 的持久化切片）与 P1 设备凭据/撤销集合持久化（迁移 0006，IDENTITY-008~012 的存储侧）、P1 附件 FileKey 持久化（迁移 0007，attachment_secrets + 外键级联）、P1 附件传输进度持久化（迁移 0008，断点续传位图 + 外键级联）、消息对附件的引用计数（迁移 0009，message_attachments + 外键级联）也已实测通过；STORAGE-004/005 的正式语义（与加密层同事务的 provider 写入）仍未接入。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
 
 状态补充（2026-10-18）：`store.rs` 已有独立的未加密 P0 事务试验表，覆盖 T1/C01 意图与准备任务和 T2 MLS/attempt/outbox 崩溃断点，局部证据见 [P0-03 报告](../P0_PERSISTENCE.md)。`crates/storage/src/formal/` 新增正式加密存储路径，实现 STORAGE-001/003/006/007/009/010/011 与 002 的迁移器，证据见下文“P0-04 正式存储路径实现记录”；其余 STORAGE-004/005/008 仍未实现，MLS 加密语义（CRYPTO-004 等）也未接入。
 
@@ -393,6 +393,31 @@ cargo test --offline -p chat-storage --test attachment_progress   # 5 passed
 已知限制：进度条数继承附件条数上限（每个附件最多 2 条）；位图是“已确认前缀”的权威来源，
 但下载续传还额外依赖本地临时文件（本地文件被删/被改会从头重下，见 attachments.md）；
 没有进度 TTL/清理任务（完成时由 core 显式清除，删除附件时由外键级联清除）。
+
+## 消息对附件的引用（引用计数）实现记录（2026-10-18，Windows x64）
+
+迁移 [0009_message_attachments.sql](../../crates/storage/migrations/0009_message_attachments.sql)
+（schema v9，不改写 0001~0008）新增 message_attachments：主键 (message_id, attachment_id)，
+message_id 外键到 messages、attachment_id 外键到 attachments，两者都 ON DELETE CASCADE
+（删消息或删附件记录时引用自动消失，不留悬空引用）；明文列只有两个不透明 ID 与 created_at。
+实现位于 [crates/storage/src/formal/attachments.rs](../../crates/storage/src/formal/attachments.rs)。
+
+- 写入/删除：`attach_message_attachment`（INSERT OR IGNORE，同 (message, attachment) 幂等；
+  附件记录不存在 → ATTACHMENT_NOT_FOUND；消息不存在 → INVALID_INPUT）、
+  `detach_message_attachment`、`detach_message_attachments`（按消息清全部）。
+- 查询（ATTACHMENTS-008 引用计数）：`message_attachment_count`、`message_attachment_ids`
+  （上限 512）、`message_referenced_attachment_ids`（去重、有界，回收一次性取用）、
+  `attachment_ids_with_state_before(state, cutoff, limit)`（staging 过期候选）。
+
+复现命令（全程离线）：
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-storage --test message_attachments   # 4 passed
+```
+
+已知限制：没有“任务/上传队列”引用（只有消息引用）；消息引用只由应用层写入，STORAGE-008 的
+消息落库流程尚未自动登记引用（需要消息内容解析出附件 ID 后调用 attach）；没有 GC 标记表。
 
 ## 函数导航
 

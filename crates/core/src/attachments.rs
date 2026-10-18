@@ -135,6 +135,8 @@ pub enum AttachmentError {
     },
     /// 文件内容密钥只在进程内：该附件当前无法解密/导出。
     KeyUnavailable(&'static str),
+    /// 附件层入参非法（例如负数宽限期），显式拒绝而不是静默纠正。
+    InvalidInput(&'static str),
     /// 块传输端口失败（节点不可用/配额/会话过期/块缺失等）：保留冻结码，调用方可重试。
     Transport {
         /// 稳定错误码（实现方给冻结码，例如 NODE_UNAVAILABLE）。
@@ -180,6 +182,7 @@ impl AttachmentError {
             Self::InternalFailure(_) => "INTERNAL_FAILURE",
             Self::Storage { code, .. } => code,
             Self::KeyUnavailable(_) => "ATTACHMENT_KEY_UNAVAILABLE",
+            Self::InvalidInput(_) => "INVALID_INPUT",
             Self::Transport { code, .. } => code,
         }
     }
@@ -204,6 +207,9 @@ impl fmt::Display for AttachmentError {
             }
             Self::KeyUnavailable(detail) => {
                 write!(formatter, "attachment key is unavailable: {detail}")
+            }
+            Self::InvalidInput(detail) => {
+                write!(formatter, "invalid attachment input: {detail}")
             }
             Self::Transport { code, detail } => {
                 write!(formatter, "attachment transport failure {code}: {detail}")
@@ -1417,6 +1423,8 @@ pub trait BlobTransport {
 pub struct CollectReport {
     /// 删除的缓存目录数。
     pub removed_directories: u32,
+    /// 删除的 staging 附件记录数（连带其缓存目录）。
+    pub removed_records: u32,
     /// 释放的字节数（按删除前目录内文件大小合计）。
     pub freed_bytes: u64,
     /// 扫描过的缓存目录项数（有界）。
@@ -1425,6 +1433,9 @@ pub struct CollectReport {
 
 /// 单次回收最多扫描的缓存目录项数（防止异常目录炸开时无界遍历）。
 pub const MAX_COLLECT_SCAN_ENTRIES: u32 = 10_000;
+
+/// 缓存回收的默认宽限期：24 小时（刚写入的缓存不立刻回收）。
+pub const DEFAULT_COLLECT_GRACE_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// 下载回执（ATTACHMENTS-005）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2079,28 +2090,85 @@ impl PersistedAttachmentStore {
         }
     }
 
-    /// ATTACHMENTS-008（本地缓存部分）：回收没有附件记录引用的缓存目录。
+    /// ATTACHMENTS-008：回收没有被「附件记录 / 消息引用」引用的缓存，使用默认宽限期。
+    ///
+    /// 默认宽限期 [`DEFAULT_COLLECT_GRACE_MS`]（24 小时）：刚写入的缓存不会立刻被回收。
+    pub fn collect_unreferenced_attachments(&self) -> AttachmentResult<CollectReport> {
+        self.collect_unreferenced_attachments_with_grace(DEFAULT_COLLECT_GRACE_MS)
+    }
+
+    /// ATTACHMENTS-008（本地缓存 + 引用计数）：带可配宽限期的缓存回收。
     ///
     /// 语义：
-    /// - 先短事务读出“有记录引用”的附件 ID 集合（只读 ID，不解密记录）；
-    /// - 再扫描缓存根下的**目录**：只处理名字符合 `att-<32hex>` 的目录，
-    ///   没有引用才删除；名字异常（非附件 ID 形式）的文件/目录一律不动；
-    /// - 返回删除目录数、释放字节数与扫描项数；扫描项数有界（MAX_COLLECT_SCAN_ENTRIES）；
-    /// - 幂等：重复调用在无新孤儿时返回 0；有引用的目录即使为空也不删；
-    /// - 不删 staging/任务引用：本层只知道附件记录引用，消息引用由 ATTACHMENTS-008 的
-    ///   完整实现（需要消息/任务引用计数，后续任务）负责，这里只保证“有记录就不删”。
-    pub fn collect_unreferenced_attachments(&self) -> AttachmentResult<CollectReport> {
-        let ids = {
+    /// - 引用判断同时看两处：**附件记录**（`attachment_ids`）与**消息引用**
+    ///   （`message_referenced_attachment_ids`）；任一处引用存在就不删缓存；
+    /// - 第一阶段清 staging 残留：状态 staging、`created_at` 早于 `now - grace`、
+    ///   且没有消息引用的记录 → 删除记录（连带外键的密钥/进度）与其缓存目录；
+    /// - 第二阶段清孤儿目录：扫描缓存根下的目录，只处理名字符合 `att-<32hex>` 的目录，
+    ///   没有记录/消息引用**且**目录 mtime 早于 `now - grace` 才删除；
+    ///   名字异常（非附件 ID 形式）的文件/目录一律不动；
+    /// - 幂等：重复调用在无新孤儿时返回 0；扫描项数有界（MAX_COLLECT_SCAN_ENTRIES）；
+    /// - 不做消息级“两阶段 GC 标记”，文件系统与 DB 不是同一事务（失败下次幂等重做）。
+    pub fn collect_unreferenced_attachments_with_grace(
+        &self,
+        grace_ms: i64,
+    ) -> AttachmentResult<CollectReport> {
+        if grace_ms < 0 {
+            return Err(AttachmentError::InvalidInput(
+                "collect grace period must not be negative",
+            ));
+        }
+        let now = now_ms();
+        let cutoff = now.saturating_sub(grace_ms);
+        let message_referenced: HashSet<String> = {
             let store = self.lock_store()?;
-            store.attachment_ids().map_err(AttachmentError::from)?
+            store
+                .message_referenced_attachment_ids()
+                .map_err(AttachmentError::from)?
+                .into_iter()
+                .collect()
         };
-        let referenced: HashSet<String> = ids.into_iter().collect();
+        let record_referenced: HashSet<String> = {
+            let store = self.lock_store()?;
+            store
+                .attachment_ids()
+                .map_err(AttachmentError::from)?
+                .into_iter()
+                .collect()
+        };
+        let mut report = CollectReport::default();
+
+        // 第一阶段：staging 残留（有记录但从未完成导入），过了宽限期且没有被消息引用。
+        let staging = {
+            let store = self.lock_store()?;
+            store
+                .attachment_ids_with_state_before(
+                    "staging",
+                    cutoff,
+                    chat_storage::formal::MAX_ATTACHMENT_LIST,
+                )
+                .map_err(AttachmentError::from)?
+        };
+        for attachment_id in staging {
+            if message_referenced.contains(&attachment_id) {
+                continue;
+            }
+            let freed = self.cache.remove_cached_directory(&attachment_id)?;
+            let mut store = self.lock_store()?;
+            store
+                .delete_attachment(&attachment_id)
+                .map_err(AttachmentError::from)?;
+            drop(store);
+            report.removed_records = report.removed_records.saturating_add(1);
+            report.freed_bytes = report.freed_bytes.saturating_add(freed);
+        }
+
+        // 第二阶段：孤儿缓存目录（没有记录、没有消息引用、且早于宽限期）。
         let root = self.cache.root().to_path_buf();
         let entries = match fs::read_dir(&root) {
             Ok(entries) => entries,
             Err(_) => return Err(AttachmentError::FileIoFailure),
         };
-        let mut report = CollectReport::default();
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -2122,7 +2190,18 @@ impl PersistedAttachmentStore {
             if validate_attachment_id(name).is_err() {
                 continue;
             }
-            if referenced.contains(name) {
+            if record_referenced.contains(name) || message_referenced.contains(name) {
+                continue;
+            }
+            // 宽限期：刚创建/最近修改过的缓存目录先留着。
+            let modified_ms = match fs::metadata(&path).and_then(|meta| meta.modified()) {
+                Ok(modified) => match modified.duration_since(UNIX_EPOCH) {
+                    Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+            if modified_ms > cutoff {
                 continue;
             }
             let freed = self.cache.remove_cached_directory(name)?;
@@ -3536,6 +3615,158 @@ mod tests {
 
 
 
+
+    #[test]
+    fn collect_keeps_message_referenced_staging_records_until_detached() {
+        let dir = TempDir::new("collect-refs");
+        let cache_root = dir.path("cache");
+        let store =
+            PersistedAttachmentStore::open(&cache_root, formal_store(&dir.path("chat.db")))
+                .expect("open persisted store");
+        // staging 记录（从未完成导入）+ 老 created_at：是 GC 的候选。
+        let staging = chat_storage::formal::AttachmentRecordInput {
+            attachment_id: "att-00112233445566778899aabbccddeeff".to_owned(),
+            state: "staging".to_owned(),
+            plain_size: 1024,
+            chunk_size: 262_144,
+            chunk_count: 1,
+            content_digest: "ab".repeat(32),
+            ciphertext_digest: "cd".repeat(32),
+            display_name: "staging.pdf".to_owned(),
+            created_at_ms: 1_000,
+        };
+        store.store.lock().expect("store lock").save_attachment(staging).expect("save staging");
+        // staging 附件的缓存目录（模拟导入中断留下的块）。
+        let staging_dir = cache_root.join("att-00112233445566778899aabbccddeeff");
+        fs::create_dir_all(&staging_dir).expect("create staging dir");
+        fs::write(staging_dir.join("chunk-000000.bin"), vec![3u8; 17]).expect("write chunk");
+        // 一条消息引用它。
+        let connection_guard = store.store.lock().expect("store lock");
+        let connection = connection_guard.connection();
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO conversations
+                     (conversation_id, kind, coordinator_id, protected_metadata, state)
+                 VALUES ('conv-gc', 'direct', '', X'00', 'active')",
+                [],
+            )
+            .expect("seed conversation");
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO message_attempts
+                     (submission_id, origin, conversation_id, mls_epoch, immutable_ciphertext,
+                      candidate_hash, state)
+                 VALUES ('sub-gc', 'remote', 'conv-gc', 0, X'00', X'00', 'accepted')",
+                [],
+            )
+            .expect("seed attempt");
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO messages
+                     (message_id, conversation_id, submission_id, author_account_id,
+                      author_device_id, group_seq, protected_content, display_created_at, send_state)
+                 VALUES ('msg-gc', 'conv-gc', 'sub-gc', 'acct', 'dev', 1, X'00', 1, 'accepted')",
+                [],
+            )
+            .expect("seed message");
+        drop(connection_guard);
+        store
+            .store
+            .lock()
+            .expect("store lock")
+            .attach_message_attachment("msg-gc", "att-00112233445566778899aabbccddeeff")
+            .expect("attach message ref");
+
+        // 被消息引用：即使 staging 且过期，也不回收。
+        let report = store
+            .collect_unreferenced_attachments_with_grace(0)
+            .expect("collect with refs");
+        assert_eq!(report.removed_records, 0);
+        assert_eq!(report.removed_directories, 0);
+        assert!(staging_dir.is_dir(), "referenced cache must survive");
+        assert!(store
+            .attachment_record("att-00112233445566778899aabbccddeeff")
+            .expect("record")
+            .is_some());
+
+        // 解除引用后可回收（记录 + 缓存目录）。
+        store
+            .store
+            .lock()
+            .expect("store lock")
+            .detach_message_attachment("msg-gc", "att-00112233445566778899aabbccddeeff")
+            .expect("detach");
+        let report = store
+            .collect_unreferenced_attachments_with_grace(0)
+            .expect("collect after detach");
+        assert_eq!(report.removed_records, 1);
+        assert_eq!(report.freed_bytes, 17);
+        assert!(!staging_dir.exists(), "detached staging cache is collected");
+        assert!(store
+            .attachment_record("att-00112233445566778899aabbccddeeff")
+            .expect("record")
+            .is_none());
+    }
+
+    #[test]
+    fn collect_respects_the_grace_period_and_is_idempotent() {
+        let dir = TempDir::new("collect-grace");
+        let cache_root = dir.path("cache");
+        let store =
+            PersistedAttachmentStore::open(&cache_root, formal_store(&dir.path("chat.db")))
+                .expect("open persisted store");
+        let orphan = "att-fedcba9876543210fedcba9876543210";
+        let orphan_dir = cache_root.join(orphan);
+        fs::create_dir_all(&orphan_dir).expect("create orphan");
+        fs::write(orphan_dir.join("chunk-000000.bin"), vec![1u8; 42]).expect("write chunk");
+
+        // 默认宽限期 24h：刚建好的孤儿目录不回收。
+        let report = store
+            .collect_unreferenced_attachments()
+            .expect("collect default grace");
+        assert_eq!(report.removed_directories, 0, "fresh orphans stay within the grace period");
+        assert!(orphan_dir.is_dir());
+        // 负数宽限期显式拒绝。
+        assert_eq!(
+            store
+                .collect_unreferenced_attachments_with_grace(-1)
+                .unwrap_err()
+                .code(),
+            "INVALID_INPUT"
+        );
+        // 宽限期为 0：立即回收。
+        let report = store
+            .collect_unreferenced_attachments_with_grace(0)
+            .expect("collect no grace");
+        assert_eq!(report.removed_directories, 1);
+        assert_eq!(report.freed_bytes, 42);
+        assert!(!orphan_dir.exists());
+        // 幂等。
+        let again = store
+            .collect_unreferenced_attachments_with_grace(0)
+            .expect("collect again");
+        assert_eq!(again.removed_directories, 0);
+        assert_eq!(again.removed_records, 0);
+    }
+
+    #[test]
+    fn collect_keeps_record_referenced_directories_even_without_grace() {
+        let dir = TempDir::new("collect-record-refs");
+        let cache_root = dir.path("cache");
+        let (source_path, _source) = upload_source(&dir, "gc-ref.bin");
+        let store =
+            PersistedAttachmentStore::open(&cache_root, formal_store(&dir.path("chat.db")))
+                .expect("open persisted store");
+        let descriptor = store
+            .import_file(&FileToken::from_local_path(&source_path), "被引用.bin")
+            .expect("import");
+        let report = store
+            .collect_unreferenced_attachments_with_grace(0)
+            .expect("collect");
+        assert_eq!(report.removed_directories, 0, "a record reference protects the cache");
+        assert!(cache_root.join(&descriptor.attachment_id).is_dir());
+    }
+
     #[test]
     fn resumed_download_fills_the_cache_for_offline_export() {
         let dir = TempDir::new("resume-cache-fill");
@@ -3666,7 +3897,7 @@ mod tests {
             .expect("write stray file");
 
         let report = store
-            .collect_unreferenced_attachments()
+            .collect_unreferenced_attachments_with_grace(0)
             .expect("collect orphans");
         assert_eq!(report.removed_directories, 1);
         assert_eq!(report.freed_bytes, 123, "100 + 23 bytes freed");
@@ -3690,7 +3921,7 @@ mod tests {
 
         // 幂等：第二次没有孤儿可删。
         let again = store
-            .collect_unreferenced_attachments()
+            .collect_unreferenced_attachments_with_grace(0)
             .expect("collect again");
         assert_eq!(again.removed_directories, 0);
         assert_eq!(again.freed_bytes, 0);
@@ -3700,7 +3931,7 @@ mod tests {
         fs::create_dir_all(cache_root.join(&referenced_a)).expect("recreate cache dir");
         fs::write(cache_root.join(&referenced_a).join("chunk.bin"), b"abcde").expect("write");
         let report = store
-            .collect_unreferenced_attachments()
+            .collect_unreferenced_attachments_with_grace(0)
             .expect("collect after delete");
         assert_eq!(report.removed_directories, 1);
         assert_eq!(report.freed_bytes, 5);

@@ -63,6 +63,11 @@ pub(crate) const MIGRATIONS: &[MigrationDef] = &[
         name: "0008_attachment_transfer_progress",
         sql: include_str!("../../migrations/0008_attachment_transfer_progress.sql"),
     },
+    MigrationDef {
+        version: 9,
+        name: "0009_message_attachments",
+        sql: include_str!("../../migrations/0009_message_attachments.sql"),
+    },
 ];
 
 /// 迁移结果。
