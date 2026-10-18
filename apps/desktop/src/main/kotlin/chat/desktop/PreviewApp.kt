@@ -280,6 +280,12 @@ fun main() = application {
     }
 
     var syncService by remember { mutableStateOf<chat.api.SyncService?>(null) }
+    val trayNotifications = remember {
+        runCatching { TrayNotifications().also { runCatching { it.installIcon() } } }.getOrNull()
+    }
+    val lifecycle = remember {
+        DesktopLifecycle { exitApplication() }
+    }
 
     suspend fun ensureSyncService(): chat.api.SyncService? {
         syncService?.let { return it }
@@ -632,6 +638,29 @@ fun main() = application {
                     .onFailure { error ->
                         storeState = storeState.withError(
                             (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+        notify = { body ->
+            scope.launch {
+                val notifications = trayNotifications
+                if (notifications == null || !notifications.isSupported()) {
+                    // 无系统托盘：显式回退到应用内提示，不假装已弹系统通知。
+                    storeState = storeState.copy(
+                        busy = false,
+                        notice = "系统通知不可用（当前环境无托盘）；已改为应用内提示：" + body,
+                    )
+                    return@launch
+                }
+                runCatching { notifications.show(chat.platform.NotificationRequest("Chat", body, "preview-test")) }
+                    .onSuccess {
+                        storeState = storeState.copy(busy = false, notice = "已尝试弹出系统通知：" + body)
+                    }
+                    .onFailure { error ->
+                        storeState = storeState.withError(
+                            (error as? chat.platform.NotificationException)?.code ?: "UNKNOWN_RESULT",
                             error.message,
                         )
                     }

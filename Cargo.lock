@@ -631,6 +631,7 @@ dependencies = [
  "chat-node-api",
  "chat-node-client",
  "chat-node-services",
+ "chat-plugins",
  "chat-protocol",
  "chat-storage",
  "ed25519-dalek 3.0.0",

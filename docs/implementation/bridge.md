@@ -952,6 +952,47 @@ GroupSummaryFfi{ group_id, name, epoch, role, policy_version, dissolved, left, p
 - 已关闭 → `CORE_CLOSED`。
 - 测试：[crates/ffi/tests/groups_list_ffi.rs](../../crates/ffi/tests/groups_list_ffi.rs)（1 个，真库经 FFI）。
 
+## 插件宿主 FFI（PluginsFfi，2026-10-18）
+
+纯内存宿主：不加载/不执行任何插件代码。
+
+~~~text
+PluginsFfi::new() -> Arc<PluginsFfi>
+manifest_validate(manifest_json) -> ManifestViewFfi
+install(manifest_json) -> String
+start(plugin_id) -> ()          dispatch(plugin_id, extension_point, operation_id, input,
+                                        now_unix_ms, deadline_unix_ms) -> DispatchPlanViewFfi
+finish_dispatch(plugin_id, operation_id, output, now_unix_ms) -> ()
+stop(plugin_id) -> bool        uninstall(plugin_id, remove_data) -> bool
+storage_get(plugin_id, key) -> Vec<u8>?        storage_set(plugin_id, key, value) -> ()
+list_plugins() -> Vec<PluginInfoFfi>           is_open() -> bool        shutdown()
+
+ManifestViewFfi { plugin_id, version, sdk_version, platform, entry_class,
+                  capabilities, permissions, extension_points }
+DispatchPlanViewFfi { plugin_id, extension_point, operation_id, input_bytes,
+                      output_limit_bytes, deadline_unix_ms, timeout_ms }
+PluginInfoFfi { plugin_id, running, extension_points }
+~~~
+
+- 错误码原样透出 `chat-plugins` 的稳定码（`FfiError::Store { code }`）：`PLUGIN_ID_CONFLICT` /
+  `PLUGIN_NOT_INSTALLED` / `PLUGIN_NOT_RUNNING` / `PLUGIN_NOT_REGISTERED` /
+  `CAPABILITY_NOT_DECLARED` / `CONTENT_TOO_LARGE` / `PLUGIN_OPERATION_CONFLICT` /
+  `PLUGIN_OPERATION_UNKNOWN` / `PLUGIN_TASK_TIMEOUT` / `INVALID_STORAGE_KEY` /
+  `PLUGIN_STORAGE_QUOTA_EXCEEDED` / `UNKNOWN_EXTENSION_POINT`；已关闭 → `CORE_CLOSED`。
+- `dispatch` **只出计划**（预算 + 绑定），不调用插件；`finish_dispatch` 只校验输出/截止时间/幂等。
+- 存储读写需要 `PrivateStorage` 能力，且每个插件只看自己的命名空间。
+- 测试：[crates/ffi/tests/plugins_ffi.rs](../../crates/ffi/tests/plugins_ffi.rs)（7 个，纯内存）。
+  契约与证据见 [plugins.md 的“插件宿主接 FFI”](plugins.md)。
+
+复现命令：
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi --test plugins_ffi   # 7 passed
+cargo test --offline -p chat-ffi                       # 53 passed（既有 46 继续通过）
+~~~
+
+
 
 
 

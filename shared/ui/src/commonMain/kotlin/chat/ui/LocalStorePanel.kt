@@ -56,6 +56,7 @@ data class StoreHandlers(
     val loadMessageAttachments: () -> Unit = {},
     val exportCard: (String) -> Unit = {},
     val downloadCard: (String) -> Unit = {},
+    val notify: (String) -> Unit = {},
 ) {
     companion object {
         val None = StoreHandlers()
@@ -243,6 +244,11 @@ fun LocalStorePanel(
                         enabled = state.ready && !state.busy,
                         modifier = Modifier.semantics { contentDescription = "刷新同步状态" },
                     ) { Text("刷新状态", style = MaterialTheme.typography.labelMedium) }
+                    TextButton(
+                        onClick = { handlers.notify("同步已完成（测试通知）") },
+                        enabled = state.ready,
+                        modifier = Modifier.semantics { contentDescription = "发送一条测试系统通知" },
+                    ) { Text("测试通知", style = MaterialTheme.typography.labelMedium) }
                 }
                 state.syncStatus?.let { status ->
                     Text(

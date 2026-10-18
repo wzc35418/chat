@@ -746,6 +746,55 @@ suspend fun configureNode(node: NodeEndpoint): SyncStatus
 - 证据：`cargo test -p chat-core` 的 `sync_worker`(8) 与 `sync_runtime`(4) 用例（自动应用、stop 生效、断开退避后可恢复、缺口不跳过、5 种坏页被拒）。
 - 限制：作者签名不重复验证；无 MLS 内层应用；持久化复用 `mls_group_state`/`mls_record`（单群 4096）；同群多运行时无互斥；无事件回调。
 
+## 实现记录：outbox 批执行接进常驻运行时（SR2 包，2026-10-19，Windows x64）
+
+源码 [crates/core/src/sync_runtime.rs](../../crates/core/src/sync_runtime.rs)；测试 [crates/core/tests/sync_runtime.rs](../../crates/core/tests/sync_runtime.rs)。
+
+已实现行为：
+
+1. **每轮顺序：先 outbox、后 pull**。阶段 0 用上一轮的 `run_outbox_once_at`（有界 ≤32）推进待办草稿；
+   阶段 1 仍是既有的单轮拉取 + 追赶。outbox 失败**不阻塞**拉取：outbox 的错误只写自己的状态字段，
+   拉取照常决策/执行。
+2. **独立退避**：outbox 有自己的失败计数与 `outbox_next_attempt_at_ms`（失败按
+   `PullPolicy::failure_delay_for` 指数退避并 `policy.clamp`；成功则 `now + round_wait_min`）。
+   未到 `outbox_next_attempt_at_ms` 时本轮跳过 outbox，**不影响**拉取的 `next_attempt_at_ms`。
+3. **状态快照新增字段**（只读、无密钥/正文）：`outbox_accepted_total`、`outbox_unknown_total`、
+   `outbox_last_error_code`（PROTOCOL-014 文本；未注入端口时为本地标记 `OUTBOX_NOT_CONFIGURED`）、
+   `outbox_next_attempt_at_ms`。
+4. **配置开关**：`SyncRuntimeConfig::enabled_outbox` 默认 **true**；端口通过
+   `with_outbox(engine, submitter)` 注入（加密端口 `Box<dyn CryptoEngine + Send>`、提交端口
+   `Box<dyn NodeSubmitter + Send>`），`without_outbox()` 可关闭做对照。
+   为不改动其它 crate（FFI 仍在用 `SyncRuntimeConfig::new`），**未注入端口时启动不失败**：outbox 显式
+   不执行并把 `outbox_last_error_code = OUTBOX_NOT_CONFIGURED` 写进状态（不是静默跳过，也不是假成功）。
+5. **停止与不 sleep**：`stop` 在**任务边界**生效（每轮开始前与 outbox 之后各检查一次），循环仍用条件变量
+   等待（`wait_round`），没有忙等/自旋；停止原因 `stop_requested`。
+6. **后端持有方式**：开启 outbox 时库句柄由 `SendOrchestrator` 独占（拉取通过 `store_mut()` 使用同一句柄），
+   关闭时退回裸 `Store`；`stop()` 仍返回库句柄给调用方。
+
+验证证据（`cargo test --offline -p chat-core --test sync_runtime`，真 axum 节点 + 正式库）：
+
+- `outbox_runtime_sends_drafts_without_manual_dispatch`：起运行时后**不需要任何手动调度**，
+  两张草稿共 4 个任务（2 prepare + 2 send）全部 accepted，草稿落 `accepted`、恰好 2 条加密尝试。
+- `unreachable_submitter_backs_off_outbox_but_keeps_pulling`：提交端口返回 Unknown（模拟节点不可达）→
+  `outbox_accepted_total = 1`（prepare 成功）、`outbox_unknown_total = 1`（send 未知，绝不重发）；
+  拉取循环继续按轮推进、`last_error_code` 保持 `None`、运行时**没有**因 outbox 失败停止。
+- `disabled_outbox_leaves_drafts_pending`：`without_outbox()` → 多轮之后草稿仍是 `queued`、
+  零加密尝试、`outbox_accepted_total = 0`、`outbox_last_error_code` 为 `None`（关闭不是错误）。
+- `stop_halts_outbox_at_a_task_boundary`：停前只提交过 1 次（未知结果不重发），`stop()` 后状态
+  `Stopped/stop_requested`，再等一段时间**没有任何新提交**。
+
+已知限制：
+
+1. 端口必须由上层注入（core 不持有 MLS 设备与设备签名钥）；未注入时 outbox 显式不执行并标记
+   `OUTBOX_NOT_CONFIGURED`（FFI 现有调用不受影响）。
+2. outbox 的失败预算**没有**与拉取的 `max_failures` 合并成“停进程”：outbox 连续失败只延长自己的退避
+   （任务本身还会按 outbox 的 `retry_at` 排队），避免因为发送通道抖动把同步也停掉。
+3. 一轮的 outbox 与 pull 共享同一个库句柄，因此 outbox 执行期间拉取顺延到同一轮之后（不是并行）；
+   两者都不在事务里跨网络等待（事务都是短的）。
+4. 本轮的 outbox 只推进“已存在的草稿”；`begin_send` 仍由发送 API（SendRuntime/编排器）写入。
+5. 拉取侧“运行期间新追加条目”的即时性受既有 `PullPolicy.page_interval_ms` 与持久 `next_attempt_at_ms`
+   约束（本轮未改动 `sync_worker` 的决策语义）。
+
 ## 实现记录：常驻同步接 FFI（SyncFfi，R-71，2026-10-18，Windows x64）
 
 目标：界面能看到"常驻同步"的生老病死——打开、启动、状态轮询、停止、关闭，且状态全部是计数/稳定码。

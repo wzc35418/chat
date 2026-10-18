@@ -6,5 +6,6 @@ pub mod bridge;
 pub mod groups_ffi;
 pub mod identity_ffi;
 pub mod local_store;
+pub mod plugins_ffi;
 pub mod sync_ffi;
 uniffi::setup_scaffolding!();

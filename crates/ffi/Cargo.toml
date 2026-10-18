@@ -12,6 +12,8 @@ chat-core.workspace = true
 chat-identity.workspace = true
 # SYNC-003：常驻同步对象要自己装配 NodeClient 并读持久身份种子/拉取游标。
 chat-node-client = { path = "../node-client" }
+# PLUGINS：插件宿主对象需要清单校验/注册分发/私有存储的纯逻辑层。
+chat-plugins = { path = "../plugins" }
 chat-protocol.workspace = true
 chat-storage.workspace = true
 rand.workspace = true

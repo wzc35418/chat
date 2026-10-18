@@ -553,3 +553,68 @@ suspend fun loadThemeConfig(source: FileToken): ThemeConfig
 
 **实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
 
+## 插件宿主接 FFI（PluginsFfi，2026-10-18，Windows x64）
+
+背景：`chat-plugins` 的纯逻辑宿主（清单校验/注册分发/命名空间隔离/幂等，36 个测试）此前 Kotlin
+完全用不到。本轮把它接到 FFI。
+
+代码：[crates/ffi/src/plugins_ffi.rs](../../crates/ffi/src/plugins_ffi.rs)（新）+ lib.rs 一行注册；测试：
+[crates/ffi/tests/plugins_ffi.rs](../../crates/ffi/tests/plugins_ffi.rs)（7 个，**纯内存**）。契约细节见
+[bridge.md 的“插件宿主 FFI”](bridge.md)。
+
+### 公开面（Kotlin 可见）
+
+~~~text
+PluginsFfi::new() -> Arc<PluginsFfi>          // 纯内存，每个实例一个独立宿主状态
+manifest_validate(manifest_json) -> ManifestViewFfi
+install(manifest_json) -> String               // 返回插件 ID
+start(plugin_id) -> ()
+dispatch(plugin_id, extension_point, operation_id, input, now_unix_ms, deadline_unix_ms)
+    -> DispatchPlanViewFfi                     // 只出计划，不执行插件代码
+finish_dispatch(plugin_id, operation_id, output, now_unix_ms) -> ()
+stop(plugin_id) -> bool      uninstall(plugin_id, remove_data) -> bool
+storage_get(plugin_id, key) -> Vec<u8>?      storage_set(plugin_id, key, value) -> ()
+list_plugins() -> Vec<PluginInfoFfi>          is_open() -> bool      shutdown()
+~~~
+
+### 关键语义
+
+1. **纯内存、不执行插件代码**：`dispatch` 只产出受预算约束的分发计划，`finish_dispatch` 只校验
+   输出大小/截止时间/幂等；JAR/WASM/JVM 执行属后续宿主阶段。
+2. **错误码原样透出**：`FfiError::Store { code }` 就是 `chat-plugins` 的稳定码
+   （`PLUGIN_ID_CONFLICT` / `PLUGIN_NOT_RUNNING` / `PLUGIN_NOT_REGISTERED` /
+   `CAPABILITY_NOT_DECLARED` / `CONTENT_TOO_LARGE` / `PLUGIN_OPERATION_CONFLICT` /
+   `PLUGIN_OPERATION_UNKNOWN` / `UNKNOWN_EXTENSION_POINT` / `CORE_CLOSED` …）。
+3. **运行时句柄由本对象持有**：`start` 之后才允许 dispatch/finish/存储访问；
+   `stop`/`uninstall`/`shutdown` 丢弃句柄。
+4. **存储隔离与能力门**：读写都要声明 `PrivateStorage`；每个插件只看自己的命名空间。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi --test plugins_ffi   # 7 passed
+cargo test --offline -p chat-ffi                       # 53 passed（既有 46 继续通过）
+~~~
+
+### 证据
+
+- `plugins_ffi::install_start_dispatch_finish_stop_uninstall`：校验不安装 → 安装 → 启动（running）→
+  dispatch 计划（input_bytes/deadline/timeout 正确）→ finish（同输出幂等）→ 停止后 dispatch →
+  `PLUGIN_NOT_RUNNING` → 卸载清空。
+- `plugins_ffi::duplicate_install_conflicts` → `PLUGIN_ID_CONFLICT`。
+- `plugins_ffi::storage_requires_the_declared_capability` → `CAPABILITY_NOT_DECLARED`。
+- `plugins_ffi::storage_is_isolated_between_plugins`：同名键互不可见；卸载其一（保留数据）不影响另一个。
+- `plugins_ffi::oversized_input_and_output_are_rejected` → `CONTENT_TOO_LARGE`。
+- `plugins_ffi::dispatch_is_idempotent_and_conflicts_are_explicit`：同 operation 同输入幂等；
+  不同输入 → `PLUGIN_OPERATION_CONFLICT`；未知 operation → `PLUGIN_OPERATION_UNKNOWN`；
+  未注册扩展点 → `PLUGIN_NOT_REGISTERED`；未知扩展点名 → `UNKNOWN_EXTENSION_POINT`。
+- `plugins_ffi::shutdown_is_idempotent_and_closes_the_object`：关闭后 `CORE_CLOSED`、再关无副作用。
+
+### 已知限制
+
+1. **不加载/不执行插件代码**（没有 JAR 加载、WASM/JVM 运行时、信任确认与安装事务）。
+2. **纯内存**：宿主状态不落库（清单/私有存储持久化未接线）。
+3. **一次 start 一个句柄**：重启需先 stop/uninstall。
+4. **超时只是计划预算**：`dispatch` 只收紧截止时间，不启动计时器。
+5. 未知扩展点名 → `UNKNOWN_EXTENSION_POINT`；能力/权限文本未知 → `INVALID_PLUGIN_PACKAGE`。

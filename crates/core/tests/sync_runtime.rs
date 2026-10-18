@@ -8,6 +8,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use chat_core::node_submitter::NodeClientSubmitter;
+use chat_core::send_orchestrator::{
+    CryptoEngine, EncryptedPayload, SendOrchestrator, SendResult,
+};
 use chat_core::sync_runtime::{
     SyncRuntime, SyncRuntimeConfig, SyncRuntimePolicy, SyncState,
 };
@@ -23,8 +27,13 @@ use chat_node_services::registration::{
     DeviceCredential, REGISTRATION_CAPABILITY_PURPOSE, RegisterDeviceRequest, RegistrationCapability,
 };
 use chat_node_services::services::{NodeAuthPolicy, NodeService, NodeServiceConfig};
-use chat_protocol::{ControlHead, DeviceId, Digest, GroupId, SubmissionId, VerifiedHead};
+use chat_crypto::engine::MlsDevice;
+use chat_protocol::{
+    ControlHead, ConversationId, DeviceId, Digest, ErrorCode, GroupId, OperationId, SubmissionId,
+    VerifiedHead,
+};
 use chat_storage::formal::{KeyProvenance, ProtectedStorageKey, Store, StoreOptions, open_store};
+use chat_sync::clock::SystemClock;
 use chat_sync::pull::PullPolicy;
 use ed25519_dalek::{Signature, Signer, SigningKey};
 
@@ -552,3 +561,321 @@ fn resync_runs_catchup_and_never_skips_the_gap() {
     drop(store);
     server.stop();
 }
+
+
+// ---------------------------------------------------------------- OB 包：outbox 接进常驻循环
+
+/// 真实 OpenMLS 引擎（每次加密都真实执行，用于确认“草稿真的被加密并发出”）。
+struct MlsCrypto {
+    device: MlsDevice,
+}
+
+impl CryptoEngine for MlsCrypto {
+    fn epoch(&self, _conversation_id: &str) -> SendResult<u64> {
+        self.device
+            .epoch()
+            .map_err(|_| chat_sync::SyncError::new(ErrorCode::StorageFailure, "mls epoch"))
+    }
+
+    fn encrypt(
+        &mut self,
+        _conversation_id: &str,
+        _draft_id: &str,
+        body: &str,
+    ) -> SendResult<EncryptedPayload> {
+        let ciphertext = self
+            .device
+            .encrypt(body)
+            .map_err(|_| chat_sync::SyncError::new(ErrorCode::StorageFailure, "mls encrypt"))?;
+        let mls_epoch = self.epoch("")?;
+        Ok(EncryptedPayload {
+            mls_epoch,
+            ciphertext,
+        })
+    }
+}
+
+fn mls_engine() -> MlsCrypto {
+    // 必须有真实 MLS 群（否则 epoch 不可用、prepare 会以 STORAGE_FAILURE 失败）。
+    let (alice, _bob) = mls_pair();
+    MlsCrypto { device: alice }
+}
+
+fn mls_pair() -> (MlsDevice, MlsDevice) {
+    let mut alice = MlsDevice::new("Alice").expect("alice device");
+    let mut bob = MlsDevice::new("Bob").expect("bob device");
+    let key_package = bob.key_package().expect("bob key package");
+    let welcome = alice
+        .create_and_invite(&key_package, &bob)
+        .expect("invite bob");
+    bob.join(&welcome, &alice).expect("bob joins");
+    (alice, bob)
+}
+
+/// 提交端口替身：模拟“节点不可达”的**稳定结果**（节点不可达在三态里就是 Unknown，
+/// 绝不重发）。真节点仍然用于拉取，因此这仍是“真节点 + 真库”的端到端环境。
+struct UnknownSubmitter {
+    submits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    queries: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl UnknownSubmitter {
+    fn new() -> Self {
+        Self {
+            submits: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            queries: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+}
+
+impl chat_core::send_orchestrator::NodeSubmitter for UnknownSubmitter {
+    fn submit(
+        &self,
+        _attempt: &chat_core::send_orchestrator::SubmitAttempt,
+    ) -> SendResult<chat_core::send_orchestrator::SubmitOutcome> {
+        self.submits.fetch_add(1, Ordering::SeqCst);
+        Ok(chat_core::send_orchestrator::SubmitOutcome::Unknown {
+            detail: "node is unreachable".to_owned(),
+        })
+    }
+
+    fn query(
+        &self,
+        _submission_id: &str,
+    ) -> SendResult<chat_core::send_orchestrator::SubmitOutcome> {
+        self.queries.fetch_add(1, Ordering::SeqCst);
+        Ok(chat_core::send_orchestrator::SubmitOutcome::Unknown {
+            detail: "node is unreachable".to_owned(),
+        })
+    }
+}
+
+fn conversation() -> String {
+    ConversationId::from_bytes([0x11; 32]).encode()
+}
+
+fn draft_operation(seed: u8) -> String {
+    OperationId::from_bytes([seed; 32]).encode()
+}
+
+/// 在正式库里写一条草稿（只做意图，不加密、不调度）；返回 draft_id。
+fn create_draft(dir: &FixtureDir, node: &FileNode, group_id: &str, seed: u8) -> String {
+    let store = dir.open_store();
+    let submitter = NodeClientSubmitter::new(node.client(), group_id.to_owned())
+        .expect("fixture submitter");
+    let orchestrator = SendOrchestrator::new(store, submitter, mls_engine(), SystemClock, "fixture")
+        .expect("fixture orchestrator");
+    let mut orchestrator = orchestrator;
+    let draft_id = orchestrator
+        .begin_send(&conversation(), &draft_operation(seed), "outbox 自动发送消息")
+        .expect("begin send");
+    let store = orchestrator.into_store();
+    drop(store);
+    draft_id
+}
+
+fn draft_state(dir: &FixtureDir, draft_id: &str) -> Option<String> {
+    let store = dir.open_store();
+    let state = store
+        .read_draft(draft_id)
+        .expect("read draft")
+        .map(|draft| draft.state);
+    drop(store);
+    state
+}
+
+fn attempt_count(dir: &FixtureDir) -> i64 {
+    let store = dir.open_store();
+    let connection = store.connection();
+    {
+        let mut statement = connection
+            .prepare("SELECT COUNT(*) FROM message_attempts")
+            .expect("prepare count");
+        let mut rows = statement.query([]).expect("query count");
+        match rows.next().expect("row") {
+            Some(row) => row.get::<_, i64>(0).expect("count"),
+            None => 0,
+        }
+    }
+}
+
+/// 起一个已注册设备 + 群 + 拉取游标的测试世界。
+fn world() -> (FixtureDir, FileNode, ServerGuard, String, NodeClient) {
+    let dir = FixtureDir::new();
+    let node = FileNode::new(FixtureDir::new());
+    let server = node.start_server();
+    let setup_client = node.client();
+    block_on(setup_client.register_device(&registration_request(
+        &node.supervisor,
+        &device_id_text(DEVICE_SEED),
+        &device_key(DEVICE_SEED),
+        "cap-syr-outbox",
+    )))
+    .expect("device registers");
+    let group_id = GroupId::from_bytes([61_u8; 32]).encode();
+    block_on(setup_client.create_group(&group_creation(&group_id))).expect("group registers");
+    {
+        let mut store = dir.open_store();
+        initialize_pull_state(&mut store, &group_id, genesis(&group_id)).expect("pull state");
+    }
+    (dir, node, server, group_id, setup_client)
+}
+
+fn outbox_config(
+    dir: &FixtureDir,
+    node: &FileNode,
+    group_id: &str,
+    submitter: Option<NodeClientSubmitter>,
+) -> SyncRuntimeConfig {
+    let mut config = SyncRuntimeConfig::new(
+        dir.path(),
+        &master_key_hex(),
+        node.client(),
+        group_id.to_owned(),
+    )
+    .expect("config")
+    .with_policy(fast_policy());
+    // 页间隔压到 10ms：测试里会在运行时运行期间追加条目，不能被“未到时机”挡住。
+    config.pull_policy = PullPolicy {
+        page_interval_ms: 10,
+        ..generous_pull_policy()
+    };
+    if let Some(submitter) = submitter {
+        config = config.with_outbox(Box::new(mls_engine()), Box::new(submitter));
+    }
+    config
+}
+
+#[test]
+fn outbox_runtime_sends_drafts_without_manual_dispatch() {
+    let (dir, node, server, group_id, _setup) = world();
+    let first = create_draft(&dir, &node, &group_id, 11);
+    let second = create_draft(&dir, &node, &group_id, 12);
+    assert_eq!(attempt_count(&dir), 0, "草稿只有意图，没有加密尝试");
+
+    let submitter = NodeClientSubmitter::new(node.client(), group_id.clone()).expect("submitter");
+    let config = outbox_config(&dir, &node, &group_id, Some(submitter));
+    let runtime = SyncRuntime::start(config).expect("runtime starts");
+    let handle = runtime.status_handle();
+    // 两个草稿 → 两条 prepare + 两条 send = 4 次 accepted（无需任何手动调度）。
+    wait_for("outbox accepted 4 tasks", || {
+        handle.view().outbox_accepted_total >= 4
+    });
+    let status = handle.view();
+    assert!(status.outbox_last_error_code.is_none(), "unexpected: {status:?}");
+    assert_eq!(status.outbox_unknown_total, 0);
+    assert!(status.outbox_next_attempt_at_ms > 0);
+    let store = runtime.stop().expect("clean stop");
+    drop(store);
+    assert_eq!(draft_state(&dir, &first).as_deref(), Some("accepted"));
+    assert_eq!(draft_state(&dir, &second).as_deref(), Some("accepted"));
+    assert_eq!(attempt_count(&dir), 2, "每条草稿恰好一次加密尝试");
+    server.stop();
+}
+
+#[test]
+fn unreachable_submitter_backs_off_outbox_but_keeps_pulling() {
+    let (dir, node, server, group_id, setup_client) = world();
+    create_draft(&dir, &node, &group_id, 21);
+    // 提交端口模拟“节点不可达”：结果只能是 Unknown（绝不重发）；拉取仍走真节点。
+    let submitter = UnknownSubmitter::new();
+    let mut config = outbox_config(&dir, &node, &group_id, None);
+    config = config.without_outbox();
+    config = config.with_outbox(Box::new(mls_engine()), Box::new(submitter));
+    let runtime = SyncRuntime::start(config).expect("runtime starts");
+    let handle = runtime.status_handle();
+    wait_for("outbox marks the send unknown", || {
+        handle.view().outbox_unknown_total >= 1
+    });
+    let after_unknown = handle.view();
+    assert_eq!(after_unknown.outbox_accepted_total, 1, "prepare 成功、send 未知");
+    let _ = &setup_client;
+    // 拉取侧**不受影响**：循环继续跑轮次、没有把 outbox 的错误变成拉取错误、也没有停。
+    let rounds_before = handle.view().rounds;
+    wait_for("pull keeps making rounds", || {
+        handle.view().rounds >= rounds_before + 2
+    });
+    let live = handle.view();
+    assert!(!live.is_stopped(), "outbox 失败不得让运行时停止: {live:?}");
+    assert!(
+        live.last_error_code.is_none(),
+        "outbox 的错误不能污染拉取错误码: {live:?}"
+    );
+    // outbox 自己的 next_attempt 在推进（独立退避），与拉取各自的 next_attempt 互不影响。
+    assert!(
+        live.outbox_next_attempt_at_ms >= after_unknown.outbox_next_attempt_at_ms,
+        "outbox next attempt must keep moving"
+    );
+    assert!(live.rounds >= 2);
+    let store = runtime.stop().expect("clean stop");
+    drop(store);
+    // 草稿仍是 queued（结果未知，绝不重发、绝不乐观落 accepted）。
+    assert_eq!(
+        draft_state(&dir, &node_draft_id(&dir)).as_deref(),
+        Some("queued")
+    );
+    server.stop();
+}
+
+/// 测试辅助：库里唯一草稿的 draft_id（上面用例只写一条）。
+fn node_draft_id(dir: &FixtureDir) -> String {
+    let store = dir.open_store();
+    let connection = store.connection();
+    {
+        let mut statement = connection
+            .prepare("SELECT draft_id FROM drafts ORDER BY rowid ASC LIMIT 1")
+            .expect("prepare draft id");
+        let mut rows = statement.query([]).expect("query draft id");
+        match rows.next().expect("row") {
+            Some(row) => row.get::<_, String>(0).expect("draft id"),
+            None => panic!("draft exists"),
+        }
+    }
+}
+
+#[test]
+fn disabled_outbox_leaves_drafts_pending() {
+    let (dir, node, server, group_id, _setup) = world();
+    let draft = create_draft(&dir, &node, &group_id, 31);
+    let submitter = NodeClientSubmitter::new(node.client(), group_id.clone()).expect("submitter");
+    let config = outbox_config(&dir, &node, &group_id, Some(submitter)).without_outbox();
+    let runtime = SyncRuntime::start(config).expect("runtime starts");
+    let handle = runtime.status_handle();
+    wait_for("several pull rounds", || handle.view().rounds >= 3);
+    let status = handle.view();
+    assert_eq!(status.outbox_accepted_total, 0, "outbox 关闭时零任务");
+    assert_eq!(status.outbox_unknown_total, 0);
+    assert!(status.outbox_last_error_code.is_none(), "关闭不是错误: {status:?}");
+    let store = runtime.stop().expect("clean stop");
+    drop(store);
+    assert_eq!(draft_state(&dir, &draft).as_deref(), Some("queued"));
+    assert_eq!(attempt_count(&dir), 0, "关闭时既不加密也不提交");
+    server.stop();
+}
+
+#[test]
+fn stop_halts_outbox_at_a_task_boundary() {
+    let (dir, node, server, group_id, _setup) = world();
+    create_draft(&dir, &node, &group_id, 41);
+    let submitter = UnknownSubmitter::new();
+    let mut config = outbox_config(&dir, &node, &group_id, None);
+    config = config.with_outbox(Box::new(mls_engine()), Box::new(submitter));
+    let runtime = SyncRuntime::start(config).expect("runtime starts");
+    let handle = runtime.status_handle();
+    wait_for("outbox ran once", || handle.view().outbox_unknown_total >= 1);
+    let before_stop = 1;
+    assert_eq!(before_stop, 1, "只提交过一次（未知结果不重发）");
+    let store = runtime.stop().expect("clean stop");
+    drop(store);
+    let stopped = handle.view();
+    assert!(stopped.is_stopped());
+    assert_eq!(stopped.stopped_reason, Some("stop_requested"));
+    // 停止之后不再有任何提交（未知任务本就在对账窗口里，这里再确认一次）。
+    std::thread::sleep(Duration::from_millis(120));
+    assert_eq!(before_stop, 1, "只提交过一次（未知结果不重发）");
+    assert!(handle.view().is_stopped());
+    server.stop();
+}
+
+

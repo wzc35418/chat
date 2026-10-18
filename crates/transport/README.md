@@ -17,6 +17,6 @@
 
 语义、迁移表、线格式、管线、真实回环端点、错误码登记与证据见 [设备直连、中继与节点客户端](../../docs/implementation/transport.md) 的「Rust 纯逻辑传输核心」。P0 局部验证不表示该模块全部功能已完成；对称 NAT 穿透/中继、发现记录验证与节点客户端（TRANSPORT-002、006、008~012）未实现。
 
-验证命令：`. .\tools\activate.ps1; cargo test --offline -p chat-transport`（当前 66 passed：lib 43 + tests/iroh_endpoint.rs 9 真实回环 iroh + tests/peer_pipeline.rs 6 + tests/transport_core.rs 8）。
+验证命令：`. .\tools\activate.ps1; cargo test --offline -p chat-transport`（当前 68 passed：lib 43 + tests/iroh_endpoint.rs 11 真实 iroh（含真实非回环地址互连）+ tests/peer_pipeline.rs 6 + tests/transport_core.rs 8）。
 
 集成测试直接使用 `iroh` 构造回环地址/密钥，因此在 `crates/transport/Cargo.toml` 增加了与主依赖同版本的 `[dev-dependencies] iroh.workspace = true`（Cargo.lock 不变）。

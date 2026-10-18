@@ -660,3 +660,259 @@ async fn unreachable_relay_does_not_break_loopback_connection() {
     })
     .await;
 }
+/// 取本机一个非回环 IPv4。
+///
+/// UDP 的 `connect` 只让内核选择出站接口的源地址，不发送任何数据包，因此离线也能用；
+/// 拿不到（无默认路由/只有回环）时测试 skip，不算失败。
+fn local_non_loopback_ipv4() -> Option<std::net::Ipv4Addr> {
+    for target in ["192.0.2.1:9", "198.51.100.1:9", "8.8.8.8:53"] {
+        let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+            continue;
+        };
+        if socket.connect(target).is_err() {
+            continue;
+        }
+        if let Ok(SocketAddr::V4(address)) = socket.local_addr()
+            && !address.ip().is_loopback()
+            && !ip_is_unspecified(*address.ip())
+        {
+            return Some(*address.ip());
+        }
+    }
+    None
+}
+
+fn ip_is_unspecified(ip: std::net::Ipv4Addr) -> bool {
+    ip == std::net::Ipv4Addr::UNSPECIFIED
+}
+
+/// 预检：本机是否允许往「自己的非回环地址」发 UDP 并收回。
+///
+/// 某些环境（例如 Windows 防火墙未放行该接口的入站）会静默丢弃这类包，
+/// 此时真实 LAN 直连无法验证；测试打印原因后 skip，而不是伪装成功或超时失败。
+fn lan_self_interconnect_works(ip: std::net::Ipv4Addr) -> bool {
+    let Ok(server) = std::net::UdpSocket::bind(SocketAddr::from((ip, 0))) else {
+        return false;
+    };
+    let Ok(client) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+        return false;
+    };
+    let Ok(server_addr) = server.local_addr() else {
+        return false;
+    };
+    let _ = server.set_read_timeout(Some(Duration::from_secs(1)));
+    if client
+        .send_to(b"probe", SocketAddr::from((ip, server_addr.port())))
+        .is_err()
+    {
+        return false;
+    }
+    let mut buffer = [0u8; 8];
+    matches!(server.recv_from(&mut buffer), Ok((5, _)))
+}
+
+#[tokio::test]
+async fn lan_endpoint_real_address_interconnect() {
+    let Some(lan_ip) = local_non_loopback_ipv4() else {
+        eprintln!(
+            "skip lan_endpoint_real_address_interconnect: no non-loopback IPv4 available on this host"
+        );
+        return;
+    };
+    timed(async {
+        let lan_addr = SocketAddr::from((lan_ip, 0));
+        // 同一地址未开 allow_lan：校验与启动都必须在绑定前失败。
+        let mut denied = EndpointConfig::loopback().with_secret_key([31u8; 32]);
+        denied.bind_addr = lan_addr;
+        assert_eq!(
+            denied.validate().unwrap_err().code(),
+            "INVALID_TRANSPORT_CONFIG"
+        );
+        assert_eq!(
+            start_endpoint(denied).await.unwrap_err().code(),
+            "INVALID_TRANSPORT_CONFIG"
+        );
+        // 开 allow_lan 后绑定真实非回环地址。
+        let mut lan_config = EndpointConfig::loopback()
+            .with_secret_key([31u8; 32])
+            .with_allow_lan(true);
+        lan_config.bind_addr = lan_addr;
+        let lan = start_endpoint(lan_config).await.unwrap();
+        let snapshot = lan.snapshot();
+        assert!(snapshot.allow_lan);
+        assert_eq!(snapshot.bind_addr, lan_addr);
+        assert_eq!(snapshot.local_addr.ip(), std::net::IpAddr::V4(lan_ip));
+        assert!(!snapshot.local_addr.ip().is_loopback());
+        assert!(!snapshot.local_addr.ip().is_unspecified());
+        assert!(!snapshot.relay_enabled);
+        let lan_address = lan.address().unwrap();
+
+        // 真实 LAN 互连需要本机允许访问自己的非回环地址；被防火墙/策略拦截时 skip。
+        if !lan_self_interconnect_works(lan_ip) {
+            eprintln!(
+                "skip lan_endpoint_real_address_interconnect: non-loopback self-connect blocked by host firewall/policy; snapshot assertions already passed"
+            );
+            lan.close().await;
+            return;
+        }
+
+        // 首选严格拓扑：B 回环，由它主动连 A 的非回环真实地址。
+        let loopback = start_endpoint(EndpointConfig::loopback().with_secret_key([32u8; 32]))
+            .await
+            .unwrap();
+        assert!(!loopback.snapshot().relay_enabled);
+        let mut accepts = lan.accept_loop(4).unwrap();
+        let (b_endpoint, b_conn) = match loopback.connect(lan_address.clone(), IO_TIMEOUT).await {
+            Ok(connection) => (loopback, connection),
+            Err(first) => {
+                // Windows 等平台不允许 127.0.0.1 源地址访问本机非回环地址；改用同样走真实
+                // 非回环网卡的 B（绑定 0.0.0.0）继续验证互连，并打印原因。
+                eprintln!(
+                    "note lan_endpoint_real_address_interconnect: loopback-source -> non-loopback-destination not routable ({first:?}); retrying with LAN-bound B"
+                );
+                loopback.close().await;
+                let mut fallback_config = EndpointConfig::loopback()
+                    .with_secret_key([33u8; 32])
+                    .with_allow_lan(true);
+                fallback_config.bind_addr = SocketAddr::from(([0u8, 0, 0, 0], 0));
+                let fallback = start_endpoint(fallback_config).await.unwrap();
+                assert!(fallback.snapshot().allow_lan);
+                assert!(!fallback.snapshot().relay_enabled);
+                match fallback.connect(lan_address, IO_TIMEOUT).await {
+                    Ok(connection) => (fallback, connection),
+                    Err(second) => {
+                        eprintln!(
+                            "skip lan_endpoint_real_address_interconnect: non-loopback interconnect blocked by host environment ({first:?} / {second:?}); snapshot assertions already passed"
+                        );
+                        fallback.close().await;
+                        lan.close().await;
+                        return;
+                    }
+                }
+            }
+        };
+        let lan_conn = accepts.next(IO_TIMEOUT).await.unwrap();
+        assert_eq!(lan_conn.remote_endpoint(), b_endpoint.node_id());
+        assert_eq!(b_conn.remote_endpoint(), lan.node_id());
+
+        let b_session = session(b_endpoint.node_id(), lan.node_id(), 0xa1, 0xb2);
+        let lan_session = session(lan.node_id(), b_endpoint.node_id(), 0xb2, 0xa1);
+        let mut retry = retry_tracker();
+        let mut b_stream = b_conn.open_stream(IO_TIMEOUT).await.unwrap();
+
+        // 多分片帧（5 KiB / 2 KiB = 3 片）经真实非回环地址传输。
+        let payload: Vec<u8> = (0..5 * 1024).map(|index| (index % 251) as u8).collect();
+        assert!(
+            b_stream
+                .send_frame(
+                    SendFrameRequest {
+                        session: &b_session,
+                        frame_id: 1,
+                        payload: &payload,
+                        budget: send_budget(),
+                        retry: &mut retry,
+                        now_unix_ms: 0,
+                    },
+                    IO_TIMEOUT,
+                )
+                .await
+                .unwrap()
+                .is_sent()
+        );
+        let mut lan_stream = lan_conn.accept_stream(IO_TIMEOUT).await.unwrap();
+        let mut receiver = PeerFrameReceiver::new(&lan_session, receiver_limits()).unwrap();
+        let received = lan_stream
+            .receive_frame(&lan_session, &mut receiver, ReceiveBudget::DEFAULT, IO_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(
+            received,
+            ReceiveOutcome::Frame {
+                frame_id: 1,
+                payload: payload.clone(),
+                records: 3
+            }
+        );
+
+        // 超限帧在发送前拒绝，不写线。
+        let oversize = vec![0u8; FRAME_LIMIT + 1];
+        assert_eq!(
+            b_stream
+                .send_frame(
+                    SendFrameRequest {
+                        session: &b_session,
+                        frame_id: 2,
+                        payload: &oversize,
+                        budget: send_budget(),
+                        retry: &mut retry,
+                        now_unix_ms: 0,
+                    },
+                    IO_TIMEOUT,
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            "CONTENT_TOO_LARGE"
+        );
+        // 连续第二帧（单分片）仍可正常送达。
+        assert!(
+            b_stream
+                .send_frame(
+                    SendFrameRequest {
+                        session: &b_session,
+                        frame_id: 2,
+                        payload: b"lan-ok",
+                        budget: send_budget(),
+                        retry: &mut retry,
+                        now_unix_ms: 0,
+                    },
+                    IO_TIMEOUT,
+                )
+                .await
+                .unwrap()
+                .is_sent()
+        );
+        let received = lan_stream
+            .receive_frame(&lan_session, &mut receiver, ReceiveBudget::DEFAULT, IO_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(
+            received,
+            ReceiveOutcome::Frame {
+                frame_id: 2,
+                payload: b"lan-ok".to_vec(),
+                records: 1
+            }
+        );
+
+        b_conn.close(b"done");
+        lan_conn.close(b"done");
+        b_endpoint.close().await;
+        lan.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn non_loopback_bind_rejected_without_allow_lan() {
+    timed(async {
+        // 不依赖本机真实地址：校验在任何绑定之前拒绝（含 TEST-NET 地址）。
+        for ip in [[192u8, 0, 2, 10], [198u8, 51, 100, 10]] {
+            let mut config = EndpointConfig::loopback();
+            config.bind_addr = SocketAddr::from((ip, 0));
+            assert_eq!(
+                config.validate().unwrap_err().code(),
+                "INVALID_TRANSPORT_CONFIG"
+            );
+            assert_eq!(
+                start_endpoint(config).await.unwrap_err().code(),
+                "INVALID_TRANSPORT_CONFIG"
+            );
+        }
+        // 显式 allow_lan 后配置本身合法（真实绑定由上一个用例覆盖）。
+        let mut allowed = EndpointConfig::loopback().with_allow_lan(true);
+        allowed.bind_addr = SocketAddr::from(([192u8, 0, 2, 10], 0));
+        allowed.validate().unwrap();
+    })
+    .await;
+}

@@ -30,7 +30,44 @@ use chat_sync::clock::{Clock, SystemClock};
 use chat_sync::error::{Result as SyncResult, SyncError};
 use chat_sync::pull::PullPolicy;
 
+use crate::outbox_worker::{OUTBOX_BATCH_LIMIT, run_outbox_once_at};
+use crate::send_orchestrator::{
+    CryptoEngine, EncryptedPayload, NodeSubmitter, SendOrchestrator, SendResult, SubmitAttempt,
+    SubmitOutcome,
+};
 use crate::sync_worker::{load_pull_state, run_catchup_once_at, run_pull_once_at};
+
+/// outbox 未注入端口时的本地标记（不是网络错误）：outbox 会**显式不执行**并把它写进状态，
+/// 绝不假装“跑过了但没有活干”。
+pub const OUTBOX_NOT_CONFIGURED: &'static str = "OUTBOX_NOT_CONFIGURED";
+
+/// outbox 批执行的 worker 标识（进入 outbox 租约，冲突时显式失败）。
+const OUTBOX_WORKER: &'static str = "sync-runtime-outbox";
+
+impl NodeSubmitter for Box<dyn NodeSubmitter + Send> {
+    fn submit(&self, attempt: &SubmitAttempt) -> SendResult<SubmitOutcome> {
+        (**self).submit(attempt)
+    }
+
+    fn query(&self, submission_id: &str) -> SendResult<SubmitOutcome> {
+        (**self).query(submission_id)
+    }
+}
+
+impl CryptoEngine for Box<dyn CryptoEngine + Send> {
+    fn epoch(&self, conversation_id: &str) -> SendResult<u64> {
+        (**self).epoch(conversation_id)
+    }
+
+    fn encrypt(
+        &mut self,
+        conversation_id: &str,
+        draft_id: &str,
+        body: &str,
+    ) -> SendResult<EncryptedPayload> {
+        (**self).encrypt(conversation_id, draft_id, body)
+    }
+}
 
 /// 一轮之间允许的最小等待（毫秒）：既防止忙等，也保证 `stop()` 后状态能及时可见。
 pub const DEFAULT_ROUND_WAIT_MIN_MS: u64 = 50;
@@ -69,6 +106,14 @@ pub struct SyncStatusView {
     pub rounds: u64,
     /// 停止原因（稳定文本；正常 stop 为 `stop_requested`）。
     pub stopped_reason: Option<&'static str>,
+    /// outbox 批执行累计成功的任务数（本进程生命周期）。
+    pub outbox_accepted_total: u64,
+    /// outbox 批执行累计“结果未知”的任务数（只写对账窗口，绝不重发）。
+    pub outbox_unknown_total: u64,
+    /// 最近一次 outbox 失败的稳定错误码文本（PROTOCOL-014；未配置时为本地标记文本）。
+    pub outbox_last_error_code: Option<&'static str>,
+    /// 下一次允许执行 outbox 的时间（Unix 毫秒；**与拉取退避互相独立**）。
+    pub outbox_next_attempt_at_ms: i64,
 }
 
 impl SyncStatusView {
@@ -81,6 +126,10 @@ impl SyncStatusView {
             resync_required: false,
             rounds: 0,
             stopped_reason: None,
+            outbox_accepted_total: 0,
+            outbox_unknown_total: 0,
+            outbox_last_error_code: None,
+            outbox_next_attempt_at_ms: now_ms,
         }
     }
 
@@ -214,7 +263,6 @@ impl SyncRuntimePolicy {
 }
 
 /// 运行时配置。
-#[derive(Debug)]
 pub struct SyncRuntimeConfig {
     /// 正式库路径（运行时自己打开、自己关闭）。
     pub store_path: PathBuf,
@@ -231,6 +279,12 @@ pub struct SyncRuntimeConfig {
     pub policy: SyncRuntimePolicy,
     /// 拉取决策策略（页大小/退避/预算）。
     pub pull_policy: PullPolicy,
+    /// 是否启用 outbox 批执行（默认 **true**）。关闭时草稿保持 pending，便于对照实验。
+    pub enabled_outbox: bool,
+    /// outbox 的加密端口（真实 MLS 设备）。未注入时 outbox 不执行，状态里显式标记。
+    pub outbox_engine: Option<Box<dyn CryptoEngine + Send>>,
+    /// outbox 的节点提交端口（实现方必须幂等）。未注入时 outbox 不执行。
+    pub outbox_submitter: Option<Box<dyn NodeSubmitter + Send>>,
 }
 
 impl SyncRuntimeConfig {
@@ -254,7 +308,28 @@ impl SyncRuntimeConfig {
             group_id: group_id.into(),
             policy: SyncRuntimePolicy::default(),
             pull_policy: PullPolicy::DEFAULT,
+            enabled_outbox: true,
+            outbox_engine: None,
+            outbox_submitter: None,
         })
+    }
+
+    /// 注入 outbox 端口（加密 + 节点提交）。注入后才真正执行批任务。
+    pub fn with_outbox(
+        mut self,
+        engine: Box<dyn CryptoEngine + Send>,
+        submitter: Box<dyn NodeSubmitter + Send>,
+    ) -> Self {
+        self.outbox_engine = Some(engine);
+        self.outbox_submitter = Some(submitter);
+        self.enabled_outbox = true;
+        self
+    }
+
+    /// 关闭 outbox 批执行（对照实验/只做拉取的部署）。
+    pub fn without_outbox(mut self) -> Self {
+        self.enabled_outbox = false;
+        self
     }
 
     /// 注入循环参数。
@@ -282,6 +357,21 @@ impl SyncRuntimeConfig {
         GroupId::parse(&self.group_id)
             .map_err(|_| invalid_target("group id must be PROTOCOL-001 group text"))?;
         Ok(())
+    }
+}
+
+impl std::fmt::Debug for SyncRuntimeConfig {
+    /// 只打印开关与端口是否注入（引擎/提交器内部不暴露）。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SyncRuntimeConfig")
+            .field("store_path", &self.store_path)
+            .field("group_id", &self.group_id)
+            .field("policy", &self.policy)
+            .field("enabled_outbox", &self.enabled_outbox)
+            .field("outbox_engine", &self.outbox_engine.is_some())
+            .field("outbox_submitter", &self.outbox_submitter.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -371,29 +461,129 @@ impl Drop for SyncRuntime {
     }
 }
 
+/// 循环持有的后端：要么只是库句柄，要么是包住库句柄的发送编排器（outbox 需要它）。
+enum LoopBackend {
+    /// 纯拉取（outbox 关闭或未注入端口）。
+    Plain(Store),
+    /// 拉取 + outbox：编排器独占库句柄，通过 @@store_mut@@ 给拉取用。
+    WithOutbox(SendOrchestrator<
+        Box<dyn NodeSubmitter + Send>,
+        Box<dyn CryptoEngine + Send>,
+        SystemClock,
+    >),
+}
+
+impl LoopBackend {
+    fn store_mut(&mut self) -> &mut Store {
+        match self {
+            Self::Plain(store) => store,
+            Self::WithOutbox(orchestrator) => orchestrator.store_mut(),
+        }
+    }
+
+    fn into_store(self) -> Store {
+        match self {
+            Self::Plain(store) => store,
+            Self::WithOutbox(orchestrator) => orchestrator.into_store(),
+        }
+    }
+}
+
 /// 循环主体（在专属线程上跑，持有自己的库句柄与节点客户端）。
 fn run_loop(config: SyncRuntimeConfig, shared: Arc<Shared>) -> SyncResult<Store> {
-    let mut store = open_store(
+    let store = open_store(
         StoreOptions::new(config.store_path.clone(), KeyProvenance::Raw32),
         ProtectedStorageKey::from_bytes(config.master_key),
     )
     .map_err(|_| storage_error())?;
+    // outbox 开启且注入了两个端口时才真正执行；否则显式记录原因（不静默跳过）。
+    let outbox_ready = config.enabled_outbox
+        && config.outbox_engine.is_some()
+        && config.outbox_submitter.is_some();
+    let mut backend = match (outbox_ready, config.outbox_engine, config.outbox_submitter) {
+        (true, Some(engine), Some(submitter)) => {
+            let orchestrator = SendOrchestrator::new(
+                store,
+                submitter,
+                engine,
+                SystemClock,
+                OUTBOX_WORKER,
+            )?;
+            LoopBackend::WithOutbox(orchestrator)
+        }
+        _ => {
+            if config.enabled_outbox {
+                shared.update(|status| {
+                    status.outbox_last_error_code = Some(OUTBOX_NOT_CONFIGURED);
+                });
+            }
+            LoopBackend::Plain(store)
+        }
+    };
     let client = config.client;
     let group_id = config.group_id.clone();
     let mut failures = 0_u32;
+    let mut outbox_failures = 0_u32;
     let mut applied_total = 0_u64;
+    let mut outbox_accepted_total = 0_u64;
+    let mut outbox_unknown_total = 0_u64;
+    let mut outbox_next_attempt_at_ms = 0_i64;
     loop {
+        // 任务边界：每一轮开始前检查停止信号（不打断正在执行的那一个任务）。
         if shared.stopping() {
             finish(&shared, "stop_requested");
-            return Ok(store);
+            return Ok(backend.into_store());
         }
         let now = SystemClock.now_unix_ms();
         shared.update(|status| {
             status.state = SyncState::Pulling;
             status.rounds = status.rounds.saturating_add(1);
         });
-        // 一轮 = 一次 run_pull_once（决策 + 至多一页）；Resync 时立刻转一次 catchup。
-        let wait_ms = match run_pull_once_at(&mut store, &client, &group_id, now) {
+        // 阶段 0（outbox）：先跑一批待办，**失败不阻塞拉取**，退避与拉取各自独立。
+        if outbox_ready && now >= outbox_next_attempt_at_ms {
+            if let LoopBackend::WithOutbox(orchestrator) = &mut backend {
+                let stop = &shared.stop;
+                match run_outbox_once_at(orchestrator, stop, now, OUTBOX_BATCH_LIMIT) {
+                    Ok(batch) => {
+                        outbox_failures = 0;
+                        outbox_accepted_total =
+                            outbox_accepted_total.saturating_add(u64::from(batch.accepted));
+                        outbox_unknown_total =
+                            outbox_unknown_total.saturating_add(u64::from(batch.unknown));
+                        let next = now.saturating_add(config.policy.round_wait_min_ms as i64);
+                        outbox_next_attempt_at_ms = next;
+                        shared.update(|status| {
+                            status.outbox_accepted_total = outbox_accepted_total;
+                            status.outbox_unknown_total = outbox_unknown_total;
+                            status.outbox_last_error_code = None;
+                            status.outbox_next_attempt_at_ms = next;
+                        });
+                    }
+                    Err(error) => {
+                        // outbox 自己的失败预算与退避：**不影响**拉取。
+                        outbox_failures = outbox_failures.saturating_add(1);
+                        let delay = config
+                            .policy
+                            .clamp(config.pull_policy.failure_delay_for(outbox_failures) as u64);
+                        let next = SystemClock.now_unix_ms().saturating_add(delay as i64);
+                        outbox_next_attempt_at_ms = next;
+                        let code = error.code().as_str();
+                        shared.update(|status| {
+                            status.outbox_accepted_total = outbox_accepted_total;
+                            status.outbox_unknown_total = outbox_unknown_total;
+                            status.outbox_last_error_code = Some(code);
+                            status.outbox_next_attempt_at_ms = next;
+                        });
+                    }
+                }
+            }
+        }
+        if shared.stopping() {
+            finish(&shared, "stop_requested");
+            return Ok(backend.into_store());
+        }
+        // 阶段 1（pull）：一轮 = 一次 run_pull_once（决策 + 至多一页）；Resync 时立刻转一次 catchup。
+        let wait_ms = match run_pull_once_at(backend.store_mut(), &client, &group_id, now) {
             Ok(outcome) => {
                 applied_total = applied_total.saturating_add(outcome.applied);
                 failures = 0;
@@ -403,7 +593,7 @@ fn run_loop(config: SyncRuntimeConfig, shared: Arc<Shared>) -> SyncResult<Store>
                 });
                 if outcome.resync_required {
                     shared.update(|status| status.resync_required = true);
-                    match run_catchup_once_at(&mut store, &client, &group_id, now) {
+                    match run_catchup_once_at(backend.store_mut(), &client, &group_id, now) {
                         Ok(catchup) => {
                             applied_total = applied_total.saturating_add(catchup.applied);
                             // 追赶后仍有上层动作（epoch 重建/等待控制结果）时，缺口依旧存在。
@@ -421,12 +611,12 @@ fn run_loop(config: SyncRuntimeConfig, shared: Arc<Shared>) -> SyncResult<Store>
                             });
                             if !error.retryable() {
                                 finish(&shared, "unretryable_error");
-                                return Ok(store);
+                                return Ok(backend.into_store());
                             }
                             failures = failures.saturating_add(1);
                             if failures > config.policy.max_failures {
                                 finish(&shared, "failure_budget_exhausted");
-                                return Ok(store);
+                                return Ok(backend.into_store());
                             }
                             config.policy.clamp(config.pull_policy.failure_delay_for(failures) as u64)
                         }
@@ -439,7 +629,7 @@ fn run_loop(config: SyncRuntimeConfig, shared: Arc<Shared>) -> SyncResult<Store>
                         }
                     };
                     finish(&shared, label);
-                    return Ok(store);
+                    return Ok(backend.into_store());
                 } else {
                     config
                         .policy
@@ -453,12 +643,12 @@ fn run_loop(config: SyncRuntimeConfig, shared: Arc<Shared>) -> SyncResult<Store>
                 // 不可重试（授权/验签/冲突等）→ 明确终止，不再自动重试。
                 if !error.retryable() {
                     finish(&shared, "unretryable_error");
-                    return Ok(store);
+                    return Ok(backend.into_store());
                 }
                 failures = failures.saturating_add(1);
                 if failures > config.policy.max_failures {
                     finish(&shared, "failure_budget_exhausted");
-                    return Ok(store);
+                    return Ok(backend.into_store());
                 }
                 config.policy.clamp(config.pull_policy.failure_delay_for(failures) as u64)
             }
@@ -474,7 +664,7 @@ fn run_loop(config: SyncRuntimeConfig, shared: Arc<Shared>) -> SyncResult<Store>
         });
         if shared.wait_round(wait_ms) {
             finish(&shared, "stop_requested");
-            return Ok(store);
+            return Ok(backend.into_store());
         }
     }
 }
