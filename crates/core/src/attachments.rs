@@ -804,7 +804,9 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// 校验本地附件 ID 形式（att- + 32 位小写 hex）；不合法按“不存在”处理，避免路径拼接。
-fn validate_attachment_id(attachment_id: &str) -> AttachmentResult<()> {
+///
+/// `pub(crate)`：块传输适配层（attachment_transport）用同一规则校验后派生节点 blob 标识。
+pub(crate) fn validate_attachment_id(attachment_id: &str) -> AttachmentResult<()> {
     let payload = attachment_id
         .strip_prefix(ATTACHMENT_ID_PREFIX)
         .ok_or(AttachmentError::AttachmentNotFound)?;

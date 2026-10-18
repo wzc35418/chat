@@ -1,6 +1,6 @@
 # 文件导入、分块上传、下载和导出
 
-阶段：P2。状态：函数级设计；本地导入/导出与本地状态机（ATTACHMENTS-001/002/004/006/007 的本地部分）已实现；ATTACHMENTS-003 上传与 ATTACHMENTS-005 下载已通过可注入的块传输端口（`BlobTransport`）接通编排与状态机（节点客户端由适配层实现，本 crate 不依赖 node-client）；含 FileKey 的 E2EE SecretDescriptor、真实节点配额/回执校验与持久化进度仍未实现。目标源码：[crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)。
+阶段：P2。状态：函数级设计；本地导入/导出与本地状态机（ATTACHMENTS-001/002/004/006/007 的本地部分）已实现；ATTACHMENTS-003 上传与 ATTACHMENTS-005 下载已通过可注入的块传输端口（`BlobTransport`）接通编排与状态机（节点客户端由适配层 `NodeBlobTransport` 实现并已接真节点（NODE-012~015，crates/core/src/attachment_transport.rs））；节点配额与回执验签已由适配层完成；含 FileKey 的 E2EE SecretDescriptor、跨进程下载能力与持久化进度仍未实现。目标源码：[crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)（编排）与 [crates/core/src/attachment_transport.rs](../../crates/core/src/attachment_transport.rs)（节点适配）。
 
 平台 file token 仅代表用户授权的一次访问，不将任意路径传入内核。默认单附件 25 MiB，按完整原文大小计；节点配额按密文实际字节计。文件密钥只在受保护本地记录和 E2EE 描述中，不能放节点 URL 或公开清单。
 
@@ -135,7 +135,7 @@ upload_attachment(id: AttachmentId) -> Result<UploadResult>
 - [x] 响应丢失重复块不会加倍计配额：`attachments::tests::upload_sends_the_cached_ciphertext_chunks_verbatim`（重复上传已 available 的附件是幂等无操作：不建会话、不发块、不重复 complete）与 `upload_failure_keeps_progress_and_retry_is_idempotent`（重试按同一序号重发同一密文字节；端口契约要求同会话同序号幂等）。节点侧“同块只计一次配额”的记账属 NODE-013，不在本 crate。
 - [ ] 重启从位图续传。（未实现：进度只在进程内，附件表没有进度列；重启后重试会新建会话并从第 0 块重发——同序号同字节，节点侧仍幂等）
 
-**实现状态**：已实现（编排 + 状态机，Windows x64 实测）。`PersistedAttachmentStore::upload_attachment(attachment_id, &mut transport)`：按 storage 白名单 imported → uploading → available 迁移；从本地加密缓存按序读取**密文块**（不重新加密、不发明文）→ `BlobTransport::begin_upload` →逐块 `put_chunk` → `complete(整文件密文摘要)` → 标 available；已 available 时重复调用是幂等无操作；中途失败保留缓存与已发送块计数、状态停在 uploading 可重试；任何网络失败都不会把记录标成 available。证据：`attachments::tests::upload_sends_the_cached_ciphertext_chunks_verbatim`（节点收到的每块与本地缓存密文逐字节一致、节点永不收到明文、请求字段与公开清单一致、重复上传零发送）、`upload_failure_keeps_progress_and_retry_is_idempotent`（第 3 块失败时已发 2 块、缓存与进度保留、状态 uploading、重试用同一密文成功）。限制：节点配额/回执验证、位图续传、持久化进度未实现（见“上传/下载接块传输端口实现记录”）。
+**实现状态**：已实现（编排 + 状态机，Windows x64 实测）。`PersistedAttachmentStore::upload_attachment(attachment_id, &mut transport)`：按 storage 白名单 imported → uploading → available 迁移；从本地加密缓存按序读取**密文块**（不重新加密、不发明文）→ `BlobTransport::begin_upload` →逐块 `put_chunk` → `complete(整文件密文摘要)` → 标 available；已 available 时重复调用是幂等无操作；中途失败保留缓存与已发送块计数、状态停在 uploading 可重试；任何网络失败都不会把记录标成 available。证据：`attachments::tests::upload_sends_the_cached_ciphertext_chunks_verbatim`（节点收到的每块与本地缓存密文逐字节一致、节点永不收到明文、请求字段与公开清单一致、重复上传零发送）、`upload_failure_keeps_progress_and_retry_is_idempotent`（第 3 块失败时已发 2 块、缓存与进度保留、状态 uploading、重试用同一密文成功）。限制：位图续传、持久化进度未实现（见“上传/下载接块传输端口实现记录”）；节点配额/回执验证由 `NodeBlobTransport` 适配层完成（见“节点块传输适配实现记录”）。
 
 <a id="attachments-004"></a>
 
@@ -203,7 +203,7 @@ download_attachment(id: AttachmentId) -> Result<TransferTicket>
 - [x] 重排/替换/缺最后块失败：`attachments::tests::download_rejects_tampered_chunks_and_leaves_no_partial_file`（替换第 2 块 → 分块 AAD 认证失败 → ATTACHMENT_CORRUPTED，不产生目标文件与临时文件）、`download_rejects_unknown_blobs_and_missing_keys`（节点缺块/未知 blob → ATTACHMENT_NOT_FOUND）、`download_rejects_a_wrong_manifest_before_reading_any_chunk`（与本地记录不一致的 manifest 在任何网络读取前被拒）。
 - [ ] 取消下载保留可恢复进度。（未实现：下载没有取消入口；失败时状态保留在 downloading 且不写任何文件，可重新调用重试）
 
-**实现状态**：已实现（编排 + 状态机，Windows x64 实测）。`PersistedAttachmentStore::download_attachment(blob_id, expected_manifest, destination, &mut transport)`：只接受 available/downloading 记录；先用 expected_manifest 与本地持久化记录（块数/块大小/明文大小/密文摘要）比对，不一致在任何网络读取前 `ATTACHMENT_CORRUPTED`；逐块 `read_chunk` → 分块 AAD 认证解密 → 同目录临时文件 → 校验**密文整文件摘要 + 明文大小 + 明文 SHA-256** 后 rename；任何失败删除临时文件、绝不写出未验证文件；解密需要进程内 FileKey（重启后显式 `ATTACHMENT_KEY_UNAVAILABLE`）。证据：`download_roundtrip_matches_the_original_plaintext`（下载得到的明文与原始正文逐字节一致、回执摘要一致）、上面三条拒绝用例。限制：不写本地加密缓存（本轮直接写出目标路径）、无“只拉缺块”的位图、无 CAPABILITY_EXPIRED（下载能力令牌属 E2EE SecretDescriptor）。
+**实现状态**：已实现（编排 + 状态机，Windows x64 实测）。`PersistedAttachmentStore::download_attachment(blob_id, expected_manifest, destination, &mut transport)`：只接受 available/downloading 记录；先用 expected_manifest 与本地持久化记录（块数/块大小/明文大小/密文摘要）比对，不一致在任何网络读取前 `ATTACHMENT_CORRUPTED`；逐块 `read_chunk` → 分块 AAD 认证解密 → 同目录临时文件 → 校验**密文整文件摘要 + 明文大小 + 明文 SHA-256** 后 rename；任何失败删除临时文件、绝不写出未验证文件；解密需要进程内 FileKey（重启后显式 `ATTACHMENT_KEY_UNAVAILABLE`）。证据：`download_roundtrip_matches_the_original_plaintext`（下载得到的明文与原始正文逐字节一致、回执摘要一致）、上面三条拒绝用例。限制：不写本地加密缓存（本轮直接写出目标路径）、无“只拉缺块”的位图、无 CAPABILITY_EXPIRED（下载能力令牌属 E2EE SecretDescriptor）；节点读取授权由 `NodeBlobTransport` 适配层承载（NODE-015：上传设备本人恒可读）。
 
 <a id="attachments-006"></a>
 
@@ -364,7 +364,71 @@ cargo test --offline -p chat-core                     # 70 passed（既有 64 �
 
 已知限制（本切片不覆盖）：
 
-1. **真实节点适配未接线**：`BlobTransport` 是端口，NODE-012/013/014 的 begin/put/complete 与节点配额、回执验证由适配层实现（参考 `node_submitter` 的适配方式），本 crate 不含任何 HTTP/节点依赖。
+1. **节点适配在独立文件**：端口 `BlobTransport` 的节点实现是 [crates/core/src/attachment_transport.rs](../../crates/core/src/attachment_transport.rs) 的 `NodeBlobTransport`（NODE-012~015，含节点配额与回执验签），本文件（编排层）不含任何 HTTP/节点依赖；见下文“节点块传输适配实现记录”。
+
+## 节点块传输适配实现记录（NodeBlobTransport，ATTACHMENTS-003/005 的节点侧，2026-10-18，Windows x64）
+
+实现位置：[crates/core/src/attachment_transport.rs](../../crates/core/src/attachment_transport.rs)（新增，`lib.rs` 加一行），测试：[crates/core/tests/attachment_transport.rs](../../crates/core/tests/attachment_transport.rs)（6 个用例，真 axum 节点 + 真 node-client）。编排层与端口契约不变：本文件只补“端口接到真节点”的实现、标识映射、错误码保真与已知差异。
+
+公开面：
+
+~~~text
+pub struct NodeBlobTransport { .. }   // impl BlobTransport
+impl NodeBlobTransport {
+    pub fn new(client: NodeClient, group_id: impl Into<String>, source_seq: u64) -> AttachmentResult<Self>;
+    pub fn device_id(&self) -> &str;  pub fn group_id(&self) -> &str;  pub fn source_seq(&self) -> u64;
+    pub fn stats(&self) -> TransportStats;   // begin/put/complete/read 调用计数（证明没重发/没重复会话）
+}
+pub fn blob_object_id_for(attachment_id: &str) -> AttachmentResult<String>;          // att-… → obj:1:<hex>
+pub fn upload_operation_id_for(attachment_id: &str, digest: &str) -> AttachmentResult<String>; // op:1:<hex>
+pub const CIPHERTEXT_CHUNK_OVERHEAD: usize;   // 1 + nonce(12) + tag(16) = 29（CRYPTO-011 分块格式）
+~~~
+
+关键设计：
+
+1. **同步/异步边界**：端口是同步的、NodeClient 是异步的，因此沿用 `node_submitter` 的做法——独立线程 + current-thread 运行时做桥（`TransportBridge`），任何上下文都能安全调用；桥断开时显式 `NODE_UNAVAILABLE`，绝不静默成功。
+2. **标识映射（节点 blob ≠ 本地附件 ID）**：节点要求 `ObjectId` 文本与 `(设备, operation)` 幂等键，因此
+   - blob 标识 = `obj:1:sha256("chat/attachment/blob-id/v1" || attachment_id)`（确定性，跨重启下载端无需注册表）；
+   - begin 的 operation = `op:1:sha256("chat/attachment/upload-operation/v1" || attachment_id || ciphertext_digest)`（重试复用同一会话；不同附件/不同密文得到新会话）。
+3. **声明块大小**：节点要求“非末块满块、末块 ≤ 声明块大小”。客户端分块密文 = 明文块 + 29 字节封装开销，因此 `chunk_count > 1` 时 `chunk_bytes = chunk_size + 29`；`chunk_count == 1` 时 `chunk_bytes = ciphertext_bytes`。发送前先做本地一致性校验（`ciphertext_bytes == plain_size + chunk_count * 29`），矛盾清单不发网络、也绝不篡改尺寸去凑策略。
+4. **关联授权**：`source_seq` 必须是“作者正是本设备”的已接受日志条目（NODE-012 授权），由构造参数绑定；构造时校验群 ID 为 PROTOCOL-001 文本、序号非零。
+5. **回执复核**：complete 的节点回执必须绑定本次清单（块数/总密文）与派生出的 blob 标识，否则 `INVALID_RECEIPT_SCOPE` 显式失败（不把“形状不对的回执”当成功）。
+
+错误码映射（`AttachmentError::Transport { code, detail }`，`code` 优先节点稳定码，其次 PROTOCOL-014 码）：
+
+| 节点/客户端错误 | 保留的稳定码 | 说明 |
+|---|---|---|
+| 节点返回的业务码 | `BLOB_UPLOAD_CONFLICT` / `CHUNK_CONFLICT` / `MANIFEST_MISMATCH` / `CHUNK_OUT_OF_ORDER` / `UPLOAD_EXPIRED` / `UPLOAD_NOT_FOUND` / `BLOB_NOT_FOUND` / `MISSING_CHUNKS` / `QUOTA_EXCEEDED` / `PERMISSION_DENIED` / `CONTENT_TOO_LARGE` / `RATE_LIMITED` | 直接透传节点码 |
+| 网络/连接失败 | `NETWORK_UNAVAILABLE` | 调用方可重试 |
+| 桥线程不可用 | `NODE_UNAVAILABLE` | 本地故障，状态不变 |
+| 回执不绑定本次清单 | `INVALID_RECEIPT_SCOPE` | 协议违规，显式失败 |
+
+复现命令（全程离线；节点在进程内起真 axum 服务，loopback）：
+
+~~~powershell
+. .	oolsactivate.ps1
+cargo test --offline -p chat-core --test attachment_transport   # 6 passed
+cargo test --offline -p chat-core                                # 76 passed（既有 70 个继续通过）
+~~~
+
+证据（测试名 → 覆盖点）：
+
+- `attachment_transport::upload_publishes_chunks_the_node_returns_verbatim`：上传后节点读回的密文块与本地缓存**逐字节一致**、节点内容里没有明文；`TransportStats` 显示 begin/put/complete 各 1 次；记录落 available；重复上传不建会话、不发块（幂等）。
+- `attachment_transport::download_from_the_node_decrypts_the_original_plaintext`：新 transport 从节点取回分块密文并解出原文（与源文件逐字节一致、回执摘要一致、读取次数 = 块数）；与本地记录不一致的清单在**任何节点读取之前**被 `ATTACHMENT_CORRUPTED` 拒绝。
+- `attachment_transport::broken_link_keeps_the_attempt_retryable_and_retry_is_idempotent`：节点不可达 → `NETWORK_UNAVAILABLE`，状态停在 uploading、缓存块完整、记录未 available；换真节点重试成功（同 operation、同密文字节），之后再上传幂等无操作。
+- `attachment_transport::multi_chunk_attachments_are_rejected_by_the_node_chunk_policy`：3 块附件被节点以 `CONTENT_TOO_LARGE` 拒绝（码保真），本地尺寸未被篡改、记录未 available。
+- `attachment_transport::published_blob_survives_a_node_restart`：文件库节点上传→**关闭节点→用同一库文件重启**→新客户端仍能下载并解出原文。
+- `attachment_transport::node_errors_keep_their_stable_codes`：设备配额只够一份附件时第二份被 `QUOTA_EXCEEDED` 拒绝；签名钥错误时保留鉴权类冻结码；错误文本不含内容。
+
+已知限制（本切片不覆盖）：
+
+1. **节点块上限 < 客户端分块**：节点 `BlobPolicy::max_chunk_bytes` 默认 32 KiB、硬上限 60 KiB，而客户端附件分块是 256 KiB 明文（密文 +29）。因此**只有单块附件（密文 ≤ 策略上限）能走通**；多块附件会被节点以 `CONTENT_TOO_LARGE` 显式拒绝（本层不隐藏、不篡改）。要打通多块，需要 node 侧提高块上限或客户端改用更小分块参数（两者都不在本任务写入范围）。
+2. **断链时无“部分进度>0”的真实场景**：单块附件在第一次块写入前就失败（transferred = 0）；真正的“已发 2 块后失败”由编排层单元测试（假端口）覆盖。多块场景受限制 1 阻断。
+3. **没有取消/超时的网络流句柄**：`cancel_transfer` 只改本地状态，进行中的 HTTP 请求不会被中断（与编排层记录的限制一致）。
+4. **下载仍要求进程内 FileKey**：跨进程/重启的下载需要 E2EE SecretDescriptor（未实现），因此“节点重启后下载”用例保持同一个客户端 store 句柄。
+5. **一个 transport 绑定一个群 + 一条 source 条目**：多附件（不同 source seq）需要按消息构造 transport 或多绑定表；本轮按“一消息一附件一组”的切片构造。
+6. **节点授权需先有本设备的已接受日志条目**：附件上传前必须已有一条本设备条目（测试用 append 真实写入），不存在“先传附件再发消息”的路径。
+
 2. **进度不落盘**：附件表没有进度列，`transferred_chunks` 只在进程内；重启后重试从头重发（同序号同字节，端口侧幂等）。验收项“重启从位图续传”因此未勾选。
 3. **下载不写本地加密缓存**：本轮直接认证解密写到目标路径（不重新加密入缓存），因此下载后不能离线 `export_attachment`；“只拉缺块”的位图也未实现。
 4. **FileKey 仍只在进程内**：下载与导出都要求“本进程导入过”，E2EE SecretDescriptor（含 FileKey 的受保护记录）与下载能力令牌/CAPABILITY_EXPIRED 仍未实现。

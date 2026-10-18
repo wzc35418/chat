@@ -1,6 +1,6 @@
 # 可靠发送、信箱、日志补齐与生命周期
 
-阶段：P1 → P3。状态：函数级设计；SYNC-003/004（发送调度决策）、SYNC-007（信箱顺序/去重/预算/ACK 记账）、SYNC-011（重试/退避策略）已实现并被自动化用例覆盖，其余函数未开始。目标源码：[crates/sync/src/engine.rs](../../crates/sync/src/engine.rs)。
+阶段：P1 → P3。状态：函数级设计；SYNC-003/004（发送调度决策）、SYNC-007（信箱顺序/去重/预算/ACK 记账）、SYNC-011（重试/退避策略）、SYNC-002 的拉取循环决策核心（`mailbox_pull_loop`）、SYNC-008 的追赶计划核心（`catchup_plan`）已实现并被自动化用例覆盖，其余函数未开始。目标源码：[crates/sync/src/engine.rs](../../crates/sync/src/engine.rs)。
 
 可靠性来自耐久队列，不依赖 Flow 或 WebSocket 是否在线。outbox 分开 Prepare、Append、PeerPretransfer、MailboxPut、DeliveryReceipt、MailboxAck、ControlRebuild 等任务。每群同一执行器串行推进密码学状态，多个群可以有界并行。
 
@@ -16,6 +16,8 @@
 - [crates/sync/src/retry.rs](../../crates/sync/src/retry.rs)：SYNC-011 `schedule_retry` 与 `RetryLedger`。
 - [crates/sync/src/mailbox.rs](../../crates/sync/src/mailbox.rs)：SYNC-007 单页消费 + `MailboxPoller` 轮询状态机（`MailboxSource`/`AckSink` 端口）。
 - [crates/sync/src/send.rs](../../crates/sync/src/send.rs)：SYNC-003/SYNC-004 的 `plan_submission` 调度决策。
+- [crates/sync/src/pull.rs](../../crates/sync/src/pull.rs)：SYNC-002 的拉取循环决策核心 `mailbox_pull_loop`（Pull/Backoff/Resync/Stop）。
+- [crates/sync/src/catchup.rs](../../crates/sync/src/catchup.rs)：SYNC-008 的追赶计划核心 `catchup_plan`（分页拉取、逐 epoch 重建、等待控制结果）。
 - [crates/sync/src/engine.rs](../../crates/sync/src/engine.rs)：SYNC 编号与上述模块的映射，以及未实现项边界。
 
 依赖只来自根 `[workspace.dependencies]`（`chat-protocol`、`chat-domain`、`sha2`）。本轮同时**移除**了 chat-sync 里未使用的 `chat-storage`/`chat-transport` 依赖：它们会把其他 crate 的 clippy 告警带进本 crate 的验收命令，且本轮的纯逻辑不需要它们；接入 SYNC-002/005/006 时必须重新加入。
@@ -33,7 +35,10 @@
 | 游标回退/无进展/页内位置乱序/落在游标之后的未知条目 | `INVALID_CURSOR` |
 | 同一 item id 内容不同（重复但内容冲突） | `INVALID_CANDIDATE` |
 | 乱序暂存满（需要先补日志） | `MISSING_LOG_ENTRIES` |
-| 投影不一致（尝试属于别的草稿、租约无持有者、草稿已接受但尝试未接受等） | `STATE_CORRUPTED` |
+| 投影不一致（尝试属于别的草稿、租约无持有者、草稿已接受但尝试未接受、拉取页条数与范围不一致、失败未计数） | `STATE_CORRUPTED` |
+| 本地已验证日志序号/epoch 超过节点 head（节点回退或换节点） | `LOG_CONFLICT` |
+| 追赶跨度/步数超过单次计划上限（不截断） | `CONTENT_TOO_LARGE` |
+| 跨 epoch 数超过单次计划上限（缺控制日志） | `MISSING_LOG_ENTRIES` |
 | 草稿已取消、未知结果被强行重发 | `INVALID_STATE_TRANSITION` / `UNKNOWN_RESULT` |
 | 业务键冲突（计划书的 `JOB_KEY_CONFLICT`） | `INVALID_STATE_TRANSITION` |
 | 永久失败 / 重试预算耗尽（计划书的结果类别） | `RetryAction::PermanentFailure` / `RetryAction::RetryBudgetExhausted`，并保留根因冻结码 |
@@ -73,18 +78,40 @@
 - `Rebuild`：`Rejected` 且草稿未取消 → `attempt_index + 1` 得到新 SubmissionId（先同步补齐，本函数不猜 epoch）；重建序号上限 64。
 - `Abandoned`：草稿已取消（已接受的尝试仍走 Release，不丢成功事实）。
 
+### 拉取循环（SYNC-002 决策核心）
+
+`mailbox_pull_loop(policy, input) -> Result<PullAction>` 是常驻同步 worker 的循环控制，纯决策、不联网：
+
+- 输入：本地已应用到的位置 `local_tail`、节点签名 head 的 `node_head`、上一次拉取结果 `LastPull`（未拉过/连续页/空页/失败）、连续失败次数、`now_ms`、上次拉取时间、`next_attempt_at_ms`。
+- 输出：`Pull{from,to}`（含端点，条数 ≤ `page_items`）、`Backoff{delay_ms,next_attempt_at_ms,reason}`、`Resync{reason}`、`Stop{reason}`。
+- **缺口不跳过**：上一页不覆盖 `local_tail+1`（空洞）、整页落在本地游标之前（过期页）、页越过节点 head、或节点声称 head 前进却返回空页，一律 `Resync`；交给 SYNC-008 追赶计划重新对齐。
+- **范围有界**：单次 Pull ≤ `page_items`（默认 100，可配 ≤500）；落后超过 `max_incremental_gap`（默认 1000）不一次拉完，而是 `Resync{GapTooLarge}`；本地越过节点 head 是 `Resync{LocalAheadOfNode}`（节点回退/换节点不能靠“继续拉”自愈）。
+- **不忙循环**：未到 `next_attempt_at_ms` 返回 `Backoff{NotDue}` 且不调用数据源；非空页之间至少 `page_interval_ms`（默认 1 s）；失败按 `base × 2^(failures-1)`（1/2/4/8/16/32/60 s，封顶 60 s）；Retry-After 是下界并夹到 1..=5 分钟（可超过自动退避上限，但不超过 PROTOCOL-014 的 5 分钟）；超过失败预算（默认 8）返回 `Stop{FailureBudgetExhausted}`。
+- **幂等/可重入**：同一输入永远同一动作；应用一次 Pull 后重新决策只前进一页；畸形输入（负时钟、时钟回退、页条数与范围不一致、失败未计数、序号超出可存储范围）显式失败（`INVALID_TARGET` / `INVALID_CURSOR` / `STATE_CORRUPTED` / `CONTENT_TOO_LARGE`），不夹取、不静默修正。
+
+### 追赶计划（SYNC-008 计划核心）
+
+`catchup_plan(local: VerifiedHead, node: NodeLogHead, policy) -> Result<CatchupPlan>`，输入本机已验证 head 与节点签名 head 的公开字段（签名验证属于 TRANSPORT-007/PROTOCOL-007）：
+
+- 步骤序列：`PullLog{from,to}`（从 `local.log_sequence+1` 起按 `page_items` 分页、连续升序、无重叠）→ `RebuildEpoch{at_sequence,from_epoch,to_epoch}`（**一次只推进 1 个 epoch**，不跳级，锚点为本次拉取末端）→ `CommitHead`（把已验证 head 提交为节点签名 head 的值）。
+- **缺控制日志不能直接解密新 epoch**：节点 head 声称更新的 epoch/控制头却没有任何新条目承载（`span == 0`）时只返回 `AwaitControl{MissingEpochCommit}`，不猜重建；本地策略已更新但节点还没包含（`local.policy_version > node.policy_version`）时返回 `AwaitControl{PendingControlResult}`，不回退本地策略。
+- **冲突/超限显式失败，不截断**：本地日志序号或 epoch 超过节点 head → `LOG_CONFLICT`；跨度超过 `max_entries`（默认 5000）或步数超过 `max_steps`（默认 64）→ `CONTENT_TOO_LARGE`；跨 epoch 数超过 `max_epoch_jumps`（默认 64）→ `MISSING_LOG_ENTRIES`；策略参数越界或序号超出可存储范围 → `INVALID_TARGET`。
+- **幂等**：已完全追平（seq/epoch/控制头/策略一致）返回空计划且 `is_caught_up() == true`，重复调用结果相同；每群独立计算，一个群的冲突/等待不影响其它群的计划。
+
 ### 复现命令（全程离线，本轮实测）
 
 ```powershell
 . .\tools\activate.ps1
-cargo test --offline -p chat-sync    # 14 mailbox = ok / 9 retry = ok / 10 send = ok；lib 0 个
-cargo clippy --offline -p chat-sync  # 0 warning（lib + --all-targets 均无告警）
+cargo test --offline -p chat-sync    # lib 2 / mailbox 14 / pull 9 / catchup 9 / retry 9 / send 10 = 53 passed
+cargo clippy --offline -p chat-sync --all-targets  # 0 warning
 ```
 
 ### 证据（测试名 → 契约点）
 
 - 重试/退避（`tests/retry_backoff.rs`，9 个）：`backoff_is_exponential_and_capped`（1/2/4/8/16/32/60/60 s 序列与上限）、`jitter_window_is_fixed_and_bounded`（0/500/1000 抽样 = 下界/中点/上界）、`retry_after_takes_priority_and_is_capped_at_five_minutes`（优先且 5 分钟上限、0 被夹到 1 ms）、`non_retryable_errors_are_terminal_without_a_delay`（权限/撤销/损坏/凭据/epoch 立即终态且保留根因码）、`unknown_results_only_reconcile_the_existing_submission`、`retry_budget_exhaustion_stops_automatic_retries`、`ledger_counts_failures_and_only_success_resets`（重启恢复计数、只有成功重置）、`malformed_policies_and_inputs_are_rejected`、`seeded_jitter_is_deterministic_and_stays_in_the_window`。
 - 信箱（`tests/mailbox_polling.rs`，14 个）：`ordered_items_are_delivered_and_the_cursor_advances`、`duplicate_pages_are_idempotent_and_not_redelivered`、`duplicate_item_id_with_different_content_is_rejected`、`out_of_order_log_entries_are_held_then_promoted_in_order`（先 2/3 后 1 → 交付 1/2/3）、`cursor_regression_and_no_progress_are_rejected`、`ack_failure_keeps_progress_and_is_retried`、`empty_pages_back_off_and_do_not_busy_loop`、`pull_failures_back_off_exponentially_and_keep_the_cursor`、`page_and_item_budgets_are_enforced_without_state_change`、`hold_buffer_is_bounded`、`tracked_group_slots_are_bounded`、`seed_group_aligns_the_expected_sequence`、`unknown_item_kinds_are_delivered_without_interpretation`、`malformed_ids_and_cursors_are_rejected`。
+- 拉取循环（`tests/pull_loop.rs`，9 个）：`incremental_pull_is_bounded_and_advances_one_page_at_a_time`（正常增量 1..100→101..200→201..250，尾页不越界，到 head 转 IdleAtHead）、`gap_in_the_last_page_requires_a_resync_instead_of_skipping`（空洞/过期页 → Resync）、`pages_beyond_the_head_or_reversed_are_rejected_explicitly`（越过 head → Resync；页尾<页首 → INVALID_CURSOR；条数与范围不一致 → STATE_CORRUPTED）、`empty_page_with_head_ahead_requires_a_resync`、`oversized_pages_and_gaps_are_refused_instead_of_truncated`（超大一页 → CONTENT_TOO_LARGE；落后超上限 → Resync{GapTooLarge}；本地越过 head → Resync）、`failure_backoff_is_exponential_capped_and_budgeted`（1/2/4/8/16/32/60/60 s、Retry-After 下界与 5 分钟夹取、预算耗尽 → Stop）、`not_due_and_page_interval_avoid_busy_looping`、`planning_is_deterministic_and_replay_is_idempotent`、`malformed_policy_and_clock_inputs_are_rejected`。
+- 追赶计划（`tests/catchup_plan.rs`，9 个）：`incremental_catch_up_pulls_the_gap_then_commits_the_head`、`long_gaps_are_paged_and_each_step_stays_within_the_page_limit`（100 条分页、连续递增无洞）、`epoch_lag_is_rebuilt_one_epoch_at_a_time_never_jumping`（epoch 1→4 得 2/3/4 三步，且拉取在重建之前、提交在最后）、`newer_epoch_without_entries_must_wait_for_the_control_result`（缺控制条目 → AwaitControl{MissingEpochCommit}）、`local_policy_ahead_of_the_node_waits_instead_of_rolling_back`、`conflicts_fail_explicitly_and_do_not_block_other_groups`（LOG_CONFLICT 且其它群正常）、`oversized_plans_are_rejected_instead_of_truncated`（跨度/步数 → CONTENT_TOO_LARGE，跨 epoch → MISSING_LOG_ENTRIES，策略/序号 → INVALID_TARGET）、`already_caught_up_is_an_idempotent_empty_plan`、`control_change_with_new_entries_is_explained_by_the_pulled_range`。
 - 发送调度（`tests/send_scheduling.rs`，10 个）：`first_scheduling_derives_one_submission_id_and_is_idempotent`、`derived_ids_are_stable_and_domain_separated`、`prepared_attempt_is_resubmitted_with_the_same_id_and_bytes`、`active_lease_blocks_concurrent_resend_until_it_expires`、`unknown_is_never_resent_even_after_lease_expiry`、`only_formal_acceptance_releases_the_attempt`、`rejection_rebuilds_with_a_new_submission_id`、`cancelled_draft_abandons_every_path`、`inconsistent_or_malformed_snapshots_are_rejected`、`the_plan_sequence_encrypts_exactly_once`（按计划推进 6 步：加密 1 次、重发 2 次、unknown 后只对账 2 次，最终 Release）。
 
 ### 已知限制（本轮只对纯逻辑负责）
@@ -94,7 +121,10 @@ cargo clippy --offline -p chat-sync  # 0 warning（lib + --all-targets 均无告
 3. **去重窗口有界**（4096 条）：被驱逐的 item id 若被节点重放，需要存储侧 `(conversation, event_id)` 去重兜底（计划书也说明外层 item ID 不作可信消息去重）。
 4. **群日志起点默认 1**：已加入设备必须先由 SYNC-008 补齐并把 verified head 通过 `seed_group` 对齐；本层不推断 `joined_seq`，也不主动补拉缺号（那是 SYNC-008）。
 5. **退避参数是固定取值**：正式配置来源（用户/系统预算）待 CONFIG/BRIDGE 接入；抖动来源生产必须由桥接层注入系统 RNG，本轮只提供 `FixedJitter`/`SeededJitter`。
-6. **未接入真实网络/数据库/MLS/时钟**：SYNC-001/002/005/006/008/009/010/012/013/014 未实现；因此本页的完成验收只勾选纯逻辑可证的两项（SYNC-003/004/007/011 的部分项），整体模块不计完成。
+6. **未接入真实网络/数据库/MLS/时钟**：SYNC-001/002(outbox 批执行)/005/006/009/010/012/013/014 未实现；因此本页的完成验收只勾选纯逻辑可证的项（SYNC-003/004/007/011 的部分项，以及 SYNC-002/008 的决策核心），整体模块不计完成。
+7. **编号对照**：计划书的 SYNC-002 是 `run_outbox_once`（outbox 任务批执行）。本轮交付的 `mailbox_pull_loop` 是常驻同步 worker 的**拉取循环决策**（对应 SYNC-006 步骤 2-3 与 SYNC-008 的内环），不是 outbox 批执行本身，因此 SYNC-002 的验收框保持未勾选。
+8. **追赶计划不验签、不应用**：`catchup_plan` 假定节点 head 已由 TRANSPORT-007/PROTOCOL-007 用固定节点公钥验证；逐条验签/MLS 应用/持久化属于 SYNC-009 与 core，未接入。控制条目与 epoch 的对应关系也不由本函数猜测（`RebuildEpoch.at_sequence` 只是“不早于本次拉取末端”的水位）。
+9. **拉取循环的去重/ACK 仍由 SYNC-007 负责**：`mailbox_pull_loop` 只决定“这一轮该不该拉、拉哪一段、等多久、是否需要重新对齐”，不消费条目、不写去重表、不发 ACK。
 
 ## 函数导航
 
@@ -176,9 +206,9 @@ run_outbox_once(now: Time, worker: WorkerId, budget: WorkBudget) -> Result<WorkS
 **完成验收**：
 
 - [ ] 任务执行后落盘前 crash 允许原字节重复。
-- [ ] 断网不忙循环。
+- [ ] 断网不忙循环。（部分：**拉取循环**决策核心已证有界退避——`pull_loop::failure_backoff_is_exponential_capped_and_budgeted`、`pull_loop::not_due_and_page_interval_avoid_busy_looping`；本函数自身的 outbox 批执行未实现，故不勾选）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（仅拉取循环决策核心，**不是** outbox 批执行）。`mailbox_pull_loop(policy, input)` 见 [crates/sync/src/pull.rs](../../crates/sync/src/pull.rs)：输入本地已应用位置/节点 head/上次结果/失败与时间状态，输出 `Pull{from,to}` / `Backoff` / `Resync` / `Stop`；缺口、过期页、越过 head、空页但 head 前进一律 Resync（绝不跳过），单次 Pull ≤ `page_items`，落后超过 `max_incremental_gap` 交给追赶计划，失败指数退避封顶 60 s 且 Retry-After 为下界（≤5 分钟），失败预算耗尽即 Stop。证据见上文“拉取循环（SYNC-002 决策核心）”与 `tests/pull_loop.rs`（9 个用例）。限制：不联网、不消费条目、不发 ACK（那是 SYNC-007 的 `MailboxPoller`）；计划的 `run_outbox_once`（依赖 STORAGE-014/015）仍未实现，因此本函数验收框保持未勾选。
 
 <a id="sync-003"></a>
 
@@ -378,10 +408,10 @@ catch_up_group(group: GroupId, target: Option<u64>, budget: SyncBudget) -> Resul
 
 **完成验收**：
 
-- [ ] 缺控制日志不能直接解密新 epoch。
-- [ ] 暂停群不阻断其他群。
+- [ ] 缺控制日志不能直接解密新 epoch。（部分：计划层保证“先拉取控制条目、逐个 epoch 重建、缺条目即等待”——`catchup_plan::epoch_lag_is_rebuilt_one_epoch_at_a_time_never_jumping`、`catchup_plan::newer_epoch_without_entries_must_wait_for_the_control_result`；真正阻止解密的调用点在 CRYPTO-006/010 与 SYNC-009，未接入）
+- [ ] 暂停群不阻断其他群。（部分：`catchup_plan` 是每群纯函数，冲突群返回 `LOG_CONFLICT`、等待群返回 `AwaitControl`，都不影响其它群的计划——`catchup_plan::conflicts_fail_explicitly_and_do_not_block_other_groups`；跨群调度隔离在 SYNC-006/core，未接入）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（仅计划核心，不联网/不验签/不应用）。`catchup_plan(local: VerifiedHead, node: NodeLogHead, policy)` 见 [crates/sync/src/catchup.rs](../../crates/sync/src/catchup.rs)：输出按序步骤 `PullLog`（从 `local.log_sequence+1` 起按页递增、连续无重叠）→ `RebuildEpoch`（一次只推进 1 个 epoch，不跳级）→ `CommitHead`；节点 head 声称新 epoch/控制头但没有新条目承载时只给 `AwaitControl{MissingEpochCommit}`（绝不猜重建），本地策略已更新而节点未包含时 `AwaitControl{PendingControlResult}`（不回退策略）；本地序号/epoch 超过节点 → `LOG_CONFLICT`，跨度/步数超限 → `CONTENT_TOO_LARGE`，跨 epoch 超限 → `MISSING_LOG_ENTRIES`，均已完全追平时返回幂等空计划。证据见上文“追赶计划（SYNC-008 计划核心）”与 `tests/catchup_plan.rs`（9 个用例）。限制：节点 head 的签名验证（TRANSPORT-007/PROTOCOL-007）、逐条验签/MLS 应用/持久化（SYNC-009 与 core）未接入；控制条目与 epoch 的对应关系不由本函数猜测。
 
 <a id="sync-009"></a>
 

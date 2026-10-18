@@ -1,6 +1,6 @@
 # SQLite、统一事务、数据表与崩溃恢复
 
-阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/008/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过；P1 身份/联系人持久化与邀请一次性消费（迁移 0003，无计划书编号）与 P1 MLS 群状态/provider 记录持久化（迁移 0004，CRYPTO-004/010 的持久化切片）也已实测通过；STORAGE-004/005 的正式语义（与加密层同事务的 provider 写入）仍未接入。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
+阶段：P0 → P2。状态：函数级设计；P0 正式存储路径的 STORAGE-001/003/006/007/008/009/010/011（含 002 的迁移器）与 STORAGE-012/013/014/015（分页查询与 outbox 租约）已在 Windows x64 实测通过；P1 身份/联系人持久化与邀请一次性消费（迁移 0003，无计划书编号）、P1 MLS 群状态/provider 记录持久化（迁移 0004，CRYPTO-004/010 的持久化切片）与 P1 设备凭据/撤销集合持久化（迁移 0006，IDENTITY-008~012 的存储侧）也已实测通过；STORAGE-004/005 的正式语义（与加密层同事务的 provider 写入）仍未接入。正式源码：[crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)；隔离实验：[crates/storage/src/store.rs](../../crates/storage/src/store.rs)。
 
 状态补充（2026-10-18）：`store.rs` 已有独立的未加密 P0 事务试验表，覆盖 T1/C01 意图与准备任务和 T2 MLS/attempt/outbox 崩溃断点，局部证据见 [P0-03 报告](../P0_PERSISTENCE.md)。`crates/storage/src/formal/` 新增正式加密存储路径，实现 STORAGE-001/003/006/007/009/010/011 与 002 的迁移器，证据见下文“P0-04 正式存储路径实现记录”；其余 STORAGE-004/005/008 仍未实现，MLS 加密语义（CRYPTO-004 等）也未接入。
 
@@ -11,6 +11,8 @@
 状态补充（2026-10-18，P1 身份持久化）：新增迁移 [0003_identity.sql](../../crates/storage/migrations/0003_identity.sql)（**只新增表，未改动 0001/0002 任何内容**）与 [crates/storage/src/formal/identity.rs](../../crates/storage/src/formal/identity.rs)，实现身份账户（单账户/单设备）、联系人、邀请一次性消费的正式持久化；同时新增 `WriteScope::identity` 作用域、`IDENTITY_ACCOUNT_CONFLICT` 错误码与 `identity-account`/`contact-record` 两个封装用途。schema 版本由 2 提升到 3（既有库在 `open_store` 时自动迁移，校验和机制不变；库内版本更高仍返回 `SCHEMA_TOO_NEW`）。证据见下文“身份/联系人持久化与邀请一次性消费实现记录”。
 
 状态补充（2026-10-18，MLS 状态持久化）：新增迁移 [0004_mls_state.sql](../../crates/storage/migrations/0004_mls_state.sql)（**只新增表，未改动 0001/0002/0003 任何内容**）与 [crates/storage/src/formal/mls_state.rs](../../crates/storage/src/formal/mls_state.rs)，提供 `save_mls_group_state`/`load_mls_group_state`/`save_mls_record`/`load_mls_record`（另含 `load_mls_records`），把已提交 MLS 群状态与 provider 记录加密落盘；新增 `WriteScope::mls_state`、`STALE_EPOCH` 错误码与 `mls-group-state`/`mls-record` 封装用途。schema 版本 3 → 4；证据见下文“MLS 群状态与 provider 记录持久化实现记录”。
+
+状态补充（2026-10-19，P1 设备凭据生命周期）：新增迁移 [0006_device_credentials.sql](../../crates/storage/migrations/0006_device_credentials.sql)（**只新增表，未改动 0001~0005 任何内容**）并在 [crates/storage/src/formal/identity.rs](../../crates/storage/src/formal/identity.rs) 增加设备凭据与撤销集合的持久化 API（`save_device_credential`/`load_device_credential`/`list_device_credentials`/`revoke_device`/`revoked_devices`/`device_revocation_generation`）。表名统一加 `identity_` 前缀，避免与 0001 的 P0 表 `device_credentials` 冲突。schema 版本由 5 提升到 6（既有库 `open_store` 时自动迁移，校验和机制不变；库内版本更高仍 `SCHEMA_TOO_NEW`）。证据见下文“设备凭据与撤销集合持久化实现记录”。
 
 Rust storage 唯一拥有客户端核心数据库；节点库单独实现于 node-services，不能复用客户端敏感数据写入口。默认先验证全库加密或等价方案，因为会话 ID、索引、时间戳同样敏感。事务句柄不跨 FFI、不跨网络 await；读分页使用稳定快照。
 
@@ -97,8 +99,68 @@ cargo test --offline -p chat-storage -p chat-core   # 两 crate 全绿（core：
 2. 指纹以原始 32 字节存放在密封记录内，分组文本由 core/展示层生成；storage 不实现指纹比对。
 3. `contact_id` 与 `account_index` 是确定性哈希（可枚举同一账户在不同库中的键），不提供跨库不可链接性；时间戳与行数是明文元数据（与既有正式路径一致）。
 4. 联系人状态机由 core 用 identity 的冻结迁移表执行；storage 只校验状态属于白名单，直接调用 storage 的更低层路径可以写入任意合法状态（本轮 core 是唯一调用方）。
-5. 未接入身份模块的设备凭据/撤销集合持久化（`device_credentials` 仍由 0001 的旧表承载、正式路径未写）；启动恢复不重建身份表（身份只由显式保存写入）。
+5. 未接入身份模块的设备凭据/撤销集合持久化（`device_credentials` 仍由 0001 的旧表承载、正式路径未写）；**2026-10-19 已由迁移 0006 补齐**（见下节“设备凭据与撤销集合持久化实现记录”）；启动恢复不重建身份表（身份只由显式保存写入）。
 6. 迁移 0003/0004 使 schema 版本变为 4：外部工具若硬编码更早的版本需要同步更新（`crates/storage` 内的断言已更新为 4；`crates/crypto/tests/formal_master_key.rs` 使用 `>= 2`，因此不受后续迁移影响）。
+
+## 设备凭据与撤销集合持久化实现记录（2026-10-19，Windows x64）
+
+对应 [identity.md](identity.md) 的 IDENTITY-008~012 持久化切片：让设备凭据的签发/续期、
+过期与撤销状态在正式加密库里耐久保存，重启后仍能拒绝已撤销/过期设备。
+
+实现位置：
+
+- [crates/storage/migrations/0006_device_credentials.sql](../../crates/storage/migrations/0006_device_credentials.sql)：新迁移（`identity_device_credentials` / `identity_device_revocations` / `identity_device_revocation_epoch`），只新增表，0001~0005 未被改动。表名加 `identity_` 前缀以避开 0001 的 P0 表 `device_credentials`/`accounts`/`trusted_contacts`（那些表属隔离实验路径，本迁移不复用）。
+- [crates/storage/src/formal/identity.rs](../../crates/storage/src/formal/identity.rs)：设备凭据与撤销集合的读写、幂等、撤销终态与上限。
+- [crates/storage/src/formal/migrations.rs](../../crates/storage/src/formal/migrations.rs)：`MIGRATIONS` 追加版本 6（`target_version() = 6`）。
+- [crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs)：导出 `DeviceCredentialInput`/`DeviceCredentialRecord`/`DeviceRevocationRecord`/`DeviceRevocationSetRecord` 与上限常量。
+- 复用既有 `WriteScope::identity` 与 `identity-account` 封装用途：**没有新增封装用途**，改用独立 AAD 版本标签实现记录级域分隔。
+- [crates/storage/tests/formal_identity_devices.rs](../../crates/storage/tests/formal_identity_devices.rs)：新增 6 项存储测试。
+
+表结构与字段映射（敏感字段只以密封记录落盘）：
+
+| 表 | 明文列 | 密封列 | 说明 |
+|---|---|---|---|
+| `identity_device_credentials` | `device_index`（主键，64 hex）、`account_index`、`issued_at`、`expires_at`、`updated_at` | `protected_credential` | `device_index` = SHA-256(`chat/storage/device-index/v1` ‖ account_id ‖ device_id)，用作幂等键并保证跨账户隔离；设备公钥、端点、能力位、撤销版本与签名都在密封记录内 |
+| `identity_device_revocations` | `device_index`（主键）、`account_index`、`revocation_generation`、`revoked_at` | `protected_revocation` | 撤销终态；重复撤销幂等；行只增不减 |
+| `identity_device_revocation_epoch` | `account_index`（主键）、`generation`、`updated_at` | — | 账户撤销版本，单调不减（`ON CONFLICT ... WHERE excluded.generation > 现状`） |
+
+加密边界：
+
+- 封装格式沿用 `seal.rs`：`version||nonce||ciphertext||tag`；AAD =（设备索引, 账户索引, `device-credential-v1`/`device-revocation-v1`）。把密文挪到另一台设备/另一个账户、换主密钥或换标签都会认证失败并返回 `STATE_CORRUPTED`；明文时间列与密封记录不一致（`issued_at`/`expires_at`/`revocation_generation`）同样 `STATE_CORRUPTED`。
+- 明文只有不可逆索引与时间戳：扫描 .db/-wal/-shm 不会出现账户 ID、设备 ID 或设备公钥（`device_credential_roundtrip_survives_reopen` 有断言）。
+
+API 与语义（storage 层）：
+
+- `Store::save_device_credential(DeviceCredentialInput) -> DeviceCredentialRecord`：首次插入；完全相同 → 幂等返回（不写行、不推进库版本）；同设备续期必须同设备公钥且 `issued_at` 不回退，否则 `INVALID_STATE_TRANSITION`；换设备公钥 → `INVALID_INPUT`；**已撤销设备的任何再签发 → `INVALID_STATE_TRANSITION`**（不可静默复活）；凭据条数上限 `MAX_DEVICE_CREDENTIALS = 8`（越界 `INVALID_INPUT`）。
+- `Store::load_device_credential(account_id, device_id) -> Option<DeviceCredentialRecord>`：返回含 `revoked` 标志的投影；跨账户查询得到 `None`；行内账户索引/身份与请求不一致 → `STATE_CORRUPTED`。
+- `Store::list_device_credentials(account_id)`：按 `issued_at DESC, device_index ASC`，并标注每台设备的撤销状态；数量越界视为 `STATE_CORRUPTED`。
+- `Store::revoke_device(account_id, device_id, revoked_at_ms) -> DeviceRevocationRecord`：单笔身份作用域事务内写撤销记录并把账户撤销版本 +1；重复撤销幂等返回既有记录（版本与时间都不变）；未知设备允许登记（deny-list 可以先于凭据到达）；撤销集合上限 `MAX_DEVICE_REVOCATIONS = 64`。
+- `Store::revoked_devices(account_id) -> DeviceRevocationSetRecord`：返回账户 ID、当前撤销版本与已撤销设备（按撤销时间升序）。
+- `Store::device_revocation_generation(account_id) -> u64`：没有撤销记录时为 0；用于签发凭据时引用当前版本。
+
+复现命令（全程离线，本轮实测）：
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-storage    # 79 passed（新增 formal_identity_devices 6 项；schema 断言已更新为 6/6 行）
+cargo test --offline -p chat-identity   # 52 passed（34 lib + 9 device_registry + 9 identity_contract）
+```
+
+证据（测试名 → 契约点）：
+
+- `formal_identity_devices::device_credential_roundtrip_survives_reopen`：保存→幂等→重开读回；列表与撤销版本一致；.db/-wal 里没有设备公钥/账户 ID/设备 ID 明文。
+- `formal_identity_devices::duplicate_and_renewal_semantics`：换设备公钥 `INVALID_INPUT`；续期允许后移 `issued_at`；回退 `INVALID_STATE_TRANSITION`。
+- `formal_identity_devices::tampered_device_records_fail_closed`：翻转密文、把另一行密文挪过来、只改明文时间列 → 全部 `STATE_CORRUPTED`（含列表路径，不静默跳过）。
+- `formal_identity_devices::revocation_is_terminal_and_idempotent`：撤销后读回 `revoked`；重复撤销幂等且版本不变；再签发被拒；撤销版本单调 +1；重开后撤销状态仍在。
+- `formal_identity_devices::revocations_are_scoped_per_account`：另一账户撤销同名设备不影响本账户，且跨账户读不到对方凭据。
+- `formal_identity_devices::bounds_and_invalid_inputs_are_rejected`：凭据上限、撤销集合上限、非法 ID/能力位/时间戳/负撤销时间全部 `INVALID_INPUT`。
+
+已知限制：
+
+1. storage 只做结构/绑定自洽与密封，不做密码学校验（签名、账户/设备 ID 派生由 `chat-identity` 在写入前完成），避免分层反转。
+2. `device_index` 与 `account_index` 是确定性哈希（同一账户/设备在不同库中键相同），不提供跨库不可链接性；行数、时间戳与撤销版本是明文元数据（与既有正式路径一致）。
+3. 撤销集合的完整性依赖"只增不减"的 API 约定；直接改库删行属于篡改，AEAD 无法检测删除（与 0003 的删除风险同级）。
+4. 迁移 0006 使 schema 版本变为 6：外部工具若硬编码更早版本需要同步更新（`crates/storage` 内断言已更新为 6；`crates/crypto` 使用 `>= 2` 不受影响）。
 
 ## MLS 群状态与 provider 记录持久化实现记录（2026-10-18，Windows x64）
 

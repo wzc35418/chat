@@ -862,6 +862,856 @@ impl Store {
         })
     }
 }
+// ---------------------------------------------------------------------------
+// 身份设备凭据与撤销集合（IDENTITY-008~011 的持久化；迁移 0006_device_credentials.sql）
+// ---------------------------------------------------------------------------
+
+/// 单账户可持久化的设备凭据条数上限（身份层另有 ≤2 有效设备的策略上限）。
+pub const MAX_DEVICE_CREDENTIALS: u32 = 8;
+/// 单账户撤销记录条数上限。
+pub const MAX_DEVICE_REVOCATIONS: u32 = 64;
+/// Ed25519 签名字节数。
+pub const DEVICE_SIGNATURE_BYTES: usize = 64;
+/// 已知设备能力位（与 chat-identity 的冻结能力集合一致）。
+pub const DEVICE_CAPABILITY_MASK: u32 = 0b0111_1110;
+/// 设备凭据密封记录的 AAD 版本标签。
+const DEVICE_CREDENTIAL_AAD_VERSION: &[u8] = b"device-credential-v1";
+/// 撤销密封记录的 AAD 版本标签。
+const DEVICE_REVOCATION_AAD_VERSION: &[u8] = b"device-revocation-v1";
+/// 设备凭据内部 schema 版本。
+const DEVICE_CREDENTIAL_RECORD_VERSION: u8 = 1;
+/// 撤销记录内部 schema 版本。
+const DEVICE_REVOCATION_RECORD_VERSION: u8 = 1;
+/// 设备索引派生域。
+const DEVICE_INDEX_DOMAIN: &[u8] = b"chat/storage/device-index/v1";
+
+/// 设备凭据写入输入（只有公开材料；签名由账户根密钥产生）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceCredentialInput {
+    /// 签发该凭据的账户 ID。
+    pub account_id: String,
+    /// 设备 ID（由账户与设备公钥派生，由身份层校验）。
+    pub device_id: String,
+    /// 设备签名公钥。
+    pub device_public_key: [u8; PUBLIC_KEY_BYTES],
+    /// 传输端点标识（可选）。
+    pub endpoint: Option<[u8; PUBLIC_KEY_BYTES]>,
+    /// 能力位图（只允许 DEVICE_CAPABILITY_MASK 内的位）。
+    pub capability_mask: u32,
+    /// 签发时间（Unix 毫秒）。
+    pub issued_at_ms: i64,
+    /// 失效时间（Unix 毫秒，不含）。
+    pub expires_at_ms: i64,
+    /// 签发时的账户撤销版本。
+    pub revocation_generation: u64,
+    /// 账户根密钥对凭据正文的 Ed25519 签名。
+    pub signature: [u8; DEVICE_SIGNATURE_BYTES],
+}
+
+impl DeviceCredentialInput {
+    /// 有界结构校验（密码学自洽由 chat-identity 负责）。
+    pub fn validate(&self) -> Result<()> {
+        ensure_id("device owner account", &self.account_id)?;
+        ensure_id("device", &self.device_id)?;
+        if self.capability_mask & !DEVICE_CAPABILITY_MASK != 0 {
+            return Err(StorageError::InvalidInput(
+                "device capability mask contains unknown bits".to_owned(),
+            ));
+        }
+        if self.issued_at_ms <= 0 || self.expires_at_ms <= self.issued_at_ms {
+            return Err(StorageError::InvalidInput(
+                "device credential validity window is invalid".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 设备凭据投影（不含任何私钥材料）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceCredentialRecord {
+    /// 账户 ID。
+    pub account_id: String,
+    /// 设备 ID。
+    pub device_id: String,
+    /// 设备公钥。
+    pub device_public_key: [u8; PUBLIC_KEY_BYTES],
+    /// 端点标识。
+    pub endpoint: Option<[u8; PUBLIC_KEY_BYTES]>,
+    /// 能力位图。
+    pub capability_mask: u32,
+    /// 签发时间。
+    pub issued_at_ms: i64,
+    /// 失效时间。
+    pub expires_at_ms: i64,
+    /// 签发时的账户撤销版本。
+    pub revocation_generation: u64,
+    /// 账户根密钥签名。
+    pub signature: [u8; DEVICE_SIGNATURE_BYTES],
+    /// 该设备是否已被撤销（以撤销集合为准）。
+    pub revoked: bool,
+    /// 本次调用是否命中既有记录（读取路径恒为 true）。
+    pub already_existed: bool,
+}
+
+/// 撤销结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceRevocationRecord {
+    /// 账户 ID。
+    pub account_id: String,
+    /// 设备 ID。
+    pub device_id: String,
+    /// 撤销发生时的账户撤销版本。
+    pub revocation_generation: u64,
+    /// 撤销时间。
+    pub revoked_at_ms: i64,
+    /// 本次调用是否命中既有撤销记录（幂等）。
+    pub already_existed: bool,
+}
+
+/// 账户撤销集合投影。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceRevocationSetRecord {
+    /// 账户 ID。
+    pub account_id: String,
+    /// 当前账户撤销版本；新签发的凭据必须不小于该值。
+    pub generation: u64,
+    /// 已撤销设备（按撤销时间升序）。
+    pub revoked: Vec<DeviceRevocationRecord>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredDeviceCredential {
+    version: u8,
+    account_id: String,
+    device_id: String,
+    device_public_key: Vec<u8>,
+    endpoint: Option<Vec<u8>>,
+    capability_mask: u32,
+    issued_at_ms: i64,
+    expires_at_ms: i64,
+    revocation_generation: u64,
+    signature: Vec<u8>,
+}
+
+impl StoredDeviceCredential {
+    fn validate(&self) -> Result<()> {
+        if self.version != DEVICE_CREDENTIAL_RECORD_VERSION {
+            return Err(StorageError::StateCorrupted(
+                "stored device credential has an unsupported record version".to_owned(),
+            ));
+        }
+        ensure_id("device owner account", &self.account_id).map_err(|_| {
+            StorageError::StateCorrupted("stored device credential account is invalid".to_owned())
+        })?;
+        ensure_id("device", &self.device_id).map_err(|_| {
+            StorageError::StateCorrupted("stored device credential id is invalid".to_owned())
+        })?;
+        if self.device_public_key.len() != PUBLIC_KEY_BYTES {
+            return Err(StorageError::StateCorrupted(
+                "stored device public key has an invalid length".to_owned(),
+            ));
+        }
+        if let Some(endpoint) = &self.endpoint
+            && endpoint.len() != PUBLIC_KEY_BYTES
+        {
+            return Err(StorageError::StateCorrupted(
+                "stored device endpoint has an invalid length".to_owned(),
+            ));
+        }
+        if self.capability_mask & !DEVICE_CAPABILITY_MASK != 0 {
+            return Err(StorageError::StateCorrupted(
+                "stored device capability mask contains unknown bits".to_owned(),
+            ));
+        }
+        if self.issued_at_ms <= 0 || self.expires_at_ms <= self.issued_at_ms {
+            return Err(StorageError::StateCorrupted(
+                "stored device credential validity window is invalid".to_owned(),
+            ));
+        }
+        if self.signature.len() != DEVICE_SIGNATURE_BYTES {
+            return Err(StorageError::StateCorrupted(
+                "stored device credential signature has an invalid length".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredDeviceRevocation {
+    version: u8,
+    account_id: String,
+    device_id: String,
+    revocation_generation: u64,
+    revoked_at_ms: i64,
+}
+
+impl StoredDeviceRevocation {
+    fn validate(&self) -> Result<()> {
+        if self.version != DEVICE_REVOCATION_RECORD_VERSION {
+            return Err(StorageError::StateCorrupted(
+                "stored device revocation has an unsupported record version".to_owned(),
+            ));
+        }
+        ensure_id("revocation account", &self.account_id).map_err(|_| {
+            StorageError::StateCorrupted("stored revocation account is invalid".to_owned())
+        })?;
+        ensure_id("revocation device", &self.device_id).map_err(|_| {
+            StorageError::StateCorrupted("stored revocation device is invalid".to_owned())
+        })?;
+        if self.revocation_generation == 0 {
+            return Err(StorageError::StateCorrupted(
+                "stored revocation generation must be positive".to_owned(),
+            ));
+        }
+        if self.revoked_at_ms < 0 {
+            return Err(StorageError::StateCorrupted(
+                "stored revocation timestamp is negative".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn device_index_for(account_id: &str, device_id: &str) -> Result<String> {
+    ensure_id("device owner account", account_id)?;
+    ensure_id("device", device_id)?;
+    Ok(hex(&digest_parts(
+        DEVICE_INDEX_DOMAIN,
+        &[account_id.as_bytes(), device_id.as_bytes()],
+    )))
+}
+
+fn device_credential_aad<'a>(device_index: &'a str, account_index: &'a str) -> [&'a [u8]; 3] {
+    [
+        device_index.as_bytes(),
+        account_index.as_bytes(),
+        DEVICE_CREDENTIAL_AAD_VERSION,
+    ]
+}
+
+fn device_revocation_aad<'a>(device_index: &'a str, account_index: &'a str) -> [&'a [u8]; 3] {
+    [
+        device_index.as_bytes(),
+        account_index.as_bytes(),
+        DEVICE_REVOCATION_AAD_VERSION,
+    ]
+}
+
+fn seal_device_credential(
+    key: &ProtectedStorageKey,
+    device_index: &str,
+    account_index: &str,
+    stored: &StoredDeviceCredential,
+) -> Result<Vec<u8>> {
+    let plaintext = serde_json::to_vec(stored).map_err(|error| {
+        StorageError::Failure(format!("cannot encode device credential: {error}"))
+    })?;
+    let plaintext = Zeroizing::new(plaintext);
+    let sealer = RecordSealer::new(key, SealPurpose::IdentityAccount);
+    sealer.seal(
+        &device_credential_aad(device_index, account_index),
+        plaintext.as_slice(),
+    )
+}
+
+fn open_device_credential(
+    key: &ProtectedStorageKey,
+    device_index: &str,
+    account_index: &str,
+    sealed: &[u8],
+) -> Result<StoredDeviceCredential> {
+    let sealer = RecordSealer::new(key, SealPurpose::IdentityAccount);
+    let plaintext = sealer.open(&device_credential_aad(device_index, account_index), sealed)?;
+    let stored: StoredDeviceCredential = serde_json::from_slice(plaintext.as_slice()).map_err(|_| {
+        StorageError::StateCorrupted("stored device credential is not readable".to_owned())
+    })?;
+    stored.validate()?;
+    Ok(stored)
+}
+
+fn seal_device_revocation(
+    key: &ProtectedStorageKey,
+    device_index: &str,
+    account_index: &str,
+    stored: &StoredDeviceRevocation,
+) -> Result<Vec<u8>> {
+    let plaintext = serde_json::to_vec(stored).map_err(|error| {
+        StorageError::Failure(format!("cannot encode device revocation: {error}"))
+    })?;
+    let plaintext = Zeroizing::new(plaintext);
+    let sealer = RecordSealer::new(key, SealPurpose::IdentityAccount);
+    sealer.seal(
+        &device_revocation_aad(device_index, account_index),
+        plaintext.as_slice(),
+    )
+}
+
+fn open_device_revocation(
+    key: &ProtectedStorageKey,
+    device_index: &str,
+    account_index: &str,
+    sealed: &[u8],
+) -> Result<StoredDeviceRevocation> {
+    let sealer = RecordSealer::new(key, SealPurpose::IdentityAccount);
+    let plaintext = sealer.open(&device_revocation_aad(device_index, account_index), sealed)?;
+    let stored: StoredDeviceRevocation = serde_json::from_slice(plaintext.as_slice()).map_err(|_| {
+        StorageError::StateCorrupted("stored device revocation is not readable".to_owned())
+    })?;
+    stored.validate()?;
+    Ok(stored)
+}
+
+struct StoredCredentialRow {
+    stored: StoredDeviceCredential,
+    account_index: String,
+    issued_at: i64,
+    expires_at: i64,
+}
+
+fn load_device_credential_row(
+    connection: &Connection,
+    key: &ProtectedStorageKey,
+    device_index: &str,
+) -> Result<Option<StoredCredentialRow>> {
+    let row: Option<(String, Vec<u8>, i64, i64)> = connection
+        .query_row(
+            "SELECT account_index, protected_credential, issued_at, expires_at
+               FROM identity_device_credentials WHERE device_index = ?1",
+            [device_index],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((account_index, sealed, issued_at, expires_at)) = row else {
+        return Ok(None);
+    };
+    let stored = open_device_credential(key, device_index, &account_index, &sealed)?;
+    if stored.issued_at_ms != issued_at || stored.expires_at_ms != expires_at {
+        return Err(StorageError::StateCorrupted(
+            "stored device credential timestamps disagree with their sealed record".to_owned(),
+        ));
+    }
+    Ok(Some(StoredCredentialRow {
+        stored,
+        account_index,
+        issued_at,
+        expires_at,
+    }))
+}
+
+struct StoredRevocationRow {
+    stored: StoredDeviceRevocation,
+    account_index: String,
+    revocation_generation: u64,
+}
+
+fn load_device_revocation_row(
+    connection: &Connection,
+    key: &ProtectedStorageKey,
+    device_index: &str,
+) -> Result<Option<StoredRevocationRow>> {
+    let row: Option<(String, Vec<u8>, i64)> = connection
+        .query_row(
+            "SELECT account_index, protected_revocation, revocation_generation
+               FROM identity_device_revocations WHERE device_index = ?1",
+            [device_index],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((account_index, sealed, generation)) = row else {
+        return Ok(None);
+    };
+    let generation = u64::try_from(generation).map_err(|_| {
+        StorageError::StateCorrupted("stored revocation generation is out of range".to_owned())
+    })?;
+    let stored = open_device_revocation(key, device_index, &account_index, &sealed)?;
+    if stored.revocation_generation != generation {
+        return Err(StorageError::StateCorrupted(
+            "stored revocation generation disagrees with its sealed record".to_owned(),
+        ));
+    }
+    Ok(Some(StoredRevocationRow {
+        stored,
+        account_index,
+        revocation_generation: generation,
+    }))
+}
+
+fn credential_record(
+    row: &StoredCredentialRow,
+    revoked: bool,
+    already_existed: bool,
+) -> Result<DeviceCredentialRecord> {
+    let device_public_key: [u8; PUBLIC_KEY_BYTES] =
+        row.stored.device_public_key.as_slice().try_into().map_err(|_| {
+            StorageError::StateCorrupted("stored device public key has an invalid length".to_owned())
+        })?;
+    let endpoint = match &row.stored.endpoint {
+        Some(bytes) => Some(bytes.as_slice().try_into().map_err(|_| {
+            StorageError::StateCorrupted("stored device endpoint has an invalid length".to_owned())
+        })?),
+        None => None,
+    };
+    let signature: [u8; DEVICE_SIGNATURE_BYTES] =
+        row.stored.signature.as_slice().try_into().map_err(|_| {
+            StorageError::StateCorrupted("stored device signature has an invalid length".to_owned())
+        })?;
+    Ok(DeviceCredentialRecord {
+        account_id: row.stored.account_id.clone(),
+        device_id: row.stored.device_id.clone(),
+        device_public_key,
+        endpoint,
+        capability_mask: row.stored.capability_mask,
+        issued_at_ms: row.issued_at,
+        expires_at_ms: row.expires_at,
+        revocation_generation: row.stored.revocation_generation,
+        signature,
+        revoked,
+        already_existed,
+    })
+}
+
+impl Store {
+    /// 保存或续期一份设备凭据（IDENTITY-009/010 的持久化落点）。
+    ///
+    /// 语义：
+    /// - 首次写入：插入密封记录（受单账户上限约束）；
+    /// - 完全相同：幂等返回，不写行、不推进库版本；
+    /// - 同一设备的续期：必须保持同一设备公钥，签发时间不允许回退，否则拒绝；
+    /// - 已撤销设备：任何再签发都显式失败（撤销是终态，不允许静默复活）；
+    /// - 换设备公钥（即换设备身份）：INVALID_INPUT，不做隐式替换。
+    pub fn save_device_credential(
+        &mut self,
+        input: DeviceCredentialInput,
+    ) -> Result<DeviceCredentialRecord> {
+        self.ensure_ready()?;
+        input.validate()?;
+        let account_index = account_index(&input.account_id);
+        let device_index = device_index_for(&input.account_id, &input.device_id)?;
+
+        if load_device_revocation_row(self.connection(), &self.key, &device_index)?.is_some() {
+            return Err(StorageError::InvalidStateTransition(format!(
+                "device {} is revoked and cannot be re-issued",
+                input.device_id
+            )));
+        }
+
+        let next = StoredDeviceCredential {
+            version: DEVICE_CREDENTIAL_RECORD_VERSION,
+            account_id: input.account_id.clone(),
+            device_id: input.device_id.clone(),
+            device_public_key: input.device_public_key.to_vec(),
+            endpoint: input.endpoint.map(|endpoint| endpoint.to_vec()),
+            capability_mask: input.capability_mask,
+            issued_at_ms: input.issued_at_ms,
+            expires_at_ms: input.expires_at_ms,
+            revocation_generation: input.revocation_generation,
+            signature: input.signature.to_vec(),
+        };
+        let next_endpoint = next.endpoint.clone();
+
+        if let Some(existing) =
+            load_device_credential_row(self.connection(), &self.key, &device_index)?
+        {
+            if existing.stored.account_id != input.account_id
+                || existing.stored.device_id != input.device_id
+            {
+                return Err(StorageError::StateCorrupted(
+                    "stored device credential is bound to another device".to_owned(),
+                ));
+            }
+            if existing.account_index != account_index {
+                return Err(StorageError::StateCorrupted(
+                    "stored device credential is bound to another account".to_owned(),
+                ));
+            }
+            if existing.stored.device_public_key.as_slice() != input.device_public_key.as_slice() {
+                return Err(StorageError::InvalidInput(
+                    "device public key does not match the stored device binding".to_owned(),
+                ));
+            }
+            let unchanged = existing.stored.endpoint == next_endpoint
+                && existing.stored.capability_mask == input.capability_mask
+                && existing.issued_at == input.issued_at_ms
+                && existing.expires_at == input.expires_at_ms
+                && existing.stored.revocation_generation == input.revocation_generation
+                && existing.stored.signature.as_slice() == input.signature.as_slice();
+            if unchanged {
+                return credential_record(&existing, false, true);
+            }
+            if input.issued_at_ms < existing.issued_at {
+                return Err(StorageError::InvalidStateTransition(
+                    "device credential re-issue must not move issued_at backwards".to_owned(),
+                ));
+            }
+            let sealed = seal_device_credential(&self.key, &device_index, &account_index, &next)?;
+            let updated_at = now_ms();
+            let mut transaction = self.begin_transaction(WriteScope::identity())?;
+            let rows = match transaction.transaction.execute(
+                "UPDATE identity_device_credentials
+                    SET protected_credential = ?2, issued_at = ?3, expires_at = ?4, updated_at = ?5
+                  WHERE device_index = ?1",
+                params![
+                    device_index,
+                    sealed,
+                    input.issued_at_ms,
+                    input.expires_at_ms,
+                    updated_at
+                ],
+            ) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    transaction.poison();
+                    let _ = rollback_transaction(transaction);
+                    return Err(error.into());
+                }
+            };
+            if rows != 1 {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                return Err(StorageError::StateCorrupted(
+                    "device credential row disappeared while updating".to_owned(),
+                ));
+            }
+            transaction.note(rows);
+            commit_transaction(transaction)?;
+            let stored_row = StoredCredentialRow {
+                stored: next,
+                account_index,
+                issued_at: input.issued_at_ms,
+                expires_at: input.expires_at_ms,
+            };
+            return credential_record(&stored_row, false, true);
+        }
+
+        let existing_count: i64 = self.connection().query_row(
+            "SELECT COUNT(*) FROM identity_device_credentials WHERE account_index = ?1",
+            [&account_index],
+            |row| row.get(0),
+        )?;
+        if existing_count >= i64::from(MAX_DEVICE_CREDENTIALS) {
+            return Err(StorageError::InvalidInput(format!(
+                "device credential store reached the {MAX_DEVICE_CREDENTIALS} record limit"
+            )));
+        }
+        let sealed = seal_device_credential(&self.key, &device_index, &account_index, &next)?;
+        let updated_at = now_ms();
+        let mut transaction = self.begin_transaction(WriteScope::identity())?;
+        let inserted = transaction.transaction.execute(
+            "INSERT INTO identity_device_credentials
+                 (device_index, account_index, protected_credential, issued_at, expires_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                device_index,
+                account_index,
+                sealed,
+                input.issued_at_ms,
+                input.expires_at_ms,
+                updated_at
+            ],
+        );
+        let rows = match inserted {
+            Ok(rows) => rows,
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                return Err(error.into());
+            }
+        };
+        transaction.note(rows);
+        commit_transaction(transaction)?;
+        let stored_row = StoredCredentialRow {
+            stored: next,
+            account_index,
+            issued_at: input.issued_at_ms,
+            expires_at: input.expires_at_ms,
+        };
+        credential_record(&stored_row, false, false)
+    }
+
+    /// 读取单设备凭据（含撤销标志）；不存在返回 None。
+    ///
+    /// 跨账户隔离：设备索引由（账户 ID, 设备 ID）共同派生，用别的账户查询只会得到
+    /// None；如果行内账户索引与请求不一致则 STATE_CORRUPTED。
+    pub fn load_device_credential(
+        &self,
+        account_id: &str,
+        device_id: &str,
+    ) -> Result<Option<DeviceCredentialRecord>> {
+        self.ensure_ready()?;
+        let account_index = account_index(account_id);
+        let device_index = device_index_for(account_id, device_id)?;
+        let Some(row) = load_device_credential_row(self.connection(), &self.key, &device_index)?
+        else {
+            return Ok(None);
+        };
+        if row.account_index != account_index {
+            return Err(StorageError::StateCorrupted(
+                "stored device credential is bound to another account".to_owned(),
+            ));
+        }
+        if row.stored.account_id != account_id || row.stored.device_id != device_id {
+            return Err(StorageError::StateCorrupted(
+                "stored device credential identity disagrees with its row".to_owned(),
+            ));
+        }
+        let revoked =
+            load_device_revocation_row(self.connection(), &self.key, &device_index)?.is_some();
+        credential_record(&row, revoked, true).map(Some)
+    }
+
+    /// 列出账户的全部设备凭据（按签发时间倒序，其次设备索引升序）。
+    pub fn list_device_credentials(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<DeviceCredentialRecord>> {
+        self.ensure_ready()?;
+        ensure_id("device owner account", account_id)?;
+        let account_index = account_index(account_id);
+        let limit = i64::from(MAX_DEVICE_CREDENTIALS) + 1;
+        let mut statement = self.connection().prepare(
+            "SELECT device_index FROM identity_device_credentials
+              WHERE account_index = ?1
+              ORDER BY issued_at DESC, device_index ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![account_index, limit], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut indexes = Vec::new();
+        for row in rows {
+            indexes.push(row?);
+        }
+        if indexes.len() > usize::try_from(MAX_DEVICE_CREDENTIALS).unwrap_or(usize::MAX) {
+            return Err(StorageError::StateCorrupted(
+                "stored device credential count exceeds the supported limit".to_owned(),
+            ));
+        }
+        let mut revoked_statement = self.connection().prepare(
+            "SELECT device_index FROM identity_device_revocations WHERE account_index = ?1",
+        )?;
+        let revoked_rows = revoked_statement.query_map([&account_index], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut revoked_indexes: Vec<String> = Vec::new();
+        for row in revoked_rows {
+            revoked_indexes.push(row?);
+        }
+        let mut credentials = Vec::with_capacity(indexes.len());
+        for device_index in indexes {
+            let Some(row) =
+                load_device_credential_row(self.connection(), &self.key, &device_index)?
+            else {
+                return Err(StorageError::StateCorrupted(
+                    "device credential row disappeared while listing".to_owned(),
+                ));
+            };
+            if row.account_index != account_index || row.stored.account_id != account_id {
+                return Err(StorageError::StateCorrupted(
+                    "stored device credential is bound to another account".to_owned(),
+                ));
+            }
+            let revoked = revoked_indexes.contains(&device_index);
+            credentials.push(credential_record(&row, revoked, true)?);
+        }
+        Ok(credentials)
+    }
+
+    /// 账户当前撤销版本（没有撤销记录时为 0）。
+    pub fn device_revocation_generation(&self, account_id: &str) -> Result<u64> {
+        self.ensure_ready()?;
+        ensure_id("device revocation account", account_id)?;
+        let account_index = account_index(account_id);
+        let generation: Option<i64> = self
+            .connection()
+            .query_row(
+                "SELECT generation FROM identity_device_revocation_epoch WHERE account_index = ?1",
+                [&account_index],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match generation {
+            Some(value) => u64::try_from(value).map_err(|_| {
+                StorageError::StateCorrupted(
+                    "stored revocation generation is out of range".to_owned(),
+                )
+            }),
+            None => Ok(0),
+        }
+    }
+
+    /// IDENTITY-012：撤销设备（终态、幂等、撤销版本单调不减）。
+    ///
+    /// - 首次撤销：写入密封撤销记录并把账户撤销版本加一（同一事务）；
+    /// - 重复撤销同一设备：幂等返回既有记录，不推进版本、不改写时间；
+    /// - 未知设备：允许登记（撤销是 deny-list，允许先于凭据到达）；
+    /// - 撤销集合达到上限：INVALID_INPUT。
+    pub fn revoke_device(
+        &mut self,
+        account_id: &str,
+        device_id: &str,
+        revoked_at_ms: i64,
+    ) -> Result<DeviceRevocationRecord> {
+        self.ensure_ready()?;
+        ensure_id("device revocation account", account_id)?;
+        ensure_id("device revocation device", device_id)?;
+        if revoked_at_ms < 0 {
+            return Err(StorageError::InvalidInput(
+                "revoked_at_ms must be a non-negative Unix millisecond timestamp".to_owned(),
+            ));
+        }
+        let account_index = account_index(account_id);
+        let device_index = device_index_for(account_id, device_id)?;
+        if let Some(existing) =
+            load_device_revocation_row(self.connection(), &self.key, &device_index)?
+        {
+            if existing.account_index != account_index
+                || existing.stored.account_id != account_id
+                || existing.stored.device_id != device_id
+            {
+                return Err(StorageError::StateCorrupted(
+                    "stored revocation is bound to another device".to_owned(),
+                ));
+            }
+            return Ok(DeviceRevocationRecord {
+                account_id: existing.stored.account_id,
+                device_id: existing.stored.device_id,
+                revocation_generation: existing.revocation_generation,
+                revoked_at_ms: existing.stored.revoked_at_ms,
+                already_existed: true,
+            });
+        }
+
+        let revoked_count: i64 = self.connection().query_row(
+            "SELECT COUNT(*) FROM identity_device_revocations WHERE account_index = ?1",
+            [&account_index],
+            |row| row.get(0),
+        )?;
+        if revoked_count >= i64::from(MAX_DEVICE_REVOCATIONS) {
+            return Err(StorageError::InvalidInput(format!(
+                "revocation set reached the {MAX_DEVICE_REVOCATIONS} device limit"
+            )));
+        }
+        let generation = self
+            .device_revocation_generation(account_id)?
+            .checked_add(1)
+            .ok_or_else(|| {
+                StorageError::StateCorrupted("revocation generation overflow".to_owned())
+            })?;
+        let generation_i64 = i64::try_from(generation).map_err(|_| {
+            StorageError::StateCorrupted("revocation generation is out of range".to_owned())
+        })?;
+        let stored = StoredDeviceRevocation {
+            version: DEVICE_REVOCATION_RECORD_VERSION,
+            account_id: account_id.to_owned(),
+            device_id: device_id.to_owned(),
+            revocation_generation: generation,
+            revoked_at_ms,
+        };
+        let sealed = seal_device_revocation(&self.key, &device_index, &account_index, &stored)?;
+        let updated_at = now_ms();
+        let mut transaction = self.begin_transaction(WriteScope::identity())?;
+        let inserted = transaction.transaction.execute(
+            "INSERT INTO identity_device_revocations
+                 (device_index, account_index, protected_revocation, revocation_generation, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                device_index,
+                account_index,
+                sealed,
+                generation_i64,
+                revoked_at_ms
+            ],
+        );
+        let rows = match inserted {
+            Ok(rows) => rows,
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                return Err(error.into());
+            }
+        };
+        let epoch_rows = match transaction.transaction.execute(
+            "INSERT INTO identity_device_revocation_epoch (account_index, generation, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(account_index) DO UPDATE SET
+                 generation = excluded.generation,
+                 updated_at = excluded.updated_at
+             WHERE excluded.generation > identity_device_revocation_epoch.generation",
+            params![account_index, generation_i64, updated_at],
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                return Err(error.into());
+            }
+        };
+        transaction.note(rows);
+        transaction.note(epoch_rows);
+        commit_transaction(transaction)?;
+        Ok(DeviceRevocationRecord {
+            account_id: stored.account_id,
+            device_id: stored.device_id,
+            revocation_generation: generation,
+            revoked_at_ms,
+            already_existed: false,
+        })
+    }
+
+    /// 读取账户撤销集合（账户 ID、当前撤销版本与已撤销设备）。
+    pub fn revoked_devices(&self, account_id: &str) -> Result<DeviceRevocationSetRecord> {
+        self.ensure_ready()?;
+        ensure_id("device revocation account", account_id)?;
+        let account_index = account_index(account_id);
+        let generation = self.device_revocation_generation(account_id)?;
+        let limit = i64::from(MAX_DEVICE_REVOCATIONS) + 1;
+        let mut statement = self.connection().prepare(
+            "SELECT device_index FROM identity_device_revocations
+              WHERE account_index = ?1 ORDER BY revoked_at ASC, device_index ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![account_index, limit], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut indexes = Vec::new();
+        for row in rows {
+            indexes.push(row?);
+        }
+        if indexes.len() > usize::try_from(MAX_DEVICE_REVOCATIONS).unwrap_or(usize::MAX) {
+            return Err(StorageError::StateCorrupted(
+                "stored revocation count exceeds the supported limit".to_owned(),
+            ));
+        }
+        let mut revoked = Vec::with_capacity(indexes.len());
+        for device_index in indexes {
+            let Some(existing) =
+                load_device_revocation_row(self.connection(), &self.key, &device_index)?
+            else {
+                return Err(StorageError::StateCorrupted(
+                    "revocation row disappeared while listing".to_owned(),
+                ));
+            };
+            if existing.account_index != account_index || existing.stored.account_id != account_id {
+                return Err(StorageError::StateCorrupted(
+                    "stored revocation is bound to another account".to_owned(),
+                ));
+            }
+            revoked.push(DeviceRevocationRecord {
+                account_id: existing.stored.account_id,
+                device_id: existing.stored.device_id,
+                revocation_generation: existing.revocation_generation,
+                revoked_at_ms: existing.stored.revoked_at_ms,
+                already_existed: true,
+            });
+        }
+        Ok(DeviceRevocationSetRecord {
+            account_id: account_id.to_owned(),
+            generation,
+            revoked,
+        })
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -887,5 +1737,31 @@ mod tests {
         assert_eq!(identity_aad("index-a")[0], b"index-a");
         assert_eq!(contact_aad("contact-x")[0], b"contact-x");
         assert_ne!(identity_aad("a"), identity_aad("b"));
+    }
+
+    #[test]
+    fn device_indices_are_deterministic_and_domain_separated() {
+        let first = device_index_for("acct-1", "dev-1").expect("device index");
+        assert_eq!(first, device_index_for("acct-1", "dev-1").expect("device index"));
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
+        // 同一设备 ID 换账户即换索引（跨账户隔离的基础）。
+        assert_ne!(first, device_index_for("acct-2", "dev-1").expect("device index"));
+        assert_ne!(first, device_index_for("acct-1", "dev-2").expect("device index"));
+        assert!(!first.contains("dev-1"));
+        assert!(device_index_for("bad id!", "dev-1").is_err());
+    }
+
+    #[test]
+    fn device_aad_binds_index_and_record_kind() {
+        let credential = device_credential_aad("index-a", "account-a");
+        let revocation = device_revocation_aad("index-a", "account-a");
+        assert_eq!(credential[0], b"index-a");
+        assert_eq!(credential[1], b"account-a");
+        assert_ne!(credential[2], revocation[2]);
+        assert_ne!(
+            device_credential_aad("index-a", "account-a"),
+            device_credential_aad("index-a", "account-b")
+        );
     }
 }

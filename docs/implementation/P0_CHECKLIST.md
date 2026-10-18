@@ -60,6 +60,14 @@ P0-03 局部实验已通过客户端单连接事务及独立节点接受事务�
 
 注意：这仍是"提交后一次性写库"，**不是** OpenMLS provider 在调用方事务内读写，所以下面正式退出条件保持未勾选。
 
+2026-10-18 追加局部实验（附件：分块加密 + 记录持久化 + 上传/下载端口，证据见 `crates/core/src/attachments.rs` 内联测试、`crates/storage/tests/attachments_records.rs`、`:apps:desktop:attachmentSmoke`）：
+
+- [x] 25 MiB 上限、分块 AEAD、整文件与明文摘要校验、失败不留半成品；导入后磁盘缓存无明文。
+- [x] 附件记录落正式加密存储（0005），重开后记录仍在；**FileKey 未持久化 → 重启后导出/下载显式 `ATTACHMENT_KEY_UNAVAILABLE`**（诚实失败，不含伪造）。
+- [x] 上传/下载经可注入的 `BlobTransport` 端口完成（密文逐字节、同序号重试幂等、manifest 先校验）。
+
+未勾选（仍缺）：真实节点适配层（NODE-012~015 配额/回执验签）与断点续传位图、E2EE SecretDescriptor/CAPABILITY、下载写入本地加密缓存以便离线导出。
+
 下面仍为正式跨端/全场景退出条件，未因局部实验打勾：
 
 - [ ] OpenMLS provider 的每次读写绑定同一 CoreTransaction，不暗中独立 commit。

@@ -103,7 +103,11 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 fn attachment_record_roundtrip_is_idempotent_and_ordered() {
     let fixture = Fixture::new("roundtrip");
     let mut store = fixture.open();
-    assert_eq!(store.schema_version(), 5, "0005 adds the attachment columns");
+    assert_eq!(
+        store.schema_version(),
+        6,
+        "0005 adds the attachment columns, 0006 adds device credentials"
+    );
 
     let saved = store.save_attachment(input("att-1234", "staging")).expect("save");
     assert!(!saved.already_existed);
@@ -401,11 +405,11 @@ fn attachment_migration_is_applied_once_and_keeps_previous_tables() {
     let fixture = Fixture::new("migration");
     {
         let store = fixture.open();
-        assert_eq!(store.schema_version(), 5);
+        assert_eq!(store.schema_version(), 6);
     }
     let store = fixture.open();
-    assert_eq!(store.schema_version(), 5);
-    assert_eq!(rows(&store, "schema_migrations"), 5);
+    assert_eq!(store.schema_version(), 6);
+    assert_eq!(rows(&store, "schema_migrations"), 6);
     // 0001~0004 的既有表仍可用（这里抽查 0004 的 MLS 状态表与 0002 的密钥校验表）。
     assert_eq!(rows(&store, "mls_group_state"), 0);
     assert_eq!(rows(&store, "store_key_check"), 1);

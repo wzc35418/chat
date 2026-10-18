@@ -15,7 +15,7 @@ use axum::{Json, Router};
 use chat_node_services::auth::{ChallengePurpose, RequestMeta};
 use chat_node_services::services::AuthenticatedDevice;
 use chat_node_services::canonical::{hex_encode, sha256};
-use chat_node_services::limits::MAX_HTTP_BODY_BYTES;
+use chat_node_services::limits::{MAX_BLOB_CHUNK_BODY_BYTES, MAX_HTTP_BODY_BYTES};
 use serde::de::DeserializeOwned;
 
 use crate::dto::{
@@ -56,9 +56,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/blobs", post(begin_blob_upload))
         // 同一个 URL 形状承载两个动作：PUT = 写入上传会话的一块，GET = 读取已发布 blob 的一块。
         // 路由参数因此只能有一个名字（axum 不允许同名形状的两种参数命名）。
+        // 原始密文块正文可达分块硬上限（4 MiB）；路由级 DefaultBodyLimit 覆盖全局 64 KiB，
+        // 因此只有这一条路由被放宽，JSON DTO 路由仍然受全局小上限保护。
         .route(
             "/v1/blobs/{id}/chunks/{chunk_index}",
-            put(put_blob_chunk).get(read_blob_chunk),
+            put(put_blob_chunk)
+                .get(read_blob_chunk)
+                .layer(DefaultBodyLimit::max(MAX_BLOB_CHUNK_BODY_BYTES)),
         )
         .route(
             "/v1/blobs/{upload_id}/complete",
@@ -354,7 +358,9 @@ pub async fn put_blob_chunk(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    ensure_body_bounded(&state, body.len())?;
+    // 块正文是原始密文（不是 JSON DTO）：传输上限由路由级 DefaultBodyLimit 兜底
+    // （MAX_BLOB_CHUNK_BODY_BYTES），具体块大小由服务层按会话声明的 chunk_bytes 与
+    // BlobPolicy 校验，超限仍返回 CONTENT_TOO_LARGE / MANIFEST_MISMATCH，不在这里改错误码。
     let index = parse_chunk_index(&chunk_index)?;
     let now = state.now();
     let actor = authenticate(&state, &headers, &uri, "PUT", &body, now)?;

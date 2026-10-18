@@ -1,6 +1,6 @@
 # 账户、联系人、双设备与恢复
 
-阶段：P1 → P2。状态：IDENTITY-001~007 的纯密码学与状态部分已实现（crates/identity，验收命令与证据见下节）；IDENTITY-008~014 未开始。目标源码：[crates/identity/src/service.rs](../../crates/identity/src/service.rs)。
+阶段：P1 → P2。状态：IDENTITY-001~012 已实现（001~007 纯密码学/状态层；008~012 设备凭据生命周期 + 正式加密存储持久化，验收命令与证据见下节）；IDENTITY-013/014（导出/导入恢复文件）未开始。目标源码：[crates/identity/src/service.rs](../../crates/identity/src/service.rs) 与 [crates/identity/src/registry.rs](../../crates/identity/src/registry.rs)。
 
 AccountId 从规范长期公钥派生，设备密钥与传输端点分别绑定。初始设备保管主管身份密钥，第二设备不自动取得它。所有敏感读写经 storage 和系统密钥保护；签名与恢复 KDF 算法在 P0 锁定，不在此自造。
 
@@ -111,11 +111,11 @@ protocol crate，identity 不能新增字段号，因此不借用 CURSOR_*/EXTEN
 - 不提供「先解析、后验签」的第二套入口：`classify_invite_text` 只校验口令信封
   （前缀/长度/hex 规范形式），账户/设备/节点等身份字段只有 `verify_invite` 之后才可得，
   避免 UI 展示未验证身份。
-- 每账户 ≤2 有效设备的约束属于设备注册表（IDENTITY-009/011）；本层只签发凭据，不计数。
+- 每账户 ≤2 有效设备的约束由 IDENTITY-009（authorize_device）在持久化注册表上执行（MAX_ACTIVE_DEVICES）；纯签发函数 create_device_credential 本身不计数。
 - 持久化未接：IDENTITY-001 的 T1 事务与密钥包装、IDENTITY-002 的锁状态与数据库读取、
   邀请一次性消费、联系人/设备落盘都还没实现。crate 仍声明 `chat-storage` 依赖但当前
   不调用；这些由 storage/core 集成任务补齐，本层不假装已持久化。
-- IDENTITY-008~014（双设备配对、设备列表、撤销任务、导出/导入恢复）未开始。
+- IDENTITY-013/014（导出/导入恢复文件）未开始；IDENTITY-008~012 已实现，证据见上节「设备凭据生命周期与撤销集合」。
 - 设备凭据的端点绑定保存 32 字节端点标识，未绑定 iroh EndpointId 类型（不引入
   transport 依赖）；等 transport 集成时做显式映射。
 - 邀请口令内只有 16 字节 nonce 供上层去重；重放窗口与一次性消费状态需要持久化。
@@ -124,6 +124,91 @@ protocol crate，identity 不能新增字段号，因此不借用 CURSOR_*/EXTEN
 **Cargo.lock 变化**：`chat-identity` 的依赖列表新增 `ed25519-dalek 3.0.0`、`rand 0.10.3`、
 `zeroize 1.9.1`（三者均已在 Cargo.lock 中，版本未变，无新增传递依赖）；
 `chat-storage` 依赖保留。
+
+## 设备凭据生命周期与撤销集合（IDENTITY-008~012）
+
+本轮追加交付：设备配对 → 授权 → 完成 → 列表 → 撤销的持久化闭环。密码学仍为真实
+Ed25519/SHA-256，持久化只经 chat-storage 的正式加密存储（迁移 0006），不访问网络。
+
+**验收命令与结果**（本轮实测）
+
+~~~text
+cargo test --offline -p chat-storage
+  11 + 6 + 2 + 1 + 7 + 8 + 6 + 6 + 8 + 7 + 17 项全绿（79 passed；含新增 formal_identity_devices 6 项）
+cargo test --offline -p chat-identity
+  34 lib 单元 + 9 device_registry + 9 identity_contract = 52 passed / 0 failed
+cargo clippy --offline -p chat-storage -p chat-identity --all-targets
+  新增/改动文件 0 警告（storage 另有 6 条既有警告，属旧代码）
+~~~
+
+**新增/改动的文件**
+
+| 文件 | 内容 |
+|---|---|
+| [crates/storage/migrations/0006_device_credentials.sql](../../crates/storage/migrations/0006_device_credentials.sql) | 新迁移：`identity_device_credentials` / `identity_device_revocations` / `identity_device_revocation_epoch`（0001~0005 未改） |
+| [crates/storage/src/formal/identity.rs](../../crates/storage/src/formal/identity.rs) | `save_device_credential` / `load_device_credential` / `list_device_credentials` / `revoke_device` / `revoked_devices` / `device_revocation_generation` |
+| [crates/storage/src/formal/migrations.rs](../../crates/storage/src/formal/migrations.rs) | 登记 0006（**必要相邻改动**：迁移是显式登记表，不登记不会执行） |
+| [crates/storage/src/formal/mod.rs](../../crates/storage/src/formal/mod.rs) | 导出新类型（**必要相邻改动**：`identity` 子模块私有） |
+| [crates/storage/tests/formal_identity_devices.rs](../../crates/storage/tests/formal_identity_devices.rs) | 新增 6 项设备凭据/撤销存储测试 |
+| [crates/storage/tests/formal_store.rs](../../crates/storage/tests/formal_store.rs)、[attachments_records.rs](../../crates/storage/tests/attachments_records.rs) | schema 版本断言 5 → 6（**必要相邻改动**：0006 把版本提升到 6） |
+| [crates/identity/src/registry.rs](../../crates/identity/src/registry.rs) | IDENTITY-008~012 门面（配对/授权/完成/列表/撤销/发送前检查） |
+| [crates/identity/src/error.rs](../../crates/identity/src/error.rs) | `StorageErrorKind` 与设备生命周期错误，仍映射冻结码表 |
+| [crates/identity/tests/device_registry.rs](../../crates/identity/tests/device_registry.rs) | 新增 9 项端到端测试 |
+
+**存储层语义（迁移 0006）**
+
+- 表名统一加 `identity_` 前缀：0001 已有 P0 表 `device_credentials`，本迁移不复用、不改写它。
+- 明文列只有不可逆索引与时间戳：`device_index` = SHA-256(`chat/storage/device-index/v1` ‖ account_id ‖ device_id)，
+  `account_index` 同 0003；其余（设备公钥、端点、能力位、签名、撤销正文）都在密封记录里。
+- 密封复用 identity-account 子密钥，但使用独立 AAD 标签 `device-credential-v1` / `device-revocation-v1`，
+  且 AAD 绑定（设备索引 + 账户索引 + 标签）：挪行、换账户、换设备、换版本全部 STATE_CORRUPTED；
+  明文时间列与密封记录不一致同样 STATE_CORRUPTED。
+- 幂等：完全相同保存返回 `already_existed=true` 且不写行；同设备续期必须保持同一设备公钥、
+  `issued_at` 不允许回退，否则 INVALID_STATE_TRANSITION；换设备公钥按 INVALID_INPUT 拒绝。
+- 撤销终态：已撤销设备的任何再签发都 INVALID_STATE_TRANSITION（不可静默复活）；重复撤销幂等返回
+  既有记录（版本与时间都不变）；账户撤销版本 `device_revocation_epoch` 单调 +1。
+- 上限（有界拒绝）：凭据 ≤8/账户、撤销 ≤64/账户、能力位只允许冻结位、`issued_at > 0` 且 `expires_at > issued_at`。
+- 跨账户隔离：索引由（账户, 设备）共同派生，用别的账户查询得到 `None`/空列表；行内账户索引不一致 → STATE_CORRUPTED。
+
+**身份层语义（IDENTITY-008~012）**
+
+- 配对：设备密钥安全随机 + 16 字节 nonce + 6 位核对短码；TTL 30 s..=10 min；过期后授权与完成都 LINK_EXPIRED。
+- 授权：有效期 → 设备未撤销 → 有效设备数 < `MAX_ACTIVE_DEVICES`(2) → 用**当前账户撤销版本**签发 → 落库。
+- 完成：先要求凭据绑定本机待配对公钥（LINK_MISMATCH），再用凭据内账户公钥建信任锚验签/期限/撤销。
+- 列表：按稳定设备 ID 排序，状态 active·expired·revoked；跨账户查询为空。
+- 撤销：最后一台有效设备拒绝（PERMISSION_DENIED，需恢复流程）；撤销推进账户撤销版本，
+  其余设备必须重新签发否则按 INVALID_CREDENTIAL（detail `identity.credential_stale`）拒绝。
+- 发送/解密前必须调用 `require_active_device`：过期 → INVALID_CREDENTIAL，撤销 → DEVICE_REVOKED，
+  版本落后 → INVALID_CREDENTIAL，缺能力 → REQUIRED_CAPABILITY_MISSING；不存在 → INVALID_CREDENTIAL。
+
+**错误码新增映射**（仍全部取自 protocol 冻结码表，无新增码）
+
+| IdentityError | 冻结码 |
+|---|---|
+| Storage(Locked) | STORAGE_LOCKED（唯一可自动重试） |
+| Storage(Corrupted) | STATE_CORRUPTED |
+| Storage(Failure) | STORAGE_FAILURE |
+| Storage(InvalidInput) | INVALID_TARGET |
+| Storage(Conflict) | INVALID_CREDENTIAL |
+| Storage(InvalidStateTransition) | INVALID_STATE_TRANSITION |
+| DeviceLimitExceeded | DEVICE_LIMIT_EXCEEDED |
+| LastDeviceRequiresRecovery | PERMISSION_DENIED |
+| LinkExpired | CURSOR_EXPIRED（复用"不透明令牌过期"码） |
+| InvalidLinkTtl | INVALID_TARGET |
+| LinkMismatch / DeviceNotFound | INVALID_CREDENTIAL |
+| MissingCapability | REQUIRED_CAPABILITY_MISSING |
+
+**已知限制**
+
+- 待配对秘密不持久化：重启后必须重新生成配对请求（PLATFORM-001 密钥保护未接入）；二维码编码未实现。
+- 为全部会话/群排队密钥更新（SYNC-001、GROUPS-003、CRYPTO 组密钥轮换）与撤销广播未实现，本层不发网络请求。
+- 跨进程并发授权没有额外串行化：当前依赖"单写者存储 + 单进程调用方"；"最后一台有效设备"检查是
+  两次读取后的尽力而为判定（不在同一事务内），并发撤销需要 core 事务层串行化才能严格保证。
+- 撤销一个设备会推进账户撤销版本，因此其余设备必须重新签发凭据；这是有意的严格策略
+  （换取"撤销不可静默忽略"），已由 revocation_is_terminal_and_remaining_devices_must_be_reissued 固化。
+- storage 层不做密码学校验（签名、ID 派生由 chat-identity 在写入前完成），只做结构/绑定自洽与密封。
+- schema 版本因 0006 由 5 提升为 6：既有库在 `open_store` 时自动迁移并校验校验和；库内版本更高仍 SCHEMA_TOO_NEW。
+- 本轮未改动任何依赖版本与 Cargo.lock（chat-storage 与 uuid dev-dep 已存在）。
 
 <a id="identity-001"></a>
 
@@ -385,11 +470,11 @@ begin_device_link() -> Result<DeviceLinkRequest>
 
 **完成验收**：
 
-- [ ] 重启恢复配对。
-- [ ] 过期必须重新生成。
-- [ ] 二维码无私钥。
+- [ ] 重启恢复配对。（待配对记录目前只在内存；持久化待配对秘密需要 platform 密钥保护，未实现）
+- [x] 过期必须重新生成。— 过期后 authorize/complete 显式 LINK_EXPIRED（tests/device_registry.rs::link_mismatch_and_expired_links_are_rejected）
+- [x] 二维码无私钥。— PendingDeviceLink 只暴露设备公钥与 6 位核对短码，Debug 脱敏（link_request_is_bounded_and_has_a_stable_verification_code）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现纯本地部分（[registry.rs](../../crates/identity/src/registry.rs) 的 `begin_device_link` / `PendingDeviceLink`）：设备密钥安全随机、16 字节 nonce、TTL 30 s..=10 min、短码由公钥+nonce 域分隔摘要派生。待配对秘密的持久化（PLATFORM-001 密钥保护）与二维码编码未实现。
 
 <a id="identity-009"></a>
 
@@ -419,10 +504,10 @@ authorize_device(request: DeviceLinkRequest, confirmation: UserConfirmation) -> 
 
 **完成验收**：
 
-- [ ] 两次并发授权仅允许一台新增设备。
-- [ ] 管理员身份不能替代账户主管授权。
+- [ ] 两次并发授权仅允许一台新增设备。（当前是单写者存储；跨进程并发需要 core 事务层串行化，未实现）
+- [x] 管理员身份不能替代账户主管授权。— 签发只接受 AccountKeys（账户根密钥），没有"管理员"这条路径（authorize_device 签名由账户公钥验签）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（[registry.rs](../../crates/identity/src/registry.rs) 的 `authorize_device`）：校验配对请求期限 → 设备未撤销 → 有效设备数 < 2 → 用当前账户撤销版本签发凭据 → 写入正式加密存储。测试：active_device_limit_is_two、revocation_is_terminal_and_remaining_devices_must_be_reissued。为全部会话生成加入任务（SYNC-001）未实现。
 
 <a id="identity-010"></a>
 
@@ -452,11 +537,11 @@ complete_device_link(result: DeviceAuthorization) -> Result<LinkStatus>
 
 **完成验收**：
 
-- [ ] 授权给不同公钥拒绝。
-- [ ] 重放不创建重复设备。
-- [ ] 加入前历史不自动出现。
+- [x] 授权给不同公钥拒绝。— LINK_MISMATCH（link_mismatch_and_expired_links_are_rejected）
+- [x] 重放不创建重复设备。— 设备索引 = H(账户, 设备 ID) 主键 + 幂等保存（storage 测试 device_credential_roundtrip_survives_reopen 的幂等断言）
+- [x] 加入前历史不自动出现。— 只保存设备凭据，不复制任何历史/密钥；存储里没有可复制的历史行
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（[registry.rs](../../crates/identity/src/registry.rs) 的 `complete_device_link`）：先校验本机待配对公钥一致，再用凭据内账户公钥建信任锚、校验签名/期限/撤销，最后落库。self-sync 加入任务（SYNC-001）与 Welcome 未实现。
 
 <a id="identity-011"></a>
 
@@ -485,10 +570,10 @@ list_devices() -> Result<Vec<DeviceSummary>>
 
 **完成验收**：
 
-- [ ] 离线设备仍显示。
-- [ ] 部分群撤销未完成可追踪。
+- [x] 离线设备仍显示。— 列表完全由持久化记录派生，不依赖在线状态（authorize_complete_and_list_survive_reopen 重开后仍列出）
+- [ ] 部分群撤销未完成可追踪。（每群密钥更新任务属于 SYNC/GROUPS，未实现）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（[registry.rs](../../crates/identity/src/registry.rs) 的 `list_devices`）：返回设备 ID/公钥/能力/签发与失效时间/状态（active·expired·revoked），按稳定设备 ID 排序；跨账户查询天然为空。
 
 <a id="identity-012"></a>
 
@@ -518,10 +603,10 @@ revoke_device(device: DeviceId) -> Result<RevocationJob>
 
 **完成验收**：
 
-- [ ] 部分节点离线任务保持 pending。
-- [ ] 完成的群后续消息撤销设备不可解密。
+- [ ] 部分节点离线任务保持 pending。（outbox 任务与节点投递未接，本层不发网络请求）
+- [ ] 完成的群后续消息撤销设备不可解密。（MLS 密钥更新由 CRYPTO/GROUPS 负责，未在此实现）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现持久化部分（[registry.rs](../../crates/identity/src/registry.rs) 的 `revoke_device` + storage 的 `revoke_device`/`revoked_devices`）：最后一台有效设备拒绝撤销（PERMISSION_DENIED）、撤销幂等且版本单调 +1、撤销记录密封落盘、已撤销设备不能被再签发复活；发送/解密前由 `require_active_device` 显式拒绝。每群密钥更新任务与撤销广播未实现。
 
 <a id="identity-013"></a>
 

@@ -98,6 +98,10 @@ pub(crate) const fn missing_log_entries(detail: &'static str) -> SyncError {
     SyncError::new(ErrorCode::MissingLogEntries, detail)
 }
 
+pub(crate) const fn log_conflict(detail: &'static str) -> SyncError {
+    SyncError::new(ErrorCode::LogConflict, detail)
+}
+
 pub(crate) const fn unknown_result(detail: &'static str) -> SyncError {
     SyncError::new(ErrorCode::UnknownResult, detail)
 }

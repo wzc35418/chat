@@ -184,9 +184,35 @@ pub const MAX_BLOB_BYTES_PER_DEVICE_LIMIT: u64 = 1024 * 1024 * 1024;
 /// 单个密文对象总字节上限（默认 8 MiB）。
 pub const DEFAULT_BLOB_OBJECT_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_BLOB_OBJECT_BYTES_LIMIT: u64 = 64 * 1024 * 1024;
-/// 声明块大小上限（默认 32 KiB；仍必须小于 HTTP 正文上限，密文按原始字节传输）。
-pub const DEFAULT_BLOB_CHUNK_BYTES: usize = 32 * 1024;
-pub const MAX_BLOB_CHUNK_BYTES_LIMIT: usize = 60 * 1024;
+/// 客户端附件分块的明文块大小（CRYPTO-011，已冻结，节点侧不改）。
+pub const CLIENT_ATTACHMENT_PLAINTEXT_CHUNK_BYTES: usize = 256 * 1024;
+/// 单块密文的封装开销：版本字节 + AEAD nonce(12) + tag(16) = 29 字节。
+///
+/// 本 crate 不依赖 chat-crypto，因此用公开常量独立表达，并用下面的 const 断言锁住
+/// “节点默认块上限 ≥ 客户端密文块”这个不变量：任何把默认值调小到 262_173 字节以下
+/// 的改动都会直接编译失败，而不是等运行期把多块附件拒成 CONTENT_TOO_LARGE。
+pub const CLIENT_ATTACHMENT_CIPHERTEXT_OVERHEAD: usize = 1 + 12 + 16;
+/// 客户端一个满密文块的字节数（256 KiB + 29 = 262_173）。
+pub const CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES: usize =
+    CLIENT_ATTACHMENT_PLAINTEXT_CHUNK_BYTES + CLIENT_ATTACHMENT_CIPHERTEXT_OVERHEAD;
+
+/// 声明块大小默认上限：1 MiB。
+///
+/// 必须 ≥ 客户端密文块（262_173 字节）：客户端按 256 KiB 明文分块（冻结格式），
+/// 节点旧默认 32 KiB / 硬上限 60 KiB 会让**任何多块附件**被 CONTENT_TOO_LARGE 拒绝。
+pub const DEFAULT_BLOB_CHUNK_BYTES: usize = 1024 * 1024;
+/// 声明块大小硬上限：4 MiB。远端节点可通过策略下调，但不得超过此值。
+pub const MAX_BLOB_CHUNK_BYTES_LIMIT: usize = 4 * 1024 * 1024;
+/// 原始密文块 PUT 的**传输正文上限**（= 分块硬上限：密文按原始字节传输，没有编码开销）。
+///
+/// 只有 `PUT /v1/blobs/{id}/chunks/{index}` 路由使用这个上限；其余 JSON DTO 路由仍是
+/// [`MAX_HTTP_BODY_BYTES`]（64 KiB），因此放宽块传输不会放大小请求的内存面。
+pub const MAX_BLOB_CHUNK_BODY_BYTES: usize = MAX_BLOB_CHUNK_BYTES_LIMIT;
+
+// 编译期不变量：默认/硬上限都必须放得下客户端满密文块，且传输上限不越过对象上限。
+const _: () = assert!(DEFAULT_BLOB_CHUNK_BYTES >= CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES);
+const _: () = assert!(MAX_BLOB_CHUNK_BYTES_LIMIT >= DEFAULT_BLOB_CHUNK_BYTES);
+const _: () = assert!(MAX_BLOB_CHUNK_BYTES_LIMIT <= MAX_BLOB_OBJECT_BYTES_LIMIT as usize);
 /// 单对象块数上限（默认 512 块）。
 pub const DEFAULT_BLOB_CHUNK_COUNT: u32 = 512;
 pub const MAX_BLOB_CHUNK_COUNT_LIMIT: u32 = 4096;

@@ -10,7 +10,9 @@ import chat.api.IdentityContact
 import chat.api.IdentityInviteSummary
 import chat.api.StoredConversation
 import chat.api.StoredDraft
+import chat.api.LocalAttachment
 import chat.api.StoredDraftStatus
+import chat.presentation.display.toBadge
 import chat.api.StoredMessage
 import chat.api.StoredPage
 import chat.presentation.P0Presenter
@@ -141,6 +143,7 @@ fun main() = runBlocking {
     checkIdentityPresentation()
     checkStorePanelState()
     checkDraftStatusProjection()
+    checkAttachmentBadges()
     checkPreviewStates()
     checkPreviewInviteValidation()
     checkConversationDisplayMerger()
@@ -392,6 +395,37 @@ private fun checkErrorPresentation() {
     val nonRetryableStorage = presentError(CoreFailure("STORAGE_FAILURE", false, null, null))
     check(nonRetryableStorage.action == ErrorAction.NONE)
     println("PASS DS-04 known/unknown/non-retryable error mapping")
+}
+
+private fun checkAttachmentBadges() {
+    fun attachment(state: String) = LocalAttachment(
+        attachmentId = "att-" + "ab".repeat(16),
+        plainSize = 1024,
+        chunkSize = 64 * 1024,
+        chunkCount = 2,
+        contentDigest = "cd".repeat(32),
+        displayName = "示例.bin",
+        state = state,
+        availableChunks = 2,
+        cancelRequested = false,
+    )
+
+    check(!attachment("imported").toBadge().downloadable) { "只导入未上传时不得声称对方可下载" }
+    check(attachment("imported").toBadge().cancellable)
+    check(!attachment("uploading").toBadge().downloadable) { "上传中不得声称可下载" }
+    check(attachment("uploading").toBadge().cancellable) { "上传中允许取消" }
+    val available = attachment("available").toBadge()
+    check(available.downloadable) { "节点已保存全部密文块后才可声称可下载" }
+    check(!available.cancellable) { "已上传的传输不提供取消" }
+    check(available.label == "已上传")
+    check(!attachment("downloading").toBadge().downloadable)
+    check(!attachment("cancelled").toBadge().downloadable)
+    check(!attachment("failed").toBadge().downloadable)
+    val unknown = attachment("weird-status").toBadge()
+    check(!unknown.downloadable) { "未知状态必须按不可下载处理" }
+    check(unknown.label == "状态未知")
+
+    println("PASS attachment badges: only available is downloadable; uploading/cancelled/failed/unknown never claim delivery")
 }
 
 private fun checkDraftStatusProjection() {

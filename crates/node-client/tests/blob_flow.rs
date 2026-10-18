@@ -367,3 +367,46 @@ async fn foreign_writer_and_non_canonical_ids_are_rejected() {
     let _ = device_text(21);
     let _ = ErrorCode::InvalidTarget;
 }
+/// 客户端冻结的 256 KiB 明文分块（密文块 262_173 字节）在**默认节点策略**下能端到端
+/// 上传/发布/取回：这是 NODE 分块上限对齐后的回归证据（旧上限 32 KiB/60 KiB 会被拒）。
+#[tokio::test]
+async fn client_scale_multi_chunk_attachment_round_trips_over_http() {
+    use chat_node_services::limits::{
+        CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES, MAX_BLOB_CHUNK_BODY_BYTES, MAX_HTTP_BODY_BYTES,
+    };
+
+    // 客户端的两个正文上限必须分开：块正文可达分块硬上限，JSON DTO 仍是小上限。
+    let limits = chat_node_client::ClientLimits::default();
+    assert_eq!(limits.max_chunk_bytes, MAX_BLOB_CHUNK_BODY_BYTES);
+    assert_eq!(limits.max_request_bytes, MAX_HTTP_BODY_BYTES);
+    assert!(limits.max_chunk_bytes > limits.max_request_bytes);
+    assert_eq!(CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES, 256 * 1024 + 29);
+
+    let flow = setup(NodeAuthPolicy::default()).await;
+    let full = vec![0xa5_u8; CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES];
+    let tail = vec![0x5a_u8; 1_000];
+    let (upload_id, receipt) = upload(&flow, 141, &[&full, &full, &tail], 241).await;
+    assert_eq!(receipt.upload_id, upload_id);
+    assert_eq!(receipt.chunk_count, 3);
+    assert_eq!(
+        receipt.ciphertext_bytes,
+        (CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES as u64) * 2 + 1_000
+    );
+    receipt
+        .verify(&flow.node.node_public_key)
+        .expect("node-signed publish receipt");
+
+    // 上传者与群成员都能按块取回完全一致的 256 KiB 密文块。
+    for reader in [&flow.owner, &flow.member] {
+        let bytes = reader
+            .read_blob_chunk(&receipt.blob_id, 0)
+            .await
+            .expect("full chunk read");
+        assert_eq!(bytes, full);
+        let tail_bytes = reader
+            .read_blob_chunk(&receipt.blob_id, 2)
+            .await
+            .expect("tail chunk read");
+        assert_eq!(tail_bytes, tail);
+    }
+}

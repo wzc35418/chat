@@ -1286,3 +1286,72 @@ async fn blob_endpoints_require_bound_authentication() {
     let unknown = get_request(&node, 21, "/v1/nothing", "").await;
     assert_eq!(unknown.status, 404);
 }
+/// 分块正文上限对齐：客户端 256 KiB 明文块（密文 262_173 字节）能通过路由层与节点策略；
+/// 同时 JSON DTO 路由仍保持 64 KiB 的正文上限，放宽只针对块路线。
+#[tokio::test]
+async fn chunk_body_limit_accepts_client_scale_chunks_but_keeps_dto_routes_bounded() {
+    use chat_node_services::limits::{CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES, MAX_HTTP_BODY_BYTES};
+
+    let (node, group) = setup(NodeAuthPolicy::default()).await;
+    let source_seq = append_attachment_entry(&node, &group, 21).await;
+    let blob = object_text(141);
+    let chunk_len = CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES;
+    assert_eq!(chunk_len, 262_173);
+    let chunk = vec![0x5a_u8; chunk_len];
+
+    // 单块附件：声明块大小 = 总长 = 客户端满密文块。
+    let begin = begin_blob(
+        &node,
+        21,
+        &group,
+        &operation_text(241),
+        &blob,
+        source_seq,
+        chunk_len as u64,
+        chunk_len as u32,
+        1,
+    )
+    .await;
+    assert_eq!(
+        begin.status,
+        200,
+        "begin: {:?}",
+        String::from_utf8_lossy(&begin.body)
+    );
+    let upload_id = begin.json()["session"]["upload_id"]
+        .as_str()
+        .expect("upload id")
+        .to_owned();
+
+    // 262_173 字节的原始正文通过（旧上限 64 KiB 会在这里 413）。
+    let uploaded = put_chunk(&node, 21, &upload_id, 0, &chunk).await;
+    assert_eq!(
+        uploaded.status,
+        200,
+        "chunk: {:?}",
+        String::from_utf8_lossy(&uploaded.body)
+    );
+    assert_eq!(uploaded.json()["receipt"]["byte_size"], chunk_len as u64);
+    let completed = complete_blob(
+        &node,
+        21,
+        &upload_id,
+        1,
+        chunk_len as u64,
+        &ciphertext_digest(&[&chunk]),
+    )
+    .await;
+    assert_eq!(completed.status, 200);
+
+    // JSON DTO 路由仍然受全局小上限保护：64 KiB + 1 的正文直接 413。
+    let oversized_json = vec![b'x'; MAX_HTTP_BODY_BYTES + 1];
+    let rejected = http(
+        &node.address,
+        "POST",
+        "/v1/auth/challenge",
+        &[],
+        &oversized_json,
+    )
+    .await;
+    assert_eq!(rejected.status, 413);
+}

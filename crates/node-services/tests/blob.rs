@@ -10,7 +10,10 @@ use chat_node_services::blob::{
     BlobReceipt, CipherManifest, PublicBlobDescriptor, UploadSession,
 };
 use chat_node_services::canonical::hex_encode;
-use chat_node_services::limits::BlobPolicy;
+use chat_node_services::limits::{
+    BlobPolicy, CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES, DEFAULT_BLOB_CHUNK_BYTES,
+    MAX_BLOB_CHUNK_BODY_BYTES, MAX_BLOB_CHUNK_BYTES_LIMIT,
+};
 use chat_node_services::services::{AuthenticatedDevice, NodeAuthPolicy};
 use chat_protocol::{ObjectId, OperationId};
 use sha2::{Digest, Sha256};
@@ -796,4 +799,92 @@ fn descriptor_validation_rejects_malformed_shapes() {
         "INVALID_CREDENTIAL"
     );
     let _ = submission_text(1);
+}
+/// 节点默认分块上限必须放得下客户端冻结的 256 KiB 明文块（密文 = 256 KiB + 29）。
+#[test]
+fn default_blob_chunk_limit_fits_the_frozen_client_chunk_size() {
+    assert_eq!(CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES, 256 * 1024 + 29);
+    assert_eq!(DEFAULT_BLOB_CHUNK_BYTES, 1024 * 1024);
+    assert_eq!(MAX_BLOB_CHUNK_BYTES_LIMIT, 4 * 1024 * 1024);
+    assert_eq!(MAX_BLOB_CHUNK_BODY_BYTES, MAX_BLOB_CHUNK_BYTES_LIMIT);
+    assert!(DEFAULT_BLOB_CHUNK_BYTES >= CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES);
+    assert!(MAX_BLOB_CHUNK_BYTES_LIMIT >= CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES);
+    // 默认策略直接可用（默认值本身就是合法配置）。
+    BlobPolicy::default().validate().expect("default blob policy is valid");
+    assert_eq!(BlobPolicy::default().max_chunk_bytes, DEFAULT_BLOB_CHUNK_BYTES);
+    // 硬上限之上的配置在启动校验处显式拒绝，不静默夹取。
+    let too_large = BlobPolicy {
+        max_chunk_bytes: MAX_BLOB_CHUNK_BYTES_LIMIT + 1,
+        ..BlobPolicy::default()
+    };
+    assert_eq!(too_large.validate().unwrap_err().code(), "INVALID_CONFIG");
+}
+
+/// 客户端 3 块附件（256 KiB + 29 的满块 ×2 + 末块）在**默认策略**下可完整上传并发布。
+#[test]
+fn client_scale_multi_chunk_attachment_is_accepted_by_the_default_policy() {
+    let mut fixture = Fixture::in_memory();
+    let full = vec![0xa5_u8; CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES];
+    let tail = vec![0x5a_u8; 1_000];
+    let (upload_id, receipt) = fixture.upload(131, &[&full, &full, &tail], 231);
+    assert_eq!(receipt.upload_id, upload_id);
+    assert_eq!(receipt.chunk_count, 3);
+    assert_eq!(
+        receipt.ciphertext_bytes,
+        (CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES as u64) * 2 + 1_000
+    );
+    receipt
+        .verify(&fixture.harness.node_public_key())
+        .expect("node-signed publish receipt");
+    // 满块能按块原样取回（密文不被重新编码）。
+    let chunk = fixture
+        .harness
+        .service
+        .read_blob_chunk(&receipt.blob_id, 0, &fixture.owner_actor, NOW)
+        .expect("owner reads the 256 KiB chunk");
+    assert_eq!(chunk.bytes, full);
+    let tail_chunk = fixture
+        .harness
+        .service
+        .read_blob_chunk(&receipt.blob_id, 2, &fixture.owner_actor, NOW)
+        .expect("owner reads the tail chunk");
+    assert_eq!(tail_chunk.bytes, tail);
+}
+
+/// 单块 260 KiB 恰好等于策略上限：通过；再多 1 字节：仍是 CONTENT_TOO_LARGE。
+#[test]
+fn chunk_exactly_at_the_limit_is_accepted_and_over_the_limit_is_rejected() {
+    const LIMIT: usize = 260 * 1024;
+    let policy = NodeAuthPolicy {
+        blob: BlobPolicy {
+            max_chunk_bytes: LIMIT,
+            ..BlobPolicy::default()
+        },
+        ..NodeAuthPolicy::default()
+    };
+    let mut fixture = Fixture::in_memory_with(policy);
+
+    // 恰好等于上限：接受并发布。
+    let exact = vec![0x11_u8; LIMIT];
+    let (_, receipt) = fixture.upload(141, &[&exact], 241);
+    assert_eq!(receipt.ciphertext_bytes, LIMIT as u64);
+    assert_eq!(receipt.chunk_count, 1);
+
+    // 超过上限 1 字节：显式 CONTENT_TOO_LARGE（不截断、不夹取）。
+    let over = vec![0x22_u8; LIMIT + 1];
+    let descriptor = descriptor(142, &fixture.group, fixture.source_seq, LIMIT as u64, LIMIT as u32, 1);
+    let session = fixture
+        .harness
+        .service
+        .begin_blob_upload(&descriptor, &operation_text(242), &fixture.owner_actor, NOW)
+        .expect("begin with the declared limit");
+    assert_eq!(
+        fixture
+            .harness
+            .service
+            .put_blob_chunk(&session.upload_id, 0, &over, &fixture.owner_actor, NOW)
+            .unwrap_err()
+            .code(),
+        "CONTENT_TOO_LARGE"
+    );
 }

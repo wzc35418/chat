@@ -29,8 +29,8 @@ use chat_node_services::group::{
     SignedGroupCreation, SignedLogHead,
 };
 use chat_node_services::limits::{
-    MAX_BLOB_ID_BYTES, MAX_BLOB_UPLOAD_ID_BYTES, MAX_DEVICE_ID_BYTES, MAX_GROUP_ID_BYTES,
-    MAX_HTTP_BODY_BYTES,
+    MAX_BLOB_CHUNK_BODY_BYTES, MAX_BLOB_ID_BYTES, MAX_BLOB_UPLOAD_ID_BYTES, MAX_DEVICE_ID_BYTES,
+    MAX_GROUP_ID_BYTES, MAX_HTTP_BODY_BYTES,
 };
 use chat_node_services::mailbox::{
     AckSummary, MailboxItem, MailboxPage, MailboxReceipt,
@@ -74,13 +74,31 @@ const MAILBOX_PATH: &str = "/v1/mailbox";
 const MAILBOX_ACK_PATH: &str = "/v1/mailbox/ack";
 const BLOBS_PATH: &str = "/v1/blobs";
 
+/// 一次已登记设备的签名发送请求（参数集中，避免 9 参数函数）。
+struct SignedSend<'a> {
+    method: &'a str,
+    path: &'a str,
+    query: &'a str,
+    body: &'a [u8],
+    purpose: ChallengePurpose,
+    signer_device_id: Option<&'a str>,
+    content_type: &'static str,
+    /// 正文本上限：JSON DTO 用 `max_request_bytes`，密文块用 `max_chunk_bytes`。
+    request_limit: usize,
+}
+
 /// 客户端上限与超时。全部在构造时校验，越界配置显式拒绝。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientLimits {
     /// 单次响应体上限（字节）。
     pub max_response_bytes: usize,
-    /// 单次请求正文上限（字节）。
+    /// 单次 JSON 请求正文上限（字节）。
     pub max_request_bytes: usize,
+    /// 单块密文 PUT 的正文上限（字节）。
+    ///
+    /// 附件块是原始字节、可达节点分块硬上限，不能套用 JSON DTO 的小上限；
+    /// 默认取节点分块硬上限（4 MiB），仍由本地先拒、不把超大块发到网络。
+    pub max_chunk_bytes: usize,
     /// 单请求总超时。
     pub timeout: Duration,
     /// 总尝试次数（含首次）；上限 2，即“失败后最多重取一次挑战”。
@@ -92,6 +110,7 @@ impl Default for ClientLimits {
         Self {
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_request_bytes: MAX_HTTP_BODY_BYTES,
+            max_chunk_bytes: MAX_BLOB_CHUNK_BODY_BYTES,
             timeout: DEFAULT_TIMEOUT,
             challenge_attempts: DEFAULT_CHALLENGE_ATTEMPTS,
         }
@@ -106,6 +125,11 @@ impl ClientLimits {
         }
         if self.max_request_bytes == 0 || self.max_request_bytes > 16 * 1024 * 1024 {
             return Err(NodeClientError::config("max request bytes is out of range"));
+        }
+        if self.max_chunk_bytes == 0 || self.max_chunk_bytes > MAX_BLOB_CHUNK_BODY_BYTES {
+            return Err(NodeClientError::config(
+                "max chunk bytes must be within 1..=node chunk hard limit",
+            ));
         }
         if self.timeout < Duration::from_millis(1) || self.timeout > Duration::from_secs(300) {
             return Err(NodeClientError::config("request timeout is out of range"));
@@ -509,23 +533,37 @@ impl NodeClient {
         body: &[u8],
         purpose: ChallengePurpose,
     ) -> Result<Vec<u8>, NodeClientError> {
-        self.send_authenticated_for_device(method, path, query, body, purpose, None, JSON_CONTENT_TYPE)
-            .await
+        self.send_authenticated_request(SignedSend {
+            method,
+            path,
+            query,
+            body,
+            purpose,
+            signer_device_id: None,
+            content_type: JSON_CONTENT_TYPE,
+            request_limit: self.limits.max_request_bytes,
+        })
+        .await
     }
 
-    async fn send_authenticated_for_device(
+    /// 已登记设备的一次签名发送；参数集中在 [`SignedSend`] 里，避免超长参数列表。
+    async fn send_authenticated_request(
         &self,
-        method: &str,
-        path: &str,
-        query: &str,
-        body: &[u8],
-        purpose: ChallengePurpose,
-        signer_device_id: Option<&str>,
-        content_type: &'static str,
+        request: SignedSend<'_>,
     ) -> Result<Vec<u8>, NodeClientError> {
+        let SignedSend {
+            method,
+            path,
+            query,
+            body,
+            purpose,
+            signer_device_id,
+            content_type,
+            request_limit,
+        } = request;
         let meta = RequestMeta::canonical(method, path, query)
             .map_err(|error| NodeClientError::from_local_node_error(&error))?;
-        if body.len() > self.limits.max_request_bytes {
+        if body.len() > request_limit {
             return Err(NodeClientError::request_too_large());
         }
         let mut attempts = 0_usize;
@@ -572,15 +610,16 @@ impl NodeClient {
         body: &[u8],
         content_type: &'static str,
     ) -> Result<Vec<u8>, NodeClientError> {
-        self.send_authenticated_for_device(
+        self.send_authenticated_request(SignedSend {
             method,
             path,
             query,
             body,
-            ChallengePurpose::RequestAuth,
-            None,
+            purpose: ChallengePurpose::RequestAuth,
+            signer_device_id: None,
             content_type,
-        )
+            request_limit: self.limits.max_chunk_bytes,
+        })
         .await
     }
 
@@ -729,15 +768,16 @@ impl NodeClient {
         })
         .map_err(|_| NodeClientError::local_invalid("register device request could not be encoded"))?;
         let bytes = self
-            .send_authenticated_for_device(
-                "POST",
-                DEVICES_PATH,
-                "",
-                &body,
-                ChallengePurpose::DeviceRegistration,
-                Some(request.credential.device_id.as_str()),
-                JSON_CONTENT_TYPE,
-            )
+            .send_authenticated_request(SignedSend {
+                method: "POST",
+                path: DEVICES_PATH,
+                query: "",
+                body: &body,
+                purpose: ChallengePurpose::DeviceRegistration,
+                signer_device_id: Some(request.credential.device_id.as_str()),
+                content_type: JSON_CONTENT_TYPE,
+                request_limit: self.limits.max_request_bytes,
+            })
             .await?;
         let envelope: RegisterDeviceEnvelope = self.decode(&bytes)?;
         let registration = envelope.registration;
@@ -1042,6 +1082,10 @@ impl NodeClient {
     }
 
     /// NODE-013：按序上传一块密文（原始字节，不做 hex/JSON 二次编码）。
+    ///
+    /// 正文上限用 [`ClientLimits::max_chunk_bytes`]（默认节点分块硬上限 4 MiB），
+    /// 不是 JSON DTO 的 [`ClientLimits::max_request_bytes`]：客户端附件按 256 KiB 明文
+    /// 分块（密文块 262_173 字节），套用 DTO 小上限会让多块附件在本地就被拒。
     pub async fn put_blob_chunk(
         &self,
         upload_id: &str,

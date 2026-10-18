@@ -35,9 +35,11 @@ pub use entry::{
 };
 pub use error::StorageError;
 pub use identity::{
-    ACCOUNT_SEED_BYTES, ContactRecord, ContactUpsertInput, ConsumedInviteRecord, DEVICE_SEED_BYTES,
-    FINGERPRINT_BYTES, IdentityAccountInput, IdentityAccountRecord, MAX_CONTACTS,
-    MAX_IDENTITY_DISPLAY_NAME_BYTES, PUBLIC_KEY_BYTES, contact_id_for,
+    ACCOUNT_SEED_BYTES, ContactRecord, ContactUpsertInput, ConsumedInviteRecord,
+    DEVICE_CAPABILITY_MASK, DEVICE_SEED_BYTES, DEVICE_SIGNATURE_BYTES, DeviceCredentialInput,
+    DeviceCredentialRecord, DeviceRevocationRecord, DeviceRevocationSetRecord, FINGERPRINT_BYTES,
+    IdentityAccountInput, IdentityAccountRecord, MAX_CONTACTS, MAX_DEVICE_CREDENTIALS,
+    MAX_DEVICE_REVOCATIONS, MAX_IDENTITY_DISPLAY_NAME_BYTES, PUBLIC_KEY_BYTES, contact_id_for,
 };
 pub use mls_state::{
     MAX_MLS_GROUP_ID_BYTES, MAX_MLS_GROUP_RECORD_BYTES, MAX_MLS_GROUP_STATE_BYTES,

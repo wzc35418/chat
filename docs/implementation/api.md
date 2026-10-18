@@ -20,7 +20,8 @@
 - 挑战请求：`{"schema_version":1,"purpose":"device_registration"|"request_auth"}`；响应为 `{"schema_version":1,"challenge":AuthChallenge}`，挑战含 `challenge_id/nonce/node_id/purpose/issued_at/expires_at/node_public_key/signature`，节点签名覆盖 `node_id + node_public_key + challenge_id + nonce + 用途 + 签发时间 + 过期时间`。
 - 注册请求：`{"schema_version":1,"account_id","credential","capability"}`（`credential` 为账户主管钥签发的设备凭据，`capability` 为只允许登记该设备的一次性注册能力）；响应为 `{"schema_version":1,"registration":DeviceRegistration}`，回执由节点签名。
 - 鉴权头：`x-chat-device-id`、`x-chat-challenge-id`、`x-chat-challenge-nonce`、`x-chat-signature`。签名原文固定为 `域分隔 + node_id + device_id + 用途 + 大写 method + 规范 path + query + sha256(正文) + challenge nonce`，与 API-003 处理步骤 1 的规范化要求一致；path 拒绝百分号编码、`?`/`#`、反斜杠与 `.`/`..` 段，保证线上原文与签名原文只有唯一写法。
-- 正文上限：64 KiB（`limits::MAX_HTTP_BODY_BYTES`，可用 `NodeAuthPolicy.max_request_body_bytes` 收紧）；超出返回 413 `PAYLOAD_TOO_LARGE`。
+- JSON DTO 正文上限：64 KiB（`limits::MAX_HTTP_BODY_BYTES`，可用 `NodeAuthPolicy.max_request_body_bytes` 收紧）；超出返回 413 `PAYLOAD_TOO_LARGE`。
+- 原始密文块正文上限：**4 MiB**（`limits::MAX_BLOB_CHUNK_BODY_BYTES` = 分块硬上限），只作用于 `PUT /v1/blobs/{id}/chunks/{index}` 这一条路由（路由级 `DefaultBodyLimit` 覆盖全局 64 KiB）；其余路由仍是上面的 64 KiB。块正文的具体大小另由服务层按会话声明的 `chunk_bytes` 与 `BlobPolicy.max_chunk_bytes` 校验，超限仍是 `CONTENT_TOO_LARGE`（错误码不变）。
 - 设备上限：每账户默认 2 台有效设备（`limits::DEFAULT_MAX_DEVICES_PER_ACCOUNT`，与产品口径一致；`NodeAuthPolicy.max_devices_per_account` 可配）；达到上限返回 409 `DEVICE_LIMIT_EXCEEDED`，不静默替换或截断旧设备。
 - 错误体：`{"schema_version":1,"error":{"code","message"}}`；状态映射：400 INVALID_REQUEST/UNSUPPORTED_SCHEMA_VERSION，401 INVALID_CHALLENGE/NODE_ID_MISMATCH/AUTH_EXPIRED/AUTH_REPLAY/INVALID_SIGNATURE/INVALID_CREDENTIAL，403 DEVICE_REVOKED/INVALID_CAPABILITY/PERMISSION_DENIED，409 DEVICE_LIMIT_EXCEEDED，413 PAYLOAD_TOO_LARGE，429 RATE_LIMITED，503 CHALLENGE_CAPACITY_EXCEEDED/STORAGE_FAILURE，500 MIGRATION_FAILED/NODE_IDENTITY_MISMATCH/INVALID_CONFIG/ENCODING_FAILURE。
 
@@ -50,7 +51,8 @@
 附件 blob 端点的两点特殊约定：
 
 - `PUT` 与 `GET` 共用同一个 URL 形状（`/v1/blobs/{id}/chunks/{index}`）：`PUT` 的 `{id}` 是**上传会话 id**，`GET` 的 `{id}` 是**已发布 blob id**。axum 不允许同名形状的两种参数命名，因此路由参数统一叫 `id`，由方法决定语义。
-- 块正文不做 hex/JSON 二次编码：`PUT` 直接发送原始密文（content-type `application/octet-stream`），`GET` 直接返回原始密文；请求签名仍然覆盖 `sha256(正文)`。因此单块上限（`BlobPolicy.max_chunk_bytes`，默认 32 KiB）必须小于正文上限 64 KiB。
+- 块正文不做 hex/JSON 二次编码：`PUT` 直接发送原始密文（content-type `application/octet-stream`），`GET` 直接返回原始密文；请求签名仍然覆盖 `sha256(正文)`。
+- **分块上限与客户端冻结分块对齐（本轮修正）**：客户端附件按 **256 KiB 明文**分块（CRYPTO-011，已冻结），密文块 = 明文 + 29 字节封装（版本 1 + nonce 12 + tag 16）= **262_173 字节**。因此 `BlobPolicy.max_chunk_bytes` 默认 **1 MiB**、硬上限 **4 MiB**（旧值 32 KiB / 60 KiB 会让所有多块附件被 413 `CONTENT_TOO_LARGE` 拒绝）；块正文的传输上限相应为 4 MiB（见上一条），JSON DTO 路由仍是 64 KiB。总大小（`max_object_bytes` 8 MiB）、块数（`max_chunk_count` 512）、每设备配额（32 MiB）**均未改变**。
 
 请求/响应同样带 `schema_version`（当前只接受 1）。校验顺序固定为：正文限长 → DTO 解码 → API-003 鉴权 → 领域调用 → 结果映射；handler 不另开事务、不重复领域规则。
 

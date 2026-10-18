@@ -942,8 +942,14 @@ cargo test --offline -p chat-core                        # lib 15（含 stub_por
 
 - `PersistedAttachmentStore::upload_attachment(attachment_id, &mut transport)`：按 storage 的 `mark_attachment_state` 白名单迁移 `imported → uploading → available`，从本地加密缓存按序上传分块**密文**，节点 complete 后才标 available；已 available 时幂等无操作；中断保留缓存与进程内进度可重试。
 - `PersistedAttachmentStore::download_attachment(blob_id, expected_manifest, destination, &mut transport)`：先用 manifest 与本地记录比对（不一致在任何网络读取前 `ATTACHMENT_CORRUPTED`），逐块 `read_chunk` → CRYPTO-012 认证解密 → 临时文件 → 校验密文摘要 + 明文总长 + 明文 SHA-256 后 rename；失败删临时文件、状态留在 `downloading` 可重试；没有进程内 FileKey 时 `ATTACHMENT_KEY_UNAVAILABLE` 且零读取。
-- 节点交互抽象为 `BlobTransport` 端口（begin_upload / put_chunk / complete / read_chunk），真实节点适配由上层实现；端口失败用 `AttachmentError::Transport { code, detail }` 保留冻结码（如 `NODE_UNAVAILABLE`）。
+- 节点交互抽象为 `BlobTransport` 端口（begin_upload / put_chunk / complete / read_chunk），真实节点适配是 [crates/core/src/attachment_transport.rs](../../crates/core/src/attachment_transport.rs) 的 `NodeBlobTransport`（NODE-012~015，真 axum 节点实测）；端口失败用 `AttachmentError::Transport { code, detail }` 保留冻结码（节点码优先，其次 PROTOCOL-014 码，如 `NODE_UNAVAILABLE` / `NETWORK_UNAVAILABLE` / `QUOTA_EXCEEDED` / `MANIFEST_MISMATCH`）。
 
-证据：`cargo test --offline -p chat-core` → 70 passed（附件 20 个 lib 用例，其中新增 6 个：上传 2 + 下载 4；既有 64 个继续通过）。
+`NodeBlobTransport` 的三条关键约定（详见 [attachments.md 的节点块传输适配实现记录](attachments.md)）：
+
+- 标识映射：本地附件 ID → 节点 blob `obj:1:sha256(域 || attachment_id)`；上传 operation → `op:1:sha256(域 || attachment_id || ciphertext_digest)`（重试复用同一会话，节点按 (设备, operation) 幂等）。
+- 声明块大小：`chunk_count > 1` → `chunk_bytes = chunk_size + 29`（封装开销）；单块 → `chunk_bytes = ciphertext_bytes`；发送前先校验 `ciphertext_bytes == plain_size + chunk_count*29`。
+- 错误保真：节点/网络错误一律 `AttachmentError::Transport{code, detail}`，细节只含静态说明，不含 URL/正文/密钥。
+
+证据：`cargo test --offline -p chat-core` → 76 passed（26 lib + 7 cancel_events + 5 draft_status_events + 6 identity + 5 node_submitter + 2 p0 + 6 attachment_transport + 14 send_orchestrator + 5 service；既有 70 个继续通过）；`--test attachment_transport` 6 passed（真节点上传/下载往返、断链可重试、节点重启后仍可下载、配额/鉴权码保真、多块被节点策略拒绝）。
 
 

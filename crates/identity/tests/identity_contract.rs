@@ -5,9 +5,9 @@
 
 use chat_identity::{
     AccountKeys, AccountView, CapabilitySet, Contact, ContactState, DeviceCapability, DeviceKeys,
-    IdentityError, IdentityUpdate, InviteExpectations, InviteScope, LocalAccount, MAX_DISPLAY_NAME_BYTES,
-    RevocationSet, TrustAnchor, accept_contact_invite, confirm_contact, current_account,
-    verification_fingerprint, verify_credential,
+    IdentityError, IdentityUpdate, InviteExpectations, InviteScope, LocalAccount,
+    MAX_DISPLAY_NAME_BYTES, RevocationSet, StorageErrorKind, TrustAnchor, accept_contact_invite,
+    confirm_contact, current_account, verification_fingerprint, verify_credential,
 };
 use chat_protocol::{AccountId, CoordinatorId, DeviceId, ErrorCode};
 
@@ -333,6 +333,19 @@ fn identity_errors_map_to_frozen_protocol_codes() {
         IdentityError::IdentityChanged,
         IdentityError::ContactNotAccepted,
         IdentityError::MissingIdentity,
+        IdentityError::Storage(StorageErrorKind::Locked),
+        IdentityError::Storage(StorageErrorKind::Corrupted),
+        IdentityError::Storage(StorageErrorKind::Failure),
+        IdentityError::Storage(StorageErrorKind::InvalidInput),
+        IdentityError::Storage(StorageErrorKind::Conflict),
+        IdentityError::Storage(StorageErrorKind::InvalidStateTransition),
+        IdentityError::DeviceLimitExceeded,
+        IdentityError::LastDeviceRequiresRecovery,
+        IdentityError::LinkExpired,
+        IdentityError::InvalidLinkTtl { max_ms: 600_000 },
+        IdentityError::LinkMismatch,
+        IdentityError::DeviceNotFound,
+        IdentityError::MissingCapability,
     ];
     for error in samples {
         let code = error.code();
@@ -340,7 +353,12 @@ fn identity_errors_map_to_frozen_protocol_codes() {
             known.contains(code.as_str()),
             "{code:?} is not in the frozen protocol code table"
         );
-        assert!(!error.retryable(), "{error:?} must not be auto retried");
+        // 唯一允许自动重试的是"存储被另一个写者锁定"（协议码表本身规定可重试）。
+        if error == IdentityError::Storage(StorageErrorKind::Locked) {
+            assert!(error.retryable(), "STORAGE_LOCKED is retryable by the frozen table");
+        } else {
+            assert!(!error.retryable(), "{error:?} must not be auto retried");
+        }
         assert!(error.detail_key().starts_with("identity."));
         assert!(!error.to_string().is_empty());
     }

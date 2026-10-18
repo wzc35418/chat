@@ -13,6 +13,40 @@ use chat_protocol::{ErrorCode, IdError, ProtocolError};
 
 use crate::contact::ContactState;
 
+/// 正式存储失败分类（只保留需要上层区分处理的种类）。
+///
+/// 存储层的完整错误码见 chat-storage 的 StorageError；身份层把它们收敛成可复制的
+/// 六类，仍映射到 protocol 冻结码表，不新增码。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageErrorKind {
+    /// 另一个写者持有独占锁。
+    Locked,
+    /// 密钥校验/密文认证/结构校验失败。
+    Corrupted,
+    /// 底层 I/O 或 SQLite 失败。
+    Failure,
+    /// 调用方输入不合法。
+    InvalidInput,
+    /// 已绑定到别的身份材料（不可覆盖）。
+    Conflict,
+    /// 目标状态与当前状态冲突（例如复活已撤销设备）。
+    InvalidStateTransition,
+}
+
+impl StorageErrorKind {
+    /// 稳定诊断键后缀（用于 UI 文案映射）。
+    pub const fn detail_suffix(self) -> &'static str {
+        match self {
+            StorageErrorKind::Locked => "locked",
+            StorageErrorKind::Corrupted => "corrupted",
+            StorageErrorKind::Failure => "failure",
+            StorageErrorKind::InvalidInput => "invalid_input",
+            StorageErrorKind::Conflict => "conflict",
+            StorageErrorKind::InvalidStateTransition => "invalid_state_transition",
+        }
+    }
+}
+
 /// identity 层返回类型。
 pub type Result<T> = core::result::Result<T, IdentityError>;
 
@@ -81,6 +115,22 @@ pub enum IdentityError {
     MissingIdentity,
     /// 撤销集合超过容量上限。
     TooManyRevocations { limit: usize },
+    /// 正式存储失败（分类见 [StorageErrorKind]）。
+    Storage(StorageErrorKind),
+    /// 账户有效设备数达到上限。
+    DeviceLimitExceeded,
+    /// 撤销最后一台可管理设备需要走恢复流程。
+    LastDeviceRequiresRecovery,
+    /// 配对请求已过期，必须重新生成。
+    LinkExpired,
+    /// 配对请求的 TTL 不在允许范围。
+    InvalidLinkTtl { max_ms: u64 },
+    /// 授权凭据与本地待配对设备的公钥不匹配。
+    LinkMismatch,
+    /// 本机没有该设备的凭据记录。
+    DeviceNotFound,
+    /// 设备凭据缺少本次操作需要的能力。
+    MissingCapability,
 }
 
 impl IdentityError {
@@ -118,6 +168,21 @@ impl IdentityError {
             | IdentityError::WrongInviteDevice => ErrorCode::InvalidTarget,
             IdentityError::InvalidStateTransition { .. } => ErrorCode::InvalidStateTransition,
             IdentityError::ContactNotAccepted => ErrorCode::ContactNotAccepted,
+            IdentityError::Storage(kind) => match kind {
+                StorageErrorKind::Locked => ErrorCode::StorageLocked,
+                StorageErrorKind::Corrupted => ErrorCode::StateCorrupted,
+                StorageErrorKind::Failure => ErrorCode::StorageFailure,
+                StorageErrorKind::InvalidInput => ErrorCode::InvalidTarget,
+                StorageErrorKind::Conflict => ErrorCode::InvalidCredential,
+                StorageErrorKind::InvalidStateTransition => ErrorCode::InvalidStateTransition,
+            },
+            IdentityError::DeviceLimitExceeded => ErrorCode::DeviceLimitExceeded,
+            IdentityError::LastDeviceRequiresRecovery => ErrorCode::PermissionDenied,
+            IdentityError::LinkExpired => ErrorCode::CursorExpired,
+            IdentityError::InvalidLinkTtl { .. } => ErrorCode::InvalidTarget,
+            IdentityError::LinkMismatch
+            | IdentityError::DeviceNotFound => ErrorCode::InvalidCredential,
+            IdentityError::MissingCapability => ErrorCode::RequiredCapabilityMissing,
         }
     }
 
@@ -155,6 +220,21 @@ impl IdentityError {
             IdentityError::ContactNotAccepted => "identity.contact_not_accepted",
             IdentityError::MissingIdentity => "identity.missing_identity",
             IdentityError::TooManyRevocations { .. } => "identity.too_many_revocations",
+            IdentityError::Storage(kind) => match kind {
+                StorageErrorKind::Locked => "identity.storage_locked",
+                StorageErrorKind::Corrupted => "identity.storage_corrupted",
+                StorageErrorKind::Failure => "identity.storage_failure",
+                StorageErrorKind::InvalidInput => "identity.storage_invalid_input",
+                StorageErrorKind::Conflict => "identity.storage_conflict",
+                StorageErrorKind::InvalidStateTransition => "identity.storage_state_transition",
+            },
+            IdentityError::DeviceLimitExceeded => "identity.device_limit_exceeded",
+            IdentityError::LastDeviceRequiresRecovery => "identity.last_device_requires_recovery",
+            IdentityError::LinkExpired => "identity.link_expired",
+            IdentityError::InvalidLinkTtl { .. } => "identity.invalid_link_ttl",
+            IdentityError::LinkMismatch => "identity.link_mismatch",
+            IdentityError::DeviceNotFound => "identity.device_not_found",
+            IdentityError::MissingCapability => "identity.missing_capability",
         }
     }
 
@@ -229,11 +309,58 @@ impl fmt::Display for IdentityError {
             IdentityError::TooManyRevocations { limit } => {
                 write!(formatter, "revocation set exceeds {limit} devices")
             }
+            IdentityError::Storage(kind) => {
+                write!(formatter, "storage failure: {}", kind.detail_suffix())
+            }
+            IdentityError::DeviceLimitExceeded => {
+                formatter.write_str("account reached the active device limit")
+            }
+            IdentityError::LastDeviceRequiresRecovery => {
+                formatter.write_str("the last manageable device cannot be revoked here")
+            }
+            IdentityError::LinkExpired => formatter.write_str("device link expired"),
+            IdentityError::InvalidLinkTtl { max_ms } => {
+                write!(formatter, "device link lifetime is outside 1..={max_ms} ms")
+            }
+            IdentityError::LinkMismatch => {
+                formatter.write_str("device link does not match this device key")
+            }
+            IdentityError::DeviceNotFound => formatter.write_str("device credential not found"),
+            IdentityError::MissingCapability => {
+                formatter.write_str("device credential lacks a required capability")
+            }
         }
     }
 }
 
 impl std::error::Error for IdentityError {}
+
+impl From<chat_storage::formal::StorageError> for IdentityError {
+    fn from(error: chat_storage::formal::StorageError) -> Self {
+        use chat_storage::formal::StorageError as Storage;
+        let kind = match error {
+            Storage::Locked(_) | Storage::Busy(_) => StorageErrorKind::Locked,
+            Storage::StateCorrupted(_)
+            | Storage::MigrationFailed(_)
+            | Storage::SchemaTooNew { .. }
+            | Storage::RollbackFailed(_)
+            | Storage::RecoveryRequired(_) => StorageErrorKind::Corrupted,
+            Storage::IdentityAccountConflict(_) => StorageErrorKind::Conflict,
+            Storage::InvalidInput(_)
+            | Storage::InvalidCursor(_)
+            | Storage::VersionConflict { .. }
+            | Storage::OperationIdConflict(_)
+            | Storage::SubmissionIdConflict(_)
+            | Storage::MessageIdConflict(_)
+            | Storage::JobLeaseConflict(_) => StorageErrorKind::InvalidInput,
+            Storage::InvalidStateTransition(_) | Storage::StaleEpoch { .. } => {
+                StorageErrorKind::InvalidStateTransition
+            }
+            _ => StorageErrorKind::Failure,
+        };
+        IdentityError::Storage(kind)
+    }
+}
 
 impl From<ProtocolError> for IdentityError {
     fn from(error: ProtocolError) -> Self {

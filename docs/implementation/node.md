@@ -570,7 +570,20 @@ begin_blob_upload(actor: AuthenticatedDevice, descriptor: PublicBlobDescriptor, 
 
 验证证据（`cargo test --offline -p chat-node-services -p chat-node-api -p chat-node-client` 全绿）：`blob::upload_round_trip_returns_exact_ciphertext_chunks`、`blob::operation_dedup_returns_same_session_and_conflicts_on_divergence`、`blob::device_quota_is_enforced_across_uploads`、`blob::device_quota_is_enforced_across_uploads`（在传预留也计入配额）、`blob::descriptor_validation_rejects_malformed_shapes`、`blob::size_and_count_limits_are_enforced`、`blob::source_entry_and_membership_window_gate_uploads_and_reads`，HTTP/客户端侧 `blob_upload_and_read_round_trip_over_http`、`blob_http_error_statuses_are_stable`、客户端 `blob_flow::blob_upload_and_read_round_trip_over_http`。
 
-已知限制：API-004 validate_capability 未实现，因此没有独立的上传能力令牌（授权=已登记设备 + 群成员 + 本人条目）；没有按设备/群的速率限制（API-005）；过期会话不会主动回收（NODE-016 未实现）。通过本函数用例不自动代表整个模块完成。
+### 分块上限与客户端冻结分块的对齐（本轮修正）
+
+节点侧的分块上限必须放得下客户端**已经冻结**的附件分块，否则多块附件在 begin/put 阶段一律被 CONTENT_TOO_LARGE 拒绝：
+
+- 客户端格式（CRYPTO-011，不改）：附件按 **256 KiB 明文**分块；每块密文 = 1 字节版本 + 12 字节 nonce + 16 字节 tag + 明文，即 **+29 字节**；满密文块 = **262_173 字节**。单块附件时声明块大小 = 密文总长，多块时声明块大小 = 262_173。
+- 修正前：`DEFAULT_BLOB_CHUNK_BYTES` 32 KiB、`MAX_BLOB_CHUNK_BYTES_LIMIT` 60 KiB → 任何 262_173 字节的块都超限，多块附件不可用（core 的 `NodeBlobTransport` 已如实记录该差异）。
+- 修正后：**默认 1 MiB、硬上限 4 MiB**；`CLIENT_ATTACHMENT_CIPHERTEXT_CHUNK_BYTES`（262_173）与上述两个常量之间的不变量用 `const` 断言锁死——把默认值改到 262_173 以下会**直接编译失败**，不会退化成运行期拒绝。
+- **未改变**的维度：单对象总密文 8 MiB（`DEFAULT_BLOB_OBJECT_BYTES`）、块数 512（`DEFAULT_BLOB_CHUNK_COUNT`）、每设备配额 32 MiB（`DEFAULT_BLOB_BYTES_PER_DEVICE`）。1 MiB 块 × 512 块远大于 8 MiB 对象上限，因此放宽块大小不会放宽实际可存字节。
+- 传输层：密文块以原始字节 PUT（无编码开销），因此路由级正文上限 `MAX_BLOB_CHUNK_BODY_BYTES` = 4 MiB（= 分块硬上限），**只**作用于 `PUT /v1/blobs/{id}/chunks/{index}`；JSON DTO 路由仍是 64 KiB（`MAX_HTTP_BODY_BYTES`）。客户端 `ClientLimits` 相应拆成 `max_request_bytes`（64 KiB，JSON）与 `max_chunk_bytes`（4 MiB，块）。
+- 尺寸校验仍是单点：块正文是否超限/与声明边界不符由服务层判定（CONTENT_TOO_LARGE / MANIFEST_MISMATCH），HTTP 层不放宽、也不改写错误码。
+
+验证证据（本轮新增）：`blob::default_blob_chunk_limit_fits_the_frozen_client_chunk_size`（默认 1 MiB / 硬上限 4 MiB / 客户端密文块 262_173 与 const 不变量、硬上限 +1 配置 INVALID_CONFIG）、`blob::client_scale_multi_chunk_attachment_is_accepted_by_the_default_policy`（默认策略下 262_173 ×2 + 末块 1 000 的三块附件可上传/发布/按块原样取回）、`blob::chunk_exactly_at_the_limit_is_accepted_and_over_the_limit_is_rejected`（260 KiB 恰好等于上限通过、+1 字节仍 CONTENT_TOO_LARGE）、`group_mailbox_http::chunk_body_limit_accepts_client_scale_chunks_but_keeps_dto_routes_bounded`（262_173 字节原始正文经路由层通过；64 KiB + 1 的 JSON 正文仍 413）、`blob_flow::client_scale_multi_chunk_attachment_round_trips_over_http`（node-client → node-api → node-services 端到端，客户端默认 `max_chunk_bytes` = 4 MiB、`max_request_bytes` 仍 64 KiB）。
+
+已知限制：API-004 validate_capability 未实现，因此没有独立的上传能力令牌（授权=已登记设备 + 群成员 + 本人条目）；过期会话不会主动回收（NODE-016 未实现）。**按设备字节预算**（API-005，默认 8 MiB/60 s 窗口）与单对象上限（8 MiB）同量级，因此一次满额附件上传可能刚好用尽一个窗口的字节预算、第二个大附件要等下一个窗口——调大默认块大小不会改变该预算，属于部署参数选择。通过本函数用例不自动代表整个模块完成。
 
 <a id="node-013"></a>
 
@@ -611,11 +624,11 @@ put_blob_chunk(upload: UploadId, index: u32, bytes: CipherChunk, actor: Authenti
 1. 归属与生命周期：只有上传设备本人能写块（否则 PERMISSION_DENIED）；会话不存在 UPLOAD_NOT_FOUND、已过期或已结束 UPLOAD_EXPIRED（已完成会话的重复块仍走幂等分支）。
 2. 幂等：同 `(upload_id, chunk_index)` 已存在时，同摘要同长度返回**同一份回执**（不占第二份），相异字节 CHUNK_CONFLICT。
 3. 按序：下一个待写序号 = 已提交块数；index 大于它即 CHUNK_OUT_OF_ORDER，小于它但内容不同即 CHUNK_CONFLICT，越界（≥ 声明块数）INVALID_REQUEST。
-4. 边界：单块超过策略上限或超过声明块大小 → CONTENT_TOO_LARGE；与声明边界不符（更短）→ MANIFEST_MISMATCH；空块 INVALID_REQUEST。
+4. 边界：单块超过策略上限（默认 1 MiB、硬上限 4 MiB，见 NODE-012 的对齐说明）或超过声明块大小 → CONTENT_TOO_LARGE；与声明边界不符（更短）→ MANIFEST_MISMATCH；空块 INVALID_REQUEST。客户端满密文块 262_173 字节在默认策略下因此可以正常写入。
 5. 原子性：块登记行（`blob_chunks`）与块内容（`blob_chunk_content`）在**同一个** IMMEDIATE 事务写入，节点没有独立文件系统路径，因此不存在“文件已写、DB 未登记”的双系统半写；`storage_ref` 是内容寻址引用（`sha256:<hex>`）。
 6. 回执：节点签名的 `ChunkReceipt`（域 `chat/p1/node-blob-chunk-receipt/v1`，绑定 upload/序号/摘要/字节数/进度）。
 
-验证证据：`blob::duplicate_chunk_is_idempotent_and_divergent_chunk_is_rejected`、`blob::chunks_must_arrive_in_order_and_index_is_bounded`、`blob::size_and_count_limits_are_enforced`、`blob::expired_upload_session_rejects_chunks_and_completion`、`blob::unknown_identifiers_and_foreign_uploads_are_rejected`，HTTP/客户端侧 `blob_http_error_statuses_are_stable`（409/413/400/410）、`blob_flow::out_of_order_and_missing_chunks_are_rejected`、`blob_flow::duplicate_chunk_is_idempotent_and_size_violation_is_rejected`。
+验证证据：`blob::duplicate_chunk_is_idempotent_and_divergent_chunk_is_rejected`、`blob::chunks_must_arrive_in_order_and_index_is_bounded`、`blob::size_and_count_limits_are_enforced`、`blob::expired_upload_session_rejects_chunks_and_completion`、`blob::unknown_identifiers_and_foreign_uploads_are_rejected`、`blob::chunk_exactly_at_the_limit_is_accepted_and_over_the_limit_is_rejected`（260 KiB 边界）、`blob::client_scale_multi_chunk_attachment_is_accepted_by_the_default_policy`（262_173 字节满块），HTTP/客户端侧 `blob_http_error_statuses_are_stable`（409/413/400/410）、`chunk_body_limit_accepts_client_scale_chunks_but_keeps_dto_routes_bounded`、`blob_flow::out_of_order_and_missing_chunks_are_rejected`、`blob_flow::duplicate_chunk_is_idempotent_and_size_violation_is_rejected`、`blob_flow::client_scale_multi_chunk_attachment_round_trips_over_http`。
 
 已知限制：块内容与登记行同库同事务，因此“写文件后 crash 的恢复/清理”这条文件系统语义**不适用**（也没有踩点实验）——本实现刻意选择单库单事务而不是“文件 + DB”双系统；NODE-016 的临时物回收仍未实现。通过本函数用例不自动代表整个模块完成。
 
