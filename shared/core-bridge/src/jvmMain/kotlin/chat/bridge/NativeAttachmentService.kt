@@ -60,5 +60,6 @@ private fun uniffi.chat_ffi.AttachmentView.toLocal() = LocalAttachment(
     displayName = displayName,
     state = state,
     availableChunks = availableChunks.toInt(),
+    transferredChunks = transferredChunks.toInt(),
     cancelRequested = cancelRequested,
 )

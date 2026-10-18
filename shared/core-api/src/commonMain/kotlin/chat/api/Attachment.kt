@@ -11,6 +11,8 @@ data class LocalAttachment(
     /** imported / cancelled … */
     val state: String,
     val availableChunks: Int,
+    /** 已传输块数（上传/下载进度；失败后保留）。 */
+    val transferredChunks: Int,
     val cancelRequested: Boolean,
 )
 

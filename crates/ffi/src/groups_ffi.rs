@@ -1,0 +1,375 @@
+//! 群治理的 UniFFI 对象（GROUPS-001~006 + 控制提交接受/丢弃）。
+//!
+//! 薄封装：建群、快照、角色、禁言、移除、改名、接受合并、丢弃回滚都在
+//! `chat_core::groups`；本层只做「打开一个独占写库 → 调 core 方法 → 投影成 FFI 记录」。
+//!
+//! 契约要点（与 docs/implementation/bridge.md 的记录一致）：
+//!
+//! - `GroupFfi::open(database_path, master_key_hex, node)`：打开**独占单写者**的正式加密库
+//!   （与 `LocalStoreFfi` / `AttachmentFfi` 不能同时打开同一库）；`node` 本轮只保存，不发请求；
+//! - 所有群方法都用**从库恢复**的本机 MLS 设备（`MlsDevice::import_from_store`），不跨调用持有设备；
+//! - 位置/角色/状态都是字符串或数字，不暴露密钥；错误一律 `FfiError::Store { code, reason }`，
+//!   `code` 是 groups 的冻结码（`PERMISSION_DENIED` / `INVALID_TARGET` / `INVALID_INPUT` /
+//!   `INVALID_ID` / `PENDING_MISMATCH` / `STATE_CORRUPTED` / `STALE_EPOCH` / `CORE_CLOSED` …）；
+//! - **本地接受证据 ≠ 节点回执**：`group_accept_pending` 只收口本地状态（epoch/成员/pending），
+//!   不证明节点已接受；真实部署需先拿节点回执（NODE 侧），见 groups.md。
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use chat_core::groups::{
+    GroupControlClearedView, GroupMemberKeyPackage, GroupMemberView, GroupPendingView, GroupView,
+    MAX_GROUP_MEMBERS, MAX_GROUP_NAME_BYTES,
+};
+use chat_core::service::{ConversationCore, group_role_code};
+
+use crate::local_store::FfiError;
+
+/// 把内核错误投影成 FFI 错误（冻结码；groups 的码由 service::error_code 透传）。
+macro_rules! failure {
+    ($error:expr) => {{
+        let (code, reason) = chat_core::service::error_projection(&$error);
+        FfiError::Store {
+            code: code.to_owned(),
+            reason,
+        }
+    }};
+}
+
+fn poisoned(what: &str) -> FfiError {
+    FfiError::Store {
+        code: "INTERNAL_FAILURE".to_owned(),
+        reason: format!("{what} is poisoned"),
+    }
+}
+
+fn invalid_input(reason: &str) -> FfiError {
+    FfiError::Store {
+        code: "INVALID_INPUT".to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
+/// 群成员投影（不含密钥材料）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupMemberFfi {
+    /// 成员凭据身份（创建/移除时用的同一个字符串）。
+    pub credential: String,
+    /// 角色：`owner` / `admin` / `member`。
+    pub role: String,
+    /// 是否被禁言。
+    pub muted: bool,
+    /// 是否本机设备。
+    pub is_local: bool,
+    /// 是否仍在 pending（追加成员被接受前为 true）。
+    pub pending: bool,
+}
+
+/// 未决控制提交投影。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupPendingFfi {
+    /// 操作种类：`add_members` / `remove_members` / `self_update`。
+    pub operation: String,
+    /// 提交基于的 epoch。
+    pub base_epoch: u64,
+    /// 接受后应到达的 epoch。
+    pub target_epoch: u64,
+    /// 预期新增成员数。
+    pub added: u32,
+    /// 预期移除成员数。
+    pub removed: u32,
+    /// 提交摘要（小写 hex）。
+    pub commit_digest: String,
+}
+
+/// 最近一次被丢弃控制提交的审计投影。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupClearedFfi {
+    /// 被丢弃的操作种类。
+    pub operation: String,
+    /// 提交基于的 epoch。
+    pub base_epoch: u64,
+    /// 提交本应到达的 epoch。
+    pub target_epoch: u64,
+    /// 提交摘要（小写 hex）。
+    pub commit_digest: String,
+    /// 稳定原因码。
+    pub reason_code: String,
+    /// 调用方给的脱敏说明。
+    pub detail: String,
+    /// 丢弃时间（Unix 毫秒）。
+    pub cleared_at_ms: i64,
+}
+
+/// 建群时追加成员的输入（真实 KeyPackage 字节 + 凭据身份）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupMemberInputFfi {
+    /// 成员凭据身份。
+    pub credential: String,
+    /// 该成员的序列化 MLS KeyPackage。
+    pub key_package: Vec<u8>,
+}
+
+/// 群投影（快照与每次治理的结果）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupViewFfi {
+    /// 协议群 ID（`grp:1:<hex>`）。
+    pub group_id: String,
+    /// 群名。
+    pub name: String,
+    /// 当前已提交 MLS epoch。
+    pub epoch: u64,
+    /// 群策略版本（每次被接受的策略操作 +1）。
+    pub policy_version: u64,
+    /// 本机在群里的角色。
+    pub role: String,
+    /// 正式控制头（小写 hex；下一次治理的 CAS 前置值）。
+    pub control_head: String,
+    /// MLS 群键（小写 hex；诊断用）。
+    pub mls_group_key: String,
+    /// 快照记录版本（每次写入 +1）。
+    pub state_version: u64,
+    /// 创建时间（Unix 毫秒）。
+    pub created_at_ms: i64,
+    /// 正式成员（不含 pending）。
+    pub members: Vec<GroupMemberFfi>,
+    /// pending 追加成员。
+    pub pending_members: Vec<GroupMemberFfi>,
+    /// 已移除但尚未合并的成员（接受移除提交后消失，丢弃则恢复）。
+    pub pending_removed: Vec<GroupMemberFfi>,
+    /// 未决控制提交。
+    pub pending: Option<GroupPendingFfi>,
+    /// 最近一次被丢弃控制提交的审计。
+    pub last_control_cleared: Option<GroupClearedFfi>,
+}
+
+fn member_view(member: &GroupMemberView) -> GroupMemberFfi {
+    GroupMemberFfi {
+        credential: member.credential.clone(),
+        role: group_role_code(member.role).to_owned(),
+        muted: member.muted,
+        is_local: member.is_local,
+        pending: member.pending,
+    }
+}
+
+fn pending_view(pending: &GroupPendingView) -> GroupPendingFfi {
+    GroupPendingFfi {
+        operation: pending.operation.clone(),
+        base_epoch: pending.base_epoch,
+        target_epoch: pending.target_epoch,
+        added: pending.added,
+        removed: pending.removed,
+        commit_digest: pending.commit_digest.clone(),
+    }
+}
+
+fn cleared_view(cleared: &GroupControlClearedView) -> GroupClearedFfi {
+    GroupClearedFfi {
+        operation: cleared.operation.clone(),
+        base_epoch: cleared.base_epoch,
+        target_epoch: cleared.target_epoch,
+        commit_digest: cleared.commit_digest.clone(),
+        reason_code: cleared.reason_code.clone(),
+        detail: cleared.detail.clone(),
+        cleared_at_ms: cleared.cleared_at_ms,
+    }
+}
+
+fn group_view(view: GroupView) -> GroupViewFfi {
+    GroupViewFfi {
+        group_id: view.group_id,
+        name: view.name,
+        epoch: view.epoch,
+        policy_version: view.policy_version,
+        role: group_role_code(view.role).to_owned(),
+        control_head: view.control_head,
+        mls_group_key: view.mls_group_key,
+        state_version: view.state_version,
+        created_at_ms: view.created_at_ms,
+        members: view.members.iter().map(member_view).collect(),
+        pending_members: view.pending_members.iter().map(member_view).collect(),
+        pending_removed: view.pending_removed.iter().map(member_view).collect(),
+        pending: view.pending.as_ref().map(pending_view),
+        last_control_cleared: view.last_control_cleared.as_ref().map(cleared_view),
+    }
+}
+
+/// 群治理 FFI 门面。
+#[derive(uniffi::Object)]
+pub struct GroupFfi {
+    core: Mutex<ConversationCore>,
+    node: Option<String>,
+}
+
+impl GroupFfi {
+    fn lock(&self) -> Result<MutexGuard<'_, ConversationCore>, FfiError> {
+        self.core.lock().map_err(|_| poisoned("group core"))
+    }
+}
+
+#[uniffi::export]
+impl GroupFfi {
+    /// 打开群治理对象（独占单写者的正式加密库）。
+    ///
+    /// 数据目录必须已存在；主密钥是 64 位十六进制；`node` 本轮只保存（不联网），
+    /// 供上层记录“该群绑定哪个协调节点”。与 `LocalStoreFfi` / `AttachmentFfi` 互斥。
+    #[uniffi::constructor]
+    pub fn open(
+        database_path: String,
+        master_key_hex: String,
+        node: Option<String>,
+    ) -> Result<Arc<Self>, FfiError> {
+        let core = ConversationCore::open(&database_path, &master_key_hex)
+            .map_err(|error| failure!(error))?;
+        Ok(Arc::new(Self {
+            core: Mutex::new(core),
+            node,
+        }))
+    }
+
+    /// 构造时保存的节点标识（本轮不联网，仅诊断/展示）。
+    pub fn node(&self) -> Option<String> {
+        self.node.clone()
+    }
+
+    /// 是否仍处于打开状态。
+    pub fn is_open(&self) -> bool {
+        match self.core.lock() {
+            Ok(core) => core.is_open(),
+            Err(_) => false,
+        }
+    }
+
+    /// 关闭并释放独占写锁；之后所有调用返回 `CORE_CLOSED`。
+    pub fn shutdown(&self) {
+        if let Ok(core) = self.core.lock() {
+            core.close();
+        }
+    }
+
+    /// GROUPS-001：建群（本机 + 引导成员），追加成员走 pending Add 提交。
+    ///
+    /// `local_credential` 传空串时使用**持久身份**的设备 ID（未入库身份 → `INVALID_STATE_TRANSITION`）。
+    /// `bootstrap_credential` 的 MLS 设备由本进程临时创建（crypto 目前只有双人引导路径，
+    /// 真实邀请加入属 GROUPS-004，未实现）。
+    pub fn group_create(
+        &self,
+        name: String,
+        local_credential: String,
+        bootstrap_credential: String,
+        members: Vec<GroupMemberInputFfi>,
+    ) -> Result<GroupViewFfi, FfiError> {
+        if name.trim().is_empty() || name.len() > MAX_GROUP_NAME_BYTES {
+            return Err(invalid_input("group name must be 1..=64 bytes"));
+        }
+        if bootstrap_credential.trim().is_empty() {
+            return Err(invalid_input("bootstrap credential must not be empty"));
+        }
+        if members.len() + 2 > MAX_GROUP_MEMBERS {
+            return Err(FfiError::Store {
+                code: "GROUP_LIMIT_EXCEEDED".to_owned(),
+                reason: "group member count exceeds the configured limit".to_owned(),
+            });
+        }
+        let members = members
+            .into_iter()
+            .map(|member| GroupMemberKeyPackage {
+                credential: member.credential,
+                key_package: member.key_package,
+            })
+            .collect();
+        let mut core = self.lock()?;
+        let view = core
+            .group_create(&name, &local_credential, &bootstrap_credential, members)
+            .map_err(|error| failure!(error))?;
+        Ok(group_view(view))
+    }
+
+    /// GROUPS-002：读取正式群快照。
+    pub fn group_snapshot(&self, group_id: String) -> Result<GroupViewFfi, FfiError> {
+        let core = self.lock()?;
+        let view = core
+            .group_snapshot(&group_id)
+            .map_err(|error| failure!(error))?;
+        Ok(group_view(view))
+    }
+
+    /// GROUPS-003：改角色（`owner`/`admin`/`member`；群主才能改，不能改群主）。
+    pub fn group_set_role(
+        &self,
+        group_id: String,
+        actor_credential: String,
+        target_credential: String,
+        role: String,
+    ) -> Result<GroupViewFfi, FfiError> {
+        let mut core = self.lock()?;
+        let view = core
+            .group_set_role(&group_id, &actor_credential, &target_credential, &role)
+            .map_err(|error| failure!(error))?;
+        Ok(group_view(view))
+    }
+
+    /// GROUPS-004：设置禁言（纯策略层）。
+    pub fn group_set_muted(
+        &self,
+        group_id: String,
+        actor_credential: String,
+        target_credential: String,
+        muted: bool,
+    ) -> Result<GroupViewFfi, FfiError> {
+        let mut core = self.lock()?;
+        let view = core
+            .group_set_muted(&group_id, &actor_credential, &target_credential, muted)
+            .map_err(|error| failure!(error))?;
+        Ok(group_view(view))
+    }
+
+    /// GROUPS-005：移除确认成员（真实 MLS 移除提交 + pending）。
+    pub fn group_remove_member(
+        &self,
+        group_id: String,
+        actor_credential: String,
+        target_credential: String,
+    ) -> Result<GroupViewFfi, FfiError> {
+        let mut core = self.lock()?;
+        let view = core
+            .group_remove_member(&group_id, &actor_credential, &target_credential)
+            .map_err(|error| failure!(error))?;
+        Ok(group_view(view))
+    }
+
+    /// GROUPS-006：改名（同名幂等无操作）。
+    pub fn group_rename(
+        &self,
+        group_id: String,
+        actor_credential: String,
+        new_name: String,
+    ) -> Result<GroupViewFfi, FfiError> {
+        let mut core = self.lock()?;
+        let view = core
+            .group_rename(&group_id, &actor_credential, &new_name)
+            .map_err(|error| failure!(error))?;
+        Ok(group_view(view))
+    }
+
+    /// 接受并合并当前控制提交（CRYPTO-007）。**本地接受证据 ≠ 节点回执**。
+    pub fn group_accept_pending(&self, group_id: String) -> Result<GroupViewFfi, FfiError> {
+        let mut core = self.lock()?;
+        let view = core
+            .group_accept_pending(&group_id)
+            .map_err(|error| failure!(error))?;
+        Ok(group_view(view))
+    }
+
+    /// 丢弃当前控制提交并回滚（CRYPTO-008；`policy_version` 不回退）。
+    pub fn group_discard_pending(
+        &self,
+        group_id: String,
+        reason: String,
+    ) -> Result<GroupViewFfi, FfiError> {
+        let mut core = self.lock()?;
+        let view = core
+            .group_discard_pending(&group_id, &reason)
+            .map_err(|error| failure!(error))?;
+        Ok(group_view(view))
+    }
+}

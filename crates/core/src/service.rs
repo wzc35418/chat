@@ -43,6 +43,11 @@ use crate::send_orchestrator::{
     SubmitOutcome,
 };
 use crate::send_runtime::{MAX_MLS_GROUP_KEY_BYTES, SendNodeConfig, SendRuntime, SendStep, SendStepView};
+use crate::groups::{
+    CreateGroupRequest, GROUP_POLICY_VERSION, GroupBootstrapPeer, GroupMemberKeyPackage, GroupView,
+};
+use chat_crypto::engine::MlsDevice;
+use chat_domain::MemberRole;
 use chat_storage::formal::{
     MASTER_KEY_BYTES, MAX_ID_BYTES, MAX_SESSION_TITLE_BYTES, KeyProvenance, MessageContent,
     MessageOrigin, MessageView, PageCursor, ProtectedStorageKey, SessionSummary, StorageError,
@@ -101,6 +106,10 @@ pub fn error_code(error: &anyhow::Error) -> &'static str {
     // 发送编排（SYNC-003/004 执行侧）与调度决策都用冻结码表。
     if let Some(sync) = error.downcast_ref::<SyncError>() {
         return sync.code().as_str();
+    }
+    // 群治理（GROUPS-001~006 + 控制提交接受/丢弃）的冻结码。
+    if let Some(group) = error.downcast_ref::<crate::groups::GroupError>() {
+        return group.code();
     }
     // 事件流的有界拒绝（容量/单批上限）。
     if let Some(event) = error.downcast_ref::<crate::core_events::EventError>() {
@@ -1326,6 +1335,188 @@ impl ConversationCore {
         }
         let digest = domain_digest(b"chat/core/invite-token-id/v1", token.as_bytes());
         Ok(format!("invite-{}", lower_hex(&digest[..16])))
+    }
+
+    // ---------------------------------------------------------------- 群治理（GROUPS）
+
+    /// GROUPS-001：建立一个小群（创建者 + 引导成员），返回真实群投影。
+    ///
+    /// - 本机 MLS 设备在建群时**新建**（群还不存在，无法从库恢复），群状态随即写入正式库；
+    /// - 引导成员需要同进程设备句柄（crypto 只有双人引导路径），因此其 MLS 设备在这里临时创建：
+    ///   真实邀请加入属 GROUPS-004 `accept_group_invite`（未实现，见 groups.md）；
+    /// - `local_credential` 为空时使用**持久身份**的设备 ID（未入库身份 → `INVALID_STATE_TRANSITION`）；
+    /// - `members` 是追加成员：调用方提供真实 KeyPackage，走 CRYPTO-005 Add 提交（结果是 pending）。
+    pub fn group_create(
+        &mut self,
+        name: &str,
+        local_credential: &str,
+        bootstrap_credential: &str,
+        members: Vec<GroupMemberKeyPackage>,
+    ) -> anyhow::Result<GroupView> {
+        let local = if local_credential.trim().is_empty() {
+            self.persisted_device_id()?
+        } else {
+            local_credential.trim().to_owned()
+        };
+        let mut device = MlsDevice::new(&local).map_err(|_| {
+            anyhow::Error::new(crate::groups::GroupError::from(
+                chat_storage::formal::StorageError::StateCorrupted(
+                    "the local MLS device could not be created".to_owned(),
+                ),
+            ))
+        })?;
+        let peer = MlsDevice::new(bootstrap_credential.trim()).map_err(|_| {
+            anyhow::Error::new(crate::groups::GroupError::from(
+                chat_storage::formal::StorageError::StateCorrupted(
+                    "the bootstrap MLS device could not be created".to_owned(),
+                ),
+            ))
+        })?;
+        let request = CreateGroupRequest {
+            name: name.to_owned(),
+            local_credential: local,
+            policy_version: GROUP_POLICY_VERSION,
+            members,
+        };
+        let bootstrap = GroupBootstrapPeer {
+            credential: bootstrap_credential.trim().to_owned(),
+            device: &peer,
+        };
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        crate::groups::create_group(&mut device, &bootstrap, store, &request)
+            .map_err(anyhow::Error::new)
+    }
+
+    /// GROUPS-002：读取正式群快照（不联网）。
+    pub fn group_snapshot(&self, group_id: &str) -> anyhow::Result<GroupView> {
+        let guard = self.store_guard()?;
+        let store = guard.as_ref().ok_or_else(closed)?;
+        crate::groups::group_snapshot(store, group_id).map_err(anyhow::Error::new)
+    }
+
+    /// GROUPS-003：变更成员角色（群主才能改；不能改群主；真实 MLS 控制提交 + pending）。
+    ///
+    /// `role` 用稳定文本（`owner`/`admin`/`member`），未知文本显式 `INVALID_INPUT`。
+    pub fn group_set_role(
+        &mut self,
+        group_id: &str,
+        actor_credential: &str,
+        target_credential: &str,
+        role: &str,
+    ) -> anyhow::Result<GroupView> {
+        let role = group_role_from_code(role)
+            .ok_or_else(|| invalid_input("role must be one of: owner, admin, member"))?;
+        self.with_group_device(group_id, |device, store| {
+            crate::groups::set_role(device, store, group_id, actor_credential, target_credential, role)
+        })
+    }
+
+    /// GROUPS-004：设置成员禁言（纯策略层，无 MLS 提交）。
+    pub fn group_set_muted(
+        &mut self,
+        group_id: &str,
+        actor_credential: &str,
+        target_credential: &str,
+        muted: bool,
+    ) -> anyhow::Result<GroupView> {
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        crate::groups::set_muted(store, group_id, actor_credential, target_credential, muted)
+            .map_err(anyhow::Error::new)
+    }
+
+    /// GROUPS-005：移除确认成员（真实 MLS 移除提交 + pending）。
+    pub fn group_remove_member(
+        &mut self,
+        group_id: &str,
+        actor_credential: &str,
+        target_credential: &str,
+    ) -> anyhow::Result<GroupView> {
+        self.with_group_device(group_id, |device, store| {
+            crate::groups::remove_member(device, store, group_id, actor_credential, target_credential)
+        })
+    }
+
+    /// GROUPS-006：改名（同一套名称校验；同名幂等）。
+    pub fn group_rename(
+        &mut self,
+        group_id: &str,
+        actor_credential: &str,
+        new_name: &str,
+    ) -> anyhow::Result<GroupView> {
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        crate::groups::rename_group(store, group_id, actor_credential, new_name)
+            .map_err(anyhow::Error::new)
+    }
+
+    /// 接受并合并当前控制提交（CRYPTO-007；本地接受证据 ≠ 节点回执）。
+    pub fn group_accept_pending(&mut self, group_id: &str) -> anyhow::Result<GroupView> {
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        let mut device = crate::groups::load_group_device(store, group_id).map_err(anyhow::Error::new)?;
+        crate::groups::accept_pending_control(&mut device, store, group_id)
+            .map_err(anyhow::Error::new)
+    }
+
+    /// 丢弃当前控制提交并回滚（CRYPTO-008；policy_version 不回退）。
+    pub fn group_discard_pending(
+        &mut self,
+        group_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<GroupView> {
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        crate::groups::discard_pending_control(store, group_id, reason).map_err(anyhow::Error::new)
+    }
+
+    /// 持久身份的设备 ID（未入库身份 → `INVALID_STATE_TRANSITION`）。
+    fn persisted_device_id(&self) -> anyhow::Result<String> {
+        let guard = self.store_guard()?;
+        let store = guard.as_ref().ok_or_else(closed)?;
+        let seeds = store
+            .load_identity_seeds()
+            .map_err(anyhow::Error::new)?
+            .ok_or_else(|| {
+                anyhow::Error::new(SyncError::new(
+                    ErrorCode::InvalidStateTransition,
+                    "the local identity is not enrolled in this database",
+                ))
+            })?;
+        Ok(seeds.device_id)
+    }
+
+    /// 群操作通用装配：从**持久库**恢复本机 MLS 设备，再执行动作（沿用 groups 的冻结码）。
+    fn with_group_device<T>(
+        &mut self,
+        group_id: &str,
+        action: impl FnOnce(&mut MlsDevice, &mut Store) -> crate::groups::GroupResult<T>,
+    ) -> anyhow::Result<T> {
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        let mut device =
+            crate::groups::load_group_device(store, group_id).map_err(anyhow::Error::new)?;
+        action(&mut device, store).map_err(anyhow::Error::new)
+    }
+}
+
+/// 群角色 → 稳定文本（`owner` / `admin` / `member`），供 FFI/UI 投影。
+pub fn group_role_code(role: MemberRole) -> &'static str {
+    match role {
+        MemberRole::Owner => "owner",
+        MemberRole::Admin => "admin",
+        MemberRole::Member => "member",
+    }
+}
+
+/// 稳定文本 → 群角色；未知文本返回 `None`（调用方显式 `INVALID_INPUT`）。
+pub fn group_role_from_code(text: &str) -> Option<MemberRole> {
+    match text.trim() {
+        "owner" => Some(MemberRole::Owner),
+        "admin" => Some(MemberRole::Admin),
+        "member" => Some(MemberRole::Member),
+        _ => None,
     }
 }
 

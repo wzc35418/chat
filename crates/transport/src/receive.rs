@@ -72,6 +72,15 @@ impl SessionBinding {
     }
 }
 
+/// 通过校验的完整帧（wire 适配器与纯逻辑管线共用）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceivedFrame {
+    /// 帧编号。
+    pub frame_id: u32,
+    /// 完整帧字节。
+    pub payload: Vec<u8>,
+}
+
 /// 绑定到单个会话的接收器。
 #[derive(Clone, Debug)]
 pub struct PeerFrameReceiver {
@@ -114,6 +123,53 @@ impl PeerFrameReceiver {
     /// 丢弃在途状态（重连后必须调用）。
     pub fn reset(&mut self) {
         self.assembler.reset();
+    }
+
+    /// 单条记录字节上限（分片头 + 最大分片负载）。
+    pub fn max_record_bytes(&self) -> usize {
+        self.codec
+            .limits()
+            .max_fragment_bytes
+            .saturating_add(FRAGMENT_HEADER_BYTES)
+    }
+
+    /// 校验会话可用且接收器绑定同一会话（wire 适配器复用同一规则）。
+    pub fn validate_binding(&self, session: &TransportSession) -> Result<()> {
+        if !session.is_usable() {
+            return Err(TransportError::SessionNotUsable);
+        }
+        if self.binding != SessionBinding::of(session) {
+            return Err(TransportError::SessionMismatch {
+                detail: "receiver is bound to another session",
+            });
+        }
+        Ok(())
+    }
+
+    /// 推入一条线格式记录；收齐时返回完整帧。
+    ///
+    /// 与 [`receive_peer_frame`] 走同一有界校验与严格有序重组路径，真实 wire 适配器
+    /// （iroh 连接）直接复用本方法。
+    pub fn push_record(&mut self, record: &[u8]) -> Result<Option<ReceivedFrame>> {
+        let max_record_bytes = self.max_record_bytes();
+        if record.len() > max_record_bytes {
+            return Err(TransportError::ContentTooLarge {
+                size: record.len(),
+                limit: max_record_bytes,
+            });
+        }
+        let fragment = self.codec.decode_wire(record)?;
+        let fragment_frame = fragment.frame_id();
+        match self.assembler.push(fragment)? {
+            Some(payload) => {
+                let frame_id = self
+                    .assembler
+                    .last_completed_frame()
+                    .unwrap_or(fragment_frame);
+                Ok(Some(ReceivedFrame { frame_id, payload }))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -172,15 +228,8 @@ pub fn receive_peer_frame<S: WireSource + ?Sized>(
     source: &mut S,
     budget: ReceiveBudget,
 ) -> Result<ReceiveOutcome> {
-    if !session.is_usable() {
-        return Err(TransportError::SessionNotUsable);
-    }
+    receiver.validate_binding(session)?;
     budget.validate()?;
-    if receiver.binding != SessionBinding::of(session) {
-        return Err(TransportError::SessionMismatch {
-            detail: "receiver is bound to another session",
-        });
-    }
     match source.peer_endpoint() {
         Some(endpoint) if endpoint == session.peer_endpoint() => {}
         _ => {
@@ -190,15 +239,6 @@ pub fn receive_peer_frame<S: WireSource + ?Sized>(
         }
     }
 
-    let max_record_bytes = receiver
-        .codec
-        .limits()
-        .max_fragment_bytes
-        .checked_add(FRAGMENT_HEADER_BYTES)
-        .ok_or(TransportError::ContentTooLarge {
-            size: usize::MAX,
-            limit: FRAGMENT_HEADER_BYTES,
-        })?;
     let mut records = 0usize;
     loop {
         if records >= budget.max_records_per_call {
@@ -218,22 +258,10 @@ pub fn receive_peer_frame<S: WireSource + ?Sized>(
             Err(_) => return Ok(ReceiveOutcome::Unavailable { records }),
             Ok(Some(record)) => {
                 records += 1;
-                if record.len() > max_record_bytes {
-                    return Err(TransportError::ContentTooLarge {
-                        size: record.len(),
-                        limit: max_record_bytes,
-                    });
-                }
-                let fragment = receiver.codec.decode_wire(&record)?;
-                let fragment_frame = fragment.frame_id();
-                if let Some(payload) = receiver.assembler.push(fragment)? {
-                    let frame_id = receiver
-                        .assembler
-                        .last_completed_frame()
-                        .unwrap_or(fragment_frame);
+                if let Some(frame) = receiver.push_record(&record)? {
                     return Ok(ReceiveOutcome::Frame {
-                        frame_id,
-                        payload,
+                        frame_id: frame.frame_id,
+                        payload: frame.payload,
                         records,
                     });
                 }

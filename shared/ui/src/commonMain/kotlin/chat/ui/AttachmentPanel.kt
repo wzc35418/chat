@@ -14,6 +14,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -31,7 +32,9 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import chat.presentation.display.progressLabel
 import chat.presentation.display.toBadge
+import chat.presentation.display.transferProgress
 import chat.presentation.preview.PreviewAttachmentState
 
 /** 附件面板交互回调。 */
@@ -147,6 +150,21 @@ fun AttachmentPanel(
                                 style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
                                 color = Color(0xFF5F6B63),
                             )
+                            val progress = attachment.transferProgress()
+                            if (progress != null) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    LinearProgressIndicator(
+                                        progress = { progress },
+                                        modifier = Modifier.weight(1f).semantics {
+                                            contentDescription = "传输进度 " + attachment.progressLabel()
+                                        },
+                                    )
+                                    Text(attachment.progressLabel(), style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
                             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 TextButton(
                                     onClick = { handlers.cancel(attachment.attachmentId) },

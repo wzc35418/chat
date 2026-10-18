@@ -6,6 +6,8 @@
 //! - [`frame`]：TRANSPORT-003 的帧编解码与严格有序分片重组；
 //! - [`retry`]：TRANSPORT-004 的指数退避 + 有界 jitter + 预算耗尽 Stop；
 //! - [`wire`]：可注入 `WireSink`/`WireSource` 端口（无真实 IO）；
+//! - [`endpoint`]：TRANSPORT-002 真实 iroh 端点启动/连接/接受（仅回环，显式超时）；
+//! - [`wire_io`]：TRANSPORT-006 把帧记录读写适配到 iroh 双向流（异步 API + 同步端口桥接）；
 //! - [`send`]：TRANSPORT-005 负载→分片→逐片写出，带预算与可重试/致命判定；
 //! - [`receive`]：TRANSPORT-006 逐片喂入重组器，带会话/端点绑定校验；
 //! - [`pull_map`]：TRANSPORT-007 把 sync `Pull { from, to }` 映射成帧请求序列与响应校验；
@@ -16,6 +18,7 @@
 #![forbid(unsafe_code)]
 pub mod network;
 
+pub mod endpoint;
 pub mod error;
 pub mod frame;
 pub mod pull_map;
@@ -25,7 +28,12 @@ pub mod send;
 pub mod session;
 pub mod state;
 pub mod wire;
+pub mod wire_io;
 
+pub use endpoint::{
+    AcceptLoopHandle, DEFAULT_IO_TIMEOUT_MS, EndpointConfig, MAX_ACCEPT_QUEUE, MAX_IO_TIMEOUT_MS,
+    PeerConnection, TRANSPORT_ALPN, TransportEndpoint, start_endpoint, validate_timeout,
+};
 pub use error::{CODE_TABLE, Result, TransportError};
 pub use frame::{
     FRAGMENT_HEADER_BYTES, FRAME_HARD_MAX_BYTES, Fragment, FragmentAssembler, FrameCodec,
@@ -57,3 +65,7 @@ pub use state::{
     next_state,
 };
 pub use wire::{WireFailure, WireSink, WireSource};
+pub use wire_io::{
+    IrohWireSink, IrohWireSource, MAX_IO_QUEUE, MAX_RECORD_BYTES, SendFrameRequest, WireStream,
+    accept_stream, open_stream,
+};

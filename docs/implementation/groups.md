@@ -1,6 +1,6 @@
 # 小群创建、邀请与治理用例
 
-阶段：P3。状态：函数级设计；GROUPS-001 建群与 GROUPS-002 快照已实现（真实 OpenMLS + 正式加密库），成员治理的角色变更（`set_role`）与禁言（`set_muted`）也已实现（DOMAIN-002/004 策略层 + CRYPTO-005 控制提交）；移除成员（`remove_member`）与改名（`rename_group`）也已实现（同一条 DOMAIN-002/004 + CRYPTO-005 流程）；控制提交的**接受合并（`accept_pending_control`）与丢弃回滚（`discard_pending_control`）**也已接线（CRYPTO-007/008）；其余治理函数未开始。目标源码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)。
+阶段：P3。状态：函数级设计；GROUPS-001 建群与 GROUPS-002 快照已实现（真实 OpenMLS + 正式加密库），成员治理的角色变更（`set_role`）与禁言（`set_muted`）也已实现（DOMAIN-002/004 策略层 + CRYPTO-005 控制提交）；移除成员（`remove_member`）与改名（`rename_group`）也已实现（同一条 DOMAIN-002/004 + CRYPTO-005 流程）；控制提交的**接受合并（`accept_pending_control`）与丢弃回滚（`discard_pending_control`）**也已接线（CRYPTO-007/008）；上述能力已通过 `GroupFfi` 暴露给 Kotlin（`group_create`/`snapshot`/`set_role`/`set_muted`/`remove_member`/`rename`/`accept_pending`/`discard_pending`）；其余治理函数未开始。目标源码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)。
 
 本章对应 GroupService 的完整业务入口。所有管理操作都是待确认票据；UI 读取正式快照与 pending 列表分别显示。邀请加入分为业务接受、KeyPackage 获取、正式 Commit、Welcome 投递四步。重加入需要当前成员明确授权，不直接从节点读取群密钥。
 
@@ -809,6 +809,66 @@ cargo test --offline -p chat-core                        # 118 passed（既有 1
 3. **policy_version 不回退**：丢弃只回滚 MLS 提交与成员集合，策略版本按任务约定保留（审计需要）。
 4. **一次只有一个治理操作在飞**：接受或丢弃之后才能准备下一个提交。
 5. **不联网**：不接受对端 Commit（CRYPTO-006 `process_verified_entry` 未接线到 groups）、不投递 Welcome。
+
+## 群治理接 FFI 与服务方法（GroupFfi，2026-10-18，Windows x64）
+
+代码：[crates/ffi/src/groups_ffi.rs](../../crates/ffi/src/groups_ffi.rs)（新）+ [crates/core/src/service.rs](../../crates/core/src/service.rs)
+的 `ConversationCore::group_*` 薄封装；测试：[crates/ffi/tests/groups_ffi.rs](../../crates/ffi/tests/groups_ffi.rs)
+（6 个用例，经 FFI 走真实 OpenMLS + 临时持久库）。契约细节见 [bridge.md 的“群治理 FFI 契约”](bridge.md)。
+
+### core 侧方法（都在 `ConversationCore` 上，只加方法，不改既有语义）
+
+| 方法 | 说明 |
+|---|---|
+| `group_create(name, local_credential, bootstrap_credential, members)` | 建群；`local_credential` 为空时用**持久身份设备 ID**（未入库 → `INVALID_STATE_TRANSITION`）；引导成员设备在本进程临时创建 |
+| `group_snapshot(group_id)` | 读正式快照（不联网） |
+| `group_set_role(group_id, actor, target, role_text)` | 角色变更（`owner`/`admin`/`member`；未知文本 → `INVALID_INPUT`；`owner` 由 domain 拒绝） |
+| `group_set_muted(group_id, actor, target, muted)` | 禁言（策略层） |
+| `group_remove_member(group_id, actor, target)` | 移除成员（MLS 移除提交） |
+| `group_rename(group_id, actor, new_name)` | 改名（同名幂等） |
+| `group_accept_pending(group_id)` | 接受并合并控制提交（CRYPTO-007） |
+| `group_discard_pending(group_id, reason)` | 丢弃回滚（CRYPTO-008） |
+
+设备统一用 `MlsDevice::import_from_store` 从持久库恢复（建群除外：群还不存在，设备是新建的）；
+禁用闭包 `with_group_device` 保证「先恢复、再执行、失败不留半状态」。
+为了让 FFI 拿到冻结码，`service::error_code` 增加了 `GroupError` 的 downcast 分支（方法体 3 行改动，
+不改任何既有语义）；角色 → 文本的映射以 `group_role_code` / `group_role_from_code` 暴露（FFI 不需要
+依赖 chat-domain）。
+
+### GroupFfi（Kotlin 可见）
+
+`open(database_path, master_key_hex, node)` + 上表 8 个方法，返回 `GroupViewFfi`（成员/角色/禁言/pending/
+pending_removed/last_control_cleared 全是纯数据，不含密钥）。`node` 只保存不联网。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi --test groups_ffi   # 6 passed
+cargo test --offline -p chat-core -p chat-ffi        # 118 + 36 passed
+~~~
+
+### 证据
+
+- `groups_ffi::create_snapshot_rename_mute_and_remove_through_ffi`：建群 → 快照一致 → 改名（pv2，同名幂等）→
+  禁言（pv3）→ 移除（pv4，pending_removed=[bob]）→ 接受（epoch2、pending 清空、pv 不变）→ 快照一致。
+- `groups_ffi::role_change_accept_and_discard_through_ffi`：改角色（pending self_update）→ 丢弃（epoch 不变、
+  pv 不回退、审计 self_update/node_rejected）→ 改回并接受（epoch2）。
+- `groups_ffi::error_codes_are_frozen_and_failures_leave_no_state`：`INVALID_TARGET`/`INVALID_ID`/
+  `INVALID_INPUT`/`PERMISSION_DENIED`/`PENDING_MISMATCH` 逐条断言，失败后快照与建群结果完全一致。
+- `groups_ffi::empty_local_credential_uses_the_persisted_identity_device`：持久身份建立后，空凭据建群的本地成员
+  凭据 == 身份设备 ID。
+- `groups_ffi::create_without_identity_and_empty_credential_fails`：`INVALID_STATE_TRANSITION` / `INVALID_CANDIDATE`。
+- `groups_ffi::closed_object_reports_core_closed`：`shutdown` 后 `CORE_CLOSED`。
+
+### 已知限制
+
+1. **本地接受 ≠ 节点接受**（同上节）：`group_accept_pending` 只收口本地状态。
+2. **引导成员设备由本进程临时创建**：真实邀请加入（GROUPS-004）仍未实现，因此“首个成员”目前不能是真实远端设备。
+3. **独占单写者**：`GroupFfi` 与 `LocalStoreFfi` / `AttachmentFfi` 互斥；需要身份数据时先关闭 `IdentityFfi`。
+4. **同步阻塞**：FFI 的 `Mutex` 串行执行（含 MLS 提交生成）。
+5. `node` 只保存；群治理当前不访问网络。
+
 
 
 

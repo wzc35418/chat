@@ -1,6 +1,6 @@
 # 设备直连、中继与节点客户端
 
-阶段：P0 → P1。状态：Rust **纯逻辑传输核心 + 对端收发管线**已实现于 [crates/transport](../../crates/transport/src)（会话建立、连接状态机、帧编解码/分片重组、确定性重试退避，以及可注入 wire 端口的发送/接收管线与 Pull 计划映射，见下方「Rust 纯逻辑传输核心」章节）；P0 仅 loopback 的 iroh/QUIC 实验仍在 [network.rs](../../crates/transport/src/network.rs)。真正的直连/穿透/中继与节点客户端（TRANSPORT-006、008~012）尚未实现。目标源码：[crates/transport/src/network.rs](../../crates/transport/src/network.rs)。
+阶段：P0 → P1。状态：Rust **纯逻辑传输核心 + 对端收发管线 + 真实回环 iroh 端点**已实现于 [crates/transport](../../crates/transport/src)（会话建立、连接状态机、帧编解码/分片重组、确定性重试退避、可注入 wire 端口的发送/接收管线与 Pull 计划映射，以及只绑定 127.0.0.1 的真实 iroh 端点/连接与 wire 适配，见下方「Rust 纯逻辑传输核心」章节）；P0 仅 loopback 的 iroh/QUIC 实验仍在 [network.rs](../../crates/transport/src/network.rs)。对称 NAT 穿透、自托管中继、发现记录验证与节点客户端（TRANSPORT-002、006、008~012）尚未实现。目标源码：[crates/transport/src/network.rs](../../crates/transport/src/network.rs)。
 
 网络层传送相同不可变协议帧，不负责判断已送达。节点公钥与 HTTPS 身份均验证；用户配置明确替换公共发现/中继。连接句柄不可给 UI 或插件。认证细节在 node-api 的函数计划中定义。
 
@@ -111,6 +111,23 @@ TRANSPORT-002（verify_discovery_record）与 TRANSPORT-006~012（节点 append/
 - `ResponseValidator` 要求按序响应：请求索引越界/乱序/范围不符/条目数不符 `RESPONSE_MISMATCH`，重复响应 `DUPLICATE_RESPONSE`；失败不改变校验器状态。
 - 请求正文编码属于 node-api 职责（本层不含 HTTP）。
 
+### 真实 iroh 端点与连接（TRANSPORT-002/006，本轮）
+
+在纯逻辑核心之上接入真实 iroh 端点（**仍只绑定 127.0.0.1**，关闭 relay/发现/portmapper/NetReport）。
+帧线格式、预算与错误码不变。
+
+| 本轮交付（任务 ID） | API | 与文档契约的关系 |
+|---|---|---|
+| TRANSPORT-002 start_endpoint | `endpoint::start_endpoint`/`TransportEndpoint`（`EndpointConfig`、`node_id`/`endpoint_id`、`connect`、`accept`、`accept_loop`、`close`） | 文档 TRANSPORT-001 `start_endpoint` 的回环实现：真实 iroh Endpoint、可选固定 secret key、接受循环；公共 relay/发现路径与端口冲突恢复未实现 |
+| 连接建立 | `PeerConnection`（`open_stream`/`accept_stream`/`close`） | 文档 TRANSPORT-003 `connect_peer` 的连接建立子集：回环直连、连接超时、断开重连；NAT 穿透/中继/发现记录验证未实现 |
+| TRANSPORT-006 wire 适配 | `wire_io::WireStream`（`write_record`/`read_record`/`send_frame`/`receive_frame`/`split`）、`IrohWireSink`/`IrohWireSource` | 文档 TRANSPORT-004/005 的真实 IO 子集：同一分片线格式在 iroh 双向流上收发；同步 `WireSink`/`WireSource` 通过有界通道 + 后台读写任务桥接 |
+
+- **端点**：`EndpointConfig { bind_addr, alpn, secret_key }`；只允许回环 IP（否则 `INVALID_TRANSPORT_CONFIG`）；ALPN 1–255 字节；`secret_key` 可选且固定时节点 ID 可复现（`EndpointId` 即 iroh 公钥）。`connect` 校验对端 `EndpointId` 与握手结果一致（`SESSION_MISMATCH`），不可达/超时 `PEER_UNREACHABLE`；`accept` 与接受循环超时 `TRANSPORT_TIMEOUT`；接受循环有界队列（1–256），句柄 drop 取消任务。
+- **IO 超时**：所有等待显式校验为 1ms–30s（`validate_timeout`），0 或超上限直接拒绝；测试另有整体 30s 上限。
+- **异步记录 API**：`write_record`/`read_record` 读写 `[u32 wire_len][分片元数据][payload]`；读取先读 1 字节区分「流正常结束」与「截断」，记录长度先检查（`12..=65548`）再分配；`send_frame` 复用 `encode_frame_for_send` 的预算/分片规则，写超时按重试策略返回 `RetryableFailure`/`FatalFailure`；`receive_frame` 复用 `PeerFrameReceiver::push_record` 的有界解码与严格有序重组。
+- **同步端口桥接**：`WireStream::split(queue)` 拆出后台写任务/读任务与有界通道（1–256），`IrohWireSink` 实现 `WireSink`（队列满 → `Unavailable`，连接错误 → `Closed`），`IrohWireSource` 实现 `WireSource`（`peer_endpoint` 为握手认证的对端 ID）；`IrohWireSink::flush(timeout)` 等待队列写完。既有 `send_peer_frame`/`receive_peer_frame` 可直接运行在真实连接上。
+- **真实回环用例**（全部 1–5s 单步超时 + 整体 30s 上限，实测约 3.4s）：两端点交换多分片帧并重组、单帧连续收发、超限帧发送前 `CONTENT_TOO_LARGE`、同步端口桥接（含队列预算 `SEND_BUDGET_EXCEEDED`）、断开后 `Closed` 与新连接重连继续收发、不可达对端 `PEER_UNREACHABLE` 且 10s 内返回、无入站时 `accept` `TRANSPORT_TIMEOUT`、配置校验与重复关闭。
+
 ### 传输层稳定错误码（登记）
 
 | 码 | 触发 | 可重试 | 与 PROTOCOL-014 关系 |
@@ -133,12 +150,16 @@ TRANSPORT-002（verify_discovery_record）与 TRANSPORT-006~012（节点 append/
 | `PULL_PLAN_INVALID` | 拉取范围/分页/请求数/帧号非法 | 否 | 本层新增码 |
 | `DUPLICATE_RESPONSE` | 同一请求索引的响应重复 | 否 | 本层新增码 |
 | `RESPONSE_MISMATCH` | 响应索引/范围/条目数与计划不符 | 否 | 本层新增码 |
+| `ENDPOINT_START_FAILED` | iroh 端点绑定/启动失败 | 否 | 本层新增码 |
+| `PEER_UNREACHABLE` | 对端不可达/连接被拒绝/握手失败 | 否（由显式退避策略决定是否重试） | 本层新增码 |
+| `TRANSPORT_TIMEOUT` | IO/握手/等待超时 | 否（由显式退避策略决定是否重试） | 本层新增码 |
+| `CONNECTION_CLOSED` | 连接/流已关闭 | 否 | 本层新增码 |
 
 映射约定：本层错误一律不可自动重试；跨 FFI 暴露时冻结码可直接进入 `chat_protocol::map_error`，新增码在协议层登记前映射为 `INTERNAL_FAILURE` 并保留本层码做诊断。
 
 ### 验证证据
 
-`cargo test --offline -p chat-transport`（2026-10-18）→ **53 passed / 0 failed**（lib 39 + `tests/transport_core.rs` 8 + `tests/peer_pipeline.rs` 6），`cargo clippy --offline -p chat-transport --all-targets` 0 警告。
+`cargo test --offline -p chat-transport`（2026-10-19）→ **61 passed / 0 failed**（lib 42 + `tests/iroh_endpoint.rs` 5 真实回环 iroh + `tests/peer_pipeline.rs` 6 + `tests/transport_core.rs` 8），`cargo clippy --offline -p chat-transport --all-targets` 0 警告。
 
 - 状态机：`state::tests::transition_table_matches_the_full_matrix`（5×6 逐格）、`repeated_events_are_idempotent`、`closed_is_terminal_except_repeated_close`、`illegal_transitions_are_explicit`，以及 `transport_core::transition_matrix_is_complete_and_unique`。
 - 会话：`session::tests::opens_session_in_disconnected_state`、`rejects_invalid_session_inputs`、`session_limits_are_bounded`、`negotiated_frame_limit_cannot_be_enlarged`、`session_lifecycle_uses_the_state_machine`、`transport_core::sessions_cannot_connect_without_negotiation_or_enlarge_limits`。
@@ -146,6 +167,7 @@ TRANSPORT-002（verify_discovery_record）与 TRANSPORT-006~012（节点 append/
 - 退避：`retry::tests::exponential_base_delay_is_capped`、`jitter_is_bounded_deterministic_and_capped`、`budget_exhaustion_stops_retrying`、`next_attempt_time_is_saturating`、`invalid_policies_are_rejected`、`transport_core::retry_sequence_is_deterministic_and_bounded`。
 - 端到端纯逻辑闭环：`transport_core::session_frame_retry_flow_is_closed_loop`（建立会话 → 连接 → 分片/重组 → 降级/恢复 → 退避预算 → 关闭）。
 - 收发管线：`peer_pipeline::send_receive_round_trip_across_fragments`（分片-重组往返、连续帧）、`injected_loss_duplication_and_reordering_are_rejected`（丢片→乱序、重复、尾片丢失换帧→未收齐）、`send_budgets_and_retry_budget_are_explicit`（队列/记录预算、可重试→预算耗尽→致命、Closed 不消耗预算）、`cross_session_and_unauthenticated_sources_are_rejected`（跨会话/未认证/未连接）、`pull_plan_maps_paginated_ranges_to_frame_requests`（分页映射、帧号绑定、摘要稳定、响应去重与校验）、`pull_plan_boundaries_are_explicit`（单条/整除/最大页/非法范围）。
+- 真实 iroh 回环（`tests/iroh_endpoint.rs`，单步 1–5s、整体 30s 超时）：`endpoints_exchange_fragmented_frames_and_reject_oversize`（固定密钥节点 ID、连接/接受、3 片帧重组、连续帧、超限发送前拒绝）、`sync_ports_bridge_over_real_connection_and_enforce_queue_budget`（同步端口桥接 + 队列预算）、`disconnect_then_reconnect`（断开 `Closed` 后新连接继续）、`unreachable_peer_fails_with_timeout_instead_of_hanging`（`PEER_UNREACHABLE` 且不挂死、accept `TRANSPORT_TIMEOUT`）、`start_endpoint_validates_configuration`（非回环/空 ALPN/0 超时/接受队列预算/重复关闭）；端点单元用例 `endpoint::tests::*`（配置与超时校验）。
 - 管线单元用例：`send::tests::sends_single_and_multi_fragment_frames`、`wire_failures_map_to_retry_or_fatal`、`queue_and_record_budgets_are_enforced`；`receive::tests::reassembles_frames_from_sent_records`、`partial_data_returns_pending_and_budget_flag`、`rejects_out_of_order_duplicate_and_stale_records`、`rejects_cross_session_and_unauthenticated_sources`、`source_failures_map_to_unavailable_or_closed`；`pull_map::tests::paginates_inclusive_ranges`、`plan_digest_is_deterministic_and_bound`（固定摘要向量）、`responses_are_validated_in_order_without_duplicates`、`rejects_invalid_ranges_pages_and_request_counts`。
 
 <a id="transport-001"></a>
@@ -179,7 +201,7 @@ start_endpoint(config: TransportConfig, device_key: DeviceKeyRef) -> Result<Endp
 - [ ] 关闭公共服务后仍使用自托管。
 - [ ] 端口冲突无遗留任务。
 
-**实现状态**：部分实现（Rust 纯逻辑子集：`TransportSession::open`/`open_session` 校验端点/设备标识、协商结果、初始状态与会话预算，见上方章节；证据 `cargo test --offline -p chat-transport` → 33 passed，`session::tests::*`、`transport_core::sessions_cannot_connect_without_negotiation_or_enlarge_limits`）。iroh 端点启动、设备密钥装载、运行时/任务取消、有界入站队列与端口冲突清理未实现（`network.rs` 只有 P0 loopback 实验，不构成本函数验收），两项验收未勾选。
+**实现状态**：部分实现（Rust 纯逻辑子集：`TransportSession::open`/`open_session` 校验端点/设备标识、协商结果、初始状态与会话预算；真实回环端点 `TransportEndpoint::start`/`start_endpoint`：iroh Endpoint 启动、可选 32 字节 secret key、`node_id`/`endpoint_id` 导出、`close`，见上方「真实 iroh 端点与连接」；证据 `session::tests::*`、`transport_core::sessions_cannot_connect_without_negotiation_or_enlarge_limits`、`endpoint::tests::*`、`iroh_endpoint::start_endpoint_validates_configuration`、`iroh_endpoint::endpoints_exchange_fragmented_frames_and_reject_oversize`）。公共 relay/发现已按配置关闭，但未做真实自托管 relay 端到端验证；`DeviceKeyRef` 到端点密钥的装载策略、运行时/任务取消、有界入站队列与端口冲突清理未实现，两项验收未勾选。
 
 <a id="transport-002"></a>
 
@@ -247,7 +269,7 @@ connect_peer(peer: VerifiedPeerAddress, budget: ConnectBudget) -> Result<Connect
 - [ ] 中继不可用明确错误。
 - [ ] 取消无后台重试泄漏。
 
-**实现状态**：部分实现（Rust 纯逻辑子集：连接状态机 `ConnectionStateMachine`/`next_state` 与确定性重试退避 `RetryPolicy`/`RetryTracker`，见上方章节；证据 `state::tests::transition_table_matches_the_full_matrix`、`retry::tests::budget_exhaustion_stops_retrying`、`transport_core::session_frame_retry_flow_is_closed_loop`）。局域网/穿透/中继路径、超时总预算、取消关闭竞赛连接与 `EndpointId` 验证未实现，三项验收未勾选。
+**实现状态**：部分实现（Rust 纯逻辑子集：连接状态机 `ConnectionStateMachine`/`next_state` 与确定性重试退避 `RetryPolicy`/`RetryTracker`；真实回环连接建立 `TransportEndpoint::connect`/`accept`/`accept_loop` + `PeerConnection`：连接/接受超时（1ms–30s）、对端 `EndpointId` 与握手结果校验、断开后重连，见上方「真实 iroh 端点与连接」；证据 `state::tests::transition_table_matches_the_full_matrix`、`retry::tests::budget_exhaustion_stops_retrying`、`transport_core::session_frame_retry_flow_is_closed_loop`、`iroh_endpoint::unreachable_peer_fails_with_timeout_instead_of_hanging`、`disconnect_then_reconnect`）。局域网/对称 NAT 穿透、自托管中继回退、发现记录验证、取消关闭竞赛连接与路径诊断未实现，三项验收未勾选。
 
 <a id="transport-004"></a>
 
@@ -280,7 +302,7 @@ send_peer_frame(connection: Connection, frame: ImmutableFrame) -> Result<Transpo
 - [ ] ACK 丢失后重发相同 bytes。
 - [ ] P2P 待确认消息不触发正式插件行为。
 
-**实现状态**：部分实现（Rust 纯逻辑子集：帧长度/分片/线格式编码与上限检查 + 对端发送管线 `send_peer_frame`：编码→分片→逐片写 `WireSink`、发送队列/记录预算、可重试/致命判定与退避，见上方章节；证据 `send::tests::sends_single_and_multi_fragment_frames`、`wire_failures_map_to_retry_or_fatal`、`queue_and_record_budgets_are_enforced`、`peer_pipeline::send_receive_round_trip_across_fragments`、`send_budgets_and_retry_budget_are_explicit`）。连接关联校验、有限 ACK 等待、超时错误与同字节重发（重试策略已就绪）未实现，两项验收未勾选。
+**实现状态**：部分实现（Rust 纯逻辑子集：帧长度/分片/线格式编码与上限检查 + 对端发送管线 `send_peer_frame`：编码→分片→逐片写 `WireSink`、发送队列/记录预算、可重试/致命判定与退避，见上方章节；证据 `send::tests::sends_single_and_multi_fragment_frames`、`wire_failures_map_to_retry_or_fatal`、`queue_and_record_budgets_are_enforced`、`peer_pipeline::send_receive_round_trip_across_fragments`、`send_budgets_and_retry_budget_are_explicit`）。真实 iroh 连接上的同一发送路径由 `WireStream::send_frame`/`sync_ports_bridge...` 覆盖（`iroh_endpoint::endpoints_exchange_fragmented_frames_and_reject_oversize`、`sync_ports_bridge_over_real_connection_and_enforce_queue_budget`）。连接关联校验、有限 ACK 等待、超时错误与同字节重发（重试策略已就绪）未实现，两项验收未勾选。
 
 <a id="transport-005"></a>
 
@@ -314,7 +336,7 @@ read_peer_frame(connection: Connection, limits: FrameLimits) -> Result<Unverifie
 - [ ] 超大长度声明不分配巨内存。
 - [ ] 伪造 EventId 不被提前去重。
 
-**实现状态**：部分实现（Rust 纯逻辑子集：有界解码 `FrameCodec::decode_wire`、严格有序分片重组 `FragmentAssembler`，以及接收管线 `receive_peer_frame`：逐片喂入、会话/端点绑定、跨会话/未认证拒绝、单次记录预算，见上方章节；证据 `receive::tests::reassembles_frames_from_sent_records`、`partial_data_returns_pending_and_budget_flag`、`rejects_out_of_order_duplicate_and_stale_records`、`rejects_cross_session_and_unauthenticated_sources`、`source_failures_map_to_unavailable_or_closed`、`peer_pipeline::cross_session_and_unauthenticated_sources_are_rejected`）。连接读循环、入站队列投递与背压未实现；内层去重仍归 protocol/sync（伪造 EventId 不会被本层提前去重），两项验收未勾选。
+**实现状态**：部分实现（Rust 纯逻辑子集：有界解码 `FrameCodec::decode_wire`、严格有序分片重组 `FragmentAssembler`，以及接收管线 `receive_peer_frame`：逐片喂入、会话/端点绑定、跨会话/未认证拒绝、单次记录预算，见上方章节；证据 `receive::tests::reassembles_frames_from_sent_records`、`partial_data_returns_pending_and_budget_flag`、`rejects_out_of_order_duplicate_and_stale_records`、`rejects_cross_session_and_unauthenticated_sources`、`source_failures_map_to_unavailable_or_closed`、`peer_pipeline::cross_session_and_unauthenticated_sources_are_rejected`）。真实 iroh 连接上的接收路径由 `WireStream::receive_frame` 与 `IrohWireSource`（有界通道桥接）覆盖（证据同上）。连接读循环/入站队列的完整背压语义未实现；内层去重仍归 protocol/sync（伪造 EventId 不会被本层提前去重），两项验收未勾选。
 
 <a id="transport-006"></a>
 

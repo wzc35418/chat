@@ -16,7 +16,9 @@
 //! 级失败重建会话（对端重组器随之重置），不得在旧连接上从中间分片续传。
 
 use crate::error::{Result, TransportError};
-use crate::frame::{FRAME_HARD_MAX_BYTES, FrameCodec, FrameLimits, MAX_FRAGMENTS_PER_FRAME_HARD};
+use crate::frame::{
+    FRAME_HARD_MAX_BYTES, Fragment, FrameCodec, FrameLimits, MAX_FRAGMENTS_PER_FRAME_HARD,
+};
 use crate::retry::{RetryOutcome, RetryTracker};
 use crate::session::{SessionLimits, TransportSession};
 use crate::wire::{WireFailure, WireSink};
@@ -147,16 +149,13 @@ impl SendOutcome {
     }
 }
 
-/// TRANSPORT-005：编码并逐片发送一帧。
-pub fn send_peer_frame<S: WireSink + ?Sized>(
+/// 校验并编码一帧为规范分片（同步管线与真实 wire 适配器共用）。
+pub fn encode_frame_for_send(
     session: &TransportSession,
     frame_id: u32,
     payload: &[u8],
-    sink: &mut S,
     budget: SendBudget,
-    retry: &mut RetryTracker,
-    now_unix_ms: u64,
-) -> Result<SendOutcome> {
+) -> Result<Vec<Fragment>> {
     if !session.is_usable() {
         return Err(TransportError::SessionNotUsable);
     }
@@ -193,6 +192,20 @@ pub fn send_peer_frame<S: WireSink + ?Sized>(
             detail: "frame fragments exceed maxRecordsPerSend",
         });
     }
+    Ok(fragments)
+}
+
+/// TRANSPORT-005：编码并逐片发送一帧。
+pub fn send_peer_frame<S: WireSink + ?Sized>(
+    session: &TransportSession,
+    frame_id: u32,
+    payload: &[u8],
+    sink: &mut S,
+    budget: SendBudget,
+    retry: &mut RetryTracker,
+    now_unix_ms: u64,
+) -> Result<SendOutcome> {
+    let fragments = encode_frame_for_send(session, frame_id, payload, budget)?;
     let queued = sink.queued_records();
     let queued_after =
         queued

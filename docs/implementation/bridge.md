@@ -679,6 +679,92 @@ cargo test --offline -p chat-ffi -p chat-core             # 30 + 81 passed
 3. 下载不写本地加密缓存（直接写出目标路径），因此下载后不能离线再 export。
 4. 上传/下载是**同步阻塞**调用（FFI 的 `Mutex` 串行化）：不要在 UI 线程上直接跑大文件。
 
+## 群治理 FFI 契约（GroupFfi，2026-10-18，Windows x64）
+
+代码：[crates/ffi/src/groups_ffi.rs](../../crates/ffi/src/groups_ffi.rs)（新，薄封装）+ [crates/core/src/service.rs](../../crates/core/src/service.rs) 的 `ConversationCore::group_*`；
+测试：[crates/ffi/tests/groups_ffi.rs](../../crates/ffi/tests/groups_ffi.rs)（6 个用例，真 OpenMLS + 临时持久库，经 FFI 走完整链路）。
+
+### 对象与方法
+
+~~~text
+GroupFfi::open(database_path, master_key_hex, node: String?) -> Arc<GroupFfi>   // 构造；node 只保存，不联网
+group_create(name, local_credential, bootstrap_credential, members: Vec<GroupMemberInputFfi>) -> GroupViewFfi
+group_snapshot(group_id) -> GroupViewFfi
+group_set_role(group_id, actor_credential, target_credential, role) -> GroupViewFfi   // role: owner/admin/member
+group_set_muted(group_id, actor_credential, target_credential, muted) -> GroupViewFfi
+group_remove_member(group_id, actor_credential, target_credential) -> GroupViewFfi
+group_rename(group_id, actor_credential, new_name) -> GroupViewFfi
+group_accept_pending(group_id) -> GroupViewFfi      // 接受并合并控制提交（CRYPTO-007）
+group_discard_pending(group_id, reason) -> GroupViewFfi  // 丢弃回滚（CRYPTO-008）
+node() -> String?    is_open() -> bool    shutdown()
+~~~
+
+`GroupMemberInputFfi { credential, key_package: Vec<u8> }`（追加成员的真实 KeyPackage）；
+`GroupViewFfi { group_id, name, epoch, policy_version, role, control_head, mls_group_key, state_version,
+created_at_ms, members, pending_members, pending_removed, pending, last_control_cleared }`；
+成员 `GroupMemberFfi { credential, role, muted, is_local, pending }`；
+pending `GroupPendingFfi { operation, base_epoch, target_epoch, added, removed, commit_digest }`；
+丢弃审计 `GroupClearedFfi { operation, base_epoch, target_epoch, commit_digest, reason_code, detail, cleared_at_ms }`。
+
+### 接线要点
+
+- **独占单写者**：`GroupFfi::open` 持有正式加密库的写句柄，与 `LocalStoreFfi` / `AttachmentFfi`
+  互斥（同一库同一时刻只能有一个句柄）；也正因如此，需要身份类数据时先关闭 `IdentityFfi`。
+- **设备从库恢复**：除建群外，每个方法都会 `MlsDevice::import_from_store` 重新装载本机设备
+  （不跨调用持有设备句柄）；建群时设备是新建的（群还不存在），群状态随即落库。
+- **凭据来源**：`group_create` 的 `local_credential` 传空串时使用库里**持久身份**的设备 ID
+  （未入库身份 → `INVALID_STATE_TRANSITION`）；非空时用调用方给的凭据文本。
+- **角色是稳定文本**（`owner`/`admin`/`member`）；未知文本 → `INVALID_INPUT`；
+  传 `owner` 会被 domain 拒绝（`PERMISSION_DENIED`，只能走转让）。
+
+### 错误码（`FfiError::Store.code`，全部冻结码）
+
+| 情形 | code |
+|---|---|
+| 非群主/管理员治理、改群主、改自己、禁言自己 | `PERMISSION_DENIED` |
+| 未知群 / 目标不是确认成员 / 本机不在该群 | `INVALID_TARGET` |
+| 非法群名 / 非法角色文本 / 非法丢弃原因 | `INVALID_INPUT` |
+| 群 ID 不是 PROTOCOL-001 文本 | `INVALID_ID` |
+| 成员数或名称超出上限 | `GROUP_LIMIT_EXCEEDED` |
+| 没有 pending / pending 与设备不一致 | `PENDING_MISMATCH` / `STATE_CORRUPTED` |
+| 未决提交期间的策略写入或第二个提交 | `INVALID_STATE_TRANSITION` |
+| 本机 epoch 与快照不一致 | `STALE_EPOCH` |
+| 已关闭 | `CORE_CLOSED` |
+
+### 证据
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi --test groups_ffi   # 6 passed
+cargo test --offline -p chat-core -p chat-ffi        # 118 + 36 passed
+~~~
+
+- `groups_ffi::create_snapshot_rename_mute_and_remove_through_ffi`：建群（epoch 1/owner/全零控制头/两成员）→
+  快照逐字段一致 → 改名（pv 2、同名幂等不改 state_version）→ 禁言（pv 3、muted=true）→ 移除（pv 4、
+  正式成员只剩 alice、pending_removed=[bob]、pending.operation=remove_members base1→target2）→
+  接受（epoch 2、pending 与 pending_removed 清空、pv 仍 4）→ 快照一致。
+- `groups_ffi::role_change_accept_and_discard_through_ffi`：改角色（pv 2、pending self_update）→ 丢弃
+  （epoch 1、pending 清空、pv 不回退、审计 remove 记录 self_update/node_rejected/base1→target2、角色保留）→
+  改回 member（pv 3、base_epoch 仍 1）→ 接受（epoch 2、角色 member）。
+- `groups_ffi::error_codes_are_frozen_and_failures_leave_no_state`：未知群 `INVALID_TARGET`、畸形群 ID
+  `INVALID_ID`、非法角色/非法名 `INVALID_INPUT`、非治理者三种操作 `PERMISSION_DENIED`、未知目标
+  `INVALID_TARGET`、无 pending 的接受/丢弃 `PENDING_MISMATCH`、空原因 `INVALID_INPUT`；
+  全部失败后快照与建群结果完全一致（无半状态）。
+- `groups_ffi::empty_local_credential_uses_the_persisted_identity_device`：先用 `IdentityFfi` 在库里建立
+  持久身份，再让 `group_create` 的 `local_credential` 留空 → 本地成员凭据就是该身份的设备 ID。
+- `groups_ffi::create_without_identity_and_empty_credential_fails`：未入库身份 + 空凭据 → `INVALID_STATE_TRANSITION`；
+  空 KeyPackage 的追加成员 → `INVALID_CANDIDATE`（对象仍可用）。
+- `groups_ffi::closed_object_reports_core_closed`：`shutdown` 后快照/改名 → `CORE_CLOSED`。
+
+已知限制：
+
+1. **本地接受 ≠ 节点接受**：`group_accept_pending` 只收口本地状态，没有节点回执校验与日志对账（见 groups.md）。
+2. **建群的引导成员由本进程临时创建设备**：crypto 只有双人引导路径，真实邀请加入（GROUPS-004）未实现。
+3. **独占单写者**：不能与 `LocalStoreFfi` / `AttachmentFfi` 同时打开同一库；需要跨对象操作时要先关一个。
+4. **同步阻塞**：所有群方法在 FFI 的 `Mutex` 内串行执行（含 MLS 提交生成），不要在 UI 线程做长循环。
+5. `node` 参数只保存不联网；群治理当前不访问网络。
+
+
 
 
 

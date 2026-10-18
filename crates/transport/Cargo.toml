@@ -10,3 +10,6 @@ anyhow.workspace = true
 iroh.workspace = true
 tokio.workspace = true
 sha2.workspace = true
+[dev-dependencies]
+# 集成测试直接构造 iroh 地址/密钥（与运行时同一版本）。
+iroh.workspace = true

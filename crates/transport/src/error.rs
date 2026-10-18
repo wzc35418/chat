@@ -55,6 +55,14 @@ pub enum TransportError {
     DuplicateResponse,
     /// 响应与请求计划不一致（索引/范围/条目数）。
     ResponseMismatch { detail: &'static str },
+    /// iroh 端点启动失败（绑定/配置）。
+    EndpointStartFailed { detail: &'static str },
+    /// 对端不可达或连接被拒绝（可重试）。
+    PeerUnreachable { detail: &'static str },
+    /// IO/握手超时（有界预算）。
+    TransportTimeout { detail: &'static str },
+    /// 连接/流已关闭。
+    ConnectionClosed { detail: &'static str },
 }
 
 impl TransportError {
@@ -79,6 +87,10 @@ impl TransportError {
             TransportError::PullPlanInvalid { .. } => "PULL_PLAN_INVALID",
             TransportError::DuplicateResponse => "DUPLICATE_RESPONSE",
             TransportError::ResponseMismatch { .. } => "RESPONSE_MISMATCH",
+            TransportError::EndpointStartFailed { .. } => "ENDPOINT_START_FAILED",
+            TransportError::PeerUnreachable { .. } => "PEER_UNREACHABLE",
+            TransportError::TransportTimeout { .. } => "TRANSPORT_TIMEOUT",
+            TransportError::ConnectionClosed { .. } => "CONNECTION_CLOSED",
         }
     }
 
@@ -147,6 +159,18 @@ impl fmt::Display for TransportError {
             TransportError::ResponseMismatch { detail } => {
                 write!(formatter, "pull response mismatch: {detail}")
             }
+            TransportError::EndpointStartFailed { detail } => {
+                write!(formatter, "endpoint start failed: {detail}")
+            }
+            TransportError::PeerUnreachable { detail } => {
+                write!(formatter, "peer unreachable: {detail}")
+            }
+            TransportError::TransportTimeout { detail } => {
+                write!(formatter, "transport timeout: {detail}")
+            }
+            TransportError::ConnectionClosed { detail } => {
+                write!(formatter, "connection closed: {detail}")
+            }
         }
     }
 }
@@ -157,7 +181,7 @@ impl std::error::Error for TransportError {}
 pub type Result<T> = core::result::Result<T, TransportError>;
 
 /// 传输层稳定码全量，供唯一性测试与文档码表使用。
-pub const CODE_TABLE: [&str; 18] = [
+pub const CODE_TABLE: [&str; 22] = [
     "INVALID_TRANSPORT_CONFIG",
     "INVALID_TRANSITION",
     "CAPABILITY_MISMATCH",
@@ -176,6 +200,10 @@ pub const CODE_TABLE: [&str; 18] = [
     "PULL_PLAN_INVALID",
     "DUPLICATE_RESPONSE",
     "RESPONSE_MISMATCH",
+    "ENDPOINT_START_FAILED",
+    "PEER_UNREACHABLE",
+    "TRANSPORT_TIMEOUT",
+    "CONNECTION_CLOSED",
 ];
 
 #[cfg(test)]
@@ -218,6 +246,10 @@ mod tests {
             TransportError::PullPlanInvalid { detail: "x" },
             TransportError::DuplicateResponse,
             TransportError::ResponseMismatch { detail: "x" },
+            TransportError::EndpointStartFailed { detail: "x" },
+            TransportError::PeerUnreachable { detail: "x" },
+            TransportError::TransportTimeout { detail: "x" },
+            TransportError::ConnectionClosed { detail: "x" },
         ] {
             assert_eq!(error.frozen_code(), None);
             assert!(!error.retryable());

@@ -265,3 +265,19 @@ fun chat.api.LocalAttachment.toBadge(): AttachmentBadge = when (state) {
         detail = "收到无法识别的附件状态，已按不可下载处理。",
     )
 }
+
+/** 传输进度（0..1）；块数未知时返回 null（界面显示不确定进度，不伪造百分比）。 */
+fun chat.api.LocalAttachment.transferProgress(): Float? {
+    if (chunkCount <= 0) return null
+    if (state != "uploading" && state != "downloading") return null
+    val done = transferredChunks.coerceIn(0, chunkCount)
+    return done.toFloat() / chunkCount.toFloat()
+}
+
+/** 进度文案：明确是"已传块数/总块数"，不是字节数。 */
+fun chat.api.LocalAttachment.progressLabel(): String =
+    if (state == "uploading" || state == "downloading") {
+        transferredChunks.coerceIn(0, chunkCount).toString() + "/" + chunkCount + " 块"
+    } else {
+        ""
+    }

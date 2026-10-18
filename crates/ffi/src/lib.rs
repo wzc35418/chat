@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 pub mod attachments_ffi;
 pub mod bridge;
+pub mod groups_ffi;
 pub mod identity_ffi;
 pub mod local_store;
 uniffi::setup_scaffolding!();

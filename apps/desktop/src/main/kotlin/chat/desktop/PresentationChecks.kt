@@ -440,6 +440,7 @@ private fun checkAttachmentBadges() {
         displayName = "示例.bin",
         state = state,
         availableChunks = 2,
+        transferredChunks = if (state == "available") 2 else 0,
         cancelRequested = false,
     )
 
