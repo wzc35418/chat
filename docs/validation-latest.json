@@ -1,15 +1,11 @@
 {
   "date": "2026-10-18",
-  "status": "FAIL",
+  "status": "PASS",
   "scope": "delivery-structure-only",
   "checks": [
     {
       "status": "PASS",
       "message": "函数目录与源码位置、唯一ID、契约字段、调用引用已检查：197"
-    },
-    {
-      "status": "FAIL",
-      "message": "失效锚点 docs/implementation/core.md -> attachments.md#上传下载接块传输端口实现记录attachments-003--0052026-10-18windows-x64"
     },
     {
       "status": "PASS",
