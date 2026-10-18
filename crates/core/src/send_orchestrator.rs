@@ -92,6 +92,10 @@ fn storage_failure(error: StorageError) -> SyncError {
         // MLS epoch 单调性被破坏：PROTOCOL-014 有 STALE_EPOCH，DOMAIN-010 归类为
         // “先同步再重建”，不能降级成普通失败或成功。
         StorageError::StaleEpoch { .. } => ErrorCode::StaleEpoch,
+        // 附件记录不存在：PROTOCOL-014 码表没有 ATTACHMENT_NOT_FOUND（那是附件层
+        // 本地码），storage 边界按“目标不存在/不可达”映射为 INVALID_TARGET，
+        // 显式失败而不是落到 catch-all。
+        StorageError::AttachmentNotFound(_) => ErrorCode::InvalidTarget,
     };
     SyncError::new(code, storage_detail(code))
 }

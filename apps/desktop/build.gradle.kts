@@ -106,6 +106,17 @@ tasks.register<JavaExec>("identityPersistSmoke") {
     systemProperty("stdout.encoding", "UTF-8")
 }
 
+tasks.register<JavaExec>("attachmentSmoke") {
+    group = "verification"
+    description = "ATTACHMENTS 本机链路冒烟：导入/状态/导出/取消 + 25MiB 上限。"
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.AttachmentSmokeKt")
+    systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+}
+
 tasks.register<JavaExec>("previewApp") {
     group = "application"
     dependsOn("classes")

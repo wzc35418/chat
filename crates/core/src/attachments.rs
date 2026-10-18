@@ -4,14 +4,15 @@
 //! - 只做"本地加密缓存 + 本地导出"：不发起上传/下载，不写节点，不伪造传输成功；
 //! - 每块明文用 CRYPTO-011 的 FileKey 独立认证加密，缓存目录里只有密文块；
 //! - FileKey 与明文摘要只留在本进程内存与（未来的）受保护本地记录中，不进入公开描述符；
-//! - 记录（附件 ID、状态、进度）是进程内状态机：重启后缓存视为未引用，由
-//!   ATTACHMENTS-008 回收；正式持久化需要接入 storage 的 attachments 表（未实现）。
+//! - 记录（附件 ID、状态、大小/块数/摘要/展示名）可落到正式加密存储的 attachments 表
+//!   （[PersistedAttachmentStore]）：重启后仍可查询；但 FileKey 只在进程内，重启后没有
+//!   密钥，导出必须显式失败（ATTACHMENT_KEY_UNAVAILABLE），绝不伪造“可导出”。
 //!
 //! 已知限制（详见 docs/implementation/attachments.md）：
 //! - 未知大小流按 fail-closed 显式拒绝：分块 AAD 必须绑定 total_chunks，无法在不知道
 //!   总数时安全导入，因此本实现要求来源声明大小（本地文件用 metadata 大小）；
 //! - 上传/下载（ATTACHMENTS-003/005）、含 FileKey 的 E2EE SecretDescriptor、
-//!   取消导出（EXPORT_CANCELLED）与持久化状态机均未实现。
+//!   取消导出（EXPORT_CANCELLED）与 FileKey 的持久化保护（需要 PLATFORM/CRYPTO 设计）未实现。
 
 use std::collections::HashMap;
 use std::fmt;
@@ -25,7 +26,22 @@ use chat_crypto::attachment::{
     chunk_context_for, chunk_count, chunk_plain_length, decrypt_attachment_chunk,
     encrypt_attachment_chunk,
 };
+use chat_storage::formal::{
+    AttachmentRecordInput as PersistedAttachmentInput, StorageError, Store as FormalStore,
+};
 use sha2::{Digest, Sha256};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// 正式存储里的附件记录投影（密封元数据已解密，**不含 FileKey**）。
+pub use chat_storage::formal::AttachmentRecord as StoredAttachmentRecord;
+
+/// 当前时间（Unix 毫秒，饱和到 i64）。
+fn now_ms() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(elapsed) => i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
 
 /// 单附件明文上限（字节，25 MiB），与 CRYPTO-011 保持一致。
 pub const MAX_ATTACHMENT_BYTES_LIMIT: u64 = MAX_ATTACHMENT_BYTES;
@@ -66,10 +82,24 @@ impl AttachmentState {
             Self::Cancelled => "cancelled",
         }
     }
+
+    /// 由 schema 状态码还原（未知码返回 None，不做猜测映射）。
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "staging" => Some(Self::Staging),
+            "imported" => Some(Self::Imported),
+            "uploading" => Some(Self::Uploading),
+            "available" => Some(Self::Available),
+            "downloading" => Some(Self::Downloading),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
 }
 
 /// 附件层稳定错误码。安全校验失败必须显式失败，绝不降级继续。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttachmentError {
     /// 明文超过 25 MiB 上限。
     ContentTooLarge,
@@ -93,11 +123,29 @@ pub enum AttachmentError {
     CryptoFailure(&'static str),
     /// 进程内状态被 poison 等内部故障。
     InternalFailure(&'static str),
+    /// 正式存储层错误：保留稳定码与脱敏消息（不把 storage 类型泄漏出 core）。
+    Storage {
+        /// 稳定错误码（来自 `StorageError::code`）。
+        code: &'static str,
+        /// 脱敏错误消息（不含正文/密钥）。
+        detail: String,
+    },
+    /// 文件内容密钥只在进程内：该附件当前无法解密/导出。
+    KeyUnavailable(&'static str),
+}
+
+impl From<StorageError> for AttachmentError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage {
+            code: error.code(),
+            detail: error.to_string(),
+        }
+    }
 }
 
 impl AttachmentError {
     /// 稳定错误码字符串。
-    pub const fn code(self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Self::ContentTooLarge => "CONTENT_TOO_LARGE",
             Self::FileIoFailure => "FILE_IO_FAILURE",
@@ -110,6 +158,8 @@ impl AttachmentError {
             Self::InvalidChunkContext(_) => "INVALID_CHUNK_CONTEXT",
             Self::CryptoFailure(_) => "CRYPTO_FAILURE",
             Self::InternalFailure(_) => "INTERNAL_FAILURE",
+            Self::Storage { code, .. } => code,
+            Self::KeyUnavailable(_) => "ATTACHMENT_KEY_UNAVAILABLE",
         }
     }
 }
@@ -128,6 +178,12 @@ impl fmt::Display for AttachmentError {
             Self::InvalidChunkContext(detail) => write!(formatter, "invalid chunk context: {detail}"),
             Self::CryptoFailure(detail) => write!(formatter, "attachment crypto failure: {detail}"),
             Self::InternalFailure(detail) => write!(formatter, "internal failure: {detail}"),
+            Self::Storage { code, detail } => {
+                write!(formatter, "attachment storage failure {code}: {detail}")
+            }
+            Self::KeyUnavailable(detail) => {
+                write!(formatter, "attachment key is unavailable: {detail}")
+            }
         }
     }
 }
@@ -284,6 +340,32 @@ impl AttachmentStore {
     /// 缓存根目录。
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// 本进程内缓存的描述符（含明文摘要，仅供可信核心路径；重启后为 None）。
+    pub fn cached_descriptor(&self, attachment_id: &str) -> Option<AttachmentDescriptor> {
+        let records = self.records.lock().ok()?;
+        records
+            .get(attachment_id)
+            .map(|record| record.descriptor.clone())
+    }
+
+    /// 删除本地缓存目录与进程内记录；返回是否删掉了其中任意一项。
+    ///
+    /// 只清理本地缓存，不涉及已发送消息引用（引用清理由 ATTACHMENTS-008 负责）。
+    pub fn delete(&self, attachment_id: &str) -> AttachmentResult<bool> {
+        let directory = self.attachment_dir(attachment_id)?;
+        let removed_record = {
+            let mut records = self.lock_records()?;
+            records.remove(attachment_id).is_some()
+        };
+        let removed_directory = if directory.is_dir() {
+            fs::remove_dir_all(&directory).map_err(|_| AttachmentError::FileIoFailure)?;
+            true
+        } else {
+            false
+        };
+        Ok(removed_record || removed_directory)
     }
 
     /// ATTACHMENTS-001：流式导入本地文件，逐块加密写入缓存，返回公开描述符。
@@ -698,6 +780,234 @@ fn hex(bytes: &[u8]) -> String {
         text.push_str(&format!("{byte:02x}"));
     }
     text
+}
+
+/// 校验本地附件 ID 形式（att- + 32 位小写 hex）；不合法按“不存在”处理，避免路径拼接。
+fn validate_attachment_id(attachment_id: &str) -> AttachmentResult<()> {
+    let payload = attachment_id
+        .strip_prefix(ATTACHMENT_ID_PREFIX)
+        .ok_or(AttachmentError::AttachmentNotFound)?;
+    let valid = payload.len() == 32
+        && payload
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !valid {
+        return Err(AttachmentError::AttachmentNotFound);
+    }
+    Ok(())
+}
+
+fn status_from_stored(record: &StoredAttachmentRecord) -> AttachmentStatus {
+    let state = AttachmentState::from_code(&record.state).unwrap_or(AttachmentState::Failed);
+    AttachmentStatus {
+        attachment_id: record.attachment_id.clone(),
+        state,
+        plain_size: record.plain_size,
+        chunk_count: record.chunk_count,
+        // 本进程没有该附件的缓存（例如重启后），可用块数只能是 0，不猜造进度。
+        available_chunks: 0,
+        transferred_chunks: 0,
+        cancel_requested: state == AttachmentState::Cancelled,
+        failure: (state == AttachmentState::Failed).then_some("attachment import failed"),
+    }
+}
+
+/// 组合“本地加密缓存 + 正式加密存储记录”的附件入口。
+///
+/// - 记录只保存非秘密元数据（ID/状态/大小/块数/明文与密文摘要/展示名），敏感字段由
+///   storage 用主密钥派生的附件用途子密钥密封；
+/// - **FileKey 不持久化**：它只在 [AttachmentStore] 的进程内记录里，因此重启后
+///   [Self::export_attachment] 会显式返回 ATTACHMENT_KEY_UNAVAILABLE，本类型不伪造
+///   可导出状态；
+/// - 记录写入失败时清理刚写入的缓存，不留“只有缓存没有记录”的半成品。
+pub struct PersistedAttachmentStore {
+    cache: AttachmentStore,
+    store: Mutex<FormalStore>,
+}
+
+impl fmt::Debug for PersistedAttachmentStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistedAttachmentStore")
+            .field("cache_root", &self.cache.root())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PersistedAttachmentStore {
+    /// 打开附件入口：缓存根目录 + 已打开的正式加密库（调用方负责主密钥与独占锁）。
+    pub fn open(cache_root: impl Into<PathBuf>, store: FormalStore) -> AttachmentResult<Self> {
+        Ok(Self {
+            cache: AttachmentStore::new(cache_root)?,
+            store: Mutex::new(store),
+        })
+    }
+
+    /// 本地缓存根目录。
+    pub fn cache_root(&self) -> &Path {
+        self.cache.root()
+    }
+
+    fn lock_store(&self) -> AttachmentResult<MutexGuard<'_, FormalStore>> {
+        self.store.lock().map_err(|_| {
+            AttachmentError::InternalFailure("attachment record store lock is poisoned")
+        })
+    }
+
+    /// 导入文件：先写本地加密缓存，再把非秘密元数据写入正式存储记录。
+    pub fn import_file(
+        &self,
+        source: &FileToken,
+        display_name: &str,
+    ) -> AttachmentResult<AttachmentDescriptor> {
+        let descriptor = self.cache.import_file(source, display_name)?;
+        let persisted = (|| -> AttachmentResult<()> {
+            let manifest = self.cache.attachment_manifest(&descriptor.attachment_id)?;
+            let input = PersistedAttachmentInput {
+                attachment_id: descriptor.attachment_id.clone(),
+                state: AttachmentState::Imported.code().to_owned(),
+                plain_size: descriptor.plain_size,
+                chunk_size: descriptor.chunk_size,
+                chunk_count: descriptor.chunk_count,
+                content_digest: descriptor.content_digest.clone(),
+                ciphertext_digest: manifest.ciphertext_digest,
+                display_name: descriptor.display_name.clone(),
+                created_at_ms: now_ms(),
+            };
+            let mut store = self.lock_store()?;
+            store.save_attachment(input)?;
+            Ok(())
+        })();
+        if let Err(error) = persisted {
+            // 记录写失败：清掉刚写入的缓存，避免半成品（记录才是持久真相）。
+            let _ = self.cache.delete(&descriptor.attachment_id);
+            return Err(error);
+        }
+        Ok(descriptor)
+    }
+
+    /// 读取一条持久化附件记录；不存在返回 None。
+    pub fn attachment_record(
+        &self,
+        attachment_id: &str,
+    ) -> AttachmentResult<Option<StoredAttachmentRecord>> {
+        validate_attachment_id(attachment_id)?;
+        let store = self.lock_store()?;
+        store
+            .load_attachment(attachment_id)
+            .map_err(AttachmentError::from)
+    }
+
+    /// 按创建时间倒序列出持久化附件记录。
+    pub fn attachment_records(
+        &self,
+        limit: u32,
+    ) -> AttachmentResult<Vec<StoredAttachmentRecord>> {
+        let store = self.lock_store()?;
+        store
+            .list_attachments(limit)
+            .map_err(AttachmentError::from)
+    }
+
+    /// 查询附件状态：本进程有缓存时用缓存状态，否则退回持久化记录（可用块数为 0）。
+    pub fn attachment_status(&self, attachment_id: &str) -> AttachmentResult<AttachmentStatus> {
+        validate_attachment_id(attachment_id)?;
+        match self.cache.attachment_status(attachment_id) {
+            Ok(status) => Ok(status),
+            Err(AttachmentError::AttachmentNotFound) => {
+                let record = self
+                    .attachment_record(attachment_id)?
+                    .ok_or(AttachmentError::AttachmentNotFound)?;
+                Ok(status_from_stored(&record))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 取消传输：同步持久化记录状态（幂等；已完成/终态显式拒绝或保持）。
+    pub fn cancel_transfer(&self, attachment_id: &str) -> AttachmentResult<AttachmentStatus> {
+        validate_attachment_id(attachment_id)?;
+        let cache_status = self.cache.attachment_status(attachment_id);
+        if let Some(record) = self.attachment_record(attachment_id)? {
+            let state = AttachmentState::from_code(&record.state).ok_or(
+                AttachmentError::AttachmentCorrupted("stored attachment state is unknown"),
+            )?;
+            match state {
+                AttachmentState::Cancelled | AttachmentState::Failed => {}
+                AttachmentState::Available => return Err(AttachmentError::TransferAlreadyComplete),
+                _ => {
+                    let mut store = self.lock_store()?;
+                    store.mark_attachment_state(attachment_id, AttachmentState::Cancelled.code())?;
+                }
+            }
+        }
+        match cache_status {
+            Ok(_) => self.cache.cancel_transfer(attachment_id),
+            Err(AttachmentError::AttachmentNotFound) => {
+                let record = self
+                    .attachment_record(attachment_id)?
+                    .ok_or(AttachmentError::AttachmentNotFound)?;
+                Ok(status_from_stored(&record))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// 导出附件：先核对持久化记录与本地缓存一致，再逐块认证解密并复核完整摘要。
+    ///
+    /// FileKey 只在进程内，所以重启后（缓存记录缺失）必须显式失败，不产生任何目标文件。
+    pub fn export_attachment(
+        &self,
+        attachment_id: &str,
+        destination: &FileToken,
+    ) -> AttachmentResult<ExportReceipt> {
+        validate_attachment_id(attachment_id)?;
+        let record = self
+            .attachment_record(attachment_id)?
+            .ok_or(AttachmentError::AttachmentNotFound)?;
+        let Some(cached) = self.cache.cached_descriptor(attachment_id) else {
+            return Err(AttachmentError::KeyUnavailable(
+                "the file key is only held in memory; re-import the file before exporting",
+            ));
+        };
+        let manifest = self.cache.attachment_manifest(attachment_id)?;
+        let matches = cached.plain_size == record.plain_size
+            && cached.chunk_size == record.chunk_size
+            && cached.chunk_count == record.chunk_count
+            && cached.content_digest == record.content_digest
+            && cached.display_name == record.display_name
+            && manifest.ciphertext_digest == record.ciphertext_digest;
+        if !matches {
+            return Err(AttachmentError::AttachmentCorrupted(
+                "persisted attachment record does not match the local encrypted cache",
+            ));
+        }
+        let state = AttachmentState::from_code(&record.state).ok_or(
+            AttachmentError::AttachmentCorrupted("stored attachment state is unknown"),
+        )?;
+        if matches!(state, AttachmentState::Staging | AttachmentState::Failed) {
+            return Err(AttachmentError::AttachmentNotReady(
+                "attachment record is not exportable yet",
+            ));
+        }
+        self.cache.export_attachment(attachment_id, destination)
+    }
+
+    /// 删除附件：先删持久化记录（权威），再清本地缓存；返回是否删掉了任意一项。
+    pub fn delete_attachment(&self, attachment_id: &str) -> AttachmentResult<bool> {
+        validate_attachment_id(attachment_id)?;
+        let record_existed = self.attachment_record(attachment_id)?.is_some();
+        if record_existed {
+            let mut store = self.lock_store()?;
+            store.delete_attachment(attachment_id)?;
+        }
+        let cache_deleted = match self.cache.delete(attachment_id) {
+            Ok(deleted) => deleted,
+            Err(AttachmentError::AttachmentNotFound) => false,
+            Err(error) => return Err(error),
+        };
+        Ok(record_existed || cache_deleted)
+    }
 }
 
 #[cfg(test)]
@@ -1177,4 +1487,243 @@ mod tests {
             assert!(!path.to_string_lossy().contains("报告"));
         }
     }
+
+    fn formal_store(path: &Path) -> FormalStore {
+        chat_storage::formal::open_store(
+            chat_storage::formal::StoreOptions::new(
+                path,
+                chat_storage::formal::KeyProvenance::Raw32,
+            ),
+            chat_storage::formal::ProtectedStorageKey::from_bytes([7u8; 32]),
+        )
+        .expect("open formal store")
+    }
+
+    #[test]
+    fn persisted_import_survives_restart_and_export_fails_honestly() {
+        let dir = TempDir::new("persisted-restart");
+        let db_path = dir.path("chat.db");
+        let cache_root = dir.path("cache");
+        let marker = b"PERSISTED-ATTACHMENT-PLAINTEXT-MARKER";
+        let mut source = marker.to_vec();
+        source.extend(pattern(CHUNK_BYTES + 16, 4));
+        let source_path = dir.source("persisted.bin", &source);
+        let attachment_id;
+        {
+            let store = PersistedAttachmentStore::open(&cache_root, formal_store(&db_path))
+                .expect("open persisted store");
+            let descriptor = store
+                .import_file(&FileToken::from_local_path(&source_path), "持久化.pdf")
+                .expect("import");
+            attachment_id = descriptor.attachment_id.clone();
+            assert_eq!(descriptor.chunk_count, 2);
+            let record = store
+                .attachment_record(&attachment_id)
+                .expect("record")
+                .expect("record persisted");
+            assert_eq!(record.state, "imported");
+            assert_eq!(record.plain_size, descriptor.plain_size);
+            assert_eq!(record.chunk_count, descriptor.chunk_count);
+            assert_eq!(record.content_digest, descriptor.content_digest);
+            assert_eq!(record.display_name, "持久化.pdf");
+            assert!(record.already_existed, "reads always report an existing record");
+            assert!(record.created_at_ms >= 0);
+            assert_eq!(store.attachment_records(10).expect("list").len(), 1);
+            assert_eq!(
+                store.attachment_status(&attachment_id).expect("status").state,
+                AttachmentState::Imported
+            );
+            // 同进程内 FileKey 还在内存：可以导出。
+            let destination = dir.path("export.bin");
+            let receipt = store
+                .export_attachment(&attachment_id, &FileToken::from_local_path(&destination))
+                .expect("export");
+            assert_eq!(receipt.content_digest, descriptor.content_digest);
+            assert_eq!(fs::read(&destination).expect("read export"), source);
+        }
+
+        // 关闭后同主密钥重开：记录仍在（持久真相），但 FileKey 只在进程内。
+        {
+            let store = PersistedAttachmentStore::open(&cache_root, formal_store(&db_path))
+                .expect("reopen persisted store");
+            let record = store
+                .attachment_record(&attachment_id)
+                .expect("record")
+                .expect("record survives restart");
+            assert_eq!(record.state, "imported");
+            assert_eq!(record.display_name, "持久化.pdf");
+            assert_eq!(store.attachment_records(10).expect("list").len(), 1);
+            let status = store.attachment_status(&attachment_id).expect("status");
+            assert_eq!(status.state, AttachmentState::Imported);
+            assert_eq!(status.available_chunks, 0, "no in-memory chunks after restart");
+            // 诚实失败：FileKey 未持久化 → 显式 ATTACHMENT_KEY_UNAVAILABLE，不产生目标文件。
+            let destination = dir.path("after-restart.out");
+            let error = store
+                .export_attachment(&attachment_id, &FileToken::from_local_path(&destination))
+                .unwrap_err();
+            assert_eq!(error.code(), "ATTACHMENT_KEY_UNAVAILABLE");
+            assert!(!destination.exists(), "no bogus export may be produced");
+            // 未知附件仍然是 ATTACHMENT_NOT_FOUND（不把“缺密钥”泛化成“不存在”）。
+            let missing = store
+                .export_attachment(
+                    "att-00000000000000000000000000000000",
+                    &FileToken::from_local_path(&destination),
+                )
+                .unwrap_err();
+            assert_eq!(missing.code(), "ATTACHMENT_NOT_FOUND");
+        }
+
+        // 缓存与数据库文件里不出现明文或展示名（展示名只在密封列里）。
+        let mut files = Vec::new();
+        collect_files(&cache_root, &mut files);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = PathBuf::from(format!("{}{suffix}", db_path.display()));
+            if let Ok(bytes) = fs::read(path) {
+                files.push((PathBuf::from(format!("db{suffix}")), bytes));
+            }
+        }
+        assert!(!files.is_empty(), "cache and database files must be scanned");
+        for (path, bytes) in files {
+            assert!(
+                !contains(&bytes, marker),
+                "plaintext leaked into {}",
+                path.display()
+            );
+            assert!(
+                !contains(&bytes, "持久化.pdf".as_bytes()),
+                "display name leaked into {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_export_compares_record_with_cache() {
+        let dir = TempDir::new("persisted-match");
+        let store = PersistedAttachmentStore::open(
+            dir.path("cache"),
+            formal_store(&dir.path("chat.db")),
+        )
+        .expect("open persisted store");
+        let source_path = dir.source("match.bin", &pattern(2048, 1));
+        let descriptor = store
+            .import_file(&FileToken::from_local_path(&source_path), "match.bin")
+            .expect("import");
+
+        // 篡改进程内缓存描述符的明文摘要：与持久化记录不一致 → 拒绝导出。
+        {
+            let mut records = store.cache.records.lock().expect("cache lock");
+            let record = records.get_mut(&descriptor.attachment_id).expect("cached");
+            record.descriptor.content_digest = "00".repeat(32);
+        }
+        let destination = dir.path("match.out");
+        let error = store
+            .export_attachment(&descriptor.attachment_id, &FileToken::from_local_path(&destination))
+            .unwrap_err();
+        assert_eq!(error.code(), "ATTACHMENT_CORRUPTED");
+        assert!(!destination.exists());
+        // 畸形 ID 一律按不存在处理（不拼接路径）。
+        assert_eq!(
+            store
+                .attachment_record("../../etc/passwd")
+                .unwrap_err()
+                .code(),
+            "ATTACHMENT_NOT_FOUND"
+        );
+    }
+
+    #[test]
+    fn persisted_delete_removes_record_and_cache() {
+        let dir = TempDir::new("persisted-delete");
+        let store = PersistedAttachmentStore::open(
+            dir.path("cache"),
+            formal_store(&dir.path("chat.db")),
+        )
+        .expect("open persisted store");
+        let source_path = dir.source("delete.bin", &pattern(512, 2));
+        let descriptor = store
+            .import_file(&FileToken::from_local_path(&source_path), "delete.bin")
+            .expect("import");
+        assert!(store
+            .cache_root()
+            .join(&descriptor.attachment_id)
+            .is_dir());
+        assert!(store.delete_attachment(&descriptor.attachment_id).expect("delete"));
+        assert!(store
+            .attachment_record(&descriptor.attachment_id)
+            .expect("record")
+            .is_none());
+        assert!(!store.cache_root().join(&descriptor.attachment_id).exists());
+        assert!(!store.delete_attachment(&descriptor.attachment_id).expect("delete again"));
+        assert_eq!(
+            store
+                .attachment_status(&descriptor.attachment_id)
+                .unwrap_err()
+                .code(),
+            "ATTACHMENT_NOT_FOUND"
+        );
+        assert!(store.attachment_records(10).expect("list").is_empty());
+    }
+
+    #[test]
+    fn persisted_cancel_updates_record_and_survives_restart() {
+        let dir = TempDir::new("persisted-cancel");
+        let db_path = dir.path("chat.db");
+        let cache_root = dir.path("cache");
+        let source_path = dir.source("cancel.bin", &pattern(700, 3));
+        let attachment_id;
+        {
+            let store = PersistedAttachmentStore::open(&cache_root, formal_store(&db_path))
+                .expect("open persisted store");
+            let descriptor = store
+                .import_file(&FileToken::from_local_path(&source_path), "cancel.bin")
+                .expect("import");
+            attachment_id = descriptor.attachment_id.clone();
+            let status = store.cancel_transfer(&attachment_id).expect("cancel");
+            assert_eq!(status.state, AttachmentState::Cancelled);
+            assert!(status.cancel_requested);
+            let record = store.attachment_record(&attachment_id).unwrap().unwrap();
+            assert_eq!(record.state, "cancelled");
+            // 已取消再取消是幂等的。
+            assert_eq!(
+                store.cancel_transfer(&attachment_id).expect("cancel again").state,
+                AttachmentState::Cancelled
+            );
+        }
+        // 重开后记录仍是 cancelled；没有缓存时状态从记录派生。
+        let store = PersistedAttachmentStore::open(&cache_root, formal_store(&db_path))
+            .expect("reopen persisted store");
+        let status = store.attachment_status(&attachment_id).expect("status");
+        assert_eq!(status.state, AttachmentState::Cancelled);
+        assert!(status.cancel_requested);
+        assert_eq!(
+            store.cancel_transfer(&attachment_id).expect("cancel after restart").state,
+            AttachmentState::Cancelled
+        );
+    }
+
+    #[test]
+    fn persisted_import_cleans_cache_when_record_write_fails() {
+        let dir = TempDir::new("persisted-fail");
+        let db_path = dir.path("chat.db");
+        let source_path = dir.source("fail.bin", &pattern(300, 5));
+        // 注入故障：存储连接已 fail-closed，记录一定写不进去。
+        let mut formal = formal_store(&db_path);
+        formal.mark_faulted("injected: record store is fail-closed");
+        let store = PersistedAttachmentStore::open(dir.path("cache"), formal)
+            .expect("open persisted store");
+        let error = store
+            .import_file(&FileToken::from_local_path(&source_path), "fail.bin")
+            .unwrap_err();
+        assert_eq!(error.code(), "STORAGE_FAILURE");
+        // 缓存被清理，不留“只有缓存没有记录”的半成品。
+        let mut files = Vec::new();
+        collect_files(store.cache_root(), &mut files);
+        assert!(
+            files.is_empty(),
+            "failed record write must clean the attachment cache"
+        );
+        assert!(store.attachment_records(10).is_err());
+    }
 }
+

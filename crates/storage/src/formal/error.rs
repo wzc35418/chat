@@ -69,6 +69,9 @@ pub enum StorageError {
     /// MLS epoch 单调性被破坏：旧 epoch 不得覆盖新 epoch，也不得被读出使用。
     #[error("stale MLS epoch: stored {stored}, offered {offered}")]
     StaleEpoch { stored: u64, offered: u64 },
+    /// 附件记录不存在（或 ID 形式不合法）。
+    #[error("attachment not found: {0}")]
+    AttachmentNotFound(String),
 }
 
 impl StorageError {
@@ -95,6 +98,7 @@ impl StorageError {
             Self::InvalidStateTransition(_) => "INVALID_STATE_TRANSITION",
             Self::IdentityAccountConflict(_) => "IDENTITY_ACCOUNT_CONFLICT",
             Self::StaleEpoch { .. } => "STALE_EPOCH",
+            Self::AttachmentNotFound(_) => "ATTACHMENT_NOT_FOUND",
         }
     }
 }

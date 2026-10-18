@@ -11,6 +11,7 @@
 //! - recover_incomplete_writes 用恢复标记核对已提交状态，只按已存在的字节恢复，
 //!   绝不重新加密、也绝不从标记重建消息。
 
+mod attachments;
 mod cursor;
 mod entry;
 mod error;
@@ -21,6 +22,12 @@ mod outbox_lease;
 mod query;
 mod seal;
 
+pub use attachments::{
+    ATTACHMENT_DIGEST_BYTES, ATTACHMENT_STATES, ATTACHMENT_STATE_TRANSITIONS, AttachmentRecord,
+    AttachmentRecordInput, MAX_ATTACHMENTS, MAX_ATTACHMENT_CHUNKS, MAX_ATTACHMENT_CHUNK_SIZE,
+    MAX_ATTACHMENT_DISPLAY_NAME_BYTES, MAX_ATTACHMENT_ID_BYTES, MAX_ATTACHMENT_LIST,
+    MAX_ATTACHMENT_PLAIN_BYTES,
+};
 pub use cursor::PageCursor;
 pub use entry::{
     AppliedEntry, MAX_SESSION_PREVIEW_CHARS, MAX_SESSION_TITLE_BYTES, SessionSummary,
@@ -292,6 +299,8 @@ pub enum WriteScopeKind {
     Identity,
     /// MLS 群状态与 provider 记录（CRYPTO-004/010 持久化切片）：只动 mls_* 表。
     MlsState,
+    /// 附件记录（ATTACHMENTS-001 持久化）：只动 attachments 表，不绑定会话。
+    Attachments,
 }
 
 /// 受限写事务的作用域。
@@ -352,6 +361,15 @@ impl WriteScope {
     pub fn identity() -> Self {
         Self {
             kind: WriteScopeKind::Identity,
+            conversation_id: None,
+            expected_version: None,
+        }
+    }
+
+    /// 附件记录作用域（不受单会话限制；只动 attachments 表）。
+    pub fn attachments() -> Self {
+        Self {
+            kind: WriteScopeKind::Attachments,
             conversation_id: None,
             expected_version: None,
         }

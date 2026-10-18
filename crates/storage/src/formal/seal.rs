@@ -59,6 +59,8 @@ pub enum SealPurpose {
     MlsGroupState,
     /// `mls_record.protected_value`：MLS provider 记录（群状态、epoch 秘密、签名密钥）。
     MlsRecord,
+    /// `attachments.protected_descriptor`：附件记录的敏感元数据（内容/密文摘要、展示名）。
+    AttachmentRecord,
 }
 
 impl SealPurpose {
@@ -76,6 +78,7 @@ impl SealPurpose {
             Self::ContactRecord => b"contact-record",
             Self::MlsGroupState => b"mls-group-state",
             Self::MlsRecord => b"mls-record",
+            Self::AttachmentRecord => b"attachment-record",
         }
     }
 }
