@@ -45,12 +45,20 @@
 |`POST /v1/blobs/{upload_id}/complete`|校验清单并发布（NODE-014）|清单块数/总长/整体摘要必须与已上传内容一致；重复完成返回同一回执|
 |`GET /v1/blobs/{blob_id}/chunks/{index}`|取回一块密文（NODE-015）|成员窗口授权；未发布或越权一律拒绝；响应是原始密文字节|
 |GET /v1/health|健康检查（API-010）|**匿名、不鉴权、不限流**；只返回 `status/node_id/node_public_key/schema_version`，不含任何秘密与内部状态|
-|POST /v1/capabilities|签发对象级能力令牌（API-004）|设备鉴权 + **对象级授权**（上传会话归属 / 附件可读性）后才签发；ttl 上限 1 小时|
+|POST /v1/capabilities|签发对象级能力令牌（API-004）|设备鉴权 + **对象级授权**（上传会话归属 / 附件可读性）后才签发；ttl 上限 1 小时（CAP 包可由策略下调）|
+|（CAP 包）附件块端点|可选/强制携带 `x-chat-capability`|策略 `capability.required` 或 `CHAT_NODE_CAPABILITY_REQUIRED` 打开后必带；缺失 401 `AUTH_REQUIRED`|
 |POST /v1/groups/{id}/entries（DM 包补充）|追加候选**可选带领域操作声明**（PROTOCOL-004 字段 55/56）|请求体多一个可选 `domainOperation: { operation, target_digest }`；声明参与作者签名原文，非法组合/未知枚举/零摘要 → 400 `INVALID_CANDIDATE`；不传 = 旧客户端行为|
 
 健康检查的定位：运维/探活用，所以既不能要签名（探活方没有设备凭据），也不能被限流（否则过载时最先失去可观测性）。它不返回库路径、配置、队列长度等内部状态，避免成为信息泄露面。
 
 能力令牌的传输约定：附件块端点（`PUT/GET /v1/blobs/…/chunks/{index}`）在设备鉴权之外**接受**可选的 `x-chat-capability` 请求头。带上时令牌必须与（对象 id、本设备、用途）绑定且未过期——否则 401/403；不带时仍按设备鉴权（会员窗口/上传者）判定。**强制模式尚未开启**（会破坏既有客户端，见 API-004 的限制）。
+
+能力令牌强制模式（CAP 包）的传输约定：节点策略 `CapabilityPolicy.required`（默认 **false**）或进程环境变量
+`CHAT_NODE_CAPABILITY_REQUIRED=1/true/yes/on` 打开后，附件块 `PUT/GET /v1/blobs/…/chunks/{index}` **必须**带
+`x-chat-capability`（先 `POST /v1/capabilities` 取）。缺失 → **401 `AUTH_REQUIRED`**；令牌绑定不符 →
+403 `INVALID_CAPABILITY`；令牌过期 → 401 `AUTH_EXPIRED`；令牌头存在但为空/超长 → 400 `INVALID_REQUEST`
+（“空令牌”是畸形请求，不等于“没带令牌”，不会被当成 AUTH_REQUIRED）。关闭时行为完全不变（旧客户端零改动）。
+`CHAT_NODE_CAPABILITY_MAX_TTL_SECONDS` 可调签发上限（默认 3600，硬上限仍是 1 小时）。
 
 领域操作声明（DM 包）的传输约定：`POST /v1/groups/{id}/entries` 的请求体可选携带
 `domainOperation: { "operation": "set_role" | "transfer_ownership" | "leave_self" | "dissolve", "target_digest": "<64 位小写 hex>" }`

@@ -11,9 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chat_core::groups::{
     CreateGroupRequest, GroupBootstrapPeer, GroupView, PeerEntryInput, PeerEntryOutcome,
-    ProposalEntryInput, accept_pending_control, create_group_with_welcome, dissolve_group,
-    group_commit_proposals, group_join_from_welcome, group_prepare_leave, group_process_peer_entry,
-    group_process_proposal, group_snapshot, transfer_ownership,
+    ProposalEntryInput, create_group_with_welcome, dissolve_group, group_commit_proposals,
+    group_join_from_welcome, group_prepare_leave, group_process_peer_entry, group_process_proposal,
+    group_snapshot,
 };
 use chat_crypto::control::{CommitExpectation, WelcomeAcceptance};
 use chat_crypto::engine::MlsDevice;
@@ -118,37 +118,54 @@ impl Fixture {
         }
     }
 
-    /// 把群主转让给 bob，并让 bob 合并该提交（两侧都到 epoch 2）。
-    fn transfer_ownership_to_bob(&mut self) {
-        let pending = transfer_ownership(
-            &mut self.alice,
-            &mut self.store_a,
-            &self.group_id,
-            "alice",
-            "bob",
-        )
-        .expect("transfer ownership");
-        assert!(pending.pending.is_some());
-        let commit = self
-            .alice
-            .pending_control()
-            .expect("pending query")
-            .expect("pending commit")
-            .commit;
-        let accepted = accept_pending_control(&mut self.alice, &mut self.store_a, &self.group_id)
-            .expect("accept the transfer");
-        assert_eq!(accepted.epoch, 2);
-        assert_eq!(accepted.role, MemberRole::Member);
+    /// bob 是建群者（群主），alice 是 Welcome 加入的成员——两侧记录里的角色都准确。
+    fn assert_roles(&self) {
+        assert_eq!(self.view_b.role, MemberRole::Owner);
+        assert_eq!(self.view_a.role, MemberRole::Member);
+    }
+}
 
-        // 角色转让是 SelfUpdate 提交；MLS 侧的 update 计数不是策略层能预知的，
-        // 因此这里不声明预期计数（None），只保证提交真的被合并。
-        let input = PeerEntryInput::new(self.group_id.clone(), 1, "alice", commit);
-        let outcome = group_process_peer_entry(&mut self.bob, &mut self.store_b, &input)
-            .expect("bob merges the transfer commit");
-        match outcome {
-            PeerEntryOutcome::Commit { new_epoch, .. } => assert_eq!(new_epoch, 2),
-            other => panic!("expected a merged commit, got {other:?}"),
-        }
+/// bob 建群（群主）+ alice 用 Welcome 加入（成员）：提交侧权限用例需要 B 侧角色准确。
+fn bob_owned_fixture() -> Fixture {
+    let dir_a = FixtureDir::new();
+    let dir_b = FixtureDir::new();
+    let mut store_a = dir_a.open();
+    let mut store_b = dir_b.open();
+    let mut alice = MlsDevice::new("alice").expect("alice");
+    let mut bob = MlsDevice::new("bob").expect("bob");
+    let request = CreateGroupRequest::new("提案群（bob 建）", "bob");
+    let peer = GroupBootstrapPeer {
+        credential: "alice".to_owned(),
+        device: &alice,
+    };
+    let (view_b, welcome) =
+        create_group_with_welcome(&mut bob, &peer, &mut store_b, &request).expect("create");
+    let acceptance = WelcomeAcceptance {
+        group_id: view_b.mls_group_key.clone(),
+        expected_epoch: view_b.epoch,
+        members: vec!["alice".to_owned(), "bob".to_owned()],
+    };
+    let view_a = group_join_from_welcome(
+        &mut alice,
+        &mut store_a,
+        "提案群（bob 建）",
+        &welcome,
+        &acceptance,
+        "alice",
+        "bob",
+    )
+    .expect("alice joins");
+    Fixture {
+        dir_a,
+        dir_b,
+        store_a,
+        store_b,
+        alice,
+        bob,
+        group_id: view_b.group_id.clone(),
+        mls_key: view_b.mls_group_key.clone(),
+        view_a,
+        view_b,
     }
 }
 
@@ -166,22 +183,23 @@ fn owner_cannot_prepare_leave() {
 
 #[test]
 fn self_removal_proposal_end_to_end() {
-    let mut fixture = Fixture::new();
-    fixture.transfer_ownership_to_bob();
+    // bob 建群（群主）+ alice 加入（成员）：提交侧权限要求打包者是群主/管理员。
+    let mut fixture = bob_owned_fixture();
+    fixture.assert_roles();
     let group_id = fixture.group_id.clone();
 
-    // 1) 普通成员（原群主 alice）发起自移除提案：epoch 与策略版本都不变，无 pending 控制提交。
+    // 1) 普通成员 alice 发起自移除提案：epoch 与策略版本都不变，无 pending 控制提交。
     let before = group_snapshot(&fixture.store_a, &group_id).expect("snapshot");
     let proposal = group_prepare_leave(&mut fixture.alice, &mut fixture.store_a, &group_id)
         .expect("prepare self-removal");
-    assert_eq!(proposal.base_epoch, 2);
-    assert_eq!(proposal.epoch, 2);
+    assert_eq!(proposal.base_epoch, 1);
+    assert_eq!(proposal.epoch, 1);
     assert_eq!(proposal.removed, 1);
     assert!(!proposal.has_welcome);
     assert_eq!(proposal.proposal_digest.len(), 64);
     assert!(!proposal.proposal.is_empty());
     let after = group_snapshot(&fixture.store_a, &group_id).expect("snapshot");
-    assert_eq!(after.epoch, 2, "preparing a proposal does not advance the epoch");
+    assert_eq!(after.epoch, 1, "preparing a proposal does not advance the epoch");
     assert_eq!(after.policy_version, before.policy_version);
     assert!(after.pending.is_none(), "no pending control commit is created");
     assert!(after.leaving_at_ms.is_some());
@@ -191,25 +209,25 @@ fn self_removal_proposal_end_to_end() {
     let outcome = group_process_proposal(
         &mut fixture.bob,
         &mut fixture.store_b,
-        &ProposalEntryInput::new(group_id.clone(), 2, "alice", proposal.proposal.clone()),
+        &ProposalEntryInput::new(group_id.clone(), 1, "alice", proposal.proposal.clone()),
     )
     .expect("process the proposal");
     assert_eq!(outcome.kind, "remove");
     assert_eq!(outcome.by, "alice");
-    assert_eq!(outcome.epoch, 2);
+    assert_eq!(outcome.epoch, 1);
     assert_eq!(outcome.targets, vec!["alice".to_owned()]);
     assert_eq!(outcome.proposals_pending, 1);
-    assert_eq!(outcome.view.epoch, 2);
+    assert_eq!(outcome.view.epoch, 1);
 
     // 3) 对端把提案打包成 pending 控制提交：epoch 不推进，快照如实报告 pending。
     let committed = group_commit_proposals(&mut fixture.bob, &mut fixture.store_b, &group_id)
         .expect("commit pending proposals");
-    assert_eq!(committed.epoch, 2, "committing does not advance the epoch");
+    assert_eq!(committed.epoch, 1, "committing does not advance the epoch");
     assert_eq!(committed.members.len(), 2, "members change only after merge");
     let pending = committed.pending.as_ref().expect("pending control commit");
     assert_eq!(pending.operation, "remove_members");
-    assert_eq!(pending.base_epoch, 2);
-    assert_eq!(pending.target_epoch, 3);
+    assert_eq!(pending.base_epoch, 1);
+    assert_eq!(pending.target_epoch, 2);
     assert_eq!(pending.removed, 1);
 
     // 4) 本机合并对端的提交：self_removed，epoch 前进，本机不再是成员。
@@ -219,7 +237,7 @@ fn self_removal_proposal_end_to_end() {
         .expect("pending query")
         .expect("pending commit")
         .commit;
-    let mut input = PeerEntryInput::new(group_id.clone(), 2, "bob", commit);
+    let mut input = PeerEntryInput::new(group_id.clone(), 1, "bob", commit);
     input.expectation = Some(CommitExpectation {
         added: 0,
         removed: 1,
@@ -237,15 +255,15 @@ fn self_removal_proposal_end_to_end() {
             view,
             ..
         } => {
-            assert_eq!(old_epoch, 2);
-            assert_eq!(new_epoch, 3);
+            assert_eq!(old_epoch, 1);
+            assert_eq!(new_epoch, 2);
             assert_eq!(removed, 1);
             assert!(self_removed, "this commit removes the local device");
             view
         }
         other => panic!("expected a merged commit, got {other:?}"),
     };
-    assert_eq!(view.epoch, 3);
+    assert_eq!(view.epoch, 2);
     assert_eq!(
         view.members
             .iter()
@@ -261,7 +279,7 @@ fn self_removal_proposal_end_to_end() {
         "a removed device must not be able to encrypt"
     );
     // bob 自己还有 pending 提交（它打包的那条）：本地按 crypto 语义先落 pending，因此不能加密，
-    // 但它的群状态是健康的（epoch 仍 2、pending 仍在）。
+    // 但它的群状态是健康的（epoch 仍 1、pending 仍在）。
     assert!(
         fixture.bob.encrypt("still here").is_err(),
         "a device with a pending commit cannot encrypt before merging it"

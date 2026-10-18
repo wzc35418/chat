@@ -154,7 +154,13 @@ impl NodeService {
         validate_timestamp("now", now)?;
         validate_bounded_id("device id", device_id, MAX_DEVICE_ID_BYTES)?;
         validate_object_id(scope, object_id)?;
-        if ttl_seconds == 0 || ttl_seconds > MAX_CAPABILITY_TTL_SECONDS {
+        // 生效上限 = 策略上限（CAP 包可调）与协议的硬上限取小。
+        let policy_limit = self
+            .policy()
+            .capability
+            .max_ttl_seconds
+            .min(MAX_CAPABILITY_TTL_SECONDS);
+        if ttl_seconds == 0 || ttl_seconds > policy_limit {
             return Err(NodeError::InvalidRequest("capability ttl"));
         }
         let expires_at = now

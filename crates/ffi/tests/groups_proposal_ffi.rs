@@ -176,70 +176,75 @@ fn owner_prepare_leave_is_rejected_through_ffi() {
 
 #[test]
 fn member_prepare_leave_process_and_commit_through_ffi() {
-    let harness = Harness::new(true);
+    // 群主（alice）从建群起就在本侧：提交他人的提案必须由群主/管理员发起。
+    // 注意角色不随 MLS Commit 传播（见 groups.md 限制①），所以这里不做转让。
+    let harness = Harness::new(false);
     let group_id = harness.group_id.clone();
     let before = harness.snapshot();
-    assert_eq!(before.epoch, 2);
-    assert_eq!(before.role, "member", "alice transferred ownership to bob");
+    assert_eq!(before.epoch, 1);
+    assert_eq!(before.role, "owner");
 
     // 1) 成员发起自移除提案：返回可转发字节，epoch/策略版本不变，无 pending 控制提交。
     let proposal = harness
-        .alice
+        .bob
         .group_prepare_leave(group_id.clone())
         .expect("prepare self-removal");
-    assert_eq!(proposal.base_epoch, 2);
-    assert_eq!(proposal.epoch, 2);
+    assert_eq!(proposal.base_epoch, 1);
+    assert_eq!(proposal.epoch, 1);
     assert_eq!(proposal.removed, 1);
     assert!(!proposal.has_welcome);
     assert_eq!(proposal.proposal_digest.len(), 64);
     assert!(!proposal.proposal.is_empty());
     assert!(proposal.leaving_at_ms > 0);
     let after_prepare = harness.snapshot();
-    assert_eq!(after_prepare.epoch, 2);
+    assert_eq!(after_prepare.epoch, 1);
     assert_eq!(after_prepare.policy_version, before.policy_version);
     assert!(after_prepare.pending.is_none());
-    assert!(after_prepare.leaving_at_ms.is_some());
+    // leaving 标记记在**发起方**（bob）的快照上；群主（alice）侧没有该标记。
+    assert!(after_prepare.leaving_at_ms.is_none());
+    let bob_view = harness.bob.group_snapshot(group_id.clone()).expect("bob snapshot");
+    assert!(bob_view.leaving_at_ms.is_some());
     assert_eq!(member_credentials(&after_prepare), vec!["alice", "bob"]);
 
     // 2) 重复发起 → 显式拒绝。
     let error = harness
-        .alice
+        .bob
         .group_prepare_leave(group_id.clone())
         .expect_err("duplicate prepare");
     assert_eq!(code(error), "INVALID_STATE_TRANSITION");
 
     // 3) 对端处理提案：epoch 不变、提案入本地 store。
     let outcome = harness
-        .bob
+        .alice
         .group_process_proposal(
             group_id.clone(),
-            2,
-            "alice".to_owned(),
+            1,
+            "bob".to_owned(),
             proposal.proposal.clone(),
         )
         .expect("process proposal");
     assert_eq!(outcome.kind, "remove");
-    assert_eq!(outcome.by, "alice");
-    assert_eq!(outcome.epoch, 2);
-    assert_eq!(outcome.targets, vec!["alice".to_owned()]);
+    assert_eq!(outcome.by, "bob");
+    assert_eq!(outcome.epoch, 1);
+    assert_eq!(outcome.targets, vec!["bob".to_owned()]);
     assert_eq!(outcome.proposals_pending, 1);
 
     // 4) 对端打包成 pending 控制提交：epoch 不推进、成员不变、快照如实报告 pending。
     let committed = harness
-        .bob
+        .alice
         .group_commit_proposals(group_id.clone())
         .expect("commit proposals");
-    assert_eq!(committed.epoch, 2);
+    assert_eq!(committed.epoch, 1);
     assert_eq!(member_credentials(&committed), vec!["alice", "bob"]);
     let pending = committed.pending.as_ref().expect("pending control commit");
     assert_eq!(pending.operation, "remove_members");
-    assert_eq!(pending.base_epoch, 2);
-    assert_eq!(pending.target_epoch, 3);
+    assert_eq!(pending.base_epoch, 1);
+    assert_eq!(pending.target_epoch, 2);
     assert_eq!(pending.removed, 1);
 
     // 5) 已有 pending 提交时再次打包 → 显式拒绝。
     let error = harness
-        .bob
+        .alice
         .group_commit_proposals(group_id.clone())
         .expect_err("a control commit is already pending");
     assert!(!code(error).is_empty());

@@ -46,6 +46,22 @@ class NativeAttachmentService(cacheRoot: String) : AttachmentService {
         }
     }
 
+    override suspend fun download(
+        attachmentId: String,
+        targetPath: String,
+        endpointUrl: String,
+        nodeId: String,
+        nodePublicKeyHex: String?,
+        groupId: String,
+        sourceSeq: Long,
+    ): Long = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            guard {
+                store.download(attachmentId, targetPath, endpointUrl, nodeId, nodePublicKeyHex, groupId, sourceSeq.toULong())
+            }.writtenBytes.toLong()
+        }
+    }
+
     override suspend fun cancel(attachmentId: String): LocalAttachment = mutex.withLock {
         withContext(Dispatchers.IO) { guard { store.cancel(attachmentId).toLocal() } }
     }

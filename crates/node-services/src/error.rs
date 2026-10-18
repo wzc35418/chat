@@ -21,6 +21,8 @@ pub enum NodeError {
     AuthExpired,
     /// 同一挑战被第二次消费。
     AuthReplay,
+    /// CAP 包：强制模式下请求缺少能力令牌。
+    AuthRequired,
     /// 设备签名验证失败（含跨方法/路径/查询/正文/节点重放）。
     InvalidSignature,
     /// 设备凭据无效：签名、账户绑定、期限、supervisor 公钥或已登记数据不一致。
@@ -105,6 +107,7 @@ impl NodeError {
             Self::NodeIdMismatch => "NODE_ID_MISMATCH",
             Self::AuthExpired => "AUTH_EXPIRED",
             Self::AuthReplay => "AUTH_REPLAY",
+            Self::AuthRequired => "AUTH_REQUIRED",
             Self::InvalidSignature => "INVALID_SIGNATURE",
             Self::InvalidCredential => "INVALID_CREDENTIAL",
             Self::DeviceRevoked => "DEVICE_REVOKED",
@@ -151,6 +154,7 @@ impl NodeError {
             Self::NodeIdMismatch => "challenge belongs to another node",
             Self::AuthExpired => "challenge has expired",
             Self::AuthReplay => "challenge was already used",
+            Self::AuthRequired => "this endpoint requires a capability token",
             Self::InvalidSignature => "device signature does not match this request",
             Self::InvalidCredential => "device credential is not valid",
             Self::DeviceRevoked => "device is revoked",

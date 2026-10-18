@@ -407,3 +407,69 @@ impl CleanupPolicy {
         Ok(())
     }
 }
+
+/// CAP 包：能力令牌强制模式策略。
+///
+/// 默认**关闭**（`required = false`），因此既有客户端与既有 HTTP 调用路径完全不变；
+/// 打开后附件块 `PUT/GET` 必须带有效能力令牌（缺失 → `AUTH_REQUIRED`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityPolicy {
+    /// 是否强制附件块端点携带能力令牌。
+    pub required: bool,
+    /// 节点签发能力令牌的有效期上限（秒，硬上限仍是 `MAX_CAPABILITY_TTL_SECONDS`）。
+    pub max_ttl_seconds: u64,
+}
+
+/// 能力令牌默认有效期上限（秒）。
+pub const DEFAULT_CAPABILITY_MAX_TTL_SECONDS: u64 = 3_600;
+
+impl Default for CapabilityPolicy {
+    fn default() -> Self {
+        Self {
+            required: false,
+            max_ttl_seconds: DEFAULT_CAPABILITY_MAX_TTL_SECONDS,
+        }
+    }
+}
+
+impl CapabilityPolicy {
+    /// 校验策略；TTL 必须落在 `1..=MAX_CAPABILITY_TTL_SECONDS`。
+    pub fn validate(&self) -> NodeResult<()> {
+        if self.max_ttl_seconds == 0
+            || self.max_ttl_seconds > crate::capability::MAX_CAPABILITY_TTL_SECONDS
+        {
+            return Err(NodeError::InvalidConfig("capability max ttl"));
+        }
+        Ok(())
+    }
+
+    /// 从环境变量读强制开关（部署侧/CLI 之外的运行期开关）。
+    ///
+    /// - `CHAT_NODE_CAPABILITY_REQUIRED`：`1/true/yes/on` 打开，其他值（含缺失）关闭；
+    /// - `CHAT_NODE_CAPABILITY_MAX_TTL_SECONDS`：正整数，缺省用默认值。
+    ///
+    /// 非法 TTL 直接返回策略错误（不静默回退到默认值，避免“以为开/关”的错觉）。
+    pub fn from_env() -> NodeResult<Self> {
+        let required = std::env::var("CHAT_NODE_CAPABILITY_REQUIRED")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        let max_ttl_seconds = match std::env::var("CHAT_NODE_CAPABILITY_MAX_TTL_SECONDS") {
+            Ok(value) => value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| NodeError::InvalidConfig("capability max ttl env"))?,
+            Err(_) => DEFAULT_CAPABILITY_MAX_TTL_SECONDS,
+        };
+        let policy = Self {
+            required,
+            max_ttl_seconds,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+}

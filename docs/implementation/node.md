@@ -293,6 +293,32 @@ append_group_entry(group: GroupId, candidate: SignedCandidate, actor: Authentica
 - 前置状态竞争：`stale_control_head_and_epoch_are_rejected`（两个管理员基于同一 expected_control_head，第二个 STALE_CONTROL_HEAD；epoch 不符 STALE_EPOCH）。
 - 越权与畸形输入：`unauthorized_appends_are_rejected`（跨群/代签/篡改签名/超上限密文/未知群）、`append_requires_bound_authentication_and_matching_group`（缺鉴权头、换方法/路径/正文、路径与正文 group 不一致、挑战重放）。
 
+**CAP 包补充（能力令牌强制模式）**：`NodeAuthPolicy` 新增 `capability: CapabilityPolicy { required, max_ttl_seconds }`
+（源码 [limits.rs](../../crates/node-services/src/limits.rs)），默认 `required = false`、`max_ttl_seconds = 3600`：
+
+1. **策略**：`CapabilityPolicy::validate` 拒绝 0 或超过协议硬上限（1 小时）的 TTL；`CapabilityPolicy::from_env` 读
+   `CHAT_NODE_CAPABILITY_REQUIRED`（1/true/yes/on，大小写不敏感）与 `CHAT_NODE_CAPABILITY_MAX_TTL_SECONDS`，
+   非法 TTL 显式报 `INVALID_CONFIG`（不静默回退）。
+2. **签发上限**：`issue_capability` 的生效上限 = `min(策略上限, 协议硬上限)`，因此策略只能收紧不能放宽。
+3. **强制**：node-api 的 `AppState::capability_required()` = 环境变量/显式开关 **或** 节点策略；附件块 `PUT/GET`
+   在没有令牌且强制时返回 **`AUTH_REQUIRED`**（401，新固定码，见 `NodeError::AuthRequired`）。关闭时仍是“可选头”。
+4. **客户端（node-client）**：`put_blob_chunk`/`read_blob_chunk` 首次被 `AUTH_REQUIRED` 拒绝后自动
+   `POST /v1/capabilities` 取令牌并**重试一次**，此后 `capability_mode()` 为真、按 (对象, 用途) 缓存；
+   `issue_capability` 暴露显式申请；`set_capability_mode(true)` 可提前打开。缓存用**单调时钟截止点**
+  （有效期长度换算成本地 `Instant`），因此节点与客户端时钟不一致时不会误用/误弃令牌。
+
+验证证据（`cargo test --offline -p chat-node-services -p chat-node-api -p chat-node-client` 全绿）：
+`group_mailbox_http::capability_required_mode_rejects_missing_tokens_and_accepts_valid_ones`（无令牌 401 AUTH_REQUIRED、
+带令牌 200、过期令牌 401 AUTH_EXPIRED、空令牌头 400 INVALID_REQUEST、下载侧同样强制）、
+`group_mailbox_http::disabled_capability_mode_keeps_legacy_clients_working`（默认关闭时旧客户端零改动）；
+客户端真节点端到端 `capability_flow::client_fetches_capability_tokens_automatically_when_the_node_requires_them`
+（自适应取令牌 → 上传/下载成功 → 令牌按对象+用途缓存复用）、`capability_flow::pre_enabled_mode_fetches_before_the_first_chunk`、
+`capability_flow::disabled_capability_mode_keeps_the_legacy_client_flow`（关闭时不发额外请求、不缓存令牌）。
+
+已知限制：强制开关的**进程级接线**（apps/node 启动时把环境变量灌进策略或用 `AppState::set_capability_required`）
+在 apps/** 作用域之外，本包只提供策略字段、环境变量解析函数与 HTTP 层强制；令牌仍是无状态签名令牌，没有撤销列表；
+强制模式只覆盖附件块端点（其它端点仍只做设备鉴权）。
+
 **DM 包补充（领域操作声明，PROTOCOL-004 字段 55/56）**：追加路径新增
 `NodeService::append_group_entry_with_domain(&mut self, group, candidate, domain: Option<&CandidateDomainOperation>, actor, now)`，
 `append_group_entry` 就是它的 `domain = None` 形态（旧客户端字节与行为完全不变）。

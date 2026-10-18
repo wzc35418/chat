@@ -209,7 +209,7 @@ impl NodeClientError {
             "NODE_ID_MISMATCH" => ErrorCode::InvalidTarget,
             "DEVICE_REVOKED" => ErrorCode::DeviceRevoked,
             "DEVICE_LIMIT_EXCEEDED" => ErrorCode::DeviceLimitExceeded,
-            "INVALID_CAPABILITY" => ErrorCode::RequiredCapabilityMissing,
+            "INVALID_CAPABILITY" | "AUTH_REQUIRED" => ErrorCode::RequiredCapabilityMissing,
             "PERMISSION_DENIED" => ErrorCode::PermissionDenied,
             "HISTORY_NOT_AUTHORIZED" => ErrorCode::HistoryNotAuthorized,
             "CHALLENGE_CAPACITY_EXCEEDED" => ErrorCode::NodeUnavailable,
@@ -244,9 +244,8 @@ impl NodeClientError {
         match node_code {
             "INVALID_CHALLENGE" | "AUTH_EXPIRED" | "AUTH_REPLAY" | "INVALID_SIGNATURE"
             | "INVALID_CREDENTIAL" | "DEVICE_REVOKED" => NodeClientErrorKind::Authentication,
-            "INVALID_CAPABILITY" | "PERMISSION_DENIED" | "HISTORY_NOT_AUTHORIZED" => {
-                NodeClientErrorKind::Permission
-            }
+            "INVALID_CAPABILITY" | "AUTH_REQUIRED" | "PERMISSION_DENIED"
+            | "HISTORY_NOT_AUTHORIZED" => NodeClientErrorKind::Permission,
             "GROUP_ID_CONFLICT" | "SUBMISSION_ID_CONFLICT" | "ITEM_ID_CONFLICT"
             | "STALE_CONTROL_HEAD" | "STALE_EPOCH" => NodeClientErrorKind::Conflict,
             "GROUP_NOT_FOUND" | "UPLOAD_NOT_FOUND" | "BLOB_NOT_FOUND" => {
@@ -334,12 +333,13 @@ impl NodeClientError {
 }
 
 /// 节点侧可能的稳定码字符串（用于把未知码显式标记为 UNKNOWN_NODE_CODE）。
-const NODE_CODES: [&str; 39] = [
+const NODE_CODES: [&str; 40] = [
     "INVALID_REQUEST",
     "PAYLOAD_TOO_LARGE",
     "INVALID_CHALLENGE",
     "NODE_ID_MISMATCH",
     "AUTH_EXPIRED",
+    "AUTH_REQUIRED",
     "AUTH_REPLAY",
     "INVALID_SIGNATURE",
     "INVALID_CREDENTIAL",

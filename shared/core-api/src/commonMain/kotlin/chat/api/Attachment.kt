@@ -32,5 +32,20 @@ interface AttachmentService {
     /** 批量读附件显示信息（消息附件卡片用）：未知 ID 跳过；不解密内容。 */
     suspend fun records(attachmentIds: List<String>): List<LocalAttachment>
 
+    /**
+     * 从节点下载并认证解密到目标路径（ATTACHMENTS-005）。
+     *
+     * 需要节点端点、群 ID 与本设备已接受条目的序号；未配置时显式失败，不伪造下载成功。
+     */
+    suspend fun download(
+        attachmentId: String,
+        targetPath: String,
+        endpointUrl: String,
+        nodeId: String,
+        nodePublicKeyHex: String?,
+        groupId: String,
+        sourceSeq: Long,
+    ): Long
+
     suspend fun cancel(attachmentId: String): LocalAttachment
 }

@@ -24,7 +24,8 @@ use chat_crypto::engine::MlsDevice;
 use chat_node_client::{NodeClient, NodeClientError, NodeClientErrorKind};
 use chat_node_services::canonical::{hex_decode, hex_encode, sha256_concat};
 use chat_node_services::group::{
-    AppendResult, CandidateControlMetadata, GroupCandidate, KIND_CONTROL, SignedLogHead,
+    AppendResult, CandidateControlMetadata, GroupCandidate, KIND_APPLICATION, KIND_CONTROL,
+    SignedLogHead,
     log_chain_hash,
 };
 use chat_protocol::{ErrorCode, GroupId, SubmissionId};
@@ -454,6 +455,167 @@ const CONTROL_TARGET_DOMAIN: &[u8] = b"chat/core/control-target/v1";
 fn control_target_digest(credential: &str) -> [u8; 32] {
     sha256_concat(&[CONTROL_TARGET_DOMAIN, credential.as_bytes()])
 }
+// ---------------------------------------------------------------- 提案投递（GROUPS-013）
+
+/// 用**持久身份**派生设备签名钥并构造节点客户端（端点/节点 ID/节点公钥全部显式）。
+///
+/// 身份未入库 → `INVALID_STATE_TRANSITION`；端点不可解析/公钥格式错 → `INVALID_TARGET`。
+pub fn build_node_client(
+    store: &Store,
+    endpoint_url: &str,
+    node_id: &str,
+    node_public_key_hex: Option<&str>,
+) -> ControlReceiptResult<NodeClient> {
+    let seeds = store
+        .load_identity_seeds()
+        .map_err(|_| {
+            ControlReceiptError::new(
+                ErrorCode::StorageFailure.as_str(),
+                "the persisted identity could not be read",
+            )
+        })?
+        .ok_or_else(|| {
+            ControlReceiptError::new(
+                ErrorCode::InvalidStateTransition.as_str(),
+                "the local identity is not enrolled in this database",
+            )
+        })?;
+    let device_seed: [u8; 32] = seeds.device_seed.as_slice().try_into().map_err(|_| {
+        ControlReceiptError::new(
+            ErrorCode::StateCorrupted.as_str(),
+            "the persisted device seed is not 32 bytes",
+        )
+    })?;
+    let signing_key = chat_protocol::signing_key_from_seed(&device_seed);
+    let mut endpoint = chat_node_client::NodeEndpoint::new(endpoint_url, node_id).map_err(|_| {
+        ControlReceiptError::new(
+            ErrorCode::InvalidTarget.as_str(),
+            "node endpoint must be a parseable http(s) url",
+        )
+    })?;
+    if let Some(hex_key) = node_public_key_hex {
+        let key: [u8; 32] = hex_decode::<32>("node public key", hex_key.trim()).map_err(|_| {
+            ControlReceiptError::new(
+                ErrorCode::InvalidTarget.as_str(),
+                "node public key must be 32 bytes of lowercase hex",
+            )
+        })?;
+        endpoint = endpoint.with_node_public_key(key);
+    }
+    NodeClient::new(endpoint, seeds.device_id.clone(), signing_key).map_err(|_| {
+        ControlReceiptError::new(
+            ErrorCode::InvalidTarget.as_str(),
+            "node client could not be created from the persisted device identity",
+        )
+    })
+}
+
+/// 提案条目的提交标识派生域。
+const PROPOSAL_SUBMISSION_DOMAIN: &[u8] = b"chat/core/proposal-submission/v1";
+
+/// 把独立提案作为**节点条目**提交，返回真实回执（绝不伪造）。
+///
+/// 语义：
+/// - 候选以**应用条目**（kind = `application`）写入节点日志：节点不解析提案内容，也不为提案做
+///   公开语义声明（PROTOCOL-004 没有“独立提案”的控制操作值）；提案的 MLS 认证由收侧
+///   `groups::group_process_proposal` 完成；
+/// - `submission_id` 由 (群, 提案摘要, base_epoch) 确定性派生，重复提交幂等（节点按提交 ID 去重）；
+/// - CAS 字段只取自节点 head（不本地推断）；回执的节点身份与日志链绑定由本层复核。
+pub fn submit_proposal_entry(
+    client: &NodeClient,
+    group_id: &str,
+    proposal: &[u8],
+    base_epoch: u64,
+) -> ControlReceiptResult<ProposalSubmission> {
+    GroupId::parse(group_id).map_err(|_| {
+        ControlReceiptError::new(
+            ErrorCode::InvalidId.as_str(),
+            "group id must be PROTOCOL-001 group text",
+        )
+    })?;
+    if proposal.is_empty() || proposal.len() > MAX_CONTROL_CANDIDATE_BYTES {
+        return Err(ControlReceiptError::new(
+            ErrorCode::InvalidCandidate.as_str(),
+            "proposal bytes are outside the supported bounds",
+        ));
+    }
+    let head = fetch_head(client, group_id)?;
+    if head.group_id != group_id {
+        return Err(ControlReceiptError::new(
+            ErrorCode::InvalidReceiptScope.as_str(),
+            "node head is for another group",
+        ));
+    }
+    let digest = sha256_concat(&[
+        PROPOSAL_SUBMISSION_DOMAIN,
+        group_id.as_bytes(),
+        &base_epoch.to_be_bytes(),
+        proposal,
+    ]);
+    let candidate = GroupCandidate {
+        protocol_major: 1,
+        protocol_minor: 0,
+        submission_id: SubmissionId::from_bytes(digest).encode(),
+        group_id: group_id.to_owned(),
+        author_device_id: client.device_id().to_owned(),
+        kind: KIND_APPLICATION.to_owned(),
+        expected_control_head: head.control_head.clone(),
+        policy_version: head.policy_version,
+        mls_epoch: head.mls_epoch,
+        encrypted_payload: hex_encode(proposal),
+        control_metadata: None,
+    };
+    let receipt = match append_candidate(client, &candidate)? {
+        Ok(receipt) => receipt,
+        // 同一提交 ID 的重复提交：按 submission 从节点日志对账取回原回执。
+        Err(error) if error.node_code() == Some("SUBMISSION_ID_CONFLICT") => {
+            reconcile_submission(client, group_id, &candidate.submission_id)?
+                .map(|(_, receipt)| receipt)
+                .ok_or_else(|| ControlReceiptError::from(error))?
+        }
+        Err(error) => return Err(ControlReceiptError::from(error)),
+    };
+    if receipt.group_id != group_id
+        || receipt.submission_id != candidate.submission_id
+        || receipt.author_device_id != candidate.author_device_id
+    {
+        return Err(ControlReceiptError::new(
+            ErrorCode::InvalidReceiptScope.as_str(),
+            "the receipt does not bind this proposal submission",
+        ));
+    }
+    if receipt.node_id != head.node_id || receipt.node_public_key != head.node_public_key {
+        return Err(ControlReceiptError::new(
+            ErrorCode::InvalidReceiptScope.as_str(),
+            "the receipt was issued by another node",
+        ));
+    }
+    let node_public_key = hex_decode::<32>("node public key", &head.node_public_key)
+        .map_err(|error| ControlReceiptError::new(error.code(), "node public key is malformed"))?;
+    receipt
+        .verify(&node_public_key)
+        .map_err(|error| ControlReceiptError::new(error.code(), "the node receipt signature is invalid"))?;
+    Ok(ProposalSubmission {
+        submission_id: receipt.submission_id,
+        seq: receipt.seq,
+        log_hash: receipt.log_hash,
+        node_id: receipt.node_id,
+    })
+}
+
+/// 提案提交回执的公开投影。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalSubmission {
+    /// 节点分配的提交标识。
+    pub submission_id: String,
+    /// 节点日志序号。
+    pub seq: u64,
+    /// 该条目之后的日志链摘要。
+    pub log_hash: String,
+    /// 节点身份。
+    pub node_id: String,
+}
+
 
 /// 把“提交 + 公开语义声明”解析成节点元数据；不成立就显式失败。
 ///

@@ -70,6 +70,11 @@ pub struct AppState {
     service: Arc<Mutex<NodeService>>,
     clock: Arc<dyn Clock>,
     rate_limiter: Arc<RateLimiter>,
+    /// CAP 包：能力令牌强制开关（启动时从环境变量读，可被显式设置覆盖）。
+    ///
+    /// 与节点策略 `capability.required` 取**或**：任一为真即强制，这样“部署侧环境变量”
+    /// 与“代码里配置的策略”都能打开它，而且关闭状态是默认。
+    capability_required: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -88,6 +93,9 @@ impl AppState {
             service: Arc::new(Mutex::new(service)),
             clock,
             rate_limiter: Arc::new(rate_limiter),
+            capability_required: Arc::new(std::sync::atomic::AtomicBool::new(
+                capability_required_from_env(),
+            )),
         }
     }
 
@@ -101,7 +109,27 @@ impl AppState {
             service: Arc::new(Mutex::new(service)),
             clock,
             rate_limiter: Arc::new(rate_limiter),
+            capability_required: Arc::new(std::sync::atomic::AtomicBool::new(
+                capability_required_from_env(),
+            )),
         }
+    }
+
+    /// 显式设置能力令牌强制开关（测试/上层 CLI 用；默认取环境变量）。
+    pub fn set_capability_required(&self, required: bool) {
+        self.capability_required
+            .store(required, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 当前是否强制能力令牌：环境变量/显式开关 **或** 节点策略 `capability.required`。
+    pub fn capability_required(&self) -> bool {
+        self.capability_required
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || self
+                .service
+                .lock()
+                .map(|service| service.policy().capability.required)
+                .unwrap_or(false)
     }
 
     /// 用系统时钟建立状态（生产路径）。
@@ -169,4 +197,19 @@ impl AppState {
             .map_err(|_| ApiError::from_node(NodeError::StorageUnavailable))?;
         operation(&mut service).map_err(ApiError::from_node)
     }
+}
+
+/// CAP 包：从环境变量读能力令牌强制开关（`CHAT_NODE_CAPABILITY_REQUIRED`）。
+///
+/// `1/true/yes/on`（大小写不敏感）打开，其他值或缺省关闭——默认**关闭**以保持向后兼容。
+/// 只读一个布尔开关；TTL 上限属于节点策略（见 `CapabilityPolicy::from_env`）。
+pub fn capability_required_from_env() -> bool {
+    std::env::var("CHAT_NODE_CAPABILITY_REQUIRED")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }

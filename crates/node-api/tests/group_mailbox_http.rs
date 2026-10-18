@@ -1667,3 +1667,140 @@ async fn legacy_entry_requests_without_a_declaration_still_work() {
     assert_eq!(page.status, 200);
     assert!(page.json()["page"]["entries"][0]["domain_operation"].is_null());
 }
+
+// ---------------------------------------------------------------- CAP 包强制模式
+
+fn capability_policy(required: bool) -> NodeAuthPolicy {
+    NodeAuthPolicy {
+        capability: chat_node_services::limits::CapabilityPolicy {
+            required,
+            max_ttl_seconds: 3_600,
+        },
+        ..NodeAuthPolicy::default()
+    }
+}
+
+/// 申请能力的辅助：返回 (status, token)。
+async fn request_capability(
+    node: &Node,
+    seed: u8,
+    object_id: &str,
+    scope: &str,
+    ttl_seconds: Option<u64>,
+) -> (u16, Option<String>) {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "object_id": object_id,
+        "scope": scope,
+        "ttl_seconds": ttl_seconds,
+    }))
+    .expect("capability json");
+    let headers = request_headers(node, seed, "POST", "/v1/capabilities", "", &body).await;
+    let response = http(&node.address, "POST", "/v1/capabilities", &headers, &body).await;
+    let token = response.json()["capability"]["token"]
+        .as_str()
+        .map(str::to_owned);
+    (response.status, token)
+}
+
+#[tokio::test]
+async fn capability_required_mode_rejects_missing_tokens_and_accepts_valid_ones() {
+    let (node, group) = setup(capability_policy(true)).await;
+    let source_seq = append_attachment_entry(&node, &group, 21).await;
+    let first: &[u8] = b"head";
+    let second: &[u8] = b"tail";
+    let blob = object_text(151);
+    let begin = begin_blob(&node, 21, &group, &operation_text(251), &blob, source_seq, 8, 4, 2).await;
+    assert_eq!(begin.status, 200);
+    let upload_id = begin.json()["session"]["upload_id"].as_str().expect("id").to_owned();
+
+    // ① 不带令牌：强制模式下显式 AUTH_REQUIRED（401），不是 AUTH_EXPIRED/403。
+    let path = format!("/v1/blobs/{upload_id}/chunks/0");
+    let headers = request_headers(&node, 21, "PUT", &path, "", first).await;
+    let rejected = http_with(
+        &node.address,
+        "PUT",
+        &path,
+        &headers,
+        first,
+        "application/octet-stream",
+    )
+    .await;
+    assert_eq!(
+        rejected.status,
+        401,
+        "missing token must be AUTH_REQUIRED, got {} {:?}",
+        rejected.status,
+        String::from_utf8_lossy(&rejected.body)
+    );
+    assert_eq!(rejected.error_code(), "AUTH_REQUIRED");
+
+    // ② 带合法令牌：通过。
+    let (status, token) = request_capability(&node, 21, &upload_id, "blob:upload", Some(120)).await;
+    assert_eq!(status, 200);
+    let token = token.expect("token");
+    let with_token = put_chunk_with_capability(&node, 21, &upload_id, 0, first, &token).await;
+    assert_eq!(with_token.status, 200, "{}", String::from_utf8_lossy(&with_token.body));
+    let with_token = put_chunk_with_capability(&node, 21, &upload_id, 1, second, &token).await;
+    assert_eq!(with_token.status, 200);
+
+    // ③ 过期令牌：AUTH_EXPIRED（401）。
+    let digest = ciphertext_digest(&[first, second]);
+    assert_eq!(complete_blob(&node, 21, &upload_id, 2, 8, &digest).await.status, 200);
+    let (status, short) = request_capability(&node, 21, &blob, "blob:download", Some(1)).await;
+    assert_eq!(status, 200);
+    let short = short.expect("token");
+    // 让令牌过期：推进固定时钟。
+    node.clock.advance(5);
+    let expired = read_chunk_with_capability(&node, 21, &blob, 0, &short).await;
+    assert_eq!(expired.status, 401);
+    assert_eq!(expired.error_code(), "AUTH_EXPIRED");
+
+    // ④ 下载也必须带令牌（完全不带令牌头 → AUTH_REQUIRED；空令牌头属于畸形请求 400）。
+    let missing = read_chunk(&node, 21, &blob, 0).await;
+    assert_eq!(
+        missing.status,
+        401,
+        "get without token: {} {:?}",
+        missing.status,
+        String::from_utf8_lossy(&missing.body)
+    );
+    assert_eq!(missing.error_code(), "AUTH_REQUIRED");
+    let malformed = read_chunk_with_capability(&node, 21, &blob, 0, "").await;
+    assert_eq!(malformed.status, 400);
+    assert_eq!(malformed.error_code(), "INVALID_REQUEST");
+    let (status, download) = request_capability(&node, 21, &blob, "blob:download", None).await;
+    assert_eq!(status, 200);
+    let ok = read_chunk_with_capability(&node, 21, &blob, 0, &download.expect("token")).await;
+    assert_eq!(ok.status, 200);
+    assert_eq!(ok.body, first);
+}
+
+#[tokio::test]
+async fn disabled_capability_mode_keeps_legacy_clients_working() {
+    let (node, group) = setup(NodeAuthPolicy::default()).await;
+    let source_seq = append_attachment_entry(&node, &group, 21).await;
+    let blob = object_text(152);
+    let begin = begin_blob(&node, 21, &group, &operation_text(252), &blob, source_seq, 4, 4, 1).await;
+    assert_eq!(begin.status, 200);
+    let upload_id = begin.json()["session"]["upload_id"].as_str().expect("id").to_owned();
+    // 旧客户端：不带任何能力令牌也能上传/读取。
+    let chunk: &[u8] = b"lega";
+    let path = format!("/v1/blobs/{upload_id}/chunks/0");
+    let headers = request_headers(&node, 21, "PUT", &path, "", chunk).await;
+    let uploaded = http_with(
+        &node.address,
+        "PUT",
+        &path,
+        &headers,
+        chunk,
+        "application/octet-stream",
+    )
+    .await;
+    assert_eq!(uploaded.status, 200);
+    let digest = ciphertext_digest(&[chunk]);
+    assert_eq!(complete_blob(&node, 21, &upload_id, 1, 4, &digest).await.status, 200);
+    let read = read_chunk(&node, 21, &blob, 0).await;
+    assert_eq!(read.status, 200);
+    assert_eq!(read.body, chunk);
+}

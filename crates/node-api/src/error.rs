@@ -96,6 +96,7 @@ impl ApiError {
             | NodeError::NodeIdMismatch
             | NodeError::AuthExpired
             | NodeError::AuthReplay
+            | NodeError::AuthRequired
             | NodeError::InvalidSignature
             | NodeError::InvalidCredential => StatusCode::UNAUTHORIZED,
             NodeError::DeviceRevoked

@@ -56,7 +56,7 @@ pub const GROUP_POLICY_VERSION: u32 = 1;
 ///
 /// v3：增加 `pending_removed`（已本地生效但尚未被接受合并的移除）与
 /// `last_control_cleared`（最近一次被丢弃的控制提交，CRYPTO-008）。
-const SNAPSHOT_VERSION: u8 = 5;
+const SNAPSHOT_VERSION: u8 = 6;
 /// 快照记录的 storage group_id 命名空间前缀。
 const SNAPSHOT_GROUP_PREFIX: &str = "grpmeta/";
 /// 快照记录体上限（字节）。
@@ -135,6 +135,13 @@ impl From<StorageError> for GroupError {
 impl From<ControlError> for GroupError {
     fn from(error: ControlError) -> Self {
         Self::new(error.code(), error.to_string())
+    }
+}
+
+impl From<crate::group_node::ControlReceiptError> for GroupError {
+    fn from(error: crate::group_node::ControlReceiptError) -> Self {
+        // 节点回执路径的稳定码原样透传（NODE_UNAVAILABLE / INVALID_RECEIPT_SCOPE / …）。
+        Self::new(error.code(), error.detail().to_owned())
     }
 }
 
@@ -328,6 +335,26 @@ struct GroupRecord {
     /// 本机已提交自移除提案的时间（Unix 毫秒；未提交为 0）。
     #[serde(default)]
     leaving_at_ms: i64,
+    /// 待提交的独立提案（本机发起或对端收下；打包成 Commit 后清空）。
+    #[serde(default)]
+    pending_proposal: Option<RecordProposal>,
+}
+
+/// 待提交独立提案（公开绑定 + 可转发字节）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RecordProposal {
+    /// 提案作者凭据身份。
+    author: String,
+    /// 提案目标凭据身份。
+    target: String,
+    /// 提案所属 epoch。
+    base_epoch: u64,
+    /// 提案摘要（小写 hex）。
+    digest: String,
+    /// 序列化提案字节（小写 hex；提交到节点时使用）。
+    proposal_hex: String,
+    /// 记录时间（Unix 毫秒）。
+    recorded_at_ms: i64,
 }
 
 /// 被丢弃的控制提交（只含公开绑定信息与稳定原因码）。
@@ -386,6 +413,20 @@ impl GroupRecord {
             return Err(GroupError::corrupted(
                 "persisted group has a negative leave timestamp",
             ));
+        }
+        if let Some(proposal) = &self.pending_proposal {
+            validate_credential(&proposal.author)?;
+            validate_credential(&proposal.target)?;
+            if proposal.digest.len() != 64 {
+                return Err(GroupError::corrupted(
+                    "persisted pending proposal has a malformed digest",
+                ));
+            }
+            if proposal.proposal_hex.is_empty() || proposal.proposal_hex.len() % 2 != 0 {
+                return Err(GroupError::corrupted(
+                    "persisted pending proposal has a malformed payload",
+                ));
+            }
         }
         if let Some(cleared) = &self.last_control_cleared {
             if cleared.operation.is_empty() || cleared.operation.len() > 32 {
@@ -617,6 +658,16 @@ fn apply_domain_policy(record: &mut GroupRecord, policy: &GroupSnapshot) -> Grou
         record.pending_removed = removed;
     }
     record.validate()
+}
+
+/// 提案摘要：域分隔 + 作者 + epoch + 提案字节（提交侧/对端核对用）。
+fn proposal_digest(author: &str, epoch: u64, payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"chat/core/proposal-entry/v1");
+    hasher.update(author.as_bytes());
+    hasher.update(epoch.to_be_bytes());
+    hasher.update(payload);
+    hasher.finalize().into()
 }
 
 /// 已解散的群：所有治理操作显式 `INVALID_STATE_TRANSITION`（记录保留，绝不悄悄改状态）。
@@ -926,6 +977,7 @@ pub fn create_group_with_welcome(
         dissolved_at_ms: 0,
         left_at_ms: 0,
         leaving_at_ms: 0,
+        pending_proposal: None,
     };
     record.validate()?;
     // 建群时先自检策略快照不变量（全零头 + 唯一群主）。
@@ -1688,6 +1740,7 @@ pub fn group_join_from_welcome(
         dissolved_at_ms: 0,
         left_at_ms: 0,
         leaving_at_ms: 0,
+        pending_proposal: None,
     };
     record.validate()?;
     let _ = domain_snapshot(&record)?;
@@ -1991,8 +2044,17 @@ pub fn group_prepare_leave(
         ));
     }
     let proposal = device.prepare_self_removal(store).map_err(GroupError::from)?;
-    // 生成提案不推进 epoch，也不改策略版本；只记录"本机已发起离开"。
+    // 生成提案不推进 epoch，也不改策略版本；只记录"本机已发起离开"与待提交提案。
     record.leaving_at_ms = now_ms();
+    let digest_hex = hex_lower(&proposal.proposal_digest);
+    record.pending_proposal = Some(RecordProposal {
+        author: local.credential.clone(),
+        target: local.credential.clone(),
+        base_epoch: proposal.base_epoch,
+        digest: digest_hex.clone(),
+        proposal_hex: hex_lower(&proposal.proposal),
+        recorded_at_ms: record.leaving_at_ms,
+    });
     record.validate()?;
     let saved = persist_snapshot(store, &record, record.mls_epoch)?;
     Ok(LeaveProposalView {
@@ -2018,7 +2080,7 @@ pub fn group_process_proposal(
     store: &mut Store,
     input: &ProposalEntryInput,
 ) -> GroupResult<ProposalOutcomeView> {
-    let (record, state_version) = load_record(store, &input.group_id)?;
+    let (record, _) = load_record(store, &input.group_id)?;
     reject_dissolved(&record)?;
     let group_key = device
         .group_key()
@@ -2060,6 +2122,23 @@ pub fn group_process_proposal(
             "the proposal could not be persisted",
         )
     })?;
+    // 把提案的公开绑定（作者/目标/epoch/字节）记进快照，供提交侧做权限校验与节点提交。
+    let mut record = record;
+    let target = outcome
+        .targets
+        .first()
+        .cloned()
+        .ok_or_else(|| GroupError::corrupted("proposal outcome has no target"))?;
+    record.pending_proposal = Some(RecordProposal {
+        author: outcome.by.clone(),
+        target,
+        base_epoch: outcome.epoch,
+        digest: hex_lower(&proposal_digest(&outcome.by, outcome.epoch, &input.payload)),
+        proposal_hex: hex_lower(&input.payload),
+        recorded_at_ms: now_ms(),
+    });
+    record.validate()?;
+    let state_version = persist_snapshot(store, &record, record.mls_epoch)?;
     let epoch = device
         .epoch()
         .map_err(|_| GroupError::corrupted("MLS group epoch is unavailable"))?;
@@ -2090,8 +2169,53 @@ pub fn group_commit_proposals(
     store: &mut Store,
     group_id: &str,
 ) -> GroupResult<GroupView> {
-    let (record, _) = load_record(store, group_id)?;
+    let (mut record, _) = load_record(store, group_id)?;
     reject_dissolved(&record)?;
+    // ---- 提交侧权限（在任何 crypto/写入之前校验） --------------------------
+    let proposal = record.pending_proposal.clone().ok_or_else(|| {
+        GroupError::new(
+            "NO_PENDING_PROPOSALS",
+            "there is no pending proposal to commit",
+        )
+    })?;
+    let local = record
+        .members
+        .iter()
+        .find(|member| member.is_local)
+        .ok_or_else(|| GroupError::invalid_target("the local device is not a confirmed member"))?;
+    if local.role == MemberRole::Member.as_u64() {
+        return Err(GroupError::new(
+            "PERMISSION_DENIED",
+            "only the owner or an admin may commit another member's proposal",
+        ));
+    }
+    if proposal.author == local.credential {
+        return Err(GroupError::new(
+            "PERMISSION_DENIED",
+            "a member cannot commit their own removal proposal",
+        ));
+    }
+    if proposal.target == local.credential {
+        return Err(GroupError::new(
+            "PERMISSION_DENIED",
+            "a member cannot commit a proposal that removes themselves",
+        ));
+    }
+    if !record
+        .members
+        .iter()
+        .any(|member| member.credential == proposal.target)
+    {
+        return Err(GroupError::invalid_target(
+            "the proposal target is not a confirmed member",
+        ));
+    }
+    if proposal.base_epoch != record.mls_epoch {
+        return Err(GroupError::new(
+            "STALE_EPOCH",
+            "the pending proposal belongs to another epoch",
+        ));
+    }
     let group_key = device
         .group_key()
         .map_err(|_| GroupError::invalid_target("the local device has no MLS group"))?;
@@ -2121,8 +2245,109 @@ pub fn group_commit_proposals(
             "committing proposals must not advance the epoch",
         ));
     }
+    // 提案已打包成提交：清空记录（后续由接受/丢弃收口）。
+    record.pending_proposal = None;
+    record.validate()?;
     let saved = persist_snapshot(store, &record, record.mls_epoch)?;
     Ok(project(&record, epoch_after, Some(&pending), saved))
+}
+/// 提案提交到节点的回执投影（只含公开绑定信息）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalReceiptView {
+    /// 协议群 ID。
+    pub group_id: String,
+    /// 节点分配的提交标识（PROTOCOL-001 submission 文本）。
+    pub submission_id: String,
+    /// 节点日志序号（从 1 开始）。
+    pub seq: u64,
+    /// 该条目之后的节点日志链摘要（小写 hex）。
+    pub log_hash: String,
+    /// 节点身份。
+    pub node_id: String,
+    /// 被提交的提案摘要（与本机记录一致）。
+    pub proposal_digest: String,
+    /// 写入后的快照版本。
+    pub state_version: u64,
+}
+
+/// GROUPS-013（投递侧）：把本机待提交的独立提案作为**节点条目**提交，返回真实回执。
+///
+/// - 没有待提交提案（本机既没发起也没收下） → `NO_PENDING_PROPOSALS`；
+/// - 已解散 / 已关闭 / 设备不属于该群 / epoch 不符 → 既有冻结码；
+/// - 候选以**应用条目**的形式写入节点日志（节点不解析提案内容；提案的 MLS 认证由收侧
+///   `group_process_proposal` 完成），回执来自 node-client 的真实签名响应，绝不伪造；
+/// - 传输/超时统一 `NODE_UNAVAILABLE`；失败不改变本地快照。
+pub fn group_submit_proposal(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    group_id: &str,
+    endpoint_url: &str,
+    node_id: &str,
+    node_public_key_hex: Option<&str>,
+) -> GroupResult<ProposalReceiptView> {
+    let (record, state_version) = load_record(store, group_id)?;
+    reject_dissolved(&record)?;
+    let proposal = record.pending_proposal.as_ref().ok_or_else(|| {
+        GroupError::new(
+            "NO_PENDING_PROPOSALS",
+            "there is no pending proposal to submit",
+        )
+    })?;
+    let group_key = device
+        .group_key()
+        .map_err(|_| GroupError::invalid_target("the local device has no MLS group"))?;
+    if group_key != record.mls_group_key {
+        return Err(GroupError::invalid_target(
+            "the local device is not in this group",
+        ));
+    }
+    let epoch = device
+        .epoch()
+        .map_err(|_| GroupError::corrupted("MLS group epoch is unavailable"))?;
+    if epoch != record.mls_epoch {
+        return Err(GroupError::new(
+            "STALE_EPOCH",
+            "the local MLS epoch does not match the persisted group",
+        ));
+    }
+    let proposal_bytes = decode_hex(&proposal.proposal_hex)
+        .ok_or_else(|| GroupError::corrupted("persisted pending proposal is malformed"))?;
+    let client = crate::group_node::build_node_client(
+        store,
+        endpoint_url,
+        node_id,
+        node_public_key_hex,
+    )
+    .map_err(GroupError::from)?;
+    let receipt = crate::group_node::submit_proposal_entry(
+        &client,
+        group_id,
+        &proposal_bytes,
+        proposal.base_epoch,
+    )?;
+    Ok(ProposalReceiptView {
+        group_id: record.group_id.clone(),
+        submission_id: receipt.submission_id,
+        seq: receipt.seq,
+        log_hash: receipt.log_hash,
+        node_id: receipt.node_id,
+        proposal_digest: proposal.digest.clone(),
+        state_version,
+    })
+}
+
+/// 小写 hex → 字节（非法输入返回 None）。
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks(2) {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        bytes.push((high as u8) << 4 | low as u8);
+    }
+    Some(bytes)
 }
 
 

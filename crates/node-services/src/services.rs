@@ -19,8 +19,8 @@ use crate::error::{NodeError, NodeResult};
 use crate::limits::{
     CHALLENGE_PURGE_BATCH, CHALLENGE_RETENTION_SECONDS, DEFAULT_CHALLENGE_TTL_SECONDS,
     DEFAULT_CLOCK_SKEW_SECONDS, DEFAULT_MAX_DEVICES_PER_ACCOUNT, DEFAULT_MAX_PENDING_CHALLENGES,
-    BlobPolicy, GroupLogPolicy, MAX_ACCOUNT_ID_BYTES, MAX_DEVICE_ID_BYTES, MAX_HTTP_BODY_BYTES,
-    CleanupPolicy, MAX_NODE_ID_BYTES, MailboxPolicy, RateLimitPolicy,
+    BlobPolicy, CapabilityPolicy, GroupLogPolicy, MAX_ACCOUNT_ID_BYTES, MAX_DEVICE_ID_BYTES,
+    MAX_HTTP_BODY_BYTES, CleanupPolicy, MAX_NODE_ID_BYTES, MailboxPolicy, RateLimitPolicy,
 };
 use crate::registration::{DeviceRegistration, RegisterDeviceRequest};
 
@@ -55,6 +55,8 @@ pub struct NodeAuthPolicy {
     pub rate_limit: RateLimitPolicy,
     /// NODE-016 过期回收策略。
     pub cleanup: CleanupPolicy,
+    /// CAP 包：能力令牌强制模式。
+    pub capability: CapabilityPolicy,
 }
 
 impl Default for NodeAuthPolicy {
@@ -70,6 +72,7 @@ impl Default for NodeAuthPolicy {
             blob: BlobPolicy::default(),
             rate_limit: RateLimitPolicy::default(),
             cleanup: CleanupPolicy::default(),
+            capability: CapabilityPolicy::default(),
         }
     }
 }
@@ -96,6 +99,7 @@ impl NodeAuthPolicy {
         self.blob.validate()?;
         self.rate_limit.validate()?;
         self.cleanup.validate()?;
+        self.capability.validate()?;
         Ok(())
     }
 }

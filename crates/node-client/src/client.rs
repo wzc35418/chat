@@ -60,11 +60,41 @@ const JSON_CONTENT_TYPE: &'static str = "application/json";
 /// 附件密文块的 content-type（原始字节，不做 hex/JSON 二次编码）。
 const OCTET_STREAM_CONTENT_TYPE: &'static str = "application/octet-stream";
 
+/// CAP 包：能力令牌的两种用途文本（与节点 `CapabilityScope::as_str` 一致）。
+const SCOPE_BLOB_UPLOAD: &'static str = "blob:upload";
+const SCOPE_BLOB_DOWNLOAD: &'static str = "blob:download";
+
+#[derive(Serialize)]
+struct CapabilityBody<'a> {
+    schema_version: u16,
+    object_id: &'a str,
+    scope: &'a str,
+    ttl_seconds: u64,
+}
+
+#[derive(Deserialize)]
+struct CapabilityEnvelope {
+    schema_version: u16,
+    capability: CapabilityView,
+}
+
+#[derive(Deserialize)]
+struct CapabilityView {
+    token: String,
+    object_id: String,
+    device_id: String,
+    scope: String,
+    issued_at: u64,
+    expires_at: u64,
+}
+
 /// 鉴权头（与节点 API-003 的传输字段一致）。
 pub const HEADER_DEVICE_ID: &str = "x-chat-device-id";
 pub const HEADER_CHALLENGE_ID: &str = "x-chat-challenge-id";
 pub const HEADER_NONCE: &str = "x-chat-challenge-nonce";
 pub const HEADER_SIGNATURE: &str = "x-chat-signature";
+/// CAP 包：能力令牌请求头（与设备鉴权头并存，节点强制模式下必带）。
+pub const HEADER_CAPABILITY: &str = "x-chat-capability";
 
 const CHALLENGE_PATH: &str = "/v1/auth/challenge";
 const DEVICES_PATH: &str = "/v1/devices";
@@ -73,6 +103,9 @@ const MAILBOX_ITEMS_PATH: &str = "/v1/mailbox/items";
 const MAILBOX_PATH: &str = "/v1/mailbox";
 const MAILBOX_ACK_PATH: &str = "/v1/mailbox/ack";
 const BLOBS_PATH: &str = "/v1/blobs";
+const CAPABILITIES_PATH: &str = "/v1/capabilities";
+/// CAP 包：默认申请的能力令牌有效期（秒；服务端上限 1 小时）。
+const CAPABILITY_TTL_SECONDS: u64 = 600;
 
 /// 一次已登记设备的签名发送请求（参数集中，避免 9 参数函数）。
 struct SignedSend<'a> {
@@ -85,6 +118,8 @@ struct SignedSend<'a> {
     content_type: &'static str,
     /// 正文本上限：JSON DTO 用 `max_request_bytes`，密文块用 `max_chunk_bytes`。
     request_limit: usize,
+    /// CAP 包：可选能力令牌（只作为请求头附加，不参与签名原文）。
+    capability: Option<&'a str>,
 }
 
 /// 客户端上限与超时。全部在构造时校验，越界配置显式拒绝。
@@ -307,6 +342,7 @@ versioned!(
     UploadSessionEnvelope,
     ChunkReceiptEnvelope,
     BlobReceiptEnvelope,
+    CapabilityEnvelope,
 );
 /// 节点客户端：固定端点 + 固定设备身份 + Ed25519 签名钥。
 pub struct NodeClient {
@@ -315,6 +351,20 @@ pub struct NodeClient {
     device_id: String,
     signing_key: SigningKey,
     limits: ClientLimits,
+    /// CAP 包：按 (对象, 用途) 复用的能力令牌缓存（读到过期即失效）。
+    capabilities: std::sync::Mutex<std::collections::HashMap<String, CachedCapability>>,
+    /// CAP 包：节点是否强制能力令牌（初次 `AUTH_REQUIRED` 后自适应为 true）。
+    capability_required: std::sync::atomic::AtomicBool,
+}
+
+/// 一个缓存的能力令牌及其本地到期点。
+///
+/// 用**单调时钟**（`Instant`）而不是令牌里的绝对时间：节点时钟与客户端时钟可能相差很大
+/// （测试用固定时钟、生产也可能有偏差），按“签发时拿到的有效期长度”换算成本地截止点，
+/// 是唯一不受时钟偏差影响的判据。
+struct CachedCapability {
+    token: String,
+    deadline: std::time::Instant,
 }
 
 impl std::fmt::Debug for NodeClient {
@@ -390,7 +440,37 @@ impl NodeClient {
             device_id,
             signing_key,
             limits,
+            capabilities: std::sync::Mutex::new(std::collections::HashMap::new()),
+            capability_required: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// CAP 包：显式打开/关闭“自动取能力令牌”模式。
+    ///
+    /// 关闭时仍会在收到 `AUTH_REQUIRED` 后自适应打开一次（服务端强制时旧调用方自动可用）。
+    pub fn set_capability_mode(&self, required: bool) {
+        self.capability_required
+            .store(required, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// CAP 包：当前是否处于“必须带令牌”模式。
+    pub fn capability_mode(&self) -> bool {
+        self.capability_required
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// CAP 包：当前缓存里未过期的令牌数量（诊断/测试用，不含令牌内容）。
+    pub fn cached_capability_count(&self) -> usize {
+        let now = std::time::Instant::now();
+        self.capabilities
+            .lock()
+            .map(|cache| {
+                cache
+                    .values()
+                    .filter(|cached| cached.deadline > now)
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     /// 固定端点。
@@ -521,8 +601,15 @@ impl NodeClient {
         if body.len() > self.limits.max_request_bytes {
             return Err(NodeClientError::request_too_large());
         }
-        self.send_signed(challenge, &meta, body, &self.device_id, JSON_CONTENT_TYPE)
-            .await
+        self.send_signed(
+            challenge,
+            &meta,
+            body,
+            &self.device_id,
+            JSON_CONTENT_TYPE,
+            None,
+        )
+        .await
     }
     /// 取新挑战 → 签名 → 发送；失败按 [`retryable_failure`] 决定是否重取一次。
     async fn send_authenticated(
@@ -542,6 +629,33 @@ impl NodeClient {
             signer_device_id: None,
             content_type: JSON_CONTENT_TYPE,
             request_limit: self.limits.max_request_bytes,
+            capability: None,
+        })
+        .await
+    }
+
+    /// 带可选能力令牌的已登记设备请求（CAP 包：附件块上传/下载复用同一条发送逻辑）。
+    async fn send_authenticated_with_capability(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+        content_type: &'static str,
+        request_limit: usize,
+        capability: Option<&str>,
+    ) -> Result<Vec<u8>, NodeClientError> {
+        let owned: Option<String> = capability.map(str::to_owned);
+        self.send_authenticated_request(SignedSend {
+            method,
+            path,
+            query,
+            body,
+            purpose: ChallengePurpose::RequestAuth,
+            signer_device_id: None,
+            content_type,
+            request_limit,
+            capability: owned.as_deref(),
         })
         .await
     }
@@ -560,6 +674,7 @@ impl NodeClient {
             signer_device_id,
             content_type,
             request_limit,
+            capability,
         } = request;
         let meta = RequestMeta::canonical(method, path, query)
             .map_err(|error| NodeClientError::from_local_node_error(&error))?;
@@ -574,7 +689,7 @@ impl NodeClient {
                 None => self.device_id.as_str(),
             };
             match self
-                .attempt_signed(&meta, body, purpose, signer, content_type)
+                .attempt_signed(&meta, body, purpose, signer, content_type, capability)
                 .await
             {
                 Ok(bytes) => return Ok(bytes),
@@ -595,32 +710,11 @@ impl NodeClient {
         purpose: ChallengePurpose,
         signer_device_id: &str,
         content_type: &'static str,
+        capability: Option<&str>,
     ) -> Result<Vec<u8>, NodeClientError> {
         let challenge = self.fetch_challenge(purpose).await?;
-        self.send_signed(&challenge, meta, body, signer_device_id, content_type)
+        self.send_signed(&challenge, meta, body, signer_device_id, content_type, capability)
             .await
-    }
-
-    /// 原始字节正文的已登记设备请求（附件密文块用）。
-    async fn send_authenticated_raw(
-        &self,
-        method: &str,
-        path: &str,
-        query: &str,
-        body: &[u8],
-        content_type: &'static str,
-    ) -> Result<Vec<u8>, NodeClientError> {
-        self.send_authenticated_request(SignedSend {
-            method,
-            path,
-            query,
-            body,
-            purpose: ChallengePurpose::RequestAuth,
-            signer_device_id: None,
-            content_type,
-            request_limit: self.limits.max_chunk_bytes,
-        })
-        .await
     }
 
     async fn send_signed(
@@ -630,6 +724,7 @@ impl NodeClient {
         body: &[u8],
         signer_device_id: &str,
         content_type: &'static str,
+        capability: Option<&str>,
     ) -> Result<Vec<u8>, NodeClientError> {
         validate_bounded_id("device id", signer_device_id, MAX_DEVICE_ID_BYTES)
             .map_err(|error| NodeClientError::from_local_node_error(&error))?;
@@ -647,14 +742,19 @@ impl NodeClient {
         let method = Method::from_bytes(meta.method.as_bytes())
             .map_err(|_| NodeClientError::local_invalid("http method is not valid"))?;
         let url = self.endpoint.request_url(&meta.path, &meta.query)?;
-        let response = self
+        let mut request = self
             .http
             .request(method, url)
             .header(HEADER_DEVICE_ID, signer_device_id)
             .header(HEADER_CHALLENGE_ID, challenge.challenge_id.as_str())
             .header(HEADER_NONCE, challenge.nonce.as_str())
             .header(HEADER_SIGNATURE, hex_encode(&signature.to_bytes()))
-            .header(CONTENT_TYPE, content_type)
+            .header(CONTENT_TYPE, content_type);
+        // CAP 包：能力令牌只作为附加请求头，不进入签名原文（签名已覆盖方法/路径/正文）。
+        if let Some(token) = capability {
+            request = request.header(HEADER_CAPABILITY, token);
+        }
+        let response = request
             .body(body.to_vec())
             .send()
             .await
@@ -777,6 +877,7 @@ impl NodeClient {
                 signer_device_id: Some(request.credential.device_id.as_str()),
                 content_type: JSON_CONTENT_TYPE,
                 request_limit: self.limits.max_request_bytes,
+                capability: None,
             })
             .await?;
         let envelope: RegisterDeviceEnvelope = self.decode(&bytes)?;
@@ -1081,6 +1182,107 @@ impl NodeClient {
         Ok(session)
     }
 
+    /// CAP 包：向节点申请一个对象级能力令牌（POST /v1/capabilities）并写入缓存。
+    ///
+    /// 令牌公开绑定 (对象, 本设备, 用途, 期限)；客户端只核对绑定是否与本机一致，不解析签名。
+    pub async fn issue_capability(
+        &self,
+        object_id: &str,
+        scope: &str,
+        ttl_seconds: Option<u64>,
+    ) -> Result<String, NodeClientError> {
+        if !matches!(scope, SCOPE_BLOB_UPLOAD | SCOPE_BLOB_DOWNLOAD) {
+            return Err(NodeClientError::local_invalid("capability scope is not supported"));
+        }
+        let body = serde_json::to_vec(&CapabilityBody {
+            schema_version: CLIENT_SCHEMA_VERSION,
+            object_id,
+            scope,
+            ttl_seconds: ttl_seconds.unwrap_or(CAPABILITY_TTL_SECONDS),
+        })
+        .map_err(|_| NodeClientError::local_invalid("capability request could not be encoded"))?;
+        let bytes = self
+            .send_authenticated(
+                "POST",
+                CAPABILITIES_PATH,
+                "",
+                &body,
+                ChallengePurpose::RequestAuth,
+            )
+            .await?;
+        let envelope: CapabilityEnvelope = self.decode(&bytes)?;
+        let view = envelope.capability;
+        if view.object_id != object_id || view.scope != scope || view.device_id != self.device_id
+        {
+            return Err(NodeClientError::protocol(
+                ErrorCode::InvalidReceiptScope,
+                "capability token does not bind this object, device and scope",
+            ));
+        }
+        if view.expires_at <= view.issued_at || view.token.is_empty() {
+            return Err(NodeClientError::protocol(
+                ErrorCode::InvalidReceiptScope,
+                "capability token has an invalid validity window",
+            ));
+        }
+        self.store_capability(object_id, scope, &view.token, view.issued_at, view.expires_at);
+        Ok(view.token)
+    }
+
+    /// CAP 包：取一个当前可用的令牌（缓存命中直接用；否则按需申请）。
+    async fn capability_for(
+        &self,
+        object_id: &str,
+        scope: &str,
+    ) -> Result<Option<String>, NodeClientError> {
+        if let Some(token) = self.cached_capability(object_id, scope) {
+            return Ok(Some(token));
+        }
+        if !self.capability_mode() {
+            // 服务端不强制时不做额外请求（保持旧客户端行为与请求数）。
+            return Ok(None);
+        }
+        self.issue_capability(object_id, scope, None).await.map(Some)
+    }
+
+    fn cached_capability(&self, object_id: &str, scope: &str) -> Option<String> {
+        let key = format!("{scope}|{object_id}");
+        let now = std::time::Instant::now();
+        let cache = self.capabilities.lock().ok()?;
+        cache
+            .get(&key)
+            .filter(|cached| cached.deadline > now)
+            .map(|cached| cached.token.clone())
+    }
+
+    /// 写入缓存：有效期长度 = `expires_at - issued_at`（秒），换算成本地单调截止点；
+    /// 留 1 秒余量，避免刚好卡在边界时把即将过期的令牌发出去。
+    fn store_capability(
+        &self,
+        object_id: &str,
+        scope: &str,
+        token: &str,
+        issued_at: u64,
+        expires_at: u64,
+    ) {
+        let key = format!("{scope}|{object_id}");
+        let lifetime = expires_at.saturating_sub(issued_at);
+        let usable = lifetime.saturating_sub(1).max(1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(usable);
+        if let Ok(mut cache) = self.capabilities.lock() {
+            // 附带清理过期项，避免缓存随对象数量无界增长。
+            let now = std::time::Instant::now();
+            cache.retain(|_, cached| cached.deadline > now);
+            cache.insert(
+                key,
+                CachedCapability {
+                    token: token.to_owned(),
+                    deadline,
+                },
+            );
+        }
+    }
+
     /// NODE-013：按序上传一块密文（原始字节，不做 hex/JSON 二次编码）。
     ///
     /// 正文上限用 [`ClientLimits::max_chunk_bytes`]（默认节点分块硬上限 4 MiB），
@@ -1098,9 +1300,56 @@ impl NodeClient {
             return Err(NodeClientError::local_invalid("cipher chunk must not be empty"));
         }
         let path = format!("{BLOBS_PATH}/{upload_id}/chunks/{chunk_index}");
-        let response = self
-            .send_authenticated_raw("PUT", &path, "", bytes, OCTET_STREAM_CONTENT_TYPE)
-            .await?;
+        let capability = self.capability_for(upload_id, SCOPE_BLOB_UPLOAD).await?;
+        let response = match self
+            .send_authenticated_with_capability(
+                "PUT",
+                &path,
+                "",
+                bytes,
+                OCTET_STREAM_CONTENT_TYPE,
+                self.limits.max_chunk_bytes,
+                capability.as_deref(),
+            )
+            .await
+        {
+            // 服务端强制而客户端还不知道：自适应打开模式并重试一次。
+            Err(error) if error.node_code() == Some("AUTH_REQUIRED") => {
+                self.set_capability_mode(true);
+                let capability = self.issue_capability(upload_id, SCOPE_BLOB_UPLOAD, None).await?;
+                self.send_authenticated_with_capability(
+                    "PUT",
+                    &path,
+                    "",
+                    bytes,
+                    OCTET_STREAM_CONTENT_TYPE,
+                    self.limits.max_chunk_bytes,
+                    Some(&capability),
+                )
+                .await?
+            }
+            // 令牌被判过期/无效：丢掉缓存再取一次（只重试一次，不做无限循环）。
+            Err(error)
+                if matches!(
+                    error.node_code(),
+                    Some("AUTH_EXPIRED" | "INVALID_CAPABILITY")
+                ) =>
+            {
+                self.set_capability_mode(true);
+                let capability = self.issue_capability(upload_id, SCOPE_BLOB_UPLOAD, None).await?;
+                self.send_authenticated_with_capability(
+                    "PUT",
+                    &path,
+                    "",
+                    bytes,
+                    OCTET_STREAM_CONTENT_TYPE,
+                    self.limits.max_chunk_bytes,
+                    Some(&capability),
+                )
+                .await?
+            }
+            other => other?,
+        };
         let envelope: ChunkReceiptEnvelope = self.decode(&response)?;
         let receipt = envelope.receipt;
         self.ensure_node_identity(&receipt.node_id)?;
@@ -1168,8 +1417,44 @@ impl NodeClient {
         ObjectId::parse(blob_id)
             .map_err(|_| NodeClientError::local_invalid("blob id is not a canonical protocol id"))?;
         let path = format!("{BLOBS_PATH}/{blob_id}/chunks/{chunk_index}");
-        self.send_authenticated("GET", &path, "", b"", ChallengePurpose::RequestAuth)
+        let capability = self.capability_for(blob_id, SCOPE_BLOB_DOWNLOAD).await?;
+        match self
+            .send_authenticated_with_capability(
+                "GET",
+                &path,
+                "",
+                b"",
+                JSON_CONTENT_TYPE,
+                self.limits.max_request_bytes,
+                capability.as_deref(),
+            )
             .await
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(error)
+                if matches!(
+                    error.node_code(),
+                    Some("AUTH_REQUIRED" | "AUTH_EXPIRED" | "INVALID_CAPABILITY")
+                ) =>
+            {
+                // 强制模式自适应 + 过期令牌刷新，只重试一次。
+                self.set_capability_mode(true);
+                let capability = self
+                    .issue_capability(blob_id, SCOPE_BLOB_DOWNLOAD, None)
+                    .await?;
+                self.send_authenticated_with_capability(
+                    "GET",
+                    &path,
+                    "",
+                    b"",
+                    JSON_CONTENT_TYPE,
+                    self.limits.max_request_bytes,
+                    Some(&capability),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 

@@ -917,3 +917,84 @@ cargo test --offline -p chat-core -p chat-ffi                  # 170 + 45 passed
    （例如只有群主/管理员能打包移除他人的提案）尚未决定。
 5. **一次一条 pending**：提案打包后必须先接受/丢弃才能继续（既有语义）。
 6. **节点公开元数据**：自移除提案目前不走节点日志；等接线时需要为提案/提交补 kind 映射。
+
+## 提案投递与提交侧权限（GROUPS-013 续，2026-10-18，Windows x64）
+
+上一轮提案字节靠测试直接传递、提交侧没有任何权限校验。本轮补上：提案经**真实节点**投递，
+打包成提交前做策略层授权。
+
+代码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)、[crates/core/src/group_node.rs](../../crates/core/src/group_node.rs)（定点新增）；
+测试：[crates/core/tests/groups_proposal_submit.rs](../../crates/core/tests/groups_proposal_submit.rs)（3 个，真节点 + 真双设备两库）。
+
+### 公开面
+
+~~~text
+pub fn group_submit_proposal(device, store, group_id, endpoint_url, node_id, node_public_key_hex)
+    -> GroupResult<ProposalReceiptView>
+ProposalReceiptView { group_id, submission_id, seq, log_hash, node_id, proposal_digest, state_version }
+
+// group_node.rs
+pub fn submit_proposal_entry(client, group_id, proposal: &[u8], base_epoch) -> ControlReceiptResult<ProposalSubmission>
+pub fn build_node_client(store, endpoint_url, node_id, node_public_key_hex) -> ControlReceiptResult<NodeClient>
+~~~
+
+持久记录 v5 → **v6**：新增 `pending_proposal = {author, target, base_epoch, digest, proposal_hex, recorded_at_ms}`
+（发起或收下提案时写入；打包成提交后清空）。
+
+### 关键语义
+
+1. **提交侧权限（group_commit_proposals）**：打包前依次校验——
+   `pending_proposal` 存在（否则 `NO_PENDING_PROPOSALS`）；
+   本机角色必须是**群主或管理员**（普通成员 → `PERMISSION_DENIED`）；
+   **提案作者不能打包自己的提案**（`PERMISSION_DENIED`）；
+   本机不能是提案目标（`PERMISSION_DENIED`）；
+   提案目标必须仍是确认成员（否则 `INVALID_TARGET`）；
+   提案 epoch 必须等于当前快照 epoch（`STALE_EPOCH`）。
+   全部通过后才调 crypto；打包成功后清空 `pending_proposal`。
+2. **提案投递（group_submit_proposal）**：把 `pending_proposal.proposal_hex` 作为**应用条目**写入节点日志
+   （节点不解析提案内容；PROTOCOL-004 没有“独立提案”的控制操作值），回执来自 node-client 的真实签名响应，
+   `submission_id` 由 (群, 提案摘要, base_epoch) 确定性派生（重复投递幂等），回执的群/提交/作者/节点身份与
+   节点公钥签名全部复核；传输失败统一 `NODE_UNAVAILABLE`，**不改变本地快照**。
+3. **收侧记录**：`group_process_proposal` 现在把提案的公开绑定（作者/目标/epoch/摘要/字节）写进快照，
+   供提交侧授权与后续投递使用。
+
+### 错误码
+
+`NO_PENDING_PROPOSALS`（没有提案可提交/打包）、`PERMISSION_DENIED`（成员打包、作者打包自己的提案、
+自己打包移除自己的提案）、`INVALID_TARGET`（目标不是确认成员）、`STALE_EPOCH`（提案 epoch 旧）、
+`NODE_UNAVAILABLE`（节点不可达）、`INVALID_RECEIPT_SCOPE` / `INVALID_SIGNATURE`（回执绑定/验签失败）。
+
+### 复现命令（全程离线；测试内起真实 loopback 节点）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test groups_proposal_submit   # 3 passed
+cargo test --offline -p chat-core                                 # 173 passed（既有 170 继续通过）
+~~~
+
+### 证据
+
+- `groups_proposal_submit::member_submits_proposal_and_owner_commits_it`：bob 建群（群主）+ alice 加入（成员）→
+  alice `group_prepare_leave` → `group_submit_proposal` 拿到真回执（`seq >= 1`、`sub:1:…`、
+  log_hash 64 hex、node_id 正确）且**节点日志恰好一条、内容就是提案字节** → bob 从日志取回提案
+  `group_process_proposal`（kind=remove、targets=[alice]、pending 1）→ bob `group_commit_proposals`
+  （pending=remove_members target 2）→ alice 合并（**self_removed**、epoch 2、成员只剩 bob、
+  `encrypt` 显式失败）。
+- `groups_proposal_submit::commit_side_permissions_are_enforced`：无提案打包 → `NO_PENDING_PROPOSALS`；
+  成员（提案人）自己打包 → `PERMISSION_DENIED`；群主收下他人提案后打包成功；打包后再打包显式失败。
+- `groups_proposal_submit::submitting_without_a_proposal_or_reachable_node_changes_nothing`：
+  无提案投递 → `NO_PENDING_PROPOSALS`（不触网）；有提案但节点不可达 → `NODE_UNAVAILABLE` 且快照完全不变。
+- 既有的 `groups_proposal::self_removal_proposal_end_to_end` 改为“bob 建群 + alice 加入”的拓扑
+  （提交侧权限要求打包者是群主/管理员，而角色不会随 MLS Commit 传播——见限制）。
+
+### 已知限制
+
+1. **角色不随 MLS Commit 传播**：对端无法从 Commit 得知策略角色变化，因此“转让后再由新群主打包”在**对端
+   记录**里仍是旧角色；本轮用例改用“群主从建群起就在本侧”的拓扑。管理员路径与群主共用同一校验分支，
+   但需要角色同步才能端到端覆盖（未实现）。
+2. **提案以应用条目投递**：节点不区分提案与普通消息；收侧仍会用 MLS 认证复核作者/epoch（安全边界不降级），
+   但节点侧无法按提案类型审计（等 PROTOCOL-004 增加通用提案/自更新值时改造）。
+3. **一次一条待提交提案**：打包后记录被清空，必须先接受/丢弃才能继续。
+4. **投递不自动重试**：失败只返回稳定码，重试策略在上层（SYNC/发送队列）。
+5. **提案字节仍在本地快照里**（hex），用于重试投递；对端不需要它也能处理（只靠节点日志）。
+

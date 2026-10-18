@@ -423,8 +423,13 @@ pub async fn put_blob_chunk(
     let index = parse_chunk_index(&chunk_index)?;
     let now = state.now();
     let actor = authenticate(&state, &headers, &uri, "PUT", &body, now)?;
-    // API-004：带上能力令牌时，令牌必须与 (上传会话, 本设备, blob:upload) 绑定且未过期。
-    if let Some(token) = capability_token(&headers)? {
+    // API-004/CAP：带上能力令牌时，令牌必须与 (上传会话, 本设备, blob:upload) 绑定且未过期；
+    // 强制模式下**必须**带（缺失 → AUTH_REQUIRED，401），关闭模式下不传保持旧行为。
+    let declared = capability_token(&headers)?;
+    if declared.is_none() && state.capability_required() {
+        return Err(ApiError::from_node(chat_node_services::error::NodeError::AuthRequired));
+    }
+    if let Some(token) = declared {
         let device_id = actor.device_id.clone();
         state.with_service(|service| {
             service.verify_capability(
@@ -472,8 +477,13 @@ pub async fn read_blob_chunk(
     let index = parse_chunk_index(&chunk_index)?;
     let now = state.now();
     let actor = authenticate(&state, &headers, &uri, "GET", b"", now)?;
-    // API-004：带上能力令牌时，令牌必须与 (对象, 本设备, blob:download) 绑定且未过期。
-    if let Some(token) = capability_token(&headers)? {
+    // API-004/CAP：带上能力令牌时，令牌必须与 (对象, 本设备, blob:download) 绑定且未过期；
+    // 强制模式下必须带（缺失 → AUTH_REQUIRED）。
+    let declared = capability_token(&headers)?;
+    if declared.is_none() && state.capability_required() {
+        return Err(ApiError::from_node(chat_node_services::error::NodeError::AuthRequired));
+    }
+    if let Some(token) = declared {
         let device_id = actor.device_id.clone();
         state.with_service(|service| {
             service.verify_capability(
