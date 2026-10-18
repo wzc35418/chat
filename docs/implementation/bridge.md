@@ -764,6 +764,86 @@ cargo test --offline -p chat-core -p chat-ffi        # 118 + 36 passed
 4. **同步阻塞**：所有群方法在 FFI 的 `Mutex` 内串行执行（含 MLS 提交生成），不要在 UI 线程做长循环。
 5. `node` 参数只保存不联网；群治理当前不访问网络。
 
+## 群治理经节点回执（GroupFfi.group_submit_control / group_accept_with_receipt，2026-10-18，Windows x64）
+
+目标：把 `group_node` 的真节点回执路径接到 Kotlin——界面能"提交治理操作到节点、拿到回执、再接受"。
+
+代码：[crates/ffi/src/groups_ffi.rs](../../crates/ffi/src/groups_ffi.rs)（+2 方法、+4 记录）+
+[crates/core/src/service.rs](../../crates/core/src/service.rs) 的 `ConversationCore::group_submit_control` /
+`group_accept_with_receipt`；测试：[crates/ffi/tests/groups_ffi_receipt.rs](../../crates/ffi/tests/groups_ffi_receipt.rs)
+（3 个用例，**真 axum 节点 + 真 OpenMLS + 真临时库**，全程经 FFI）。
+
+### 新增公开面
+
+~~~text
+group_submit_control(group_id, endpoint_url, node_id, node_public_key_hex: String?) -> ControlReceiptFfi
+group_accept_with_receipt(group_id, receipt: ControlReceiptFfi) -> GroupViewFfi
+
+ControlReceiptFfi { receipt: ControlAppendFfi, candidate: ControlCandidateFfi, head: ControlHeadFfi }
+ControlAppendFfi  { group_id, submission_id, author_device_id, seq, candidate_hash, previous_hash,
+                    log_hash, accepted_at, node_id, node_public_key, signature }
+ControlCandidateFfi { protocol_major, protocol_minor, submission_id, group_id, author_device_id, kind,
+                      expected_control_head, policy_version, mls_epoch, encrypted_payload,
+                      operation: String?, target_digest: String? }
+ControlHeadFfi    { group_id, coordinator_id, seq, log_hash, control_head, policy_version, mls_epoch,
+                    node_id, node_public_key, signature }
+~~~
+
+全部是**公开材料**（节点回执/候选/head 本来就是公开字段），没有私钥、没有明文正文。
+
+### 接线要点
+
+- **设备身份复用持久身份**：`group_submit_control` 从库里的 `load_identity_seeds` 派生设备签名钥
+  （与 identity 同一派生函数），节点看到的设备 ID 与库里一致；未入库身份 → `INVALID_STATE_TRANSITION`。
+- **证据三要素一起回传**：`ControlReceiptFfi` 必须把回执 + 候选原文 + 提交时的 head 一起交回
+  `group_accept_with_receipt`；只给回执无法证明"它绑定的就是这个 pending 提交"。
+- **三重校验在 core 侧重做**：候选密文逐字节等于本机 pending Commit、节点验签、日志链摘要重算；
+  任一不符显式失败且 epoch/成员/pending 不变。
+- **`node_public_key_hex` 可选**：给了就固定节点公钥（提交时），回执验签仍以回执自带的 head 公钥为准。
+
+### 错误码（冻结）
+
+| 情形 | code |
+|---|---|
+| 节点不可达 / 超时 | `NODE_UNAVAILABLE` |
+| 回执不属于该群、绑定别的提交或别的节点、链摘要不符 | `INVALID_RECEIPT_SCOPE` |
+| 回执/head 节点签名无效、候选摘要不符 | `INVALID_SIGNATURE` |
+| 候选正文不是本机 pending 的 Commit、候选结构非法 | `INVALID_CANDIDATE` |
+| 没有 pending / pending 与快照不符 | `PENDING_MISMATCH` / `STALE_EPOCH` |
+| 未入库身份 / 已关闭 / 端点不可解析 | `INVALID_STATE_TRANSITION` / `CORE_CLOSED` / `INVALID_TARGET` |
+
+### 复现命令（全程离线；测试内起真实 loopback 节点）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi --test groups_ffi_receipt   # 3 passed
+cargo test --offline -p chat-core -p chat-ffi                # 155 + 39 passed（既有 151 + 36 全部继续通过）
+~~~
+
+### 证据
+
+- `groups_ffi_receipt::submit_and_accept_with_a_real_node_receipt`：建群（本地凭据 = 持久身份设备 ID，
+  同一设备已在节点登记、群也已在节点建立）→ `group_set_role` 产生 pending self_update（epoch 1）→
+  `group_submit_control` 拿到真回执（`seq >= 1`、`submission_id` 是 `sub:1:…`、候选 kind=control、
+  operation=set_role、head 属于该节点/该群）→ `group_accept_with_receipt` 后 **epoch 2**、pending 清空、
+  bob 变 admin、快照与返回值一致；再接受同一份回执 → `PENDING_MISMATCH` 且快照不变。
+- `groups_ffi_receipt::forged_receipts_are_rejected_without_advancing_the_epoch`：改日志链摘要 →
+  `INVALID_SIGNATURE`；改节点签名 → `INVALID_SIGNATURE`；换密文 → `INVALID_CANDIDATE`；
+  三次拒绝后快照仍是 pending 的 epoch 1，最后真回执仍能推进到 epoch 2（失败不是破坏性的）。
+- `groups_ffi_receipt::unreachable_node_fails_explicitly_and_leaves_state`：指向 `127.0.0.1:1` →
+  `NODE_UNAVAILABLE`，快照（epoch/pending）完全不变；换真节点后提交 + 接受成功。
+
+### 已知限制
+
+1. **同步阻塞**：提交走同步桥（独立线程 + 独立运行时），在 FFI 的 `Mutex` 内串行执行；不要在 UI 线程做长循环。
+2. **pending 的来源**：本实现里 `rename` 是纯策略层（无 MLS 提交），能产生 pending 的治理操作目前是
+   改角色 / 移除成员 / 建群追加成员；测试因此用 `group_set_role` 产生 pending。
+3. **节点侧群/成员标识是另一套命名空间**：节点用"节点设备 ID"，MLS 用凭据文本；测试必须两侧都登记
+   （节点建群 + 设备注册），生产由 NODE 侧流程负责，本轮不自动同步。
+4. **只做提交与接受**：不拉取/不对账别人的条目（SYNC 侧）、不重试队列、不投递 Welcome。
+5. `node_public_key_hex` 只影响提交时的端点固定；回执验签用回执自带公钥（这是 NODE-006 的既定语义）。
+
+
 
 
 

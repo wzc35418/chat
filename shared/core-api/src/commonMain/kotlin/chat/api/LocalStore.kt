@@ -93,6 +93,9 @@ interface LocalStore {
 
     suspend fun listMessages(conversationId: String, cursor: String?, limit: Int): StoredPage<StoredMessage>
 
+    /** 某条消息引用的附件 ID 列表（按 ID 升序、有界）。 */
+    suspend fun messageAttachmentIds(messageId: String): List<String>
+
     /** 取消草稿（CORE-009，三态）。 */
     suspend fun cancelDraft(draftId: String): DraftCancelOutcome
 

@@ -19,17 +19,31 @@ use chat_core::groups::{
     GroupControlClearedView, GroupMemberKeyPackage, GroupMemberView, GroupPendingView, GroupView,
     MAX_GROUP_MEMBERS, MAX_GROUP_NAME_BYTES,
 };
-use chat_core::service::{ConversationCore, group_role_code};
+use chat_core::service::{
+    ControlAppendView, ControlCandidateView, ControlHeadSnapshotView, ControlReceiptView,
+    ConversationCore, group_role_code,
+};
 
 use crate::local_store::FfiError;
 
-/// 把内核错误投影成 FFI 错误（冻结码；groups 的码由 service::error_code 透传）。
+/// 把内核错误投影成 FFI 错误（冻结码）。
+///
+/// 控制提交回执（NODE-006）有自己的稳定错误码集合（`NODE_UNAVAILABLE` / `INVALID_RECEIPT_SCOPE` /
+/// `INVALID_SIGNATURE` / `PENDING_MISMATCH` …），因此先单独取；其余交给 service 的通用投影
+/// （groups/storage/sync 的冻结码都透传）。
 macro_rules! failure {
     ($error:expr) => {{
-        let (code, reason) = chat_core::service::error_projection(&$error);
-        FfiError::Store {
-            code: code.to_owned(),
-            reason,
+        if let Some(control) = $error.downcast_ref::<chat_core::group_node::ControlReceiptError>() {
+            FfiError::Store {
+                code: control.code().to_owned(),
+                reason: control.detail().to_owned(),
+            }
+        } else {
+            let (code, reason) = chat_core::service::error_projection(&$error);
+            FfiError::Store {
+                code: code.to_owned(),
+                reason,
+            }
         }
     }};
 }
@@ -190,6 +204,190 @@ fn group_view(view: GroupView) -> GroupViewFfi {
         pending_removed: view.pending_removed.iter().map(member_view).collect(),
         pending: view.pending.as_ref().map(pending_view),
         last_control_cleared: view.last_control_cleared.as_ref().map(cleared_view),
+    }
+}
+
+
+/// 节点签名回执（原样字段；全部是公开材料，不含任何私钥）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ControlAppendFfi {
+    /// 群。
+    pub group_id: String,
+    /// 提交标识。
+    pub submission_id: String,
+    /// 作者设备。
+    pub author_device_id: String,
+    /// 节点日志序号（从 1 开始）。
+    pub seq: u64,
+    /// 候选全文摘要。
+    pub candidate_hash: String,
+    /// 前序日志摘要。
+    pub previous_hash: String,
+    /// 本条之后的日志链摘要。
+    pub log_hash: String,
+    /// 节点接受时间（Unix 秒）。
+    pub accepted_at: u64,
+    /// 节点身份。
+    pub node_id: String,
+    /// 节点公钥。
+    pub node_public_key: String,
+    /// 节点签名（小写 hex）。
+    pub signature: String,
+}
+
+/// 被提交的控制候选原文（原样字段）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ControlCandidateFfi {
+    /// 协议主版本。
+    pub protocol_major: u8,
+    /// 协议次版本。
+    pub protocol_minor: u8,
+    /// 提交标识。
+    pub submission_id: String,
+    /// 群。
+    pub group_id: String,
+    /// 作者设备。
+    pub author_device_id: String,
+    /// 候选类别（本路径恒为 `control`）。
+    pub kind: String,
+    /// 期望控制头（CAS）。
+    pub expected_control_head: String,
+    /// 期望策略版本。
+    pub policy_version: u64,
+    /// 期望 MLS epoch。
+    pub mls_epoch: u64,
+    /// 密文（pending Commit 的小写 hex）。
+    pub encrypted_payload: String,
+    /// 公开控制操作种类（invite/remove/set_role…）。
+    pub operation: Option<String>,
+    /// 操作目标摘要。
+    pub target_digest: Option<String>,
+}
+
+/// 提交时读到的节点 head 快照（原样字段）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ControlHeadFfi {
+    /// 群。
+    pub group_id: String,
+    /// 协调节点身份。
+    pub coordinator_id: String,
+    /// 日志序号。
+    pub seq: u64,
+    /// 链尾摘要。
+    pub log_hash: String,
+    /// 控制头。
+    pub control_head: String,
+    /// 策略版本。
+    pub policy_version: u64,
+    /// MLS epoch。
+    pub mls_epoch: u64,
+    /// 节点身份。
+    pub node_id: String,
+    /// 节点公钥。
+    pub node_public_key: String,
+    /// 节点签名（小写 hex）。
+    pub signature: String,
+}
+
+/// 一次控制提交的完整证据：节点回执 + 候选原文 + 提交时的 head。
+///
+/// 三者必须一起回传给 `group_accept_with_receipt`：只凭回执无法证明“它绑定的就是这个 pending
+/// 提交”，group_node 会用这三段重做绑定校验（含节点验签与日志链摘要）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ControlReceiptFfi {
+    /// 节点签名回执。
+    pub receipt: ControlAppendFfi,
+    /// 被提交的候选原文。
+    pub candidate: ControlCandidateFfi,
+    /// 提交时读到的节点 head。
+    pub head: ControlHeadFfi,
+}
+
+fn receipt_ffi(view: &ControlReceiptView) -> ControlReceiptFfi {
+    ControlReceiptFfi {
+        receipt: ControlAppendFfi {
+            group_id: view.receipt.group_id.clone(),
+            submission_id: view.receipt.submission_id.clone(),
+            author_device_id: view.receipt.author_device_id.clone(),
+            seq: view.receipt.seq,
+            candidate_hash: view.receipt.candidate_hash.clone(),
+            previous_hash: view.receipt.previous_hash.clone(),
+            log_hash: view.receipt.log_hash.clone(),
+            accepted_at: view.receipt.accepted_at,
+            node_id: view.receipt.node_id.clone(),
+            node_public_key: view.receipt.node_public_key.clone(),
+            signature: view.receipt.signature.clone(),
+        },
+        candidate: ControlCandidateFfi {
+            protocol_major: view.candidate.protocol_major,
+            protocol_minor: view.candidate.protocol_minor,
+            submission_id: view.candidate.submission_id.clone(),
+            group_id: view.candidate.group_id.clone(),
+            author_device_id: view.candidate.author_device_id.clone(),
+            kind: view.candidate.kind.clone(),
+            expected_control_head: view.candidate.expected_control_head.clone(),
+            policy_version: view.candidate.policy_version,
+            mls_epoch: view.candidate.mls_epoch,
+            encrypted_payload: view.candidate.encrypted_payload.clone(),
+            operation: view.candidate.operation.clone(),
+            target_digest: view.candidate.target_digest.clone(),
+        },
+        head: ControlHeadFfi {
+            group_id: view.head.group_id.clone(),
+            coordinator_id: view.head.coordinator_id.clone(),
+            seq: view.head.seq,
+            log_hash: view.head.log_hash.clone(),
+            control_head: view.head.control_head.clone(),
+            policy_version: view.head.policy_version,
+            mls_epoch: view.head.mls_epoch,
+            node_id: view.head.node_id.clone(),
+            node_public_key: view.head.node_public_key.clone(),
+            signature: view.head.signature.clone(),
+        },
+    }
+}
+
+fn receipt_back(record: &ControlReceiptFfi) -> ControlReceiptView {
+    ControlReceiptView {
+        receipt: ControlAppendView {
+            group_id: record.receipt.group_id.clone(),
+            submission_id: record.receipt.submission_id.clone(),
+            author_device_id: record.receipt.author_device_id.clone(),
+            seq: record.receipt.seq,
+            candidate_hash: record.receipt.candidate_hash.clone(),
+            previous_hash: record.receipt.previous_hash.clone(),
+            log_hash: record.receipt.log_hash.clone(),
+            accepted_at: record.receipt.accepted_at,
+            node_id: record.receipt.node_id.clone(),
+            node_public_key: record.receipt.node_public_key.clone(),
+            signature: record.receipt.signature.clone(),
+        },
+        candidate: ControlCandidateView {
+            protocol_major: record.candidate.protocol_major,
+            protocol_minor: record.candidate.protocol_minor,
+            submission_id: record.candidate.submission_id.clone(),
+            group_id: record.candidate.group_id.clone(),
+            author_device_id: record.candidate.author_device_id.clone(),
+            kind: record.candidate.kind.clone(),
+            expected_control_head: record.candidate.expected_control_head.clone(),
+            policy_version: record.candidate.policy_version,
+            mls_epoch: record.candidate.mls_epoch,
+            encrypted_payload: record.candidate.encrypted_payload.clone(),
+            operation: record.candidate.operation.clone(),
+            target_digest: record.candidate.target_digest.clone(),
+        },
+        head: ControlHeadSnapshotView {
+            group_id: record.head.group_id.clone(),
+            coordinator_id: record.head.coordinator_id.clone(),
+            seq: record.head.seq,
+            log_hash: record.head.log_hash.clone(),
+            control_head: record.head.control_head.clone(),
+            policy_version: record.head.policy_version,
+            mls_epoch: record.head.mls_epoch,
+            node_id: record.head.node_id.clone(),
+            node_public_key: record.head.node_public_key.clone(),
+            signature: record.head.signature.clone(),
+        },
     }
 }
 
@@ -371,5 +569,45 @@ impl GroupFfi {
             .group_discard_pending(&group_id, &reason)
             .map_err(|error| failure!(error))?;
         Ok(group_view(view))
+    }
+
+    /// NODE-006：把 pending 控制提交送到节点，返回真实回执（seq 从 1 开始）。
+    ///
+    /// 设备签名钥复用库里**持久身份**的派生（未入库身份 → `INVALID_STATE_TRANSITION`）；
+    /// `node_public_key_hex` 可选（给了就固定节点公钥）。节点不可达统一 `NODE_UNAVAILABLE`。
+    pub fn group_submit_control(
+        &self,
+        group_id: String,
+        endpoint_url: String,
+        node_id: String,
+        node_public_key_hex: Option<String>,
+    ) -> Result<ControlReceiptFfi, FfiError> {
+        let mut core = self.lock()?;
+        let receipt = core
+            .group_submit_control(
+                &group_id,
+                &endpoint_url,
+                &node_id,
+                node_public_key_hex.as_deref(),
+            )
+            .map_err(|error| failure!(error))?;
+        Ok(receipt_ffi(&receipt))
+    }
+
+    /// NODE-006 接受侧：用真实回执接受并合并 pending 控制提交（epoch 前进、pending 清空）。
+    ///
+    /// 回执与候选/head 的绑定会被重做校验（节点验签 + 日志链摘要 + 密文逐字节比对）；
+    /// 伪造或错绑定回执显式失败且 epoch/成员不变。
+    pub fn group_accept_with_receipt(
+        &self,
+        group_id: String,
+        receipt: ControlReceiptFfi,
+    ) -> Result<GroupViewFfi, FfiError> {
+        let view = receipt_back(&receipt);
+        let mut core = self.lock()?;
+        let accepted = core
+            .group_accept_with_receipt(&group_id, &view)
+            .map_err(|error| failure!(error))?;
+        Ok(group_view(accepted))
     }
 }

@@ -1514,6 +1514,99 @@ impl ConversationCore {
         crate::groups::discard_pending_control(store, group_id, reason).map_err(anyhow::Error::new)
     }
 
+    // ------------------------------------------------ 群治理经节点回执（NODE-006）
+
+    /// NODE-006：把本机 pending 控制提交送到节点，返回**真实回执**（回执 + 候选原文 + 提交时的 head）。
+    ///
+    /// - 设备签名钥与持久身份同源（`load_identity_seeds` → `signing_key_from_seed`），因此节点看到的
+    ///   设备 ID 与库里一致；未入库身份 → `INVALID_STATE_TRANSITION`；
+    /// - `endpoint_url` 必须是可解析的 http(s) URL；`node_id` 是节点身份；`node_public_key_hex` 可选
+    ///   （给了就固定节点公钥，回执验签仍以回执自带的 head 公钥为准）；
+    /// - 提交前的全部前置（群快照、pending、群键、epoch 绑定、节点 head CAS）由
+    ///   crate::group_node::submit_pending_control 执行，任一不满足都显式失败且不发请求；
+    /// - 传输/超时统一映射为 `NODE_UNAVAILABLE`。
+    pub fn group_submit_control(
+        &mut self,
+        group_id: &str,
+        endpoint_url: &str,
+        node_id: &str,
+        node_public_key_hex: Option<&str>,
+    ) -> anyhow::Result<ControlReceiptView> {
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        let seeds = store
+            .load_identity_seeds()
+            .map_err(anyhow::Error::new)?
+            .ok_or_else(|| {
+                anyhow::Error::new(SyncError::new(
+                    ErrorCode::InvalidStateTransition,
+                    "the local identity is not enrolled in this database",
+                ))
+            })?;
+        let device_seed: [u8; 32] = seeds.device_seed.as_slice().try_into().map_err(|_| {
+            anyhow::Error::new(SyncError::new(
+                ErrorCode::StateCorrupted,
+                "the persisted device seed is not 32 bytes",
+            ))
+        })?;
+        let signing_key = chat_protocol::signing_key_from_seed(&device_seed);
+        let mut endpoint =
+            chat_node_client::NodeEndpoint::new(endpoint_url, node_id).map_err(|_| {
+                anyhow::Error::new(SyncError::new(
+                    ErrorCode::InvalidTarget,
+                    "node endpoint must be a parseable http(s) url",
+                ))
+            })?;
+        if let Some(hex_key) = node_public_key_hex {
+            let key: [u8; 32] = chat_node_services::canonical::hex_decode::<32>(
+                "node public key",
+                hex_key.trim(),
+            )
+            .map_err(|_| {
+                anyhow::Error::new(SyncError::new(
+                    ErrorCode::InvalidTarget,
+                    "node public key must be 32 bytes of lowercase hex",
+                ))
+            })?;
+            endpoint = endpoint.with_node_public_key(key);
+        }
+        let client =
+            chat_node_client::NodeClient::new(endpoint, seeds.device_id.clone(), signing_key)
+                .map_err(|_| {
+                    anyhow::Error::new(SyncError::new(
+                        ErrorCode::InvalidTarget,
+                        "node client could not be created from the persisted device identity",
+                    ))
+                })?;
+        let device = crate::groups::load_group_device(store, group_id).map_err(anyhow::Error::new)?;
+        let receipt = crate::group_node::submit_pending_control(&device, store, group_id, &client)
+            .map_err(anyhow::Error::new)?;
+        Ok(ControlReceiptView::from_receipt(receipt))
+    }
+
+    /// NODE-006 接受侧：用**真实回执**接受并合并 pending 控制提交。
+    ///
+    /// 回执绑定（候选正文逐字节等于本 pending 的 Commit、提交/作者/群/节点身份、节点签名、
+    /// 日志链摘要）全部复核通过后才合并；任何不符都显式失败且 epoch/成员不变。
+    pub fn group_accept_with_receipt(
+        &mut self,
+        group_id: &str,
+        receipt: &ControlReceiptView,
+    ) -> anyhow::Result<GroupView> {
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        let mut device =
+            crate::groups::load_group_device(store, group_id).map_err(anyhow::Error::new)?;
+        let rebuilt = receipt.to_control_receipt()?;
+        crate::group_node::accept_pending_control_with_receipt(
+            &mut device,
+            store,
+            group_id,
+            &rebuilt,
+        )
+        .map_err(anyhow::Error::new)
+    }
+
     /// 持久身份的设备 ID（未入库身份 → `INVALID_STATE_TRANSITION`）。
     fn persisted_device_id(&self) -> anyhow::Result<String> {
         let guard = self.store_guard()?;
@@ -1542,6 +1635,223 @@ impl ConversationCore {
             crate::groups::load_group_device(store, group_id).map_err(anyhow::Error::new)?;
         action(&mut device, store).map_err(anyhow::Error::new)
     }
+}
+
+/// 节点回执的**公开副本**（不含任何秘密材料：全是节点与协议本来就要公开的字段）。
+///
+/// 三段分别对应 NODE-006 的证据三要素：节点签名回执、被提交的候选原文、提交时的节点 head 快照。
+/// 三者必须一起流转——只保存回执无法排除“拿 A 的回执去接受 B 的提交”。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ControlReceiptView {
+    /// 节点签名回执。
+    pub receipt: ControlAppendView,
+    /// 被提交的候选原文（kind = control，正文是 pending Commit 的十六进制）。
+    pub candidate: ControlCandidateView,
+    /// 提交时读到的节点 head 快照（节点身份与 CAS 依据）。
+    pub head: ControlHeadSnapshotView,
+}
+
+impl ControlReceiptView {
+    /// 由 group_node 的真实回执构造公开副本。
+    pub fn from_receipt(receipt: crate::group_node::ControlReceipt) -> Self {
+        let metadata = receipt.candidate.control_metadata.clone();
+        Self {
+            receipt: ControlAppendView {
+                group_id: receipt.receipt.group_id,
+                submission_id: receipt.receipt.submission_id,
+                author_device_id: receipt.receipt.author_device_id,
+                seq: receipt.receipt.seq,
+                candidate_hash: receipt.receipt.candidate_hash,
+                previous_hash: receipt.receipt.previous_hash,
+                log_hash: receipt.receipt.log_hash,
+                accepted_at: receipt.receipt.accepted_at,
+                node_id: receipt.receipt.node_id,
+                node_public_key: receipt.receipt.node_public_key,
+                signature: receipt.receipt.signature,
+            },
+            candidate: ControlCandidateView {
+                protocol_major: receipt.candidate.protocol_major,
+                protocol_minor: receipt.candidate.protocol_minor,
+                submission_id: receipt.candidate.submission_id,
+                group_id: receipt.candidate.group_id,
+                author_device_id: receipt.candidate.author_device_id,
+                kind: receipt.candidate.kind,
+                expected_control_head: receipt.candidate.expected_control_head,
+                policy_version: receipt.candidate.policy_version,
+                mls_epoch: receipt.candidate.mls_epoch,
+                encrypted_payload: receipt.candidate.encrypted_payload,
+                operation: metadata.as_ref().map(|item| item.operation.clone()),
+                target_digest: metadata.as_ref().map(|item| item.target_digest.clone()),
+            },
+            head: ControlHeadSnapshotView {
+                group_id: receipt.head.group_id,
+                coordinator_id: receipt.head.coordinator_id,
+                seq: receipt.head.seq,
+                log_hash: receipt.head.log_hash,
+                control_head: receipt.head.control_head,
+                policy_version: receipt.head.policy_version,
+                mls_epoch: receipt.head.mls_epoch,
+                node_id: receipt.head.node_id,
+                node_public_key: receipt.head.node_public_key,
+                signature: receipt.head.signature,
+            },
+        }
+    }
+
+    /// 还原成 group_node 的证据三要素（字段原样搬运，验签与绑定校验在 group_node 侧完成）。
+    pub fn to_control_receipt(&self) -> anyhow::Result<crate::group_node::ControlReceipt> {
+        let metadata = match (&self.candidate.operation, &self.candidate.target_digest) {
+            (Some(operation), Some(target_digest)) => {
+                Some(chat_node_services::group::CandidateControlMetadata {
+                    operation: operation.clone(),
+                    target_digest: target_digest.clone(),
+                })
+            }
+            (None, None) => None,
+            _ => {
+                return Err(anyhow::Error::new(SyncError::new(
+                    ErrorCode::InvalidCandidate,
+                    "control metadata must carry both operation and target digest",
+                )));
+            }
+        };
+        Ok(crate::group_node::ControlReceipt {
+            receipt: chat_node_services::group::AppendResult {
+                group_id: self.receipt.group_id.clone(),
+                submission_id: self.receipt.submission_id.clone(),
+                author_device_id: self.receipt.author_device_id.clone(),
+                seq: self.receipt.seq,
+                candidate_hash: self.receipt.candidate_hash.clone(),
+                previous_hash: self.receipt.previous_hash.clone(),
+                log_hash: self.receipt.log_hash.clone(),
+                accepted_at: self.receipt.accepted_at,
+                node_id: self.receipt.node_id.clone(),
+                node_public_key: self.receipt.node_public_key.clone(),
+                signature: self.receipt.signature.clone(),
+            },
+            candidate: chat_node_services::group::GroupCandidate {
+                protocol_major: self.candidate.protocol_major,
+                protocol_minor: self.candidate.protocol_minor,
+                submission_id: self.candidate.submission_id.clone(),
+                group_id: self.candidate.group_id.clone(),
+                author_device_id: self.candidate.author_device_id.clone(),
+                kind: self.candidate.kind.clone(),
+                expected_control_head: self.candidate.expected_control_head.clone(),
+                policy_version: self.candidate.policy_version,
+                mls_epoch: self.candidate.mls_epoch,
+                encrypted_payload: self.candidate.encrypted_payload.clone(),
+                control_metadata: metadata,
+            },
+            head: chat_node_services::group::SignedLogHead {
+                group_id: self.head.group_id.clone(),
+                coordinator_id: self.head.coordinator_id.clone(),
+                seq: self.head.seq,
+                log_hash: self.head.log_hash.clone(),
+                control_head: self.head.control_head.clone(),
+                policy_version: self.head.policy_version,
+                mls_epoch: self.head.mls_epoch,
+                node_id: self.head.node_id.clone(),
+                node_public_key: self.head.node_public_key.clone(),
+                signature: self.head.signature.clone(),
+            },
+        })
+    }
+
+    /// 节点分配的提交标识（PROTOCOL-001 submission 文本）。
+    pub fn submission_id(&self) -> &str {
+        &self.receipt.submission_id
+    }
+
+    /// 节点日志序号。
+    pub fn seq(&self) -> u64 {
+        self.receipt.seq
+    }
+
+    /// 该条目之后的节点日志链摘要。
+    pub fn log_hash(&self) -> &str {
+        &self.receipt.log_hash
+    }
+}
+
+/// 节点签名回执（原样字段）。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ControlAppendView {
+    /// 群。
+    pub group_id: String,
+    /// 提交标识。
+    pub submission_id: String,
+    /// 作者设备。
+    pub author_device_id: String,
+    /// 节点日志序号（从 1 开始）。
+    pub seq: u64,
+    /// 候选全文摘要。
+    pub candidate_hash: String,
+    /// 前序日志摘要。
+    pub previous_hash: String,
+    /// 本条之后的日志链摘要。
+    pub log_hash: String,
+    /// 节点接受时间（Unix 秒）。
+    pub accepted_at: u64,
+    /// 节点身份。
+    pub node_id: String,
+    /// 节点公钥（公开材料）。
+    pub node_public_key: String,
+    /// 节点签名（小写 hex）。
+    pub signature: String,
+}
+
+/// 被提交的控制候选原文（原样字段）。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ControlCandidateView {
+    /// 协议主版本。
+    pub protocol_major: u8,
+    /// 协议次版本。
+    pub protocol_minor: u8,
+    /// 提交标识。
+    pub submission_id: String,
+    /// 群。
+    pub group_id: String,
+    /// 作者设备。
+    pub author_device_id: String,
+    /// 候选类别（本路径恒为 `control`）。
+    pub kind: String,
+    /// 期望控制头（CAS）。
+    pub expected_control_head: String,
+    /// 期望策略版本。
+    pub policy_version: u64,
+    /// 期望 MLS epoch。
+    pub mls_epoch: u64,
+    /// 密文（pending Commit 的小写 hex）。
+    pub encrypted_payload: String,
+    /// 公开控制操作种类。
+    pub operation: Option<String>,
+    /// 操作目标摘要（本切片用提交摘要）。
+    pub target_digest: Option<String>,
+}
+
+/// 提交时读到的节点 head 快照（原样字段）。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ControlHeadSnapshotView {
+    /// 群。
+    pub group_id: String,
+    /// 协调节点身份。
+    pub coordinator_id: String,
+    /// 日志序号。
+    pub seq: u64,
+    /// 链尾摘要。
+    pub log_hash: String,
+    /// 控制头。
+    pub control_head: String,
+    /// 策略版本。
+    pub policy_version: u64,
+    /// MLS epoch。
+    pub mls_epoch: u64,
+    /// 节点身份。
+    pub node_id: String,
+    /// 节点公钥（公开材料）。
+    pub node_public_key: String,
+    /// 节点签名（小写 hex）。
+    pub signature: String,
 }
 
 /// 群角色 → 稳定文本（`owner` / `admin` / `member`），供 FFI/UI 投影。

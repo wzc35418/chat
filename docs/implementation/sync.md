@@ -640,94 +640,53 @@ schedule_retry(job: JobId, error: CoreError, now: Time) -> Result<RetrySchedule>
 set_lifecycle(state: AppLifecycleState) -> Result<SyncStatus>
 ~~~
 
-**职责与输出**：前台恢复补齐，后台保存进度并收缩连接。
-
-**输入与前置条件**：Android/桌面通过平台事件调用，状态可重复。参数类型含义见类型字典；调用方只传必要范围，秘密不得进入日志或普通 DTO。
-
-**处理步骤**：
-
-1. 原子更新生命周期。
-2. 后台暂停非必要任务。
-3. 耐久保存检查点。
-4. 前台重建连接并触发同步。
-5. 发布状态。
-
-**持久化、并发与副作用**：不因进入后台删除 outbox；系统可直接杀进程。
-
-**失败处理**：STORAGE_FAILURE，BACKGROUND_BUDGET_EXCEEDED。网络类错误按持久退避处理；验证/损坏类错误不自动放宽安全条件。
-
-**调用关系**：[SYNC-006 sync_now](sync.md#sync-006)、[TRANSPORT-012 shutdown_transport](transport.md#transport-012)。此处列主要逻辑协作关系，纯函数之间的调用不代表共享事务，也不代表代码已经存在。
-
-**完成验收**：
-
-- [ ] Android kill 后重启恢复。
-- [ ] 前后台频繁切换不漏消息。
-
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+<a id="sync-worker"></a>
 
 <a id="sync-013"></a>
 
 ## SYNC-013 · set_connectivity
 
-~~~text
-set_connectivity(state: ConnectivityState) -> Result<SyncStatus>
+~~~kotlin
+suspend fun setConnectivity(state: ConnectivityState): SyncStatus
 ~~~
 
-**职责与输出**：断网暂停网络工作，恢复后合并触发重连。
+**职责与输出**：把上层观测到的网络/生命周期状态交给同步引擎，返回当前同步状态快照。
 
-**输入与前置条件**：OS 网络提示不保证节点可达。参数类型含义见类型字典；调用方只传必要范围，秘密不得进入日志或普通 DTO。
+**输入与前置条件**：状态取自平台生命周期与网络监听；重复设置同一状态幂等；引擎未启动显式失败。
 
-**处理步骤**：
+**处理步骤**：校验枚举 → 相同则直接返回（幂等）→ Offline/Background 停止新的拉取与提交（保留耐久队列与游标）→ 恢复时按既有退避策略唤醒拉取循环。
 
-1. 记录连接 hint。
-2. 失网取消有限网络任务。
-3. 在线使到期 job 可执行。
-4. 节点实际失败仍退避。
+**持久化、并发与副作用**：不修改消息/草稿状态，不伪造投递成功，只影响调度。
 
-**持久化、并发与副作用**：只改调度状态，不改消息已接受事实。
+**失败处理**：非法枚举 INVALID_INPUT；引擎未启动 INVALID_STATE_TRANSITION。
 
-**失败处理**：NETWORK_UNAVAILABLE。网络类错误按持久退避处理；验证/损坏类错误不自动放宽安全条件。
-
-**调用关系**：[SYNC-011 schedule_retry](sync.md#sync-011)、[SYNC-006 sync_now](sync.md#sync-006)。此处列主要逻辑协作关系，纯函数之间的调用不代表共享事务，也不代表代码已经存在。
-
-**完成验收**：
-
-- [ ] 有 Wi-Fi 无互联网保持待发。
-- [ ] 旧连接 ACK 不覆盖新状态。
-
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：**未实现**（常驻运行时见 `crates/core/src/sync_runtime.rs`；连接态调度尚未接入）。
 
 <a id="sync-014"></a>
 
 ## SYNC-014 · configure_node
 
-~~~text
-configure_node(profile: NodeProfile) -> Result<NodeConfigurationStatus>
+~~~kotlin
+suspend fun configureNode(node: NodeEndpoint): SyncStatus
 ~~~
 
-**职责与输出**：验证并保存节点设置，不自动迁移已有会话协调者。
+**职责与输出**：设置同步使用的节点端点（地址 + 节点 ID + 可选固定公钥），返回当前同步状态。
 
-**输入与前置条件**：用户显式输入地址和信任确认；禁止静默公共回退。参数类型含义见类型字典；调用方只传必要范围，秘密不得进入日志或普通 DTO。
+**输入与前置条件**：端点与节点 ID 校验通过；固定公钥仅在明确配置时使用。
 
-**处理步骤**：
+**处理步骤**：校验格式 → 保存配置（不联网探测）→ 已运行的拉取循环下一轮使用新端点 → 返回状态快照。
 
-1. 校验 HTTPS/主机策略。
-2. 抓能力。
-3. 核对公钥信任。
-4. 保存 profile。
-5. 新会话使用新设置。
-6. 旧会话保留固定协调关系。
+**持久化、并发与副作用**：只改配置，不发送请求、不改游标、不改投递状态。
 
-**持久化、并发与副作用**：配置短事务；网络检查事务外；错误保留旧可用配置。
+**失败处理**：格式非法 INVALID_INPUT；不可达在真正请求时以 NODE_UNAVAILABLE 显式失败（配置阶段不假装可用）。
 
-**失败处理**：INVALID_NODE_PROFILE，NODE_KEY_CHANGED，PROTOCOL_UNSUPPORTED。网络类错误按持久退避处理；验证/损坏类错误不自动放宽安全条件。
+**实现状态**：**未实现**（发送侧 `configure_send_node` 与群治理 `submit_control` 已各自接受端点参数，统一配置层待接入）。
 
-**调用关系**：[PROTOCOL-011 negotiate_capabilities](protocol.md#protocol-011)。此处列主要逻辑协作关系，纯函数之间的调用不代表共享事务，也不代表代码已经存在。
+<a id="sync-worker"></a>
 
-**完成验收**：
+## 实现记录：常驻拉取与同步运行时（R-67 / R-70）
 
-- [ ] 换节点不改变账户 ID。
-- [ ] 旧群不被误指到新节点。
-
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
-
+- 拉取 worker（`crates/core/src/sync_worker.rs`）：`run_pull_once` 读游标与节点 head → `pull::mailbox_pull_loop` 决策 → 分页拉取并逐条验签（回执签名、绑定候选、群绑定、序号连续、前序哈希接上游标、页 head 与固定公钥），与游标同一快照落库后再前进；`run_catchup_once` 执行 `catchup_plan` 的 `PullLog`，只有当日志真验到该序号才 `CommitHead`，`RebuildEpoch`/`AwaitControl` 交回上层。
+- 常驻运行时（`crates/core/src/sync_runtime.rs`）：独立线程 + current-thread 运行时；每轮一次拉取，成功按间隔等待、Resync 立刻追赶、失败退避、预算耗尽或不可重试错误终止；`status()` 暴露状态快照；`stop()` join 并交还库句柄。
+- 证据：`cargo test -p chat-core` 的 `sync_worker`(8) 与 `sync_runtime`(4) 用例（自动应用、stop 生效、断开退避后可恢复、缺口不跳过、5 种坏页被拒）。
+- 限制：作者签名不重复验证；无 MLS 内层应用；持久化复用 `mls_group_state`/`mls_record`（单群 4096）；同群多运行时无互斥；无事件回调。

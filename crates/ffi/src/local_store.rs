@@ -244,6 +244,13 @@ impl LocalStoreFfi {
     }
 
     /// 查询草稿状态；未知草稿返回 null。
+    /// 某条消息引用的附件 ID 列表（ATTACHMENTS 引用；按 ID 升序、有界）。
+    pub fn message_attachment_ids(&self, message_id: String) -> Result<Vec<String>, FfiError> {
+        let core = self.lock()?;
+        core.attachments_for_message(&message_id)
+            .map_err(|error| failure!(error))
+    }
+
     /// 草稿真实状态（CORE-010）：不含正文，供列表/按钮态使用。
     pub fn draft_status_view(&self, draft_id: String) -> Result<Option<DraftStatusView>, FfiError> {
         let core = self.lock()?;

@@ -1087,3 +1087,77 @@ cargo test --offline -p chat-core                      # 140 passed（既有 133
 5. **Welcome 一次性**：被拒绝的 Welcome 已消耗 KeyPackage，必须重新获取邀请与 KeyPackage（GROUPS-004 票据未实现）。
 6. **self_removed 只更新快照**：本机被移除后快照会去掉本机成员，但重新加入需要新的 Welcome（未实现）。
 
+## 群治理经节点回执接进服务层与 FFI（2026-10-18，Windows x64）
+
+本轮把 group_node 的真节点回执路径（NODE-006 `submit_pending_control` /
+`accept_pending_control_with_receipt`）接到 `ConversationCore` 与 `GroupFfi`：界面可以"提交治理操作到节点
+→ 拿到回执 → 用回执接受"。
+
+代码：[crates/core/src/service.rs](../../crates/core/src/service.rs)（`group_submit_control` /
+`group_accept_with_receipt` + 回执公开副本类型）、[crates/ffi/src/groups_ffi.rs](../../crates/ffi/src/groups_ffi.rs)
+（`ControlReceiptFfi` 等 4 个记录 + 2 个方法）；测试：
+[crates/ffi/tests/groups_ffi_receipt.rs](../../crates/ffi/tests/groups_ffi_receipt.rs)（3 个用例，**真 axum 节点 +
+真 OpenMLS + 真临时库**，全程经 FFI）。FFI 契约细节见 [bridge.md 的“群治理经节点回执”](bridge.md)。
+
+### 公开面（core）
+
+~~~text
+ConversationCore::group_submit_control(group_id, endpoint_url, node_id, node_public_key_hex: Option<&str>)
+    -> ControlReceiptView
+ConversationCore::group_accept_with_receipt(group_id, &ControlReceiptView) -> GroupView
+
+ControlReceiptView { receipt: ControlAppendView, candidate: ControlCandidateView,
+                     head: ControlHeadSnapshotView }   // 公开材料，无密钥
+ControlReceiptView::submission_id() / seq() / log_hash()
+~~~
+
+### 关键语义
+
+1. **设备身份来自持久身份**：提交时用 `load_identity_seeds` 派生设备签名钥（与 identity 同一个派生函数），
+   节点看到的设备 ID 与库里一致；未入库身份 → `INVALID_STATE_TRANSITION`。
+2. **先本地自证，再触网**：群快照/pending/群键/epoch 绑定全部由 group_node 前置校验；不满足就**不发请求**。
+3. **回执 = 三要素**：回执 + 候选原文 + 提交时的 head 必须一起流转并一起交回；接受时重做三重校验
+   （候选密文逐字节等于本机 pending Commit、节点验签、日志链摘要重算）。
+4. **接受后真实推进**：epoch 前进到 target、pending 清空、策略快照写入；失败保持原状态（测试逐一断言
+   `GroupView` 完全不变）。
+5. **不联网的部分保持不联网**：`group_snapshot` / 策略层治理（改名、禁言）仍然不触网。
+
+### 错误码（冻结）
+
+`NODE_UNAVAILABLE`（不可达/超时）、`INVALID_RECEIPT_SCOPE`（错群/错提交/错节点/链摘要不符）、
+`INVALID_SIGNATURE`（节点签名或候选摘要不符）、`INVALID_CANDIDATE`（候选结构/密文不符）、
+`PENDING_MISMATCH` / `STALE_EPOCH`（本地 pending 状态不符）、`CORE_CLOSED` / `INVALID_TARGET`。
+
+### 复现命令（全程离线；测试内起真实 loopback 节点）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi --test groups_ffi_receipt   # 3 passed
+cargo test --offline -p chat-core -p chat-ffi                # 155 + 39 passed（既有 151 + 36 继续通过）
+~~~
+
+### 证据
+
+- `groups_ffi_receipt::submit_and_accept_with_a_real_node_receipt`：建群（本地凭据 = 持久身份设备 ID，
+  该设备已在节点登记、群也已在节点建立）→ 改角色产生 pending self_update（epoch 1）→ 提交拿到真回执
+  （`seq >= 1`、`sub:1:…`、候选 kind=control、operation=set_role、head 属于该节点/该群）→ 接受后
+  **epoch 2**、pending 清空、bob 变 admin、快照一致；重复接受 → `PENDING_MISMATCH` 且快照不变。
+- `groups_ffi_receipt::forged_receipts_are_rejected_without_advancing_the_epoch`：改链摘要 / 改节点签名 →
+  `INVALID_SIGNATURE`；换密文 → `INVALID_CANDIDATE`；每次拒绝后快照仍是 epoch 1 + pending 仍在，
+  最后真回执仍能推进到 epoch 2。
+- `groups_ffi_receipt::unreachable_node_fails_explicitly_and_leaves_state`：指向 `127.0.0.1:1` →
+  `NODE_UNAVAILABLE`、快照完全不变；换真节点后提交 + 接受成功。
+
+### 已知限制
+
+1. **pending 的来源**：本实现里 `rename` 是纯策略层（不产生 MLS 提交），能产生 pending 的是改角色 /
+   移除成员 / 建群追加成员；端到端用例因此用改角色产生 pending。
+2. **节点与 MLS 两套标识**：节点用"节点设备 ID"登记成员与群，MLS 用凭据文本；两侧都要各自登记
+   （测试里显式做，生产由 NODE 侧流程负责）。
+3. **同步阻塞**：提交走同步桥（独立线程 + 独立运行时），在 FFI 的 `Mutex` 内串行执行。
+4. **只做提交与接受**：不拉取/不对账别人的条目（SYNC 侧）、不重试队列、不投递 Welcome。
+5. ~~本地接受证据 ≠ 节点回执~~（本轮的**节点回执路径**已补上）；但 `group_accept_pending`（无回执接受）
+   依然只是本地收口，两者不可混用。
+6. `node_public_key_hex` 只影响提交时的端点固定；回执验签用回执自带的 head 公钥（NODE-006 既定语义）。
+
+

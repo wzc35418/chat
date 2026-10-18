@@ -281,3 +281,21 @@ fun chat.api.LocalAttachment.progressLabel(): String =
     } else {
         ""
     }
+
+/** 消息附件摘要（界面只展示计数与 ID 前缀，避免把附件当正文）。 */
+data class MessageAttachmentSummary(
+    val count: Int,
+    val label: String,
+    val detail: String,
+)
+
+fun summarizeMessageAttachments(messageId: String, attachmentIds: List<String>): MessageAttachmentSummary =
+    if (attachmentIds.isEmpty()) {
+        MessageAttachmentSummary(count = 0, label = "", detail = "")
+    } else {
+        MessageAttachmentSummary(
+            count = attachmentIds.size,
+            label = attachmentIds.size.toString() + " 个附件",
+            detail = messageId.take(12) + "… → " + attachmentIds.joinToString("、") { it.take(12) + "…" },
+        )
+    }

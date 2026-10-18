@@ -116,6 +116,10 @@ class NativeLocalStore : LocalStore {
     }
 
 
+    override suspend fun messageAttachmentIds(messageId: String): List<String> = withStore { store ->
+        store.messageAttachmentIds(messageId)
+    }
+
     override suspend fun cancelDraft(draftId: String): DraftCancelOutcome = withStore { store ->
         val view = store.cancelDraft(draftId)
         DraftCancelOutcome(
