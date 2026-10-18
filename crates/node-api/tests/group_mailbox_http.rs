@@ -74,6 +74,8 @@ async fn start_node(policy: NodeAuthPolicy) -> Node {
 
 struct HttpResponse {
     status: u16,
+    /// 响应头（小写名，便于按名查找）。
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -93,6 +95,14 @@ impl HttpResponse {
             .unwrap_or_default()
             .to_owned()
     }
+
+    /// 响应头取值（不存在时为 None）。
+    fn content_type(&self) -> Option<String> {
+        self.headers
+            .iter()
+            .find(|(name, _)| name == "content-type")
+            .map(|(_, value)| value.clone())
+    }
 }
 
 async fn http(
@@ -102,9 +112,29 @@ async fn http(
     headers: &[(String, String)],
     body: &[u8],
 ) -> HttpResponse {
+    http_with(
+        address,
+        method,
+        path_and_query,
+        headers,
+        body,
+        "application/json",
+    )
+    .await
+}
+
+/// 与 http() 相同，但可指定请求 content-type（附件密文块用 octet-stream）。
+async fn http_with(
+    address: &str,
+    method: &str,
+    path_and_query: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    content_type: &str,
+) -> HttpResponse {
     let mut stream = TcpStream::connect(address).await.expect("connect");
     let mut head = format!(
-        "{method} {path_and_query} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\ncontent-type: application/json\r\n",
+        "{method} {path_and_query} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\ncontent-type: {content_type}\r\n",
         body.len()
     );
     for (name, value) in headers {
@@ -125,14 +155,21 @@ fn parse_response(raw: &[u8]) -> HttpResponse {
         .position(|window| window == b"\r\n\r\n")
         .expect("response header terminator");
     let head = String::from_utf8_lossy(&raw[..header_end]);
-    let status = head
-        .lines()
+    let mut lines = head.lines();
+    let status = lines
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
         .expect("status code");
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+        })
+        .collect();
     HttpResponse {
         status,
+        headers,
         body: raw[header_end + 4..].to_vec(),
     }
 }
@@ -842,4 +879,410 @@ async fn non_member_is_forbidden_on_group_and_mailbox_endpoints() {
     let response = append_request(&node, 21, &unknown_group, &unknown_candidate, &unknown_signature).await;
     assert_eq!(response.status, 404);
     assert_eq!(response.error_code(), "GROUP_NOT_FOUND");
+}
+// ---------------------------------------------------------------- 附件 blob 端点（NODE-012~015）
+
+fn object_text(seed: u8) -> String {
+    chat_protocol::ObjectId::from_bytes([seed; 32]).encode()
+}
+
+fn operation_text(seed: u8) -> String {
+    chat_protocol::OperationId::from_bytes([seed; 32]).encode()
+}
+
+/// 整体密文摘要 = 按块序拼接后的一次 SHA-256（与节点侧校验一致）。
+fn ciphertext_digest(chunks: &[&[u8]]) -> String {
+    let mut combined = Vec::new();
+    for chunk in chunks {
+        combined.extend_from_slice(chunk);
+    }
+    hex_encode(&chat_node_services::canonical::sha256(&combined))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn begin_blob(
+    node: &Node,
+    seed: u8,
+    group: &str,
+    operation: &str,
+    blob: &str,
+    source_seq: u64,
+    total: u64,
+    chunk_bytes: u32,
+    chunk_count: u32,
+) -> HttpResponse {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "operation_id": operation,
+        "descriptor": {
+            "blob_id": blob,
+            "group_id": group,
+            "source_seq": source_seq,
+            "ciphertext_bytes": total,
+            "chunk_bytes": chunk_bytes,
+            "chunk_count": chunk_count,
+        },
+    }))
+    .expect("blob begin json");
+    let headers = request_headers(node, seed, "POST", "/v1/blobs", "", &body).await;
+    http(&node.address, "POST", "/v1/blobs", &headers, &body).await
+}
+
+async fn put_chunk(
+    node: &Node,
+    seed: u8,
+    upload_id: &str,
+    index: u32,
+    bytes: &[u8],
+) -> HttpResponse {
+    let path = format!("/v1/blobs/{upload_id}/chunks/{index}");
+    let headers = request_headers(node, seed, "PUT", &path, "", bytes).await;
+    http_with(
+        &node.address,
+        "PUT",
+        &path,
+        &headers,
+        bytes,
+        "application/octet-stream",
+    )
+    .await
+}
+
+async fn complete_blob(
+    node: &Node,
+    seed: u8,
+    upload_id: &str,
+    chunk_count: u32,
+    total: u64,
+    digest: &str,
+) -> HttpResponse {
+    let path = format!("/v1/blobs/{upload_id}/complete");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "manifest": {
+            "chunk_count": chunk_count,
+            "ciphertext_bytes": total,
+            "ciphertext_digest": digest,
+        },
+    }))
+    .expect("manifest json");
+    let headers = request_headers(node, seed, "POST", &path, "", &body).await;
+    http(&node.address, "POST", &path, &headers, &body).await
+}
+
+async fn read_chunk(node: &Node, seed: u8, blob_id: &str, index: u32) -> HttpResponse {
+    let path = format!("/v1/blobs/{blob_id}/chunks/{index}");
+    let headers = request_headers(node, seed, "GET", &path, "", b"").await;
+    http(&node.address, "GET", &path, &headers, b"").await
+}
+
+/// 上传一条已接受日志条目，返回其 seq。
+async fn append_attachment_entry(node: &Node, group: &str, seed: u8) -> u64 {
+    let (entry, signature) = candidate(
+        group,
+        seed,
+        41,
+        b"attachment message",
+        chat_node_services::group::KIND_APPLICATION,
+        INITIAL_CONTROL_HEAD,
+    );
+    let response = append_request(node, seed, group, &entry, &signature).await;
+    assert_eq!(response.status, 200);
+    response.json()["result"]["seq"].as_u64().expect("seq")
+}
+
+#[tokio::test]
+async fn blob_upload_and_read_round_trip_over_http() {
+    let (node, group) = setup(NodeAuthPolicy::default()).await;
+    let source_seq = append_attachment_entry(&node, &group, 21).await;
+    let blob = object_text(131);
+    let first: &[u8] = b"head";
+    let second: &[u8] = b"tail";
+    let begin = begin_blob(&node, 21, &group, &operation_text(231), &blob, source_seq, 8, 4, 2).await;
+    assert_eq!(
+        begin.status,
+        200,
+        "begin: {:?}",
+        String::from_utf8_lossy(&begin.body)
+    );
+    let session = begin.json()["session"].clone();
+    let upload_id = session["upload_id"].as_str().expect("upload id").to_owned();
+    assert_eq!(session["blob_id"], blob);
+    assert_eq!(session["chunk_count"], 2);
+    // 原始字节正文（不是 hex/JSON）。
+    let uploaded = put_chunk(&node, 21, &upload_id, 0, first).await;
+    assert_eq!(uploaded.status, 200);
+    let receipt = uploaded.json()["receipt"].clone();
+    assert_eq!(receipt["chunk_index"], 0);
+    assert_eq!(receipt["received_chunks"], 1);
+    // 同块同字节重传：同一份回执。
+    let repeat = put_chunk(&node, 21, &upload_id, 0, first).await;
+    assert_eq!(repeat.status, 200);
+    assert_eq!(repeat.json()["receipt"], receipt);
+    assert_eq!(put_chunk(&node, 21, &upload_id, 1, second).await.status, 200);
+    let digest = ciphertext_digest(&[first, second]);
+    let completed = complete_blob(&node, 21, &upload_id, 2, 8, &digest).await;
+    assert_eq!(
+        completed.status,
+        200,
+        "complete: {:?}",
+        String::from_utf8_lossy(&completed.body)
+    );
+    let published = completed.json()["receipt"].clone();
+    assert_eq!(published["blob_id"], blob);
+    assert_eq!(published["ciphertext_digest"], digest);
+
+    // 成员按块取回**原始**密文（响应不是 JSON）。
+    let chunk = read_chunk(&node, 22, &blob, 0).await;
+    assert_eq!(chunk.status, 200);
+    assert_eq!(chunk.body, first);
+    assert_eq!(
+        chunk.content_type().as_deref(),
+        Some("application/octet-stream")
+    );
+    let chunk = read_chunk(&node, 22, &blob, 1).await;
+    assert_eq!(chunk.body, second);
+    // 上传者本人也能读。
+    assert_eq!(read_chunk(&node, 21, &blob, 0).await.body, first);
+}
+fn small_blob_policy() -> NodeAuthPolicy {
+    NodeAuthPolicy {
+        max_devices_per_account: 3,
+        blob: chat_node_services::limits::BlobPolicy {
+            max_bytes_per_device: 64,
+            max_object_bytes: 32,
+            max_chunk_bytes: 8,
+            max_chunk_count: 4,
+            upload_ttl_seconds: 60,
+        },
+        ..NodeAuthPolicy::default()
+    }
+}
+
+#[tokio::test]
+async fn blob_http_error_statuses_are_stable() {
+    let (node, group) = setup(small_blob_policy()).await;
+    let source_seq = append_attachment_entry(&node, &group, 21).await;
+    let blob = object_text(132);
+    let begin = begin_blob(
+        &node,
+        21,
+        &group,
+        &operation_text(232),
+        &blob,
+        source_seq,
+        16,
+        8,
+        2,
+    )
+    .await;
+    assert_eq!(
+        begin.status,
+        200,
+        "begin: {:?}",
+        String::from_utf8_lossy(&begin.body)
+    );
+    let upload_id = begin.json()["session"]["upload_id"]
+        .as_str()
+        .expect("upload id")
+        .to_owned();
+
+    // 乱序写入 → 409。
+    let out_of_order = put_chunk(&node, 21, &upload_id, 1, b"abcdefgh").await;
+    assert_eq!(out_of_order.status, 409);
+    assert_eq!(out_of_order.error_code(), "CHUNK_OUT_OF_ORDER");
+    // 超过声明块大小 → 413。
+    let oversized = put_chunk(&node, 21, &upload_id, 0, b"123456789").await;
+    assert_eq!(oversized.status, 413);
+    assert_eq!(oversized.error_code(), "CONTENT_TOO_LARGE");
+    // 短于声明边界 → 409。
+    let short = put_chunk(&node, 21, &upload_id, 0, b"123").await;
+    assert_eq!(short.status, 409);
+    assert_eq!(short.error_code(), "MANIFEST_MISMATCH");
+    // 非数字块序号 → 400（不是 axum 默认错误体）。
+    let bad_path = format!("/v1/blobs/{upload_id}/chunks/abc");
+    let headers = request_headers(&node, 21, "PUT", &bad_path, "", b"12345678").await;
+    let bad_index = http_with(
+        &node.address,
+        "PUT",
+        &bad_path,
+        &headers,
+        b"12345678",
+        "application/octet-stream",
+    )
+    .await;
+    assert_eq!(bad_index.status, 400);
+    assert_eq!(bad_index.error_code(), "INVALID_REQUEST");
+    // 未知上传会话 → 404。
+    let unknown = put_chunk(&node, 21, "upl_missing", 0, b"12345678").await;
+    assert_eq!(unknown.status, 404);
+    assert_eq!(unknown.error_code(), "UPLOAD_NOT_FOUND");
+
+    // 正常写第一块，但缺末块就完成 → 409 MISSING_CHUNKS。
+    assert_eq!(put_chunk(&node, 21, &upload_id, 0, b"12345678").await.status, 200);
+    let correct_digest = ciphertext_digest(&[b"12345678", b"abcdefgh"]);
+    let missing = complete_blob(&node, 21, &upload_id, 2, 16, &correct_digest).await;
+    assert_eq!(missing.status, 409);
+    assert_eq!(missing.error_code(), "MISSING_CHUNKS");
+    // 写满后摘要不符 → 409 MANIFEST_MISMATCH。
+    assert_eq!(put_chunk(&node, 21, &upload_id, 1, b"abcdefgh").await.status, 200);
+    let wrong_digest = complete_blob(&node, 21, &upload_id, 2, 16, &"00".repeat(32)).await;
+    assert_eq!(wrong_digest.status, 409);
+    assert_eq!(wrong_digest.error_code(), "MANIFEST_MISMATCH");
+    // 未发布不可读 → 404。
+    let unpublished = read_chunk(&node, 21, &blob, 0).await;
+    assert_eq!(unpublished.status, 404);
+    assert_eq!(unpublished.error_code(), "BLOB_NOT_FOUND");
+    // 正确清单发布成功。
+    let published = complete_blob(&node, 21, &upload_id, 2, 16, &correct_digest).await;
+    assert_eq!(
+        published.status,
+        200,
+        "complete: {:?}",
+        String::from_utf8_lossy(&published.body)
+    );
+    // 越界块序号 → 400。
+    let range = read_chunk(&node, 21, &blob, 5).await;
+    assert_eq!(range.status, 400);
+    assert_eq!(range.error_code(), "INVALID_REQUEST");
+    // 声明超过对象上限 → 413。
+    let too_big = begin_blob(
+        &node,
+        21,
+        &group,
+        &operation_text(233),
+        &object_text(133),
+        source_seq,
+        33,
+        8,
+        5,
+    )
+    .await;
+    assert_eq!(too_big.status, 413);
+    assert_eq!(too_big.error_code(), "CONTENT_TOO_LARGE");
+    // 会话过期后再写块 → 410 UPLOAD_EXPIRED。
+    let expiring = begin_blob(
+        &node,
+        21,
+        &group,
+        &operation_text(234),
+        &object_text(134),
+        source_seq,
+        8,
+        8,
+        1,
+    )
+    .await;
+    assert_eq!(expiring.status, 200);
+    let expiring_id = expiring.json()["session"]["upload_id"]
+        .as_str()
+        .expect("upload id")
+        .to_owned();
+    node.clock.advance(61);
+    let expired = put_chunk(&node, 21, &expiring_id, 0, b"12345678").await;
+    assert_eq!(expired.status, 410);
+    assert_eq!(expired.error_code(), "UPLOAD_EXPIRED");
+}
+
+#[tokio::test]
+async fn blob_endpoints_require_bound_authentication() {
+    let (node, group) = setup(NodeAuthPolicy {
+        max_devices_per_account: 3,
+        ..NodeAuthPolicy::default()
+    })
+    .await;
+    let source_seq = append_attachment_entry(&node, &group, 21).await;
+    let blob = object_text(135);
+    let begin = begin_blob(
+        &node,
+        21,
+        &group,
+        &operation_text(235),
+        &blob,
+        source_seq,
+        8,
+        8,
+        1,
+    )
+    .await;
+    assert_eq!(begin.status, 200);
+    let upload_id = begin.json()["session"]["upload_id"]
+        .as_str()
+        .expect("upload id")
+        .to_owned();
+    let path = format!("/v1/blobs/{upload_id}/chunks/0");
+
+    // 缺鉴权头 → 400。
+    let no_headers = http_with(
+        &node.address,
+        "PUT",
+        &path,
+        &[],
+        b"12345678",
+        "application/octet-stream",
+    )
+    .await;
+    assert_eq!(no_headers.status, 400);
+    assert_eq!(no_headers.error_code(), "INVALID_REQUEST");
+    // 签名覆盖 GET 却以 PUT 提交 → 401。
+    let headers = request_headers(&node, 21, "GET", &path, "", b"12345678").await;
+    let wrong_method = http_with(
+        &node.address,
+        "PUT",
+        &path,
+        &headers,
+        b"12345678",
+        "application/octet-stream",
+    )
+    .await;
+    assert_eq!(wrong_method.status, 401);
+    assert_eq!(wrong_method.error_code(), "INVALID_SIGNATURE");
+    // 签名覆盖另一条路径 → 401。
+    let other_path = format!("/v1/blobs/{}/chunks/0", object_text(136));
+    let headers = request_headers(&node, 21, "PUT", &other_path, "", b"12345678").await;
+    let wrong_path = http_with(
+        &node.address,
+        "PUT",
+        &path,
+        &headers,
+        b"12345678",
+        "application/octet-stream",
+    )
+    .await;
+    assert_eq!(wrong_path.status, 401);
+    // 签名覆盖另一份正文 → 401（正文摘要参与签名）。
+    let headers = request_headers(&node, 21, "PUT", &path, "", b"87654321").await;
+    let wrong_body = http_with(
+        &node.address,
+        "PUT",
+        &path,
+        &headers,
+        b"12345678",
+        "application/octet-stream",
+    )
+    .await;
+    assert_eq!(wrong_body.status, 401);
+
+    // 正确写入并发布。
+    assert_eq!(put_chunk(&node, 21, &upload_id, 0, b"12345678").await.status, 200);
+    let published = complete_blob(
+        &node,
+        21,
+        &upload_id,
+        1,
+        8,
+        &ciphertext_digest(&[b"12345678"]),
+    )
+    .await;
+    assert_eq!(published.status, 200);
+    // 已登记但不在群内的设备读取 → 403。
+    register_device(&node, 23).await;
+    let denied = read_chunk(&node, 23, &blob, 0).await;
+    assert_eq!(denied.status, 403);
+    assert_eq!(denied.error_code(), "HISTORY_NOT_AUTHORIZED");
+    // 方法/路由边界：complete 端点只允许 POST，未知路由 404。
+    let method = get_request(&node, 21, &format!("/v1/blobs/{upload_id}/complete"), "").await;
+    assert_eq!(method.status, 405);
+    let unknown = get_request(&node, 21, "/v1/nothing", "").await;
+    assert_eq!(unknown.status, 404);
 }

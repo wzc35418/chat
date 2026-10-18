@@ -136,3 +136,70 @@ fun chat.api.StoredDraftStatus.toDraftUiState(): DraftUiState {
     }
     return base.copy(actions = actions)
 }
+
+/** 事件 → 可读文案（CORE-003）。不含正文，只解释发生了什么。 */
+data class StoreEventUi(
+    val kind: String,
+    val title: String,
+    val detail: String,
+    val requiresResync: Boolean,
+)
+
+fun chat.api.StoreEvent.toUi(): StoreEventUi = when (kind) {
+    "draft_changed" -> StoreEventUi(
+        kind = kind,
+        title = "草稿状态变化",
+        detail = (draftId ?: "草稿") + " → " + (status ?: "未知"),
+        requiresResync = false,
+    )
+    "conversation_changed" -> StoreEventUi(
+        kind = kind,
+        title = "会话变化",
+        detail = conversationId ?: "会话",
+        requiresResync = false,
+    )
+    "resync_required" -> StoreEventUi(
+        kind = kind,
+        title = "需要重新拉取",
+        detail = "事件窗口已溢出或游标超前，界面应整体重查，不能把事件当作完整数据。",
+        requiresResync = true,
+    )
+    "core_closed" -> StoreEventUi(
+        kind = kind,
+        title = "内核已关闭",
+        detail = "本地内核已关闭，之后的操作会失败。",
+        requiresResync = false,
+    )
+    else -> StoreEventUi(
+        kind = kind,
+        title = "未知事件",
+        detail = "收到暂未识别的事件类型，已安全忽略。",
+        requiresResync = false,
+    )
+}
+
+/** 取消结果 → 展示结论（CORE-009 三态）。 */
+data class CancelUi(val title: String, val detail: String, val keepMessage: Boolean)
+
+fun chat.api.DraftCancelOutcome.toUi(): CancelUi = when (outcome) {
+    "cancel_requested" -> CancelUi(
+        title = "已请求取消",
+        detail = "取消已记录；不保证撤回已经在途的消息。",
+        keepMessage = true,
+    )
+    "cancel_too_late" -> CancelUi(
+        title = "取消未生效：已被接受",
+        detail = "消息已被节点接受，取消不能撤回；仍按已接受展示。",
+        keepMessage = true,
+    )
+    "cancel_unknown" -> CancelUi(
+        title = "结果未知，已标记待对账",
+        detail = "没有拿到确定结果；不会自动重发，等待对账查询更新状态。",
+        keepMessage = true,
+    )
+    else -> CancelUi(
+        title = "取消失败",
+        detail = "取消没有成功，界面不会把失败当成功。",
+        keepMessage = true,
+    )
+}

@@ -280,7 +280,9 @@ LocalStoreFfi::apply_verified_entry(
 ) -> Result<MessageRowView, FfiError>
 LocalStoreFfi::list_conversations(cursor: Option<String>, limit: u32) -> Result<ConversationPageView, FfiError>
 LocalStoreFfi::list_messages(conversation_id: String, cursor: Option<String>, limit: u32) -> Result<MessagePageView, FfiError>
-LocalStoreFfi::shutdown()         // 幂等，释放独占写锁
+LocalStoreFfi::cancel_draft(draft_id: String) -> Result<CancelViewFfi, FfiError>
+LocalStoreFfi::poll_events(since_seq: u64, limit: u32) -> Result<EventBatchFfi, FfiError>
+LocalStoreFfi::shutdown()         // 幂等，释放独占写锁并发布一条 core_closed 事件
 // 方法名必须叫 shutdown：UniFFI 为每个对象生成 AutoCloseable.close()，
 // 原生 close() 会与生成代码产生 JVM 签名冲突（与 P0Core.shutdown 的既有做法一致）。
 LocalStoreFfi::is_open() -> Boolean
@@ -293,6 +295,9 @@ LocalStoreFfi::is_open() -> Boolean
 - `MessageRowView { message_id, conversation_id, author, body, mine: Boolean, created_at_ms: u64 }`。
 - `ConversationPageView { items: Vec<ConversationView>, next_cursor: Option<String> }`。
 - `MessagePageView { items: Vec<MessageRowView>, next_cursor: Option<String> }`。
+- `CancelViewFfi { draft_id: String, outcome: String, submission_id: Option<String> }`：`outcome` 只有三态 `cancel_requested` / `cancel_too_late` / `cancel_unknown`（语义由 core 的 `SendService::cancel_draft` 决定，FFI 不重写）。
+- `CoreEventFfi { kind: String, draft_id: Option<String>, conversation_id: Option<String>, status: Option<String>, submission_id: Option<String>, reason: Option<String> }`：`kind` 只有 `draft_changed` / `conversation_changed` / `resync_required` / `core_closed`；**只含 ID 与稳定状态文本，绝不含正文/密钥**。
+- `EventBatchFfi { events: Vec<CoreEventFfi>, next_seq: u64, resync_required: Boolean }`。
 
 错误（Kotlin 侧 `catch (e: FfiException.Store)`）：
 
@@ -314,12 +319,16 @@ enum FfiError {
 3. `next_cursor` 原样回传；它是 storage 内部 `spg1` 令牌（10 分钟 TTL），不是线协议 `cur1`，不要解释、不要跨设备复用；过期/伪造返回 `INVALID_CURSOR`。
 4. `close` 幂等且立即释放独占写锁（同进程内第二次 `open` 在关闭前返回 `STORAGE_LOCKED`）；关闭后所有方法返回 `CORE_CLOSED`。
 5. 记录 `Debug` 不含正文之外的密钥材料，正文只出现在返回值里；日志不得打印 `body`/`preview`。
+6. **取消**（`cancel_draft`）只做薄封装：三态、落库与事件全部由 core 的 `ConversationCore::cancel_draft` 决定（同一个 `Store` 句柄，不重开库）。FFI 未接真实节点与 MLS 群时**不伪造成功**：取消只记录用户意图；后续 retry/dispatch 在桩端口上显式失败（`NETWORK_UNAVAILABLE` / `PROTOCOL_UNSUPPORTED`）。FFI 目前**不暴露** dispatch/retry，因此“取消后还能不能发”以 `draft_status_view` 的 `status = "cancelled"`、`can_retry = false`、`can_cancel = false` 判定。
+7. **事件**（`poll_events`）来自 `ConversationCore` 自有的有界 `EventBus`（`Mutex<EventBus>`，随 `open` 初始化）：`since_seq = 0` 表示从头；`next_seq` 原样回传作为下一次游标；重复调用同参数**幂等**；游标早于缓冲起点或超前于本实例时返回 `resync_required = true` 与一条 `resync_required` 事件，调用方必须整体重查；`limit` 必须 `1..=256`（`INVALID_EVENT_LIMIT`）。事件不是可靠消息日志，收到后必须重查真实状态。
+8. `shutdown` 在真正从打开变关闭时追加一条 `core_closed` 事件（重复 shutdown 不重复）；关闭后事件仍可由 `poll_events` 读取，但业务方法返回 `CORE_CLOSED`。
 
 复现命令（全程离线，本轮实测）：
 
 ~~~powershell
 . .\tools\activate.ps1
-cargo test --offline -p chat-ffi      # 2 passed（LocalStoreFfi 端到端 + 错误码映射）
+cargo test --offline -p chat-ffi      # 20 passed（LocalStoreFfi 5 个：端到端、错误码映射、取消+事件、失败后可用+limit 边界的稳定码、shutdown 发布 core_closed；其余 15 个 IdentityFfi 不变）
+cargo test --offline -p chat-core --test cancel_events   # 7 passed（取消三态/事件/溢出/关闭，core 层）
 cargo build --locked --offline -p chat-ffi   # 成功，Cargo.lock 未变化
 ~~~
 
@@ -327,8 +336,11 @@ cargo build --locked --offline -p chat-ffi   # 成功，Cargo.lock 未变化
 
 - `local_store::tests::open_write_and_read_through_the_ffi_shape`：构造函数建库 → create_draft → draft_status → apply_verified_entry → list_messages（待发 + 正式）→ list_conversations（标题/预览/未读 None）→ close 后 `CORE_CLOSED`。
 - `local_store::tests::failures_are_typed_with_stable_codes`：非规范会话 ID 与 `u64::MAX` 时间戳都返回 `FfiError::Store { code = "INVALID_INPUT", .. }`。
+- `local_store::tests::cancel_draft_and_poll_events_through_the_ffi_shape`（task-21）：`cancel_draft` → `cancel_requested`；状态 `cancelled` 且 `can_retry/can_cancel = false`；`poll_events` 返回 `draft_changed(cancelled)` + `conversation_changed`（`next_seq = 2`），重复 poll 幂等、游标之后为空、事件里不出现正文标记。
+- `local_store::tests::failed_cancel_and_invalid_limit_surface_stable_codes`：未知/畸形草稿与 `limit = 0 / MAX_EVENT_BATCH + 1` 分别返回稳定码（`INVALID_INPUT` / `INVALID_EVENT_LIMIT`），失败后同一个 Store 仍可正常写入与取消。
+- `local_store::tests::shutdown_publishes_core_closed_and_events_stay_readable`：shutdown 追加一条 `core_closed`（重复 shutdown 不重复），关闭后 `poll_events` 仍可读，业务方法返回 `CORE_CLOSED`。
 
-已知限制：本对象只覆盖竖直切片，没有事件订阅（BRIDGE-003/004/006）、没有异步/suspend 包装（BRIDGE-007）、没有平台回调（BRIDGE-001 的完整形态）；`#[uniffi::Object]` 内部的 `std::sync::Mutex` 会串行化所有调用，调用方不要在 UI 线程做长分页循环。Kotlin/Android 真机尚未实测（本轮只验证 Rust 侧编译与单元测试）。
+已知限制：本对象只覆盖竖直切片，**事件是拉取式 `poll_events`（没有 `EventListener`/`SubscriptionHandle`，即 BRIDGE-003/004/006 的回调式事件桥接仍未实现）**、没有异步/suspend 包装（BRIDGE-007）、没有平台回调（BRIDGE-001 的完整形态）；事件仍只覆盖“取消”产生的 `draft_changed/conversation_changed`、`shutdown` 的 `core_closed` 与溢出 `resync_required`，`create_draft`/`apply_verified_entry` 尚不发事件（core.md 有记录）。FFI **不暴露** dispatch/retry：桩端口（`StubSubmitter`/`StubCrypto`）只在 core 内部取回 Store 的取消包装层使用，直接调用会返回 `NETWORK_UNAVAILABLE`/`PROTOCOL_UNSUPPORTED`，未接真实节点与 MLS 群时不存在“假成功”路径。`#[uniffi::Object]` 内部的 `std::sync::Mutex` 会串行化所有调用，调用方不要在 UI 线程做长分页循环。Kotlin/Android 真机尚未实测（本轮只验证 Rust 侧编译与单元测试）。
 
 ## 身份与口令加好友竖直切片（IdentityFfi，Windows x64）
 

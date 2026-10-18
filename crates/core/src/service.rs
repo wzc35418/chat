@@ -31,8 +31,17 @@ use chat_identity::{
     ContactState, DeviceKeys, Fingerprint, IdentityError, LocalAccount, MAX_DISPLAY_NAME_BYTES,
 };
 use chat_protocol::{AccountId, ConversationId, DeviceId, MessageId, OperationId};
-use chat_sync::error::SyncError;
+use chat_sync::clock::SystemClock;
+use chat_sync::error::{ErrorCode, SyncError};
 use sha2::{Digest, Sha256};
+
+use crate::core_events::{
+    CoreEvent, EventBatch, EventBus, SendService, DEFAULT_EVENT_CAPACITY, MAX_EVENT_BATCH,
+};
+use crate::send_orchestrator::{
+    CancelOutcome, CryptoEngine, EncryptedPayload, NodeSubmitter, SendResult, SubmitAttempt,
+    SubmitOutcome,
+};
 use chat_storage::formal::{
     MASTER_KEY_BYTES, MAX_ID_BYTES, MAX_SESSION_TITLE_BYTES, KeyProvenance, MessageContent,
     MessageOrigin, MessageView, PageCursor, ProtectedStorageKey, SessionSummary, StorageError,
@@ -481,6 +490,65 @@ pub struct MessagePageView {
     pub next_cursor: Option<String>,
 }
 
+/// 事件包装使用的固定调度者标识（进入 outbox 租约语义；同一进程内稳定）。
+const EVENT_SEND_WORKER: &str = "ffi-cancel-worker";
+
+/// 不联网的节点提交桩：`submit`/`query` 一律显式失败（`NETWORK_UNAVAILABLE`）。
+///
+/// 语义（与 docs/implementation/bridge.md 一致）：FFI 尚未接入真实节点时，任何
+/// “提交/查询”都必须显式失败；桩**绝不伪造** Accepted，也不假装结果未知。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StubSubmitter;
+
+impl NodeSubmitter for StubSubmitter {
+    fn submit(&self, _attempt: &SubmitAttempt) -> SendResult<SubmitOutcome> {
+        Err(SyncError::new(
+            ErrorCode::NetworkUnavailable,
+            "node.submit_not_wired",
+        ))
+    }
+
+    fn query(&self, _submission_id: &str) -> SendResult<SubmitOutcome> {
+        Err(SyncError::new(
+            ErrorCode::NetworkUnavailable,
+            "node.query_not_wired",
+        ))
+    }
+}
+
+/// 未接入 MLS 群时桩端口报告的 epoch。
+///
+/// **不是**真实群状态：只用于“取消/状态”这类需要 plan 身份但**绝不加密**的路径；
+/// 任何真正需要密文的动作（`encrypt`）都会显式 `PROTOCOL_UNSUPPORTED`。
+pub const UNWIRED_MLS_EPOCH: u64 = 0;
+
+/// 不加密的加密引擎桩：接口齐全但绝不产生密文。
+///
+/// - `epoch`：固定返回 [`UNWIRED_MLS_EPOCH`]（让取消/状态路径能建立 plan 身份）；
+/// - `encrypt`：显式 `PROTOCOL_UNSUPPORTED`，绝不返回伪造密文。
+///
+/// 因此 `prepare`/`dispatch`/`retry` 在未接线时必然显式失败，不存在“假成功”。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StubCrypto;
+
+impl CryptoEngine for StubCrypto {
+    fn epoch(&self, _conversation_id: &str) -> SendResult<u64> {
+        Ok(UNWIRED_MLS_EPOCH)
+    }
+
+    fn encrypt(
+        &mut self,
+        _conversation_id: &str,
+        _draft_id: &str,
+        _body: &str,
+    ) -> SendResult<EncryptedPayload> {
+        Err(SyncError::new(
+            ErrorCode::ProtocolUnsupported,
+            "mls.encrypt_not_wired",
+        ))
+    }
+}
+
 /// 客户端内核服务：持有正式 `Store`（含主密钥）与生命周期状态。
 ///
 /// `Store` 是独占单写者句柄，因此这里用 `Mutex<Option<..>>` 表达“打开/已关闭”：
@@ -488,6 +556,8 @@ pub struct MessagePageView {
 pub struct ConversationCore {
     database_path: String,
     store: Mutex<Option<Store>>,
+    /// 内核事件总线（有界、单调序号）：`cancel_draft` 与 `close` 发布，`poll_events` 读取。
+    events: Mutex<EventBus>,
 }
 
 impl fmt::Debug for ConversationCore {
@@ -641,9 +711,12 @@ impl ConversationCore {
             key,
         )
         .map_err(anyhow::Error::new)?;
+        // 事件总线随 open 初始化：容量固定且可测，溢出时由 poll 显式要求 resync。
+        let events = EventBus::new(DEFAULT_EVENT_CAPACITY).map_err(anyhow::Error::new)?;
         Ok(Self {
             database_path: database_path.to_owned(),
             store: Mutex::new(Some(store)),
+            events: Mutex::new(events),
         })
     }
 
@@ -664,11 +737,83 @@ impl ConversationCore {
         self.store.lock().map_err(|_| closed())
     }
 
-    /// 关闭内核：释放存储句柄与独占写锁。重复调用是幂等的。
+    /// 关闭内核：释放存储句柄与独占写锁，并发布一条 `core_closed` 事件。
+    ///
+    /// 重复调用是幂等的（只有真正从“打开”变成“关闭”的那一次才发布事件）。
     pub fn close(&self) {
+        let mut was_open = false;
         if let Ok(mut guard) = self.store.lock() {
-            guard.take();
+            was_open = guard.take().is_some();
         }
+        if was_open
+            && let Ok(mut events) = self.events.lock()
+        {
+            events.push(CoreEvent::CoreClosed);
+        }
+    }
+
+    /// 事件总线句柄（内部使用；只在锁内短暂持有）。
+    fn events_guard(&self) -> anyhow::Result<MutexGuard<'_, EventBus>> {
+        self.events.lock().map_err(|_| closed())
+    }
+
+    /// CORE-009 + CORE-003：取消一条草稿，并把本次产生的状态变化事件并入内核事件总线。
+    ///
+    /// 单写者独占打开的存储不能同时被两个句柄持有，因此这里把 `Store` 临时交给
+    /// [`SendService`]（桩端口 + 系统时钟），执行完**无论成败都把句柄放回**；
+    /// 放回失败的唯一可能是 `SendService` 构造失败（此时句柄已被消费），对象随后
+    /// 表现为关闭（`CORE_CLOSED`），错误照原样返回。
+    ///
+    /// 三态语义完全由 `SendService::cancel_draft` 决定：`CancelRequested` /
+    /// `CancelTooLate` / `CancelUnknown`，本方法不重写、不猜测。
+    pub fn cancel_draft(&mut self, draft_id: &str) -> anyhow::Result<CancelOutcome> {
+        validate_local_draft_id(draft_id)?;
+        let store = {
+            let mut guard = self.store_guard()?;
+            guard.take().ok_or_else(closed)?
+        };
+        let mut service = match SendService::new(
+            store,
+            StubSubmitter,
+            StubCrypto,
+            SystemClock,
+            EVENT_SEND_WORKER,
+        ) {
+            Ok(service) => service,
+            Err(error) => {
+                // 句柄已经被 SendService 消费：对象进入关闭状态，错误显式返回。
+                return Err(error
+                    .context("cannot open the cancel session; the store was released"));
+            }
+        };
+        let outcome = service.cancel_draft(draft_id);
+        // 取走本次事件（序号从 0 开始；service 是本次新建的实例）。
+        let mut events = Vec::new();
+        if let Ok(batch) = service.events().poll(0, MAX_EVENT_BATCH) {
+            events = batch.events;
+        }
+        let store = service.into_store().ok_or_else(closed)?;
+        {
+            let mut guard = self.store_guard()?;
+            *guard = Some(store);
+        }
+        {
+            let mut bus = self.events_guard()?;
+            for event in events {
+                bus.push(event);
+            }
+        }
+        outcome
+    }
+
+    /// CORE-003 的最小切片：按单调序号读取内核事件（不改变任何状态，重复读取幂等）。
+    ///
+    /// 游标早于缓冲起点或超前于本实例时返回 `resync_required = true` 与一条
+    /// `resync_required` 事件，绝不静默丢事件；`limit` 必须在 `1..=MAX_EVENT_BATCH`。
+    pub fn poll_events(&self, since_seq: u64, limit: u32) -> anyhow::Result<EventBatch> {
+        self.events_guard()?
+            .poll(since_seq, limit)
+            .map_err(anyhow::Error::new)
     }
 
     /// CORE-007 的本地切片：持久化一条发送意图并返回 `queued` 草稿。
@@ -1137,3 +1282,47 @@ fn persist_draft_in_transaction(
     materialize_session(transaction, &request.conversation_id, "")?;
     persist_send_intent(transaction, request)
 }
+
+
+#[cfg(test)]
+mod stub_ports {
+    use super::{StubCrypto, StubSubmitter, UNWIRED_MLS_EPOCH};
+    use crate::send_orchestrator::{CryptoEngine, NodeSubmitter, SubmitAttempt};
+    use chat_sync::error::ErrorCode;
+
+    #[test]
+    fn stub_ports_fail_explicitly_never_fake_success() {
+        let submitter = StubSubmitter;
+        let attempt = SubmitAttempt {
+            submission_id: "sub:1:0000000000000000000000000000000000000000000000000000000000000001"
+                .to_owned(),
+            conversation_id: "conv:1:0000000000000000000000000000000000000000000000000000000000000001"
+                .to_owned(),
+            mls_epoch: 1,
+            ciphertext: vec![1, 2, 3],
+        };
+        // 未接真实节点：提交/查询必须显式失败，绝不伪造 Accepted。
+        assert_eq!(
+            submitter.submit(&attempt).unwrap_err().code(),
+            ErrorCode::NetworkUnavailable
+        );
+        assert_eq!(
+            submitter.query(&attempt.submission_id).unwrap_err().code(),
+            ErrorCode::NetworkUnavailable
+        );
+        let mut crypto = StubCrypto;
+        // epoch 只是 plan 身份，不是真实群状态；真正加密必须显式失败。
+        assert_eq!(
+            crypto.epoch(&attempt.conversation_id).expect("stub epoch"),
+            UNWIRED_MLS_EPOCH
+        );
+        assert_eq!(
+            crypto
+                .encrypt(&attempt.conversation_id, "draft-1", "body")
+                .unwrap_err()
+                .code(),
+            ErrorCode::ProtocolUnsupported
+        );
+    }
+}
+

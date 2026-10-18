@@ -1,6 +1,6 @@
 # 节点服务、排序日志、密文信箱与文件
 
-阶段：P1 → P5。状态：函数级设计。NODE-001 register_device 与 [api.md](api.md) 的 API-002/API-003 已在 [crates/node-services/src/services.rs](../../crates/node-services/src/services.rs) 与 [crates/node-api](../../crates/node-api) 落地并通过自动化测试（见各函数“实现状态”）。NODE-005~008 群登记/日志（[src/group.rs](../../crates/node-services/src/group.rs)）与 NODE-009~011 密文信箱（[src/mailbox.rs](../../crates/node-services/src/mailbox.rs)）已在同一轮落地，HTTP 端点见 [api.md](api.md)。NODE-006 的独立 P0 事务实验仍见 [节点接受报告](../P0_NODE_ACCEPTANCE.md)。NODE-002~004、NODE-012~016 仍未实现。
+阶段：P1 → P5。状态：函数级设计。NODE-001 register_device 与 [api.md](api.md) 的 API-002/API-003 已在 [crates/node-services/src/services.rs](../../crates/node-services/src/services.rs) 与 [crates/node-api](../../crates/node-api) 落地并通过自动化测试（见各函数“实现状态”）。NODE-005~008 群登记/日志（[src/group.rs](../../crates/node-services/src/group.rs)）与 NODE-009~011 密文信箱（[src/mailbox.rs](../../crates/node-services/src/mailbox.rs)）已在同一轮落地；NODE-012~015 附件密文 blob 的上传/发布/读取（[src/blob.rs](../../crates/node-services/src/blob.rs)）也已落地，HTTP 端点见 [api.md](api.md)。NODE-006 的独立 P0 事务实验仍见 [节点接受报告](../P0_NODE_ACCEPTANCE.md)。NODE-002~004、NODE-016 仍未实现。
 
 节点只持节点签名钥与用户公开凭据，不持用户解密钥。使用独立 SQLite 与密文文件目录；默认一个应用进程。设备/角色元数据可见是设计取舍。节点对 Commit 只能做公开元数据校验，最终加密结果由客户端验证。
 
@@ -87,7 +87,7 @@ register_device(request: RegisterDeviceRequest, invite: RegistrationCapability) 
 - 注册能力撤销只读取 0001 的 `capability_revocations`（按 issuer_id=account_id + capability_id 匹配版本）；本阶段没有对外撤销端点，撤销记录需由后续阶段或运维写入。
 - 挑战只持久化 nonce 的 SHA-256（沿用 0001 表结构），因此客户端必须回送 nonce；挑战不可跨重启重放，但节点重启后旧挑战仍会按过期时间被拒绝。
 - 已登记设备更换凭据（撤销后重新授权）在 P1-03 明确拒绝（`INVALID_CREDENTIAL` / `DEVICE_REVOKED`），设备撤销与重授权流程属后续阶段。
-- NODE-002 publish_discovery、NODE-003～NODE-004、NODE-012～NODE-016（密钥包、密文文件、TTL 回收）与 API-005～API-010（逐设备限流、事件套接字、`run_node` 与运行入口）仍未实现；[apps/node](../../apps/node) 仍是明确以 78 退出的骨架，不能被当作可部署节点。NODE-005~011 已有正式实现，但仍是“单进程、单 SQLite 连接串行”的形态，没有部署级运行入口。
+- NODE-002 publish_discovery、NODE-003～NODE-004（密钥包）、NODE-016（TTL 回收）与 API-005～API-010（逐设备限流、事件套接字、`run_node` 与运行入口）仍未实现；[apps/node](../../apps/node) 仍是明确以 78 退出的骨架，不能被当作可部署节点。NODE-005~015 已有正式实现，但仍是“单进程、单 SQLite 连接串行”的形态，没有部署级运行入口。
 
 通过本函数用例不自动代表整个模块完成。
 
@@ -555,10 +555,22 @@ begin_blob_upload(actor: AuthenticatedDevice, descriptor: PublicBlobDescriptor, 
 
 **完成验收**：
 
-- [ ] 并发上传不能超总配额。
-- [ ] 同 operation 重试同 session。
+- [x] 并发上传不能超总配额。
+- [x] 同 operation 重试同 session。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（W 包，附件 blob 轮次）。实现签名：`NodeService::begin_blob_upload(&mut self, descriptor: &PublicBlobDescriptor, operation_id: &str, actor: &AuthenticatedDevice, now: u64) -> NodeResult<UploadSession>`，源码 [crates/node-services/src/blob.rs](../../crates/node-services/src/blob.rs)。
+
+已实现行为：
+
+1. 描述符校验：`blob_id` 是 PROTOCOL-001 object 文本、`group_id` 是 group 文本；总密文（≤ 对象上限）、块大小（≤ 单块上限）、块数（≤ 块数上限）都必须落在 `BlobPolicy` 内，且三者必须自洽（前 n-1 块满块、最后一块非空不超块大小），否则 CONTENT_TOO_LARGE / INVALID_REQUEST。
+2. 授权关联：actor 是该群当前有效成员，且 `source_seq` 指向一条作者正是 actor 本人的已接受日志条目；否则 PERMISSION_DENIED。
+3. 幂等：`(owner_device_id, operation_id)` 唯一；同描述重试返回**同一份**会话（会话签名是确定性的），相异描述返回 BLOB_UPLOAD_CONFLICT。已发布对象或别的会话占用的 blob_id 也返回 BLOB_UPLOAD_CONFLICT。
+4. 配额：T4 同一 IMMEDIATE 事务内按“在传预留（未过期 uploading 声明字节）+ 已发布占用”精确核算该设备字节，超出 `max_bytes_per_device` 即 QUOTA_EXCEEDED（并发 begin 也只能有一个赢）。
+5. 会话：节点分配随机 `upload_id`、写入 1 小时（可配）`expires_at`，并返回**节点签名**的 `UploadSession`（域 `chat/p1/node-blob-session/v1`，绑定 blob/群/条目/块参数/期限/节点身份）。上传授权就是“该设备的 API-003 身份”，会话是条款回执而不是可转借的令牌。
+
+验证证据（`cargo test --offline -p chat-node-services -p chat-node-api -p chat-node-client` 全绿）：`blob::upload_round_trip_returns_exact_ciphertext_chunks`、`blob::operation_dedup_returns_same_session_and_conflicts_on_divergence`、`blob::device_quota_is_enforced_across_uploads`、`blob::device_quota_is_enforced_across_uploads`（在传预留也计入配额）、`blob::descriptor_validation_rejects_malformed_shapes`、`blob::size_and_count_limits_are_enforced`、`blob::source_entry_and_membership_window_gate_uploads_and_reads`，HTTP/客户端侧 `blob_upload_and_read_round_trip_over_http`、`blob_http_error_statuses_are_stable`、客户端 `blob_flow::blob_upload_and_read_round_trip_over_http`。
+
+已知限制：API-004 validate_capability 未实现，因此没有独立的上传能力令牌（授权=已登记设备 + 群成员 + 本人条目）；没有按设备/群的速率限制（API-005）；过期会话不会主动回收（NODE-016 未实现）。通过本函数用例不自动代表整个模块完成。
 
 <a id="node-013"></a>
 
@@ -589,10 +601,23 @@ put_blob_chunk(upload: UploadId, index: u32, bytes: CipherChunk, actor: Authenti
 
 **完成验收**：
 
-- [ ] 同块重传不占双份。
+- [x] 同块重传不占双份。
 - [ ] 写文件后 crash 启动可恢复/清理。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（W 包，附件 blob 轮次）。实现签名：`NodeService::put_blob_chunk(&mut self, upload_id: &str, index: u32, bytes: &[u8], actor: &AuthenticatedDevice, now: u64) -> NodeResult<ChunkReceipt>`，源码 [crates/node-services/src/blob.rs](../../crates/node-services/src/blob.rs)。
+
+已实现行为：
+
+1. 归属与生命周期：只有上传设备本人能写块（否则 PERMISSION_DENIED）；会话不存在 UPLOAD_NOT_FOUND、已过期或已结束 UPLOAD_EXPIRED（已完成会话的重复块仍走幂等分支）。
+2. 幂等：同 `(upload_id, chunk_index)` 已存在时，同摘要同长度返回**同一份回执**（不占第二份），相异字节 CHUNK_CONFLICT。
+3. 按序：下一个待写序号 = 已提交块数；index 大于它即 CHUNK_OUT_OF_ORDER，小于它但内容不同即 CHUNK_CONFLICT，越界（≥ 声明块数）INVALID_REQUEST。
+4. 边界：单块超过策略上限或超过声明块大小 → CONTENT_TOO_LARGE；与声明边界不符（更短）→ MANIFEST_MISMATCH；空块 INVALID_REQUEST。
+5. 原子性：块登记行（`blob_chunks`）与块内容（`blob_chunk_content`）在**同一个** IMMEDIATE 事务写入，节点没有独立文件系统路径，因此不存在“文件已写、DB 未登记”的双系统半写；`storage_ref` 是内容寻址引用（`sha256:<hex>`）。
+6. 回执：节点签名的 `ChunkReceipt`（域 `chat/p1/node-blob-chunk-receipt/v1`，绑定 upload/序号/摘要/字节数/进度）。
+
+验证证据：`blob::duplicate_chunk_is_idempotent_and_divergent_chunk_is_rejected`、`blob::chunks_must_arrive_in_order_and_index_is_bounded`、`blob::size_and_count_limits_are_enforced`、`blob::expired_upload_session_rejects_chunks_and_completion`、`blob::unknown_identifiers_and_foreign_uploads_are_rejected`，HTTP/客户端侧 `blob_http_error_statuses_are_stable`（409/413/400/410）、`blob_flow::out_of_order_and_missing_chunks_are_rejected`、`blob_flow::duplicate_chunk_is_idempotent_and_size_violation_is_rejected`。
+
+已知限制：块内容与登记行同库同事务，因此“写文件后 crash 的恢复/清理”这条文件系统语义**不适用**（也没有踩点实验）——本实现刻意选择单库单事务而不是“文件 + DB”双系统；NODE-016 的临时物回收仍未实现。通过本函数用例不自动代表整个模块完成。
 
 <a id="node-014"></a>
 
@@ -623,11 +648,23 @@ complete_blob_upload(upload: UploadId, manifest: CipherManifest, actor: Authenti
 
 **完成验收**：
 
-- [ ] 缺末块拒绝。
-- [ ] 重复完成不重占配额。
-- [ ] 中途重启不发布半对象。
+- [x] 缺末块拒绝。
+- [x] 重复完成不重占配额。
+- [x] 中途重启不发布半对象。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（W 包，附件 blob 轮次）。实现签名：`NodeService::complete_blob_upload(&mut self, upload_id: &str, manifest: &CipherManifest, actor: &AuthenticatedDevice, now: u64) -> NodeResult<BlobReceipt>`，源码 [crates/node-services/src/blob.rs](../../crates/node-services/src/blob.rs)。
+
+已实现行为：
+
+1. 清单校验：块数与总字节必须**等于会话声明**（否则 MANIFEST_MISMATCH）；已提交块数必须等于声明块数（否则 MISSING_CHUNKS，含缺末块）。
+2. 内容校验：逐块复核序号连续、存储摘要与块内容自洽（不一致按 STORAGE_FAILURE fail-closed），累计实际总字节（必须等于声明总字节），并对“按块序拼接的密文”重算 SHA-256 与 `manifest.ciphertext_digest` 比对，不符即 MANIFEST_MISMATCH。
+3. 原子发布：`blob_objects`（state=published，含 group/source_seq/块数/字节数）、上传会话置 complete、节点签名回执写入 `blob_receipts` 在同一 IMMEDIATE 事务；任何一步失败都不会留下“已发布但无回执”或“半对象”。
+4. 幂等：重复 complete 返回**同一份**持久回执（验签后返回），不重复占用配额；清单与已发布内容不一致则 MANIFEST_MISMATCH。
+5. 配额：把本次上传的在传预留转成已发布占用，并再次检查 `used + reserved_after <= max_bytes_per_device`（fail-closed）。
+
+验证证据：`blob::complete_rejects_missing_chunks_and_manifest_mismatch`、`blob::complete_is_idempotent_and_conflicting_retry_is_rejected`、`blob::upload_round_trip_returns_exact_ciphertext_chunks`、`blob::unpublished_blob_is_not_readable_and_owner_is_enforced`、`blob::size_and_count_limits_are_enforced`，HTTP/客户端侧 `blob_http_error_statuses_are_stable`（缺块/摘要/未发布/发布成功）、`blob_flow::digest_mismatch_is_rejected_and_unfinished_blob_is_not_readable`。
+
+已知限制：只有“已发布/未发布”两态，没有 collecting（NODE-016 的回收态）；没有跨对象的去重（同内容不同 blob_id 会各占一份配额）。通过本函数用例不自动代表整个模块完成。
 
 <a id="node-015"></a>
 
@@ -657,10 +694,21 @@ read_blob_chunk(blob: BlobId, index: u32, actor: AuthenticatedDevice, capability
 
 **完成验收**：
 
-- [ ] 新设备拿到旧 URL 仍拒绝。
+- [x] 新设备拿到旧 URL 仍拒绝。
 - [ ] 过期/跨对象能力拒绝。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（W 包，附件 blob 轮次）。实现签名：`NodeService::read_blob_chunk(&mut self, blob_id: &str, index: u32, actor: &AuthenticatedDevice, now: u64) -> NodeResult<CipherChunk>`，源码 [crates/node-services/src/blob.rs](../../crates/node-services/src/blob.rs)。
+
+已实现行为：
+
+1. 只读发布对象：blob 不存在或未发布一律 BLOB_NOT_FOUND（未完成的上传读不到任何块），并拒绝“已发布但块数/字节数为 0”的损坏记录。
+2. 下载授权按成员窗口：上传设备本人恒可读；其他设备必须是该群**当前**有效成员，且 `joined_seq <= blob.source_seq`——附件写入之后才加入的新成员（以及注册更晚的新设备，它们根本不在群成员表里）一律 HISTORY_NOT_AUTHORIZED。
+3. 范围校验：index 必须小于块数（否则 INVALID_REQUEST）；读出后再复核存储摘要与长度，不一致按 STORAGE_FAILURE 失败，不返回可疑字节。
+4. 只返回密文块本身（`CipherChunk { blob_id, chunk_index, chunk_count, cipher_hash, bytes }`）；HTTP 层以 `application/octet-stream` 返回原始字节，客户端按清单摘要自行校验。
+
+验证证据：`blob::upload_round_trip_returns_exact_ciphertext_chunks`（上传者与老成员都能读、字节完全一致）、`blob::source_entry_and_membership_window_gate_uploads_and_reads`（把成员加入点挪到附件之后 → HISTORY_NOT_AUTHORIZED）、`blob::unpublished_blob_is_not_readable_and_owner_is_enforced`、`blob::size_and_count_limits_are_enforced`（越界序号），HTTP/客户端侧 `blob_upload_and_read_round_trip_over_http`、`blob_endpoints_require_bound_authentication`（群外设备 403）、`blob_flow::blob_upload_and_read_round_trip_over_http`（群外设备 HISTORY_NOT_AUTHORIZED）。
+
+已知限制：API-004 的签名下载能力令牌（绑定对象/设备/群消息窗口/期限）**未实现**，本阶段以“成员窗口 + 发布状态”替代，因此“过期/跨对象能力拒绝”仍未勾选；也没有按能力的撤销检查与下载速率限制（API-005）。通过本函数用例不自动代表整个模块完成。
 
 <a id="node-016"></a>
 

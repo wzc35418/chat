@@ -28,6 +28,12 @@ pub const LOG_HEAD_DOMAIN: &[u8] = b"chat/p1/node-log-head/v1";
 pub const LOG_CHAIN_DOMAIN: &[u8] = b"chat/p1/node-log-chain/v1";
 /// 信箱存储回执签名域（节点签发）。
 pub const MAILBOX_RECEIPT_DOMAIN: &[u8] = b"chat/p1/node-mailbox-receipt/v1";
+/// 附件上传会话签名域（节点签发的“受限上传条款”）。
+pub const BLOB_SESSION_DOMAIN: &[u8] = b"chat/p1/node-blob-session/v1";
+/// 附件分块回执签名域。
+pub const BLOB_CHUNK_RECEIPT_DOMAIN: &[u8] = b"chat/p1/node-blob-chunk-receipt/v1";
+/// 附件发布回执签名域（与分块回执严格区分）。
+pub const BLOB_PUBLISH_RECEIPT_DOMAIN: &[u8] = b"chat/p1/node-blob-publish-receipt/v1";
 
 /// 分页游标派生密钥域（由节点签名种子派生，绝不外泄）。
 pub const CURSOR_KEY_DOMAIN: &[u8] = b"chat/p1/node-cursor-key/v1";

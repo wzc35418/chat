@@ -20,17 +20,23 @@ use chat_node_services::auth::{
 use chat_node_services::canonical::{
     decode_hex_bytes, hex_decode, hex_encode, sha256, validate_bounded_id,
 };
+use chat_node_services::blob::{
+    BlobReceipt, ChunkReceipt, CipherManifest, PublicBlobDescriptor, UploadSession,
+};
 use chat_node_services::error::NodeError;
 use chat_node_services::group::{
     AppendResult, GroupCandidate, GroupCreation, GroupRegistration, LogPage, SignedCandidate,
     SignedGroupCreation, SignedLogHead,
 };
-use chat_node_services::limits::{MAX_DEVICE_ID_BYTES, MAX_GROUP_ID_BYTES, MAX_HTTP_BODY_BYTES};
+use chat_node_services::limits::{
+    MAX_BLOB_ID_BYTES, MAX_BLOB_UPLOAD_ID_BYTES, MAX_DEVICE_ID_BYTES, MAX_GROUP_ID_BYTES,
+    MAX_HTTP_BODY_BYTES,
+};
 use chat_node_services::mailbox::{
     AckSummary, MailboxItem, MailboxPage, MailboxReceipt,
 };
 use chat_node_services::registration::{DeviceRegistration, RegisterDeviceRequest};
-use chat_protocol::{DeviceId, ErrorCode, candidate_signing_bytes};
+use chat_protocol::{DeviceId, ErrorCode, ObjectId, candidate_signing_bytes};
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Method, Response};
@@ -49,6 +55,11 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 默认总尝试次数：首次 + 重取挑战一次。
 pub const DEFAULT_CHALLENGE_ATTEMPTS: usize = 2;
 
+/// JSON 请求正文的 content-type。
+const JSON_CONTENT_TYPE: &'static str = "application/json";
+/// 附件密文块的 content-type（原始字节，不做 hex/JSON 二次编码）。
+const OCTET_STREAM_CONTENT_TYPE: &'static str = "application/octet-stream";
+
 /// 鉴权头（与节点 API-003 的传输字段一致）。
 pub const HEADER_DEVICE_ID: &str = "x-chat-device-id";
 pub const HEADER_CHALLENGE_ID: &str = "x-chat-challenge-id";
@@ -61,6 +72,7 @@ const GROUPS_PATH: &str = "/v1/groups";
 const MAILBOX_ITEMS_PATH: &str = "/v1/mailbox/items";
 const MAILBOX_PATH: &str = "/v1/mailbox";
 const MAILBOX_ACK_PATH: &str = "/v1/mailbox/ack";
+const BLOBS_PATH: &str = "/v1/blobs";
 
 /// 客户端上限与超时。全部在构造时校验，越界配置显式拒绝。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,6 +212,37 @@ struct AckEnvelope {
     summary: AckSummary,
 }
 
+#[derive(Serialize)]
+struct BeginBlobUploadBody<'a> {
+    schema_version: u16,
+    operation_id: &'a str,
+    descriptor: &'a PublicBlobDescriptor,
+}
+
+#[derive(Deserialize)]
+struct UploadSessionEnvelope {
+    schema_version: u16,
+    session: UploadSession,
+}
+
+#[derive(Deserialize)]
+struct ChunkReceiptEnvelope {
+    schema_version: u16,
+    receipt: ChunkReceipt,
+}
+
+#[derive(Serialize)]
+struct CompleteBlobUploadBody<'a> {
+    schema_version: u16,
+    manifest: &'a CipherManifest,
+}
+
+#[derive(Deserialize)]
+struct BlobReceiptEnvelope {
+    schema_version: u16,
+    receipt: BlobReceipt,
+}
+
 #[derive(Deserialize)]
 struct ErrorEnvelope {
     error: ErrorEnvelopeDetail,
@@ -237,6 +280,9 @@ versioned!(
     MailboxReceiptEnvelope,
     MailboxPageEnvelope,
     AckEnvelope,
+    UploadSessionEnvelope,
+    ChunkReceiptEnvelope,
+    BlobReceiptEnvelope,
 );
 /// 节点客户端：固定端点 + 固定设备身份 + Ed25519 签名钥。
 pub struct NodeClient {
@@ -451,7 +497,7 @@ impl NodeClient {
         if body.len() > self.limits.max_request_bytes {
             return Err(NodeClientError::request_too_large());
         }
-        self.send_signed(challenge, &meta, body, &self.device_id)
+        self.send_signed(challenge, &meta, body, &self.device_id, JSON_CONTENT_TYPE)
             .await
     }
     /// 取新挑战 → 签名 → 发送；失败按 [`retryable_failure`] 决定是否重取一次。
@@ -463,7 +509,7 @@ impl NodeClient {
         body: &[u8],
         purpose: ChallengePurpose,
     ) -> Result<Vec<u8>, NodeClientError> {
-        self.send_authenticated_for_device(method, path, query, body, purpose, None)
+        self.send_authenticated_for_device(method, path, query, body, purpose, None, JSON_CONTENT_TYPE)
             .await
     }
 
@@ -475,6 +521,7 @@ impl NodeClient {
         body: &[u8],
         purpose: ChallengePurpose,
         signer_device_id: Option<&str>,
+        content_type: &'static str,
     ) -> Result<Vec<u8>, NodeClientError> {
         let meta = RequestMeta::canonical(method, path, query)
             .map_err(|error| NodeClientError::from_local_node_error(&error))?;
@@ -488,7 +535,10 @@ impl NodeClient {
                 Some(device_id) => device_id,
                 None => self.device_id.as_str(),
             };
-            match self.attempt_signed(&meta, body, purpose, signer).await {
+            match self
+                .attempt_signed(&meta, body, purpose, signer, content_type)
+                .await
+            {
                 Ok(bytes) => return Ok(bytes),
                 Err(error) => {
                     if attempts >= self.limits.challenge_attempts || !retryable_failure(&error) {
@@ -506,10 +556,32 @@ impl NodeClient {
         body: &[u8],
         purpose: ChallengePurpose,
         signer_device_id: &str,
+        content_type: &'static str,
     ) -> Result<Vec<u8>, NodeClientError> {
         let challenge = self.fetch_challenge(purpose).await?;
-        self.send_signed(&challenge, meta, body, signer_device_id)
+        self.send_signed(&challenge, meta, body, signer_device_id, content_type)
             .await
+    }
+
+    /// 原始字节正文的已登记设备请求（附件密文块用）。
+    async fn send_authenticated_raw(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &[u8],
+        content_type: &'static str,
+    ) -> Result<Vec<u8>, NodeClientError> {
+        self.send_authenticated_for_device(
+            method,
+            path,
+            query,
+            body,
+            ChallengePurpose::RequestAuth,
+            None,
+            content_type,
+        )
+        .await
     }
 
     async fn send_signed(
@@ -518,6 +590,7 @@ impl NodeClient {
         meta: &RequestMeta,
         body: &[u8],
         signer_device_id: &str,
+        content_type: &'static str,
     ) -> Result<Vec<u8>, NodeClientError> {
         validate_bounded_id("device id", signer_device_id, MAX_DEVICE_ID_BYTES)
             .map_err(|error| NodeClientError::from_local_node_error(&error))?;
@@ -542,7 +615,7 @@ impl NodeClient {
             .header(HEADER_CHALLENGE_ID, challenge.challenge_id.as_str())
             .header(HEADER_NONCE, challenge.nonce.as_str())
             .header(HEADER_SIGNATURE, hex_encode(&signature.to_bytes()))
-            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_TYPE, content_type)
             .body(body.to_vec())
             .send()
             .await
@@ -663,6 +736,7 @@ impl NodeClient {
                 &body,
                 ChallengePurpose::DeviceRegistration,
                 Some(request.credential.device_id.as_str()),
+                JSON_CONTENT_TYPE,
             )
             .await?;
         let envelope: RegisterDeviceEnvelope = self.decode(&bytes)?;
@@ -922,6 +996,136 @@ impl NodeClient {
             .await?;
         let envelope: AckEnvelope = self.decode(&bytes)?;
         Ok(envelope.summary)
+    }
+
+    /// NODE-012：创建密文附件上传会话（同 operation + 同描述幂等返回同一会话）。
+    pub async fn begin_blob_upload(
+        &self,
+        operation_id: &str,
+        descriptor: &PublicBlobDescriptor,
+    ) -> Result<UploadSession, NodeClientError> {
+        let body = serde_json::to_vec(&BeginBlobUploadBody {
+            schema_version: CLIENT_SCHEMA_VERSION,
+            operation_id,
+            descriptor,
+        })
+        .map_err(|_| NodeClientError::local_invalid("blob upload request could not be encoded"))?;
+        let bytes = self
+            .send_authenticated(
+                "POST",
+                BLOBS_PATH,
+                "",
+                &body,
+                ChallengePurpose::RequestAuth,
+            )
+            .await?;
+        let envelope: UploadSessionEnvelope = self.decode(&bytes)?;
+        let session = envelope.session;
+        self.ensure_node_identity(&session.node_id)?;
+        self.verify_node_output(|key| session.verify(key))?;
+        // 会话必须绑定本设备与本次声明的 blob，避免用别人的会话上传。
+        if session.owner_device_id != self.device_id || session.blob_id != descriptor.blob_id {
+            return Err(NodeClientError::protocol(
+                ErrorCode::InvalidReceiptScope,
+                "upload session does not bind this device and blob",
+            ));
+        }
+        if session.chunk_count != descriptor.chunk_count
+            || session.ciphertext_bytes != descriptor.ciphertext_bytes
+        {
+            return Err(NodeClientError::protocol(
+                ErrorCode::InvalidReceiptScope,
+                "upload session does not bind the declared chunk layout",
+            ));
+        }
+        Ok(session)
+    }
+
+    /// NODE-013：按序上传一块密文（原始字节，不做 hex/JSON 二次编码）。
+    pub async fn put_blob_chunk(
+        &self,
+        upload_id: &str,
+        chunk_index: u32,
+        bytes: &[u8],
+    ) -> Result<ChunkReceipt, NodeClientError> {
+        validate_bounded_id("upload id", upload_id, MAX_BLOB_UPLOAD_ID_BYTES)
+            .map_err(|error| NodeClientError::from_local_node_error(&error))?;
+        if bytes.is_empty() {
+            return Err(NodeClientError::local_invalid("cipher chunk must not be empty"));
+        }
+        let path = format!("{BLOBS_PATH}/{upload_id}/chunks/{chunk_index}");
+        let response = self
+            .send_authenticated_raw("PUT", &path, "", bytes, OCTET_STREAM_CONTENT_TYPE)
+            .await?;
+        let envelope: ChunkReceiptEnvelope = self.decode(&response)?;
+        let receipt = envelope.receipt;
+        self.ensure_node_identity(&receipt.node_id)?;
+        self.verify_node_output(|key| receipt.verify(key))?;
+        if receipt.upload_id != upload_id
+            || receipt.chunk_index != chunk_index
+            || receipt.cipher_hash != hex_encode(&sha256(bytes))
+        {
+            return Err(NodeClientError::protocol(
+                ErrorCode::InvalidReceiptScope,
+                "chunk receipt does not bind this chunk",
+            ));
+        }
+        Ok(receipt)
+    }
+
+    /// NODE-014：提交清单、校验总长与整体摘要并发布（重复完成返回同一回执）。
+    pub async fn complete_blob_upload(
+        &self,
+        upload_id: &str,
+        manifest: &CipherManifest,
+    ) -> Result<BlobReceipt, NodeClientError> {
+        validate_bounded_id("upload id", upload_id, MAX_BLOB_UPLOAD_ID_BYTES)
+            .map_err(|error| NodeClientError::from_local_node_error(&error))?;
+        let body = serde_json::to_vec(&CompleteBlobUploadBody {
+            schema_version: CLIENT_SCHEMA_VERSION,
+            manifest,
+        })
+        .map_err(|_| NodeClientError::local_invalid("blob manifest could not be encoded"))?;
+        let path = format!("{BLOBS_PATH}/{upload_id}/complete");
+        let bytes = self
+            .send_authenticated(
+                "POST",
+                &path,
+                "",
+                &body,
+                ChallengePurpose::RequestAuth,
+            )
+            .await?;
+        let envelope: BlobReceiptEnvelope = self.decode(&bytes)?;
+        let receipt = envelope.receipt;
+        self.ensure_node_identity(&receipt.node_id)?;
+        self.verify_node_output(|key| receipt.verify(key))?;
+        if receipt.upload_id != upload_id
+            || receipt.chunk_count != manifest.chunk_count
+            || receipt.ciphertext_bytes != manifest.ciphertext_bytes
+            || receipt.ciphertext_digest != manifest.ciphertext_digest
+        {
+            return Err(NodeClientError::protocol(
+                ErrorCode::InvalidReceiptScope,
+                "publish receipt does not bind this manifest",
+            ));
+        }
+        Ok(receipt)
+    }
+
+    /// NODE-015：取回一块密文（原始字节；调用方按清单摘要自行校验）。
+    pub async fn read_blob_chunk(
+        &self,
+        blob_id: &str,
+        chunk_index: u32,
+    ) -> Result<Vec<u8>, NodeClientError> {
+        validate_bounded_id("blob id", blob_id, MAX_BLOB_ID_BYTES)
+            .map_err(|error| NodeClientError::from_local_node_error(&error))?;
+        ObjectId::parse(blob_id)
+            .map_err(|_| NodeClientError::local_invalid("blob id is not a canonical protocol id"))?;
+        let path = format!("{BLOBS_PATH}/{blob_id}/chunks/{chunk_index}");
+        self.send_authenticated("GET", &path, "", b"", ChallengePurpose::RequestAuth)
+            .await
     }
 }
 

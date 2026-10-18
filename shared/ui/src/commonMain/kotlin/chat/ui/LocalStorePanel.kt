@@ -40,6 +40,8 @@ data class StoreHandlers(
     val refreshMessages: () -> Unit = {},
     val updateDraftText: (String) -> Unit = {},
     val createDraft: () -> Unit = {},
+    val cancelLatestDraft: () -> Unit = {},
+    val pollEvents: () -> Unit = {},
 ) {
     companion object {
         val None = StoreHandlers()
@@ -188,11 +190,42 @@ fun LocalStorePanel(
                 ) { Text("写入本机库") }
 
                 if (state.drafts.isNotEmpty()) {
-                    Text("本次创建的草稿（真实状态）", style = MaterialTheme.typography.labelLarge)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("本次创建的草稿（真实状态）", style = MaterialTheme.typography.labelLarge)
+                        TextButton(
+                            onClick = handlers.cancelLatestDraft,
+                            enabled = state.ready && !state.busy,
+                            modifier = Modifier.semantics { contentDescription = "取消最近一条本机草稿" },
+                        ) { Text("取消最近草稿", style = MaterialTheme.typography.labelMedium) }
+                    }
                     state.drafts.forEach { draft ->
                         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                             Text(draft.draftId + " · " + draft.label, style = MaterialTheme.typography.bodySmall)
                             Text(draft.detail, style = MaterialTheme.typography.labelSmall, color = Color(0xFF5F6B63))
+                        }
+                    }
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("核心事件（拉取式）", style = MaterialTheme.typography.labelLarge)
+                    TextButton(
+                        onClick = handlers.pollEvents,
+                        enabled = state.ready && !state.busy,
+                        modifier = Modifier.semantics { contentDescription = "轮询核心事件" },
+                    ) { Text("拉取事件", style = MaterialTheme.typography.labelMedium) }
+                    Text(
+                        "游标 " + state.nextEventSeq + if (state.resyncRequired) "（需要整体重查）" else "",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (state.resyncRequired) Color(0xFFB3261E) else Color(0xFF5F6B63),
+                    )
+                }
+                if (state.events.isEmpty()) {
+                    Text("还没有事件；新建草稿/取消草稿后会出现。", style = MaterialTheme.typography.bodySmall)
+                } else {
+                    state.events.takeLast(6).forEach { event ->
+                        Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                            Text(event.title, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium)
+                            Text(event.detail, style = MaterialTheme.typography.labelSmall, color = Color(0xFF5F6B63))
                         }
                     }
                 }

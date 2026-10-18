@@ -57,6 +57,24 @@ pub enum NodeError {
     ItemIdConflict,
     /// ACK 批量非法（空、超上限或含重复之外的畸形标识）。
     InvalidAckBatch,
+    /// 附件上传操作/对象标识冲突（同 operation 换描述、或 blob id 已被占用）。
+    BlobUploadConflict,
+    /// 上传会话不存在。
+    UploadNotFound,
+    /// 上传会话已过期或已结束，不能再写块或完成。
+    UploadExpired,
+    /// 同一块序号已存在相异密文摘要。
+    ChunkConflict,
+    /// 块序号不是下一个待写序号（必须按序上传）。
+    ChunkOutOfOrder,
+    /// 完成时仍有块缺失（含缺末块）。
+    MissingChunks,
+    /// 清单与已上传内容不一致（块数/总长/整体摘要/单块大小）。
+    ManifestMismatch,
+    /// 密文 blob 不存在或尚未发布。
+    BlobNotFound,
+    /// 领域层面的内容尺寸越界（单块或声明总长超过节点上限）。
+    ContentTooLarge,
     /// 迁移执行或校验失败。
     MigrationFailed(&'static str),
     /// 持久化节点身份与配置不一致。
@@ -100,6 +118,15 @@ impl NodeError {
             Self::QuotaExceeded => "QUOTA_EXCEEDED",
             Self::ItemIdConflict => "ITEM_ID_CONFLICT",
             Self::InvalidAckBatch => "INVALID_ACK_BATCH",
+            Self::BlobUploadConflict => "BLOB_UPLOAD_CONFLICT",
+            Self::UploadNotFound => "UPLOAD_NOT_FOUND",
+            Self::UploadExpired => "UPLOAD_EXPIRED",
+            Self::ChunkConflict => "CHUNK_CONFLICT",
+            Self::ChunkOutOfOrder => "CHUNK_OUT_OF_ORDER",
+            Self::MissingChunks => "MISSING_CHUNKS",
+            Self::ManifestMismatch => "MANIFEST_MISMATCH",
+            Self::BlobNotFound => "BLOB_NOT_FOUND",
+            Self::ContentTooLarge => "CONTENT_TOO_LARGE",
             Self::MigrationFailed(_) => "MIGRATION_FAILED",
             Self::NodeIdentityMismatch => "NODE_IDENTITY_MISMATCH",
             Self::InvalidConfig(_) => "INVALID_CONFIG",
@@ -137,6 +164,15 @@ impl NodeError {
             Self::QuotaExceeded => "target quota is exhausted",
             Self::ItemIdConflict => "mailbox item id was already used with other bytes",
             Self::InvalidAckBatch => "acknowledgement batch is empty or out of bounds",
+            Self::BlobUploadConflict => "blob upload operation or blob id conflicts with an existing upload",
+            Self::UploadNotFound => "blob upload session is unknown",
+            Self::UploadExpired => "blob upload session is expired or finished",
+            Self::ChunkConflict => "chunk index already holds different ciphertext",
+            Self::ChunkOutOfOrder => "chunks must be uploaded in ascending index order",
+            Self::MissingChunks => "blob upload is missing required chunks",
+            Self::ManifestMismatch => "cipher manifest does not match the uploaded chunks",
+            Self::BlobNotFound => "cipher blob is unknown or not published",
+            Self::ContentTooLarge => "cipher content exceeds the node limit",
             Self::MigrationFailed(_) => "node storage migration failed",
             Self::NodeIdentityMismatch => "stored node identity differs from configuration",
             Self::InvalidConfig(_) => "node configuration is not valid",

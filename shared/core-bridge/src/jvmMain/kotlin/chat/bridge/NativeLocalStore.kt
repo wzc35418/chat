@@ -1,7 +1,10 @@
 package chat.bridge
 
+import chat.api.DraftCancelOutcome
 import chat.api.LocalStore
 import chat.api.LocalStoreException
+import chat.api.StoreEvent
+import chat.api.StoreEventBatch
 import chat.api.StoredConversation
 import chat.api.StoredDraft
 import chat.api.StoredDraftStatus
@@ -108,6 +111,37 @@ class NativeLocalStore : LocalStore {
         StoredPage(
             items = page.items.map { row -> row.toStoredMessage() },
             nextCursor = page.nextCursor,
+        )
+    }
+
+
+    override suspend fun cancelDraft(draftId: String): DraftCancelOutcome = withStore { store ->
+        val view = store.cancelDraft(draftId)
+        DraftCancelOutcome(
+            draftId = view.draftId,
+            outcome = view.outcome,
+            submissionId = view.submissionId,
+        )
+    }
+
+    override suspend fun pollEvents(sinceSeq: Long, limit: Int): StoreEventBatch = withStore { store ->
+        require(limit in 1..256) { "limit 必须在 1..256" }
+        val batch = store.pollEvents(sinceSeq.toULong(), limit.toUInt())
+        // 原生事件不携带序号：按批次末尾序号与数组位置推导（1 起、单调）。
+        val firstSequence = batch.nextSeq.toLong() - batch.events.size + 1
+        StoreEventBatch(
+            events = batch.events.mapIndexed { index, event ->
+                StoreEvent(
+                    kind = event.kind,
+                    draftId = event.draftId,
+                    conversationId = event.conversationId,
+                    status = event.status,
+                    submissionId = event.submissionId,
+                    sequence = firstSequence + index,
+                )
+            },
+            nextSeq = batch.nextSeq.toLong(),
+            resyncRequired = batch.resyncRequired,
         )
     }
 

@@ -4,6 +4,7 @@
 //! P0 isolated SQLite acceptance experiment is in p0_accept; product node remains incomplete.
 #![forbid(unsafe_code)]
 pub mod auth;
+pub mod blob;
 pub mod canonical;
 pub mod error;
 pub mod group;

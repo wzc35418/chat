@@ -221,17 +221,10 @@ fn used_bytes(tx: &rusqlite::Transaction<'_>, device_id: &str, now: i64) -> Node
 }
 
 /// 演员必须是本节点已登记的有效设备，且账户一致（跨账户直接拒绝）。
+///
+/// 具体判定在 [`NodeService::require_active_device`]，这里只是保持本模块的调用形态。
 fn require_active_device(service: &NodeService, actor: &AuthenticatedDevice) -> NodeResult<()> {
-    let (account_id, state, _version) = service
-        .device_account_state(&actor.device_id)?
-        .ok_or(NodeError::InvalidCredential)?;
-    if state != "active" {
-        return Err(NodeError::DeviceRevoked);
-    }
-    if account_id != actor.account_id {
-        return Err(NodeError::PermissionDenied);
-    }
-    Ok(())
+    service.require_active_device(actor)
 }
 
 impl NodeService {

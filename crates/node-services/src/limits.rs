@@ -174,3 +174,76 @@ impl MailboxPolicy {
         Ok(())
     }
 }
+/// 附件 blob 的标识上限（blob id / upload id 都是 PROTOCOL-001 文本或节点随机 ID）。
+pub const MAX_BLOB_ID_BYTES: usize = 128;
+pub const MAX_BLOB_UPLOAD_ID_BYTES: usize = 128;
+
+/// 每设备已发布+在传密文字节上限（默认 32 MiB）。
+pub const DEFAULT_BLOB_BYTES_PER_DEVICE: u64 = 32 * 1024 * 1024;
+pub const MAX_BLOB_BYTES_PER_DEVICE_LIMIT: u64 = 1024 * 1024 * 1024;
+/// 单个密文对象总字节上限（默认 8 MiB）。
+pub const DEFAULT_BLOB_OBJECT_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_BLOB_OBJECT_BYTES_LIMIT: u64 = 64 * 1024 * 1024;
+/// 声明块大小上限（默认 32 KiB；仍必须小于 HTTP 正文上限，密文按原始字节传输）。
+pub const DEFAULT_BLOB_CHUNK_BYTES: usize = 32 * 1024;
+pub const MAX_BLOB_CHUNK_BYTES_LIMIT: usize = 60 * 1024;
+/// 单对象块数上限（默认 512 块）。
+pub const DEFAULT_BLOB_CHUNK_COUNT: u32 = 512;
+pub const MAX_BLOB_CHUNK_COUNT_LIMIT: u32 = 4096;
+/// 上传会话默认有效期（1 小时）；过期会话不可再写块或完成。
+pub const DEFAULT_BLOB_UPLOAD_TTL_SECONDS: u64 = 60 * 60;
+
+/// 附件 blob 策略。字段在启动时校验，不接受 0 或越界配置。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobPolicy {
+    /// 每设备“已发布 + 在传”密文字节上限。
+    pub max_bytes_per_device: u64,
+    /// 单个对象总密文字节上限。
+    pub max_object_bytes: u64,
+    /// 声明单块字节上限。
+    pub max_chunk_bytes: usize,
+    /// 单对象块数上限。
+    pub max_chunk_count: u32,
+    /// 上传会话有效期（秒）。
+    pub upload_ttl_seconds: u64,
+}
+
+impl Default for BlobPolicy {
+    fn default() -> Self {
+        Self {
+            max_bytes_per_device: DEFAULT_BLOB_BYTES_PER_DEVICE,
+            max_object_bytes: DEFAULT_BLOB_OBJECT_BYTES,
+            max_chunk_bytes: DEFAULT_BLOB_CHUNK_BYTES,
+            max_chunk_count: DEFAULT_BLOB_CHUNK_COUNT,
+            upload_ttl_seconds: DEFAULT_BLOB_UPLOAD_TTL_SECONDS,
+        }
+    }
+}
+
+impl BlobPolicy {
+    /// 校验策略本身可用；任何越界配置都显式拒绝启动。
+    pub fn validate(&self) -> NodeResult<()> {
+        if self.max_bytes_per_device == 0 || self.max_bytes_per_device > MAX_BLOB_BYTES_PER_DEVICE_LIMIT {
+            return Err(NodeError::InvalidConfig("blob device quota"));
+        }
+        if self.max_object_bytes == 0
+            || self.max_object_bytes > MAX_BLOB_OBJECT_BYTES_LIMIT
+            || self.max_object_bytes > self.max_bytes_per_device
+        {
+            return Err(NodeError::InvalidConfig("blob object bytes"));
+        }
+        if self.max_chunk_bytes == 0 || self.max_chunk_bytes > MAX_BLOB_CHUNK_BYTES_LIMIT {
+            return Err(NodeError::InvalidConfig("blob chunk bytes"));
+        }
+        if u64::try_from(self.max_chunk_bytes).map_or(true, |chunk| chunk > self.max_object_bytes) {
+            return Err(NodeError::InvalidConfig("blob chunk bytes exceed object bytes"));
+        }
+        if self.max_chunk_count == 0 || self.max_chunk_count > MAX_BLOB_CHUNK_COUNT_LIMIT {
+            return Err(NodeError::InvalidConfig("blob chunk count"));
+        }
+        if self.upload_ttl_seconds == 0 || self.upload_ttl_seconds > MAX_TIMESTAMP {
+            return Err(NodeError::InvalidConfig("blob upload ttl"));
+        }
+        Ok(())
+    }
+}

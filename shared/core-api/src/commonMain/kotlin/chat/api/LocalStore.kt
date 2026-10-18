@@ -93,5 +93,11 @@ interface LocalStore {
 
     suspend fun listMessages(conversationId: String, cursor: String?, limit: Int): StoredPage<StoredMessage>
 
+    /** 取消草稿（CORE-009，三态）。 */
+    suspend fun cancelDraft(draftId: String): DraftCancelOutcome
+
+    /** 轮询核心事件（CORE-003）：拉取式，无订阅回调；溢出时 resyncRequired=true。 */
+    suspend fun pollEvents(sinceSeq: Long, limit: Int): StoreEventBatch
+
     suspend fun close()
 }

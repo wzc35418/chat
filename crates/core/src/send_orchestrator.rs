@@ -418,6 +418,13 @@ impl<S: NodeSubmitter, C: CryptoEngine, K: Clock> SendOrchestrator<S, C, K> {
         &mut self.store
     }
 
+    /// 取出底层 Store（把同一个句柄交还上层；不改变任何编排状态）。
+    ///
+    /// 存储是单写者独占打开，调用方取走后不得再使用本编排器。
+    pub fn into_store(self) -> Store {
+        self.store
+    }
+
     /// 可注入时钟（测试里显式推进时间）。
     pub fn clock_mut(&mut self) -> &mut K {
         &mut self.clock

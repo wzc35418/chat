@@ -1,6 +1,6 @@
 # 客户端内核与 Kotlin 业务服务映射
 
-阶段：P1 → P2。状态：函数级设计；竖直切片（`ConversationCore` 的 open / create_draft / draft_status / apply_verified_entry / list_conversations / list_messages / close）与 P1 身份持久化增量（save_identity_account / load_identity_account / upsert_contact / list_contacts / consume_invite）已在 Windows x64 实测通过；CORE-007 的发送编排（[crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)）已把「意图 → 一次真实 MLS 加密 → 提交 → Accepted/Unknown/Rejected 落库」接通（节点端口可注入，真实节点链路见 `node_submitter` 记录），CORE-008 重试 / CORE-009 取消 / outbox 结果对账 `reconcile` 也已实现（同一文件，只加方法）；CORE-010 草稿状态视图（`DraftStatusView` + 共用投影 `draft_status_view`）与 CORE-003 的拉取式事件流（`crates/core/src/core_events.rs`：有界缓冲 + 单调序号 + 溢出 resync）同样已实测通过；其余 CORE 函数未开始。目标源码：[crates/core/src/service.rs](../../crates/core/src/service.rs) 与 [crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)。
+阶段：P1 → P2。状态：函数级设计；竖直切片（`ConversationCore` 的 open / create_draft / draft_status / apply_verified_entry / list_conversations / list_messages / close）与 P1 身份持久化增量（save_identity_account / load_identity_account / upsert_contact / list_contacts / consume_invite）已在 Windows x64 实测通过；CORE-007 的发送编排（[crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)）已把「意图 → 一次真实 MLS 加密 → 提交 → Accepted/Unknown/Rejected 落库」接通（节点端口可注入，真实节点链路见 `node_submitter` 记录），CORE-008 重试 / CORE-009 取消 / outbox 结果对账 `reconcile` 也已实现（同一文件，只加方法）；CORE-010 草稿状态视图（`DraftStatusView` + 共用投影 `draft_status_view`）与 CORE-003 的拉取式事件流（`crates/core/src/core_events.rs`：有界缓冲 + 单调序号 + 溢出 resync）同样已实测通过；`ConversationCore` 层的 CORE-009 `cancel_draft` 与 CORE-003 `poll_events`（含 FFI 未接线时的 `StubSubmitter`/`StubCrypto` 显式失败）也已实测通过；其余 CORE 函数未开始。目标源码：[crates/core/src/service.rs](../../crates/core/src/service.rs) 与 [crates/core/src/send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)。
 
 本层编排，不把各子模块的事务拆成独立提交。函数名与 Kotlin 的 camelCase 一一对应；底层 TaskId/AttemptId 不必全暴露 UI。start/close 是幂等生命周期，所有查询都来自 Rust 持久真相。身份与群、附件服务分别委托对应章节。
 
@@ -192,7 +192,7 @@ observe_events(listener: EventListener, capacity: u32) -> Result<SubscriptionHan
 - [x] 消费者慢导致 resync 仍可查询完整状态：`draft_status_events::overflow_returns_resync_required_instead_of_dropping_silently`（慢消费者游标落在缓冲起点之前时返回 `resync_required = true` 与一条 `ResyncRequired`，调用方据此整体重查；仍在窗口内的游标可继续增量读）。
 - [ ] release 后无回调：本轮是**拉取式** `poll_events`（没有 `EventListener` 回调注册），因此“释放订阅后不再回调”暂不适用；`shutdown` 后只追加一条 `CoreClosed` 且不再发布任何事件。
 
-**实现状态**：部分实现（拉取式最小切片，Windows x64 实测）。`crates/core/src/core_events.rs` 提供 `CoreEvent`（`DraftChanged`/`ConversationChanged`/`ResyncRequired`/`CoreClosed`，只含 ID 与状态文本）、`EventBus`（有界环形缓冲，容量 `1..=MAX_EVENT_CAPACITY = 4096`，默认 256；序号从 1 单调递增；单批上限 `MAX_EVENT_BATCH = 256`）与 `SendService::poll_events(since_seq, limit)`。与契约的差异：契约是“登记 listener + 串行转发 + 释放订阅”，本轮改为“事件进入有界缓冲，调用方按序号增量拉取”，因此没有 `SubscriptionHandle`/回调释放，取而代之的是 `shutdown` + `CoreClosed`；这部分留给 BRIDGE-003/004 的事件桥接任务。证据：`draft_status_events::events_are_monotonic_and_repeat_polling_is_idempotent`、`draft_status_events::overflow_returns_resync_required_instead_of_dropping_silently`、`draft_status_events::events_never_carry_message_content_or_keys`、`draft_status_events::shutdown_publishes_core_closed_and_rejects_later_calls`。
+**实现状态**：部分实现（拉取式最小切片，Windows x64 实测）。`crates/core/src/core_events.rs` 提供 `CoreEvent`（`DraftChanged`/`ConversationChanged`/`ResyncRequired`/`CoreClosed`，只含 ID 与状态文本）、`EventBus`（有界环形缓冲，容量 `1..=MAX_EVENT_CAPACITY = 4096`，默认 256；序号从 1 单调递增；单批上限 `MAX_EVENT_BATCH = 256`）与 `SendService::poll_events(since_seq, limit)`。与契约的差异：契约是“登记 listener + 串行转发 + 释放订阅”，本轮改为“事件进入有界缓冲，调用方按序号增量拉取”，因此没有 `SubscriptionHandle`/回调释放，取而代之的是 `shutdown` + `CoreClosed`；这部分留给 BRIDGE-003/004 的事件桥接任务。证据：`draft_status_events::events_are_monotonic_and_repeat_polling_is_idempotent`、`draft_status_events::overflow_returns_resync_required_instead_of_dropping_silently`、`draft_status_events::events_never_carry_message_content_or_keys`、`draft_status_events::shutdown_publishes_core_closed_and_rejects_later_calls`。**ConversationCore 层接线（task-21）**：`ConversationCore` 现在自带 `Mutex<EventBus>` 并提供 `poll_events(since_seq, limit)` 与 `close()` 的 `CoreClosed` 发布，证据见下文“ConversationCore 层取消与事件接线”。
 
 <a id="core-004"></a>
 
@@ -399,7 +399,7 @@ cancel_queued(draft: DraftId) -> Result<CancelResult>
 - [x] 取消与节点提交竞争最终显示真实接受：`send_orchestrator::cancel_draft_returns_three_states_and_blocks_dispatch`（结果未知时 `CancelUnknown` 不写 `cancel_requested`，对账得到接受后草稿以接受为准落 `accepted`）、`send_orchestrator::reconcile_repairs_the_two_transaction_window_and_stays_idempotent`（取消与接受竞态下 `reconcile` 把草稿收敛回 `accepted`）。
 - [x] 不误删已接受记录：`send_orchestrator::cancel_draft_returns_three_states_and_blocks_dispatch`（已接受 → `CancelTooLate`，草稿 `accepted`、attempt `accepted` 均不变，`cancel_requested` 保持 0）。
 
-**实现状态**：已实现（切片，Windows x64 实测）。`SendOrchestrator::cancel_draft(draft_id) -> SendResult<CancelOutcome>`，三态 `CancelRequested { draft_id, submission_id }` / `CancelTooLate { draft_id, submission_id }` / `CancelUnknown { draft_id, submission_id }`：已接受 → `CancelTooLate`（不撤回、不删除消息）；结果未知 → `CancelUnknown`（只把 `drafts.state` 置 `cancelled` 表达用户意图，**不写** `cancel_requested`，否则对账窗口结束后该尝试永远无法再被领取对账）；其余 → `CancelRequested`（草稿字节与 attempt 行保留、`drafts.state = 'cancelled'`、prepare/send 任务标 `cancel_requested = 1`，之后 `dispatch` 一律 `DispatchOutcome::Abandoned` 且零提交）。附件释放（ATTACHMENT）未接入。证据：`send_orchestrator::cancel_draft_returns_three_states_and_blocks_dispatch`。
+**实现状态**：已实现（切片，Windows x64 实测）。`SendOrchestrator::cancel_draft(draft_id) -> SendResult<CancelOutcome>`，三态 `CancelRequested { draft_id, submission_id }` / `CancelTooLate { draft_id, submission_id }` / `CancelUnknown { draft_id, submission_id }`：已接受 → `CancelTooLate`（不撤回、不删除消息）；结果未知 → `CancelUnknown`（只把 `drafts.state` 置 `cancelled` 表达用户意图，**不写** `cancel_requested`，否则对账窗口结束后该尝试永远无法再被领取对账）；其余 → `CancelRequested`（草稿字节与 attempt 行保留、`drafts.state = 'cancelled'`、prepare/send 任务标 `cancel_requested = 1`，之后 `dispatch` 一律 `DispatchOutcome::Abandoned` 且零提交）。附件释放（ATTACHMENT）未接入。证据：`send_orchestrator::cancel_draft_returns_three_states_and_blocks_dispatch`。**ConversationCore 层（task-21）**：`ConversationCore::cancel_draft(&mut self, draft_id) -> anyhow::Result<CancelOutcome>` 把同一个 `Store` 临时交给 `SendService`（桩端口 + 系统时钟）执行三态取消并把产生的事件并入内核事件总线，无论成败都把句柄放回；证据见 `cancel_events::cancel_queued_draft_requests_and_publishes_events`、`cancel_events::cancel_accepted_draft_is_too_late`、`cancel_events::cancel_unknown_draft_reports_unknown`、`cancel_events::cancel_failure_keeps_the_store_usable`。
 
 <a id="core-010"></a>
 
@@ -867,5 +867,75 @@ cargo build --locked --offline -p chat-core   # 成功，Cargo.lock 未变化
 4. **事件覆盖范围**：本轮只有发送草稿路径（`SendService`）发布事件；`apply_verified_entry`/群/身份路径尚未发 `ConversationChanged`（需要把它们也搬到 service 包装层）。
 5. **`updated_at_ms` 不是写入时间**：schema 没有 `drafts.updated_at`，取 `drafts.created_at` 与发送任务 `retry_at`/`lease_until` 的最大值；attempt 行没有时间戳。
 6. **状态查询不解密正文**：`drafts.protected_content` 被篡改时状态查询仍返回状态（只看 `state` 列），正文损坏只在 `draft_status`（body 投影）与发送路径上显式 `STATE_CORRUPTED`。
+
+## ConversationCore 层取消与事件接线（task-21，2026-10-18，Windows x64）
+
+目标：把 CORE-009 取消与 CORE-003 事件流接到 **`ConversationCore` 本身**，让 FFI 只做薄封装；
+FFI 未接真实节点/MLS 时用桩端口**显式失败**，绝不伪造成功。
+
+实现位置：[crates/core/src/service.rs](../../crates/core/src/service.rs)（`ConversationCore` 字段/方法 +
+`StubSubmitter`/`StubCrypto`）；两个**纯 getter**（不改编排逻辑）加在
+[core_events.rs](../../crates/core/src/core_events.rs) 与 [send_orchestrator.rs](../../crates/core/src/send_orchestrator.rs)：
+`SendService::into_store(self) -> Option<Store>`、`SendOrchestrator::into_store(self) -> Store`。
+
+公开面（增量，既有方法签名不变）：
+
+~~~text
+pub struct ConversationCore { database_path, store: Mutex<Option<Store>>, events: Mutex<EventBus> }
+
+impl ConversationCore {
+    pub fn cancel_draft(&mut self, draft_id: &str) -> anyhow::Result<CancelOutcome>;
+    pub fn poll_events(&self, since_seq: u64, limit: u32) -> anyhow::Result<EventBatch>;
+    pub fn close(&self);  // 仍在打开 → 关闭时追加一条 CoreClosed（幂等）
+}
+
+pub struct StubSubmitter;  // submit/query -> NETWORK_UNAVAILABLE
+pub struct StubCrypto;     // epoch/encrypt -> PROTOCOL_UNSUPPORTED
+~~~
+
+语义：
+
+- **同一个 Store，不重开库**：`cancel_draft` 在锁内把 `Store` 从 `Mutex<Option<Store>>` 取出，
+  交给 `SendService::new(store, StubSubmitter, StubCrypto, SystemClock, "ffi-cancel-worker")`；
+  执行 `SendService::cancel_draft` 后通过 `into_store()` **无论成败都把句柄放回**；随后把
+  `SendService` 本次产生的事件按序并入 `self.events`。构造 `SendService` 失败是唯一无法
+  放回句柄的路径（句柄已被消费），此时对象表现为关闭并原样返回错误。
+- **三态不重写**：`CancelRequested`/`CancelTooLate`/`CancelUnknown` 完全由 `SendService` 决定；
+  `ConversationCore` 不猜测、不做乐观删除。
+- **事件**：`poll_events` 委托 `EventBus`（有界、序号从 1 单调、重复 poll 幂等、溢出/超前
+  游标返回 `resync_required = true` 与一条 `resync_required` 事件）；事件只含 ID 与稳定
+  状态文本，不含正文/密钥。`close()` 只在“真正从打开变关闭”的那一次追加 `CoreClosed`，
+  关闭后事件仍可读（事件总线不依赖存储句柄）。
+- **桩端口不伪造成功**：FFI 未接真实节点与 MLS 群时，`StubSubmitter` 的 submit/query 返回
+  `NETWORK_UNAVAILABLE`，`StubCrypto` 的 epoch/encrypt 返回 `PROTOCOL_UNSUPPORTED`；
+  因此 retry/dispatch 在未接线时必然显式失败（bridge.md 同步说明）。
+
+复现命令（全程离线，本轮实测）：
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test cancel_events   # 7 passed
+cargo test --offline -p chat-core                        # lib 15（含 stub_ports）+ 既有 51 个用例全绿（合计 59）
+~~~
+
+证据（测试名 → 契约点）：
+
+- `cancel_events::cancel_queued_draft_requests_and_publishes_events`：queued → `CancelRequested`（无 SubmissionId）、状态 `cancelled`、`can_retry/can_cancel = false`；事件为 `draft_changed(cancelled)` + `conversation_changed`、序号 2、重复 poll 幂等、游标之后为空、事件不含正文标记。
+- `cancel_events::cancel_accepted_draft_is_too_late`：attempt accepted → `CancelTooLate` 且状态仍 `accepted`。
+- `cancel_events::cancel_unknown_draft_reports_unknown`：attempt unknown → `CancelUnknown` 并带 SubmissionId。
+- `cancel_events::cancel_failure_keeps_the_store_usable`：未知草稿与畸形 ID 显式失败后，同一个 Store 仍可 `create_draft`/查询/取消。
+- `cancel_events::event_bus_overflow_requires_resync`：129 次取消（258 条事件 > 容量 256）后游标 0 返回 resync，最新游标可继续增量读，超前游标同样 resync。
+- `cancel_events::poll_events_rejects_invalid_limit`：limit 0 与 `MAX_EVENT_BATCH + 1` → `INVALID_EVENT_LIMIT`。
+- `cancel_events::close_publishes_core_closed_exactly_once`：close 追加一条 `CoreClosed`，重复 close 不重复。
+- `service::stub_ports::stub_ports_fail_explicitly_never_fake_success`：桩 submit/query → `NETWORK_UNAVAILABLE`，桩 epoch/encrypt → `PROTOCOL_UNSUPPORTED`。
+
+已知限制：
+
+1. **事件覆盖范围**：`ConversationCore` 自身只有取消路径发布 `DraftChanged`/`ConversationChanged`；`create_draft`/`apply_verified_entry` 仍不发布事件（要与 `SendService` 的事件合并，需要把写入路径整体搬到事件包装层，留给后续任务）。
+2. **没有 FFI 的 dispatch/retry**：本轮只加 `cancel_draft`/`poll_events`；桩端口用于`ConversationCore` 内部取回 Store 时的包装层，FFI 不暴露 dispatch/retry，因此“取消后 dispatch”以“状态 cancelled + can_retry/can_cancel=false + 桩端口显式失败”证明不可发送。
+3. `cancel_draft` 的 Store 交接要求 `&mut self`（与 `create_draft` 一致）；FFI 的 `Mutex` 串行化保证不会并发交接。
+4. 事件缓冲是内存态：进程重启后序号从 0 开始（跨进程游标会被判“超前”而 resync）；事件不是可靠日志。
+
+
 
 

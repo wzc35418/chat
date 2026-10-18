@@ -11,7 +11,9 @@ import chat.presentation.display.MessageDisplayView
 import chat.presentation.display.presentDraft
 import chat.presentation.display.toConversationDisplayPage
 import chat.presentation.display.toDraftEvidence
+import chat.presentation.display.StoreEventUi
 import chat.presentation.display.toDraftUiState
+import chat.presentation.display.toUi
 import chat.presentation.display.toMessageDisplayPage
 
 /**
@@ -32,6 +34,12 @@ data class PreviewStoreState(
     val notice: String? = null,
     val lastErrorCode: String? = null,
     val databasePath: String? = null,
+    /** 最近事件（CORE-003，拉取式）；只是变化提示，不是完整数据。 */
+    val events: List<StoreEventUi> = emptyList(),
+    /** 下一次 poll 的游标。 */
+    val nextEventSeq: Long = 0,
+    /** 事件窗口溢出时界面必须整体重查。 */
+    val resyncRequired: Boolean = false,
 )
 
 fun PreviewStoreState.opened(databasePath: String, notice: String): PreviewStoreState = copy(
@@ -121,5 +129,30 @@ fun PreviewStoreState.withDraftStatus(status: chat.api.StoredDraftStatus): Previ
         notice = "草稿状态：" + status.status +
             "（尝试 " + status.attempts + " 次，序号 " + (status.attemptIndex ?: 0) + "）",
         lastErrorCode = null,
+    )
+}
+
+/** 最近事件（拉取式，最多保留 20 条）。 */
+fun PreviewStoreState.withEvents(batch: chat.api.StoreEventBatch): PreviewStoreState {
+    val merged = (events + batch.events.map { it.toUi() }).takeLast(20)
+    return copy(
+        events = merged,
+        nextEventSeq = batch.nextSeq,
+        resyncRequired = batch.resyncRequired,
+        busy = false,
+        notice = if (batch.resyncRequired) {
+            "事件窗口已溢出或游标超前：请整体重新查询，事件不是可靠日志。"
+        } else {
+            notice
+        },
+    )
+}
+
+fun PreviewStoreState.withCancel(result: chat.api.DraftCancelOutcome): PreviewStoreState {
+    val ui = result.toUi()
+    return copy(
+        busy = false,
+        notice = ui.title + "：" + ui.detail,
+        lastErrorCode = if (result.outcome == "cancel_too_late" || result.outcome == "cancel_unknown") null else null,
     )
 }

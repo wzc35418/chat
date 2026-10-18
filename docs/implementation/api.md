@@ -1,6 +1,6 @@
 # 节点 HTTP、鉴权、限流与运行入口
 
-阶段：P1 → P5。状态：函数级设计。API-002 issue_auth_challenge 与 API-003 authenticate_request 已随 P1-03 在 [crates/node-api](../../crates/node-api) 与 [crates/node-services](../../crates/node-services) 落地（端点见“已实现端点（P1-03）”）。群日志与信箱的七个端点（NODE-005~011 的 HTTP 适配，对应 API-006 handle_append_http 与 API-007 handle_mailbox_http 的当前范围）已在同一轮落地，见“已实现端点（群日志与信箱）”。客户端侧访问这些端点的实现见 [crates/node-client](../../crates/node-client)（见“客户端（crates/node-client）”）。其余函数仍未实现。目标源码：[crates/node-api/src/handlers.rs](../../crates/node-api/src/handlers.rs)。
+阶段：P1 → P5。状态：函数级设计。API-002 issue_auth_challenge 与 API-003 authenticate_request 已随 P1-03 在 [crates/node-api](../../crates/node-api) 与 [crates/node-services](../../crates/node-services) 落地（端点见“已实现端点（P1-03）”）。群日志与信箱的七个端点（NODE-005~011 的 HTTP 适配，对应 API-006 handle_append_http 与 API-007 handle_mailbox_http 的当前范围）已在同一轮落地；附件 blob 的四个端点（NODE-012~015 的 HTTP 适配，对应 API-008 handle_blob_http 的当前范围）在同表登记，见“已实现端点（群日志与信箱）”。客户端侧访问这些端点的实现见 [crates/node-client](../../crates/node-client)（见“客户端（crates/node-client）”）。其余函数仍未实现。目标源码：[crates/node-api/src/handlers.rs](../../crates/node-api/src/handlers.rs)。
 
 所有 HTTP DTO 与错误结构单独版本化。公开 /capabilities 与 challenge 也限流。默认监听本地端口，通过明确的 TLS 部署入口提供 HTTPS/WSS；管理接口独立且默认关闭。每个 HTTP handler 只鉴权、解码、调用服务、映射结果，不重复实现领域规则。
 
@@ -39,6 +39,15 @@
 |`POST /v1/mailbox/items`|密文投递（NODE-009）|必须指向本人已接受的日志条目且目标设备在群内|
 |`GET /v1/mailbox?cursor=...&limit=N`|本设备信箱分页（NODE-010）|游标由 PROTOCOL-012/013 认证并绑定账户/设备|
 |`POST /v1/mailbox/ack`|幂等 ACK（NODE-011）|只作用于本设备条目；批量上限由策略决定|
+|`POST /v1/blobs`|创建附件上传会话（NODE-012）|必须关联一条本人已接受的日志条目；同 operation + 同描述幂等|
+|`PUT /v1/blobs/{upload_id}/chunks/{index}`|按序写入一块密文（NODE-013）|正文是**原始密文字节**（`application/octet-stream`）；顺序/边界/摘要严格校验|
+|`POST /v1/blobs/{upload_id}/complete`|校验清单并发布（NODE-014）|清单块数/总长/整体摘要必须与已上传内容一致；重复完成返回同一回执|
+|`GET /v1/blobs/{blob_id}/chunks/{index}`|取回一块密文（NODE-015）|成员窗口授权；未发布或越权一律拒绝；响应是原始密文字节|
+
+附件 blob 端点的两点特殊约定：
+
+- `PUT` 与 `GET` 共用同一个 URL 形状（`/v1/blobs/{id}/chunks/{index}`）：`PUT` 的 `{id}` 是**上传会话 id**，`GET` 的 `{id}` 是**已发布 blob id**。axum 不允许同名形状的两种参数命名，因此路由参数统一叫 `id`，由方法决定语义。
+- 块正文不做 hex/JSON 二次编码：`PUT` 直接发送原始密文（content-type `application/octet-stream`），`GET` 直接返回原始密文；请求签名仍然覆盖 `sha256(正文)`。因此单块上限（`BlobPolicy.max_chunk_bytes`，默认 32 KiB）必须小于正文上限 64 KiB。
 
 请求/响应同样带 `schema_version`（当前只接受 1）。校验顺序固定为：正文限长 → DTO 解码 → API-003 鉴权 → 领域调用 → 结果映射；handler 不另开事务、不重复领域规则。
 
@@ -50,6 +59,7 @@
   - 403 `HISTORY_NOT_AUTHORIZED`（设备不在该群允许的历史/成员窗口内）。
   - 404 `GROUP_NOT_FOUND`（群不存在或不由本节点协调）。
   - 409 `GROUP_ID_CONFLICT`、`GROUP_CAPACITY_EXCEEDED`、`SUBMISSION_ID_CONFLICT`、`STALE_CONTROL_HEAD`、`STALE_EPOCH`、`QUOTA_EXCEEDED`、`ITEM_ID_CONFLICT`。
+  - 附件 blob（NODE-012~015）新增码：400 `CHUNK_OUT_OF_ORDER`（未按序）、404 `UPLOAD_NOT_FOUND`/`BLOB_NOT_FOUND`（会话或已发布对象不存在）、410 `UPLOAD_EXPIRED`（会话过期或已结束）、409 `BLOB_UPLOAD_CONFLICT`（同 operation 换描述或 blob_id 已占用）、`CHUNK_CONFLICT`（同序号相异摘要）、`MISSING_CHUNKS`（缺块，含缺末块）、`MANIFEST_MISMATCH`（块数/总长/整体摘要/单块边界不符）、413 `CONTENT_TOO_LARGE`（单块或声明总长超上限；与“正文超过 HTTP 上限”的 `PAYLOAD_TOO_LARGE` 区分）。
 - 复用既有码：401 `INVALID_CHALLENGE/NODE_ID_MISMATCH/AUTH_EXPIRED/AUTH_REPLAY/INVALID_SIGNATURE/INVALID_CREDENTIAL`，403 `DEVICE_REVOKED/INVALID_CAPABILITY/PERMISSION_DENIED`，400 `INVALID_REQUEST/UNSUPPORTED_SCHEMA_VERSION`，503 `STORAGE_FAILURE`。
 - 不泄漏语义：未知信箱条目、他人条目、越权目标都统一返回 403 `PERMISSION_DENIED`；日志读取的成员窗口失败返回 403 `HISTORY_NOT_AUTHORIZED`，不返回“该 seq 存在但你看不到”。
 
@@ -63,7 +73,9 @@
 |src/client.rs|`NodeClient`：fetch_challenge、send_with_challenge（低层，单次发送）、register_device、create_group(+_signed)、append_entry(+_signed)、fetch_log、get_head、store_mailbox_item、read_mailbox_page、ack_mailbox_items；ClientLimits（响应/请求上限、超时、尝试预算）|
 |src/error.rs|`NodeClientError`：PROTOCOL-014 码 + 分类（network/timeout/protocol/authentication/permission/conflict/not_found/invalid_request/limit/internal/config），只带固定静态说明|
 
-端点与方法一一对应：`POST /v1/auth/challenge` → fetch_challenge；`POST /v1/devices` → register_device；`POST /v1/groups` → create_group；`POST /v1/groups/{id}/entries` → append_entry；`GET /v1/groups/{id}/log` → fetch_log；`GET /v1/groups/{id}/head` → get_head；`POST /v1/mailbox/items` → store_mailbox_item；`GET /v1/mailbox` → read_mailbox_page；`POST /v1/mailbox/ack` → ack_mailbox_items。
+端点与方法一一对应：`POST /v1/auth/challenge` → fetch_challenge；`POST /v1/devices` → register_device；`POST /v1/groups` → create_group；`POST /v1/groups/{id}/entries` → append_entry；`GET /v1/groups/{id}/log` → fetch_log；`GET /v1/groups/{id}/head` → get_head；`POST /v1/mailbox/items` → store_mailbox_item；`GET /v1/mailbox` → read_mailbox_page；`POST /v1/mailbox/ack` → ack_mailbox_items；`POST /v1/blobs` → begin_blob_upload（返回节点签名会话）；`PUT /v1/blobs/{id}/chunks/{index}` → put_blob_chunk（原始字节，回执绑定 `sha256(字节)`）；`POST /v1/blobs/{id}/complete` → complete_blob_upload（回执绑定清单三项）；`GET /v1/blobs/{id}/chunks/{index}` → read_blob_chunk（返回原始字节，摘要由调用方按清单校验）。
+
+客户端新增码映射：`BLOB_UPLOAD_CONFLICT/CHUNK_CONFLICT → LOG_CONFLICT`，`UPLOAD_NOT_FOUND/BLOB_NOT_FOUND → INVALID_TARGET`（分类 not_found），`UPLOAD_EXPIRED → INVALID_STATE_TRANSITION`，`CHUNK_OUT_OF_ORDER → INVALID_SEQUENCE`，`MISSING_CHUNKS → MISSING_LOG_ENTRIES`，`MANIFEST_MISMATCH → INVALID_CIPHERTEXT`，`CONTENT_TOO_LARGE → CONTENT_TOO_LARGE`；这些错误都不会触发“重取挑战再试”，只会显式失败。
 
 ### 签名原文与挑战生命周期
 
@@ -104,11 +116,12 @@
 
 ### 验证证据
 
-命令与结果：`cargo test --offline -p chat-node-client` → 33 个测试全部通过（13 个 lib 单元测试 + 11 个 `tests/client_limits.rs` + 9 个 `tests/http_flow.rs`），0 警告。
+命令与结果：`cargo test --offline -p chat-node-client` → 38 个测试全部通过（13 个 lib 单元测试 + 11 个 `tests/client_limits.rs` + 9 个 `tests/http_flow.rs` + 5 个 `tests/blob_flow.rs`），0 警告；三 crate 合计 117 个测试（node-services 63 + node-api 16 + node-client 38）全绿。
 
 - 真 TCP 端到端（`tests/http_flow.rs`：在进程内用 `axum::serve` 起 [crates/node-api](../../crates/node-api) 的真实路由，服务端是真实 node-services）：`challenge_registration_and_signed_outputs_are_verified`（挑战由固定节点公钥验签、注册回执验签、重复注册幂等）、`group_log_head_and_idempotent_append_flow`（建群幂等、append 同 submission 同字节重试返回同 seq、fetch_log 分页、head 与页内 head 一致）、`mailbox_store_read_and_ack_flow`（投递幂等、读取分页与重复读、ACK 幂等与越权 403）、`wrong_device_key_is_rejected_without_retrying`、`replayed_and_expired_challenges_are_rejected`、`unknown_device_and_non_member_are_rejected`、`divergent_bytes_for_one_submission_are_a_conflict`、`wrong_node_identity_and_wrong_pinned_key_are_rejected`、`oversized_request_is_rejected_before_sending`。
 - 边界语义（`tests/client_limits.rs`：脚本化最小 HTTP/1.1 服务）：`auth_failure_is_retried_once_and_then_succeeds`（旧挑战失败后重取一次成功，挑战请求恰好 2 次）、`retry_budget_is_exactly_one_retry`、`single_attempt_budget_sends_one_request`、`oversized_response_with_content_length_is_rejected`、`oversized_chunked_response_is_rejected_by_incremental_budget`、`signed_request_timeout_is_retried_once_then_reported`、`anonymous_challenge_timeout_is_reported_without_retry`、`network_failure_is_reported_and_bounded`、`redirects_are_not_followed`（重定向不产生第二次请求）、`wrong_node_id_in_challenge_is_rejected`、`unknown_error_code_is_not_silently_treated_as_success`。
 
+- 附件 blob（`tests/blob_flow.rs` + node-api 的 `tests/group_mailbox_http.rs`）：`blob_upload_and_read_round_trip_over_http`（会话/分块/发布/读取往返；上传者与群内老成员都能读到逐字节一致的密文；群外设备 403 HISTORY_NOT_AUTHORIZED）、`duplicate_chunk_is_idempotent_and_size_violation_is_rejected`、`out_of_order_and_missing_chunks_are_rejected`、`digest_mismatch_is_rejected_and_unfinished_blob_is_not_readable`、`foreign_writer_and_non_canonical_ids_are_rejected`；HTTP 契约侧 `blob_http_error_statuses_are_stable`（409/410/413/400/404 逐项断言）与 `blob_endpoints_require_bound_authentication`（缺鉴权头 400、换方法/路径/正文 401、群外设备 403、方法/路由边界 405/404）。
 ### 已知限制
 
 - 客户端不含 MLS/加密层的内容构造：候选密文、Welcome 等字节由上游加密层提供，本 crate 只负责传输、签名与错误映射（领域校验仍由节点与客户端加密层各自负责）。

@@ -19,6 +19,8 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use chat_core::core_events::{CoreEvent, EventBatch as CoreEventBatch};
+use chat_core::send_orchestrator::CancelOutcome;
 use chat_core::service::{
     self, ConversationCore, ConversationPageView as CoreConversationPageView,
     ConversationView as CoreConversationView, DraftView as CoreDraftView,
@@ -136,6 +138,47 @@ pub struct MessagePageView {
     pub items: Vec<MessageRowView>,
     /// 下一页游标；空表示没有更多。
     pub next_cursor: Option<String>,
+}
+
+/// 取消结果（CORE-009 三态；**不含正文**）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CancelViewFfi {
+    /// 本地草稿 ID。
+    pub draft_id: String,
+    /// 三态之一：`cancel_requested` / `cancel_too_late` / `cancel_unknown`。
+    pub outcome: String,
+    /// 关联的 SubmissionId（`cancel_requested` 在尚无尝试时为空）。
+    pub submission_id: Option<String>,
+}
+
+/// 内核变更事件（CORE-003 最小切片）：只含 ID 与稳定状态文本。
+///
+/// 事件不是可靠消息日志：收到后必须用 `draft_status_view` / `list_*` 重查真实状态。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CoreEventFfi {
+    /// 事件种类：`draft_changed` / `conversation_changed` / `resync_required` / `core_closed`。
+    pub kind: String,
+    /// 草稿 ID（仅 `draft_changed`）。
+    pub draft_id: Option<String>,
+    /// 会话 ID（`draft_changed` / `conversation_changed`）。
+    pub conversation_id: Option<String>,
+    /// 稳定状态文本（仅 `draft_changed`，取值同 `DraftStatusView.status`）。
+    pub status: Option<String>,
+    /// 最新尝试的 SubmissionId（仅 `draft_changed`，可能为空）。
+    pub submission_id: Option<String>,
+    /// 重查原因（仅 `resync_required`；静态文本，不含用户内容）。
+    pub reason: Option<String>,
+}
+
+/// 一页事件。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct EventBatchFfi {
+    /// 本批事件（按序号升序；resync 时只有一条 `resync_required`）。
+    pub events: Vec<CoreEventFfi>,
+    /// 下一次 poll 应传入的游标（本批最后一条事件的序号；无新事件时等于入参）。
+    pub next_seq: u64,
+    /// 是否要求整体重查（此时本批不含增量事件）。
+    pub resync_required: bool,
 }
 
 /// 正式加密存储对象。
@@ -266,7 +309,37 @@ impl LocalStoreFfi {
         Ok(message_page_view(page))
     }
 
+    /// CORE-009：取消一条尚未正式接受的草稿（三态 `cancel_requested` /
+    /// `cancel_too_late` / `cancel_unknown`）。
+    ///
+    /// 只做薄封装：状态机、落库与事件都由 core 的 `ConversationCore::cancel_draft`
+    /// 决定（同一个 `Store` 句柄，不重开库）。**不伪造成功**：FFI 未接真实节点与
+    /// MLS 群时，取消只记录用户意图；后续 dispatch/retry 在桩端口上显式失败
+    /// （`NETWORK_UNAVAILABLE` / `PROTOCOL_UNSUPPORTED`），见 bridge.md。
+    pub fn cancel_draft(&self, draft_id: String) -> Result<CancelViewFfi, FfiError> {
+        let mut core = self.lock()?;
+        let outcome = core
+            .cancel_draft(&draft_id)
+            .map_err(|error| failure!(error))?;
+        Ok(cancel_view(outcome))
+    }
+
+    /// CORE-003（最小切片）：按单调序号读取内核事件。
+    ///
+    /// 事件只含 ID 与稳定状态文本（绝不含正文/密钥）；重复 poll 幂等；游标早于缓冲
+    /// 起点或超前于本实例时返回 `resync_required = true` 与一条 `resync_required`
+    /// 事件，绝不静默丢事件。`limit` 必须在 `1..=256`。
+    pub fn poll_events(&self, since_seq: u64, limit: u32) -> Result<EventBatchFfi, FfiError> {
+        let core = self.lock()?;
+        let batch = core
+            .poll_events(since_seq, limit)
+            .map_err(|error| failure!(error))?;
+        Ok(event_batch_view(batch))
+    }
+
     /// 关闭存储并释放独占写锁；重复调用幂等。之后所有调用返回 `CORE_CLOSED`。
+    ///
+    /// 关闭时会发布一条 `core_closed` 事件（仍可通过 `poll_events` 读取）。
     ///
     /// 方法名用 `shutdown` 而不是 `close`：UniFFI 会为每个对象生成 `AutoCloseable.close()`，
     /// 同名会与生成代码产生 JVM 签名冲突（与 P0Core.shutdown 的既有做法一致）。
@@ -328,6 +401,85 @@ fn message_page_view(page: CoreMessagePageView) -> MessagePageView {
     MessagePageView {
         items: page.items.into_iter().map(message_row_view).collect(),
         next_cursor: page.next_cursor,
+    }
+}
+
+fn cancel_view(outcome: CancelOutcome) -> CancelViewFfi {
+    match outcome {
+        CancelOutcome::CancelRequested {
+            draft_id,
+            submission_id,
+        } => CancelViewFfi {
+            draft_id,
+            outcome: "cancel_requested".to_owned(),
+            submission_id,
+        },
+        CancelOutcome::CancelTooLate {
+            draft_id,
+            submission_id,
+        } => CancelViewFfi {
+            draft_id,
+            outcome: "cancel_too_late".to_owned(),
+            submission_id: Some(submission_id),
+        },
+        CancelOutcome::CancelUnknown {
+            draft_id,
+            submission_id,
+        } => CancelViewFfi {
+            draft_id,
+            outcome: "cancel_unknown".to_owned(),
+            submission_id: Some(submission_id),
+        },
+    }
+}
+
+fn core_event_view(event: CoreEvent) -> CoreEventFfi {
+    match event {
+        CoreEvent::DraftChanged {
+            draft_id,
+            conversation_id,
+            status,
+            submission_id,
+        } => CoreEventFfi {
+            kind: "draft_changed".to_owned(),
+            draft_id: Some(draft_id),
+            conversation_id: Some(conversation_id),
+            status: Some(status),
+            submission_id,
+            reason: None,
+        },
+        CoreEvent::ConversationChanged { conversation_id } => CoreEventFfi {
+            kind: "conversation_changed".to_owned(),
+            draft_id: None,
+            conversation_id: Some(conversation_id),
+            status: None,
+            submission_id: None,
+            reason: None,
+        },
+        CoreEvent::ResyncRequired { reason } => CoreEventFfi {
+            kind: "resync_required".to_owned(),
+            draft_id: None,
+            conversation_id: None,
+            status: None,
+            submission_id: None,
+            reason: Some(reason),
+        },
+        CoreEvent::CoreClosed => CoreEventFfi {
+            kind: "core_closed".to_owned(),
+            draft_id: None,
+            conversation_id: None,
+            status: None,
+            submission_id: None,
+            reason: None,
+        },
+    }
+}
+
+fn event_batch_view(batch: CoreEventBatch) -> EventBatchFfi {
+    EventBatchFfi {
+        events: batch.events.into_iter().map(core_event_view).collect(),
+        next_seq: batch.next_seq,
+        resync_required: batch.resync_required,
     }
 }
 
@@ -475,6 +627,139 @@ mod tests {
             .expect_err("out-of-range timestamp is rejected");
         match error {
             FfiError::Store { code, .. } => assert_eq!(code, "INVALID_INPUT"),
+        }
+    }
+
+    #[test]
+    fn cancel_draft_and_poll_events_through_the_ffi_shape() {
+        let temp = Temp::new();
+        let store = open(&temp);
+        let conversation_id = ConversationId::from_bytes([21u8; 32]).encode();
+        let operation_id = OperationId::from_bytes([22u8; 32]).encode();
+        let draft = store
+            .create_draft(
+                conversation_id.clone(),
+                operation_id,
+                "FFI 取消正文 body-secret".to_owned(),
+            )
+            .expect("create draft");
+
+        let cancel = store
+            .cancel_draft(draft.draft_id.clone())
+            .expect("cancel draft");
+        assert_eq!(cancel.draft_id, draft.draft_id);
+        assert_eq!(cancel.outcome, "cancel_requested");
+        assert!(cancel.submission_id.is_none());
+
+        let status = store
+            .draft_status_view(draft.draft_id.clone())
+            .expect("status")
+            .expect("present");
+        assert_eq!(status.status, "cancelled");
+        assert!(!status.can_cancel);
+        assert!(!status.can_retry);
+
+        let batch = store.poll_events(0, 10).expect("poll events");
+        assert!(!batch.resync_required);
+        assert_eq!(batch.next_seq, 2);
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(batch.events[0].kind, "draft_changed");
+        assert_eq!(batch.events[0].status.as_deref(), Some("cancelled"));
+        assert_eq!(
+            batch.events[0].draft_id.as_deref(),
+            Some(draft.draft_id.as_str())
+        );
+        assert_eq!(
+            batch.events[0].conversation_id.as_deref(),
+            Some(conversation_id.as_str())
+        );
+        assert_eq!(batch.events[1].kind, "conversation_changed");
+        // 事件只含 ID 与状态文本，不含正文。
+        for event in &batch.events {
+            let rendered = format!("{event:?}");
+            assert!(
+                !rendered.contains("body-secret"),
+                "event must not carry the body: {rendered}"
+            );
+            if let Some(reason) = &event.reason {
+                assert!(!reason.contains("body-secret"));
+            }
+        }
+        // 只读：重复 poll 幂等；游标之后没有新事件。
+        assert_eq!(store.poll_events(0, 10).expect("poll again"), batch);
+        let empty = store
+            .poll_events(batch.next_seq, 10)
+            .expect("poll after cursor");
+        assert!(empty.events.is_empty());
+        assert_eq!(empty.next_seq, batch.next_seq);
+    }
+
+    #[test]
+    fn failed_cancel_and_invalid_limit_surface_stable_codes() {
+        let temp = Temp::new();
+        let store = open(&temp);
+        let error = store
+            .cancel_draft("draft-missing".to_owned())
+            .expect_err("missing draft must fail");
+        match error {
+            FfiError::Store { code, .. } => assert!(!code.is_empty()),
+        }
+        // 畸形 draft_id：INVALID_INPUT（不进入存储）。
+        let error = store
+            .cancel_draft("bad draft!".to_owned())
+            .expect_err("malformed draft id must fail");
+        match error {
+            FfiError::Store { code, .. } => assert_eq!(code, "INVALID_INPUT"),
+        }
+        // 事件 limit 有上下界，越界显式拒绝。
+        for limit in [0u32, chat_core::core_events::MAX_EVENT_BATCH + 1] {
+            let error = store
+                .poll_events(0, limit)
+                .expect_err("invalid limit must fail");
+            match error {
+                FfiError::Store { code, .. } => assert_eq!(code, "INVALID_EVENT_LIMIT"),
+            }
+        }
+        // 失败之后同一个 Store 仍可用。
+        let draft = store
+            .create_draft(
+                ConversationId::from_bytes([23u8; 32]).encode(),
+                OperationId::from_bytes([24u8; 32]).encode(),
+                "失败后仍可写入".to_owned(),
+            )
+            .expect("store stays usable");
+        assert_eq!(
+            store
+                .cancel_draft(draft.draft_id)
+                .expect("cancel works")
+                .outcome,
+            "cancel_requested"
+        );
+    }
+
+    #[test]
+    fn shutdown_publishes_core_closed_and_events_stay_readable() {
+        let temp = Temp::new();
+        let store = open(&temp);
+        store.shutdown();
+        assert!(!store.is_open());
+        let batch = store.poll_events(0, 10).expect("poll after shutdown");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].kind, "core_closed");
+        // 重复 shutdown 幂等：不会重复发布。
+        store.shutdown();
+        let again = store.poll_events(0, 10).expect("poll after second shutdown");
+        assert_eq!(again.events.len(), 1);
+        // 关闭后业务调用仍显式 CORE_CLOSED。
+        let error = store
+            .create_draft(
+                ConversationId::from_bytes([25u8; 32]).encode(),
+                OperationId::from_bytes([26u8; 32]).encode(),
+                "关闭后".to_owned(),
+            )
+            .expect_err("closed store must fail");
+        match error {
+            FfiError::Store { code, .. } => assert_eq!(code, "CORE_CLOSED"),
         }
     }
 }

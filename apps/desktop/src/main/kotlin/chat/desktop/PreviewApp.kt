@@ -27,7 +27,9 @@ import chat.presentation.preview.updatePastedToken
 import chat.presentation.preview.withContacts
 import chat.presentation.preview.withConversations
 import chat.presentation.preview.withDraft
+import chat.presentation.preview.withCancel
 import chat.presentation.preview.withDraftStatus
+import chat.presentation.preview.withEvents
 import chat.presentation.preview.withError
 import chat.presentation.preview.withInvite
 import chat.presentation.preview.withMessages
@@ -197,6 +199,35 @@ fun main() = application {
     )
 
     val storeHandlers = StoreHandlers(
+        cancelLatestDraft = {
+            scope.launch {
+                if (store == null) return@launch
+                val latest = storeState.drafts.lastOrNull() ?: return@launch
+                storeState = storeState.beginBusy()
+                runCatching { store.cancelDraft(latest.draftId) }
+                    .onSuccess { storeState = storeState.withCancel(it) }
+                    .onFailure { error ->
+                        storeState = storeState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+        pollEvents = {
+            scope.launch {
+                if (store == null) return@launch
+                storeState = storeState.beginBusy()
+                runCatching { store.pollEvents(storeState.nextEventSeq, 64) }
+                    .onSuccess { storeState = storeState.withEvents(it) }
+                    .onFailure { error ->
+                        storeState = storeState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
         refreshConversations = { scope.launch { refreshConversations() } },
         selectConversation = { id ->
             selectedConversation = id

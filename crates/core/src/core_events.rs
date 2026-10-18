@@ -297,6 +297,14 @@ impl<S: NodeSubmitter, C: CryptoEngine, K: Clock> SendService<S, C, K> {
         }
     }
 
+    /// 取出底层 Store（把同一个句柄交还上层，避免为了同一句柄关闭再重开库）。
+    ///
+    /// 已 `shutdown` 之后返回 `None`；调用方负责把句柄放回自己的状态。
+    pub fn into_store(self) -> Option<Store> {
+        self.orchestrator
+            .map(|orchestrator| orchestrator.into_store())
+    }
+
     /// 只读编排器（诊断用）。
     pub fn orchestrator(&self) -> anyhow::Result<&SendOrchestrator<S, C, K>> {
         self.orchestrator

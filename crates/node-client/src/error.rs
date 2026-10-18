@@ -223,6 +223,12 @@ impl NodeClientError {
             "STALE_EPOCH" => ErrorCode::StaleEpoch,
             "INVALID_CURSOR" | "INVALID_CURSOR_SCOPE" => ErrorCode::InvalidCursor,
             "QUOTA_EXCEEDED" => ErrorCode::QuotaExceeded,
+            "BLOB_UPLOAD_CONFLICT" | "CHUNK_CONFLICT" => ErrorCode::LogConflict,
+            "UPLOAD_NOT_FOUND" | "BLOB_NOT_FOUND" => ErrorCode::InvalidTarget,
+            "UPLOAD_EXPIRED" => ErrorCode::InvalidStateTransition,
+            "CHUNK_OUT_OF_ORDER" => ErrorCode::InvalidSequence,
+            "MISSING_CHUNKS" => ErrorCode::MissingLogEntries,
+            "MANIFEST_MISMATCH" => ErrorCode::InvalidCiphertext,
             "STORAGE_FAILURE" => ErrorCode::StorageFailure,
             "MIGRATION_FAILED" | "NODE_IDENTITY_MISMATCH" | "INVALID_CONFIG" | "ENCODING_FAILURE" => {
                 ErrorCode::InternalFailure
@@ -243,7 +249,11 @@ impl NodeClientError {
             }
             "GROUP_ID_CONFLICT" | "SUBMISSION_ID_CONFLICT" | "ITEM_ID_CONFLICT"
             | "STALE_CONTROL_HEAD" | "STALE_EPOCH" => NodeClientErrorKind::Conflict,
-            "GROUP_NOT_FOUND" => NodeClientErrorKind::NotFound,
+            "GROUP_NOT_FOUND" | "UPLOAD_NOT_FOUND" | "BLOB_NOT_FOUND" => {
+                NodeClientErrorKind::NotFound
+            }
+            "BLOB_UPLOAD_CONFLICT" | "CHUNK_CONFLICT" | "UPLOAD_EXPIRED" | "CHUNK_OUT_OF_ORDER"
+            | "MISSING_CHUNKS" | "MANIFEST_MISMATCH" => NodeClientErrorKind::Conflict,
             "DEVICE_LIMIT_EXCEEDED" | "GROUP_CAPACITY_EXCEEDED" | "QUOTA_EXCEEDED"
             | "RATE_LIMITED" | "CHALLENGE_CAPACITY_EXCEEDED" | "PAYLOAD_TOO_LARGE"
             | "CONTENT_TOO_LARGE" => NodeClientErrorKind::Limit,
@@ -324,7 +334,7 @@ impl NodeClientError {
 }
 
 /// 节点侧可能的稳定码字符串（用于把未知码显式标记为 UNKNOWN_NODE_CODE）。
-const NODE_CODES: [&str; 30] = [
+const NODE_CODES: [&str; 39] = [
     "INVALID_REQUEST",
     "PAYLOAD_TOO_LARGE",
     "INVALID_CHALLENGE",
@@ -355,6 +365,15 @@ const NODE_CODES: [&str; 30] = [
     "QUOTA_EXCEEDED",
     "ITEM_ID_CONFLICT",
     "INVALID_ACK_BATCH",
+    "BLOB_UPLOAD_CONFLICT",
+    "UPLOAD_NOT_FOUND",
+    "UPLOAD_EXPIRED",
+    "CHUNK_CONFLICT",
+    "CHUNK_OUT_OF_ORDER",
+    "MISSING_CHUNKS",
+    "MANIFEST_MISMATCH",
+    "BLOB_NOT_FOUND",
+    "CONTENT_TOO_LARGE",
 ];
 
 impl fmt::Display for NodeClientError {

@@ -19,7 +19,7 @@ use crate::error::{NodeError, NodeResult};
 use crate::limits::{
     CHALLENGE_PURGE_BATCH, CHALLENGE_RETENTION_SECONDS, DEFAULT_CHALLENGE_TTL_SECONDS,
     DEFAULT_CLOCK_SKEW_SECONDS, DEFAULT_MAX_DEVICES_PER_ACCOUNT, DEFAULT_MAX_PENDING_CHALLENGES,
-    GroupLogPolicy, MAX_ACCOUNT_ID_BYTES, MAX_DEVICE_ID_BYTES, MAX_HTTP_BODY_BYTES,
+    BlobPolicy, GroupLogPolicy, MAX_ACCOUNT_ID_BYTES, MAX_DEVICE_ID_BYTES, MAX_HTTP_BODY_BYTES,
     MAX_NODE_ID_BYTES, MailboxPolicy,
 };
 use crate::registration::{DeviceRegistration, RegisterDeviceRequest};
@@ -27,6 +27,7 @@ use crate::registration::{DeviceRegistration, RegisterDeviceRequest};
 const MIGRATION_0001: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_node_auth.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_group_mailbox.sql");
+const MIGRATION_0004: &str = include_str!("../migrations/0004_blob_attachments.sql");
 const MIGRATION_CHECKSUM_SLOT: &str = ":checksum";
 
 /// 节点鉴权与注册策略。所有字段在启动时校验，不接受 0 或越界配置。
@@ -46,6 +47,8 @@ pub struct NodeAuthPolicy {
     pub group_log: GroupLogPolicy,
     /// 密文信箱上限。
     pub mailbox: MailboxPolicy,
+    /// 附件 blob 上传/读取上限。
+    pub blob: BlobPolicy,
 }
 
 impl Default for NodeAuthPolicy {
@@ -58,6 +61,7 @@ impl Default for NodeAuthPolicy {
             clock_skew_seconds: DEFAULT_CLOCK_SKEW_SECONDS,
             group_log: GroupLogPolicy::default(),
             mailbox: MailboxPolicy::default(),
+            blob: BlobPolicy::default(),
         }
     }
 }
@@ -81,6 +85,7 @@ impl NodeAuthPolicy {
         }
         self.group_log.validate()?;
         self.mailbox.validate()?;
+        self.blob.validate()?;
         Ok(())
     }
 }
@@ -296,6 +301,22 @@ impl NodeService {
             ))
         })
         .transpose()
+    }
+
+    /// 演员必须是本节点已登记的有效设备，且账户与声明一致（跨账户直接拒绝）。
+    ///
+    /// 群日志、信箱与附件端点共用这一条前置校验；失败一律显式返回，不继续推进。
+    pub(crate) fn require_active_device(&self, actor: &AuthenticatedDevice) -> NodeResult<()> {
+        let (account_id, state, _version) = self
+            .device_account_state(&actor.device_id)?
+            .ok_or(NodeError::InvalidCredential)?;
+        if state != "active" {
+            return Err(NodeError::DeviceRevoked);
+        }
+        if account_id != actor.account_id {
+            return Err(NodeError::PermissionDenied);
+        }
+        Ok(())
     }
 
     /// 认证游标的派生密钥：由节点签名种子派生，跨重启稳定且不对外可见。
@@ -916,6 +937,28 @@ fn migrate(connection: &Connection) -> NodeResult<()> {
         }
     }
     verify_migration_checksum(connection, 3, MIGRATION_0003)?;
+    let current: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if current < 4 {
+        let sql = MIGRATION_0004.replace(MIGRATION_CHECKSUM_SLOT, &checksum(MIGRATION_0004));
+        connection
+            .execute_batch(&sql)
+            .map_err(|_| NodeError::MigrationFailed("blob attachment migration failed"))?;
+        let applied: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if applied < 4 {
+            return Err(NodeError::MigrationFailed(
+                "blob attachment migration did not record its version",
+            ));
+        }
+    }
+    verify_migration_checksum(connection, 4, MIGRATION_0004)?;
     Ok(())
 }
 

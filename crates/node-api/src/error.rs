@@ -91,7 +91,11 @@ impl ApiError {
             | NodeError::InvalidCapability
             | NodeError::PermissionDenied
             | NodeError::HistoryNotAuthorized => StatusCode::FORBIDDEN,
-            NodeError::GroupNotFound => StatusCode::NOT_FOUND,
+            NodeError::GroupNotFound
+            | NodeError::UploadNotFound
+            | NodeError::BlobNotFound => StatusCode::NOT_FOUND,
+            NodeError::UploadExpired => StatusCode::GONE,
+            NodeError::ContentTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             NodeError::DeviceLimitExceeded
             | NodeError::GroupIdConflict
             | NodeError::GroupCapacityExceeded
@@ -99,7 +103,12 @@ impl ApiError {
             | NodeError::StaleControlHead
             | NodeError::StaleEpoch
             | NodeError::QuotaExceeded
-            | NodeError::ItemIdConflict => StatusCode::CONFLICT,
+            | NodeError::ItemIdConflict
+            | NodeError::BlobUploadConflict
+            | NodeError::ChunkConflict
+            | NodeError::ChunkOutOfOrder
+            | NodeError::MissingChunks
+            | NodeError::ManifestMismatch => StatusCode::CONFLICT,
             NodeError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             NodeError::ChallengeCapacityExceeded
             | NodeError::StorageUnavailable

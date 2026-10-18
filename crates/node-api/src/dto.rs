@@ -4,6 +4,9 @@
 //! 传输字段名固定为 snake_case，与签名原文分开（签名原文见 node-services 的规范编码）。
 use axum::http::HeaderMap;
 use chat_node_services::auth::{AuthChallenge, ChallengePurpose, SignedAuth};
+use chat_node_services::blob::{
+    BlobReceipt, ChunkReceipt, CipherManifest, PublicBlobDescriptor, UploadSession,
+};
 use chat_node_services::canonical::validate_bounded_id;
 use chat_node_services::group::{
     AppendResult, GroupCandidate, GroupCreation, GroupRegistration, LogPage, SignedCandidate,
@@ -353,4 +356,95 @@ impl AckMailboxItemsResponseDto {
             summary,
         }
     }
+}
+
+/// POST /v1/blobs 请求（NODE-012）。
+#[derive(Clone, Debug, Deserialize)]
+pub struct BeginBlobUploadRequestDto {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u16,
+    /// 客户端业务幂等键（PROTOCOL-001 operation 文本）。
+    pub operation_id: String,
+    pub descriptor: PublicBlobDescriptor,
+}
+
+impl BeginBlobUploadRequestDto {
+    /// 校验版本并取出 (operation, descriptor)。
+    pub fn into_request(self) -> Result<(String, PublicBlobDescriptor), ApiError> {
+        check_schema_version(self.schema_version)?;
+        Ok((self.operation_id, self.descriptor))
+    }
+}
+
+/// POST /v1/blobs 响应：节点签名的上传会话。
+#[derive(Clone, Debug, Serialize)]
+pub struct UploadSessionResponseDto {
+    pub schema_version: u16,
+    pub session: UploadSession,
+}
+
+impl UploadSessionResponseDto {
+    /// 包装上传会话。
+    pub fn new(session: UploadSession) -> Self {
+        Self {
+            schema_version: DTO_SCHEMA_VERSION,
+            session,
+        }
+    }
+}
+
+/// PUT /v1/blobs/{id}/chunks/{index} 响应：分块回执。
+#[derive(Clone, Debug, Serialize)]
+pub struct ChunkReceiptResponseDto {
+    pub schema_version: u16,
+    pub receipt: ChunkReceipt,
+}
+
+impl ChunkReceiptResponseDto {
+    /// 包装分块回执。
+    pub fn new(receipt: ChunkReceipt) -> Self {
+        Self {
+            schema_version: DTO_SCHEMA_VERSION,
+            receipt,
+        }
+    }
+}
+
+/// POST /v1/blobs/{id}/complete 请求（NODE-014）。
+#[derive(Clone, Debug, Deserialize)]
+pub struct CompleteBlobUploadRequestDto {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u16,
+    pub manifest: CipherManifest,
+}
+
+impl CompleteBlobUploadRequestDto {
+    /// 校验版本并取出清单。
+    pub fn into_manifest(self) -> Result<CipherManifest, ApiError> {
+        check_schema_version(self.schema_version)?;
+        Ok(self.manifest)
+    }
+}
+
+/// POST /v1/blobs/{id}/complete 响应：发布回执。
+#[derive(Clone, Debug, Serialize)]
+pub struct BlobReceiptResponseDto {
+    pub schema_version: u16,
+    pub receipt: BlobReceipt,
+}
+
+impl BlobReceiptResponseDto {
+    /// 包装发布回执。
+    pub fn new(receipt: BlobReceipt) -> Self {
+        Self {
+            schema_version: DTO_SCHEMA_VERSION,
+            receipt,
+        }
+    }
+}
+
+/// 把路径里的块序号解析成 u32；非数字一律按请求错误拒绝（不走 axum 默认错误体）。
+pub fn parse_chunk_index(raw: &str) -> Result<u32, ApiError> {
+    raw.parse::<u32>()
+        .map_err(|_| ApiError::invalid_request("chunk index must be an unsigned integer"))
 }

@@ -9,7 +9,8 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
 use axum::http::{HeaderMap, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::http::header::CONTENT_TYPE;
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chat_node_services::auth::{ChallengePurpose, RequestMeta};
 use chat_node_services::services::AuthenticatedDevice;
@@ -19,11 +20,12 @@ use serde::de::DeserializeOwned;
 
 use crate::dto::{
     AckMailboxItemsRequestDto, AckMailboxItemsResponseDto, AppendGroupEntryRequestDto,
-    AppendGroupEntryResponseDto, ChallengeRequestDto, ChallengeResponseDto,
-    DeviceRegistrationResponseDto, GroupHeadResponseDto, GroupLogResponseDto,
-    GroupRegistrationResponseDto, MailboxPageResponseDto, MailboxReceiptResponseDto,
-    RegisterDeviceRequestDto, RegisterGroupRequestDto, SignedAuthHeaders,
-    StoreMailboxItemRequestDto,
+    AppendGroupEntryResponseDto, BeginBlobUploadRequestDto, BlobReceiptResponseDto,
+    ChallengeRequestDto, ChallengeResponseDto, ChunkReceiptResponseDto,
+    CompleteBlobUploadRequestDto, DeviceRegistrationResponseDto, GroupHeadResponseDto,
+    GroupLogResponseDto, GroupRegistrationResponseDto, MailboxPageResponseDto,
+    MailboxReceiptResponseDto, RegisterDeviceRequestDto, RegisterGroupRequestDto,
+    SignedAuthHeaders, StoreMailboxItemRequestDto, UploadSessionResponseDto, parse_chunk_index,
 };
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -48,6 +50,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/mailbox/items", post(store_mailbox_item))
         .route("/v1/mailbox", get(read_mailbox_page))
         .route("/v1/mailbox/ack", post(ack_mailbox_items))
+        .route("/v1/blobs", post(begin_blob_upload))
+        // 同一个 URL 形状承载两个动作：PUT = 写入上传会话的一块，GET = 读取已发布 blob 的一块。
+        // 路由参数因此只能有一个名字（axum 不允许同名形状的两种参数命名）。
+        .route(
+            "/v1/blobs/{id}/chunks/{chunk_index}",
+            put(put_blob_chunk).get(read_blob_chunk),
+        )
+        .route(
+            "/v1/blobs/{upload_id}/complete",
+            post(complete_blob_upload),
+        )
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state)
 }
@@ -298,4 +311,81 @@ pub async fn ack_mailbox_items(
     let actor = authenticate(&state, &headers, &uri, "POST", &body, now)?;
     let summary = state.with_service(|service| service.ack_mailbox_items(&actor, &ids, now))?;
     Ok(Json(AckMailboxItemsResponseDto::new(summary)).into_response())
+}
+/// POST /v1/blobs：创建密文附件上传会话（NODE-012）。
+pub async fn begin_blob_upload(
+    State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    ensure_body_bounded(&state, body.len())?;
+    let request: BeginBlobUploadRequestDto = parse_body(&body)?;
+    let (operation_id, descriptor) = request.into_request()?;
+    let now = state.now();
+    let actor = authenticate(&state, &headers, &uri, "POST", &body, now)?;
+    let session = state.with_service(|service| {
+        service.begin_blob_upload(&descriptor, &operation_id, &actor, now)
+    })?;
+    Ok(Json(UploadSessionResponseDto::new(session)).into_response())
+}
+
+/// PUT /v1/blobs/{upload_id}/chunks/{index}：按序写入一块密文（NODE-013）。
+///
+/// 正文就是原始密文字节（`application/octet-stream`），不是 JSON/hex：
+/// 附件块不需要二次编码，请求签名仍然覆盖 `sha256(正文)`。
+pub async fn put_blob_chunk(
+    State(state): State<AppState>,
+    UrlPath((upload_id, chunk_index)): UrlPath<(String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    ensure_body_bounded(&state, body.len())?;
+    let index = parse_chunk_index(&chunk_index)?;
+    let now = state.now();
+    let actor = authenticate(&state, &headers, &uri, "PUT", &body, now)?;
+    let receipt = state.with_service(|service| {
+        service.put_blob_chunk(&upload_id, index, &body, &actor, now)
+    })?;
+    Ok(Json(ChunkReceiptResponseDto::new(receipt)).into_response())
+}
+
+/// POST /v1/blobs/{upload_id}/complete：校验清单并原子发布（NODE-014）。
+pub async fn complete_blob_upload(
+    State(state): State<AppState>,
+    UrlPath(upload_id): UrlPath<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    ensure_body_bounded(&state, body.len())?;
+    let request: CompleteBlobUploadRequestDto = parse_body(&body)?;
+    let manifest = request.into_manifest()?;
+    let now = state.now();
+    let actor = authenticate(&state, &headers, &uri, "POST", &body, now)?;
+    let receipt = state
+        .with_service(|service| service.complete_blob_upload(&upload_id, &manifest, &actor, now))?;
+    Ok(Json(BlobReceiptResponseDto::new(receipt)).into_response())
+}
+
+/// GET /v1/blobs/{blob_id}/chunks/{index}：取回一块密文（NODE-015）。
+///
+/// 成功时正文是原始密文块（`application/octet-stream`）；失败仍然返回 JSON 错误体。
+pub async fn read_blob_chunk(
+    State(state): State<AppState>,
+    UrlPath((blob_id, chunk_index)): UrlPath<(String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let index = parse_chunk_index(&chunk_index)?;
+    let now = state.now();
+    let actor = authenticate(&state, &headers, &uri, "GET", b"", now)?;
+    let chunk = state
+        .with_service(|service| service.read_blob_chunk(&blob_id, index, &actor, now))?;
+    Ok((
+        [(CONTENT_TYPE, "application/octet-stream")],
+        chunk.bytes,
+    )
+        .into_response())
 }
