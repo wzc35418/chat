@@ -14,7 +14,7 @@
 //! - 上传/下载（ATTACHMENTS-003/005）、含 FileKey 的 E2EE SecretDescriptor、
 //!   取消导出（EXPORT_CANCELLED）与 FileKey 的持久化保护（需要 PLATFORM/CRYPTO 设计）未实现。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -619,6 +619,23 @@ impl AttachmentStore {
             .unwrap_or(false)
     }
 
+    /// 删除一个附件的整个缓存目录（只接受合法附件 ID 形式），返回释放的字节数。
+    ///
+    /// 目录不存在返回 0；名字不合法的路径一律拒绝（ATTACHMENTS-008 只回收受控缓存路径）。
+    pub fn remove_cached_directory(&self, attachment_id: &str) -> AttachmentResult<u64> {
+        let directory = self.attachment_dir(attachment_id)?;
+        if !directory.is_dir() {
+            return Ok(0);
+        }
+        let mut files = Vec::new();
+        collect_files_into(&directory, &mut files);
+        let freed = files
+            .iter()
+            .fold(0u64, |total, (_, bytes)| total.saturating_add(*bytes));
+        fs::remove_dir_all(&directory).map_err(|_| AttachmentError::FileIoFailure)?;
+        Ok(freed)
+    }
+
     /// 删除本次下载新写入的缓存块（失败时只回滚本次写入，不动既有缓存）。
     pub fn remove_cached_chunk(&self, attachment_id: &str, index: u32) -> AttachmentResult<()> {
         let path = self.chunk_path(attachment_id, index)?;
@@ -940,6 +957,21 @@ fn status_of(record: &AttachmentRecord, available_chunks: u32) -> AttachmentStat
         transferred_chunks: record.transferred_chunks.min(record.descriptor.chunk_count),
         cancel_requested: record.cancel_requested,
         failure: record.failure,
+    }
+}
+
+/// 递归收集目录下每个文件的字节数（回收时统计释放空间）。
+fn collect_files_into(directory: &Path, files: &mut Vec<(PathBuf, u64)>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_into(&path, files);
+        } else if let Ok(metadata) = entry.metadata() {
+            files.push((path, metadata.len()));
+        }
     }
 }
 
@@ -1379,6 +1411,20 @@ pub trait BlobTransport {
     /// 读取一块密文（下载路径）。
     fn read_chunk(&mut self, blob_id: &str, index: u32) -> AttachmentResult<Vec<u8>>;
 }
+
+/// 缓存回收报告（ATTACHMENTS-008）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CollectReport {
+    /// 删除的缓存目录数。
+    pub removed_directories: u32,
+    /// 释放的字节数（按删除前目录内文件大小合计）。
+    pub freed_bytes: u64,
+    /// 扫描过的缓存目录项数（有界）。
+    pub scanned_entries: u32,
+}
+
+/// 单次回收最多扫描的缓存目录项数（防止异常目录炸开时无界遍历）。
+pub const MAX_COLLECT_SCAN_ENTRIES: u32 = 10_000;
 
 /// 下载回执（ATTACHMENTS-005）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1876,9 +1922,13 @@ impl PersistedAttachmentStore {
         // 只有“从头开始”的那一次能校验整段密文摘要；续传路径依赖每块 AEAD +
         // 明文整体摘要（前缀摘要已在上面按本地文件重算校验）。
         let mut ciphertext_hasher = (skip == 0).then(Sha256::new);
-        // 只有从头开始的一轮会完整缓存密文块（续传前缀的密文已不在内存中）。
-        let cache_chunks = skip == 0;
         let mut written_chunks: Vec<u32> = Vec::new();
+        // 续传时前缀块在本次没有读取：先记下它们的明文长度，成功后再从节点补读
+        // 校验并写进缓存（保证任何成功下载之后都能离线导出）。
+        let mut prefix_lengths: Vec<u32> = Vec::with_capacity(skip as usize);
+        for index in 0..skip {
+            prefix_lengths.push(chunk_plain_length(record.plain_size, index)?);
+        }
         let outcome = (|| -> AttachmentResult<()> {
             for index in skip..record.chunk_count {
                 let bytes = transport.read_chunk(blob_id, index)?;
@@ -1894,9 +1944,9 @@ impl PersistedAttachmentStore {
                     let chunk = CipherChunk::from_bytes(bytes.clone())?;
                     decrypt_attachment_chunk(&cached.file_key, &context, &chunk)?.to_vec()
                 };
-                if cache_chunks && !self.cache.has_cached_chunk(blob_id, index) {
+                if !self.cache.has_cached_chunk(blob_id, index) {
                     // 密文原样进缓存（字节与清单一致），供离线 export/status 使用；
-                    // 已有块（同进程导入过）不重复写，失败时也只回滚本次新写的块。
+                    // 已有块（同进程导入过 / 上一轮已校验）不重复写。
                     self.cache.cache_downloaded_chunk(blob_id, index, &bytes)?;
                     written_chunks.push(index);
                 }
@@ -1936,15 +1986,46 @@ impl PersistedAttachmentStore {
                     "downloaded content digest does not match the descriptor",
                 ));
             }
+            // 续传补齐：本次没读到的前缀块从节点补读，逐块 AEAD 解密校验并与本地已写
+            // 明文逐字节比对后才写进缓存；这样“续传完成的下载”同样可以离线导出。
+            if skip > 0 {
+                let local_prefix = fs::read(&partial_path).unwrap_or_default();
+                let mut offset = 0usize;
+                for index in 0..skip {
+                    let length = prefix_lengths[index as usize] as usize;
+                    let end = offset.saturating_add(length);
+                    if self.cache.has_cached_chunk(blob_id, index) {
+                        offset = end;
+                        continue;
+                    }
+                    let bytes = transport.read_chunk(blob_id, index)?;
+                    let plaintext = {
+                        let records = self.cache.lock_records()?;
+                        let cached = records.get(blob_id).ok_or(AttachmentError::KeyUnavailable(
+                            "the file key is not available for this attachment",
+                        ))?;
+                        let context = chunk_context_for(cached.file_id, record.plain_size, index)?;
+                        let chunk = CipherChunk::from_bytes(bytes.clone())?;
+                        decrypt_attachment_chunk(&cached.file_key, &context, &chunk)?.to_vec()
+                    };
+                    if end > local_prefix.len() || plaintext.as_slice() != &local_prefix[offset..end]
+                    {
+                        return Err(AttachmentError::AttachmentCorrupted(
+                            "re-filled chunk does not match the downloaded plaintext",
+                        ));
+                    }
+                    self.cache.cache_downloaded_chunk(blob_id, index, &bytes)?;
+                    written_chunks.push(index);
+                    offset = end;
+                }
+            }
             Ok(())
         })();
         drop(file);
         match outcome {
             Ok(()) => {
                 // 缓存完整性检查（密文摘要与清单一致）失败时不留本次新写的半份缓存。
-                if cache_chunks
-                    && let Err(error) = self.cache.finish_cached_download(blob_id)
-                {
+                if let Err(error) = self.cache.finish_cached_download(blob_id) {
                     for index in written_chunks.drain(..) {
                         let _ = self.cache.remove_cached_chunk(blob_id, index);
                     }
@@ -1977,14 +2058,15 @@ impl PersistedAttachmentStore {
                 // 可重试的传输类错误：保留半成品与进度供续传；其余（损坏、缺密钥、IO 等）
                 // 按终态清理半成品、缓存块与进度。
                 let retryable = is_retryable_transfer_error(&error);
-                // 只回滚本次新写的缓存块：既有缓存（导入时写入）不受失败影响。
-                for index in written_chunks.drain(..) {
-                    let _ = self.cache.remove_cached_chunk(blob_id, index);
-                }
                 if !retryable {
+                    // 终态失败：回滚本次新写的缓存块与半成品；既有缓存不受影响。
+                    for index in written_chunks.drain(..) {
+                        let _ = self.cache.remove_cached_chunk(blob_id, index);
+                    }
                     let _ = fs::remove_file(&partial_path);
                     let _ = self.clear_transfer_progress(blob_id, "download");
                 }
+                // 可重试失败保留已校验的缓存块：续传时不必重读这些块。
                 // 状态留在 downloading（可重试），不写出任何未验证文件。
                 self.cache.note_transfer(
                     blob_id,
@@ -1995,6 +2077,59 @@ impl PersistedAttachmentStore {
                 Err(error)
             }
         }
+    }
+
+    /// ATTACHMENTS-008（本地缓存部分）：回收没有附件记录引用的缓存目录。
+    ///
+    /// 语义：
+    /// - 先短事务读出“有记录引用”的附件 ID 集合（只读 ID，不解密记录）；
+    /// - 再扫描缓存根下的**目录**：只处理名字符合 `att-<32hex>` 的目录，
+    ///   没有引用才删除；名字异常（非附件 ID 形式）的文件/目录一律不动；
+    /// - 返回删除目录数、释放字节数与扫描项数；扫描项数有界（MAX_COLLECT_SCAN_ENTRIES）；
+    /// - 幂等：重复调用在无新孤儿时返回 0；有引用的目录即使为空也不删；
+    /// - 不删 staging/任务引用：本层只知道附件记录引用，消息引用由 ATTACHMENTS-008 的
+    ///   完整实现（需要消息/任务引用计数，后续任务）负责，这里只保证“有记录就不删”。
+    pub fn collect_unreferenced_attachments(&self) -> AttachmentResult<CollectReport> {
+        let ids = {
+            let store = self.lock_store()?;
+            store.attachment_ids().map_err(AttachmentError::from)?
+        };
+        let referenced: HashSet<String> = ids.into_iter().collect();
+        let root = self.cache.root().to_path_buf();
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(_) => return Err(AttachmentError::FileIoFailure),
+        };
+        let mut report = CollectReport::default();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => return Err(AttachmentError::FileIoFailure),
+            };
+            report.scanned_entries = report.scanned_entries.saturating_add(1);
+            if report.scanned_entries > MAX_COLLECT_SCAN_ENTRIES {
+                break;
+            }
+            let path = entry.path();
+            // 只回收目录；缓存根下的其它文件不归本函数管。
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            // 名字不符合附件 ID 形式：异常目录，不猜、不删。
+            if validate_attachment_id(name).is_err() {
+                continue;
+            }
+            if referenced.contains(name) {
+                continue;
+            }
+            let freed = self.cache.remove_cached_directory(name)?;
+            report.removed_directories = report.removed_directories.saturating_add(1);
+            report.freed_bytes = report.freed_bytes.saturating_add(freed);
+        }
+        Ok(report)
     }
 }
 
@@ -3399,6 +3534,179 @@ mod tests {
         assert_eq!(transport.reads, 0, "no bytes are read without the file key");
     }
 
+
+
+    #[test]
+    fn resumed_download_fills_the_cache_for_offline_export() {
+        let dir = TempDir::new("resume-cache-fill");
+        let db_path = dir.path("chat.db");
+        let cache_root = dir.path("cache");
+        let (source_path, source) = upload_source(&dir, "resume-cache.bin");
+        let attachment_id;
+        let manifest;
+        let mut node = FakeBlobTransport::default();
+        {
+            let store = PersistedAttachmentStore::open(&cache_root, formal_store(&db_path))
+                .expect("open persisted store");
+            let descriptor = store
+                .import_file(&FileToken::from_local_path(&source_path), "续传缓存.bin")
+                .expect("import");
+            attachment_id = descriptor.attachment_id.clone();
+            manifest = store
+                .cache
+                .attachment_manifest(&attachment_id)
+                .expect("manifest");
+            store
+                .upload_attachment(&attachment_id, &mut node)
+                .expect("upload");
+            // 模拟“只有记录与 FileKey、没有缓存块”的设备：清掉导入时写的缓存。
+            fs::remove_dir_all(cache_root.join(&attachment_id)).expect("clear cache");
+            // 第 3 块读取失败：可重试错误，保留半成品、进度与已校验的前 2 块缓存。
+            node.fail_read_at = Some(2);
+            let error = store
+                .download_attachment(
+                    &attachment_id,
+                    &manifest,
+                    &FileToken::from_local_path(&dir.path("out.bin")),
+                    &mut node,
+                )
+                .expect_err("the third read fails");
+            assert_eq!(error.code(), "NODE_UNAVAILABLE");
+            assert_eq!(
+                store.cache.available_chunks(&attachment_id, manifest.chunk_count),
+                2,
+                "verified chunks are kept for resumption"
+            );
+            assert!(dir.path("out.bin.download-partial").exists());
+        }
+        // 模拟“前缀密文没有保留”（例如旧版本续传/缓存被清理）：删掉缓存块，
+        // 只留下进度与明文半成品；续传时必须从节点补读前缀块并校验后补齐缓存。
+        fs::remove_dir_all(cache_root.join(&attachment_id)).expect("drop cached chunks");
+        node.fail_read_at = None;
+        let store = PersistedAttachmentStore::open(&cache_root, formal_store(&db_path))
+            .expect("reopen persisted store");
+        assert_eq!(
+            store.cache.available_chunks(&attachment_id, manifest.chunk_count),
+            0,
+            "the cache starts empty after the simulated loss"
+        );
+        let reads_before = node.reads;
+        let destination = dir.path("resumed.bin");
+        let receipt = store
+            .download_attachment(
+                &attachment_id,
+                &manifest,
+                &FileToken::from_local_path(&destination),
+                &mut node,
+            )
+            .expect("resume download");
+        assert_eq!(
+            node.reads - reads_before,
+            manifest.chunk_count as usize,
+            "one missing chunk + two re-filled prefix chunks"
+        );
+        assert_eq!(receipt.written_bytes, source.len() as u64);
+        assert_eq!(fs::read(&destination).expect("read download"), source);
+        // 续传完成后缓存必须完整：状态满块，且不联网也能导出。
+        let status = store.attachment_status(&attachment_id).expect("status");
+        assert_eq!(status.state, AttachmentState::Available);
+        assert_eq!(status.available_chunks, manifest.chunk_count);
+        for index in 0..manifest.chunk_count {
+            let cached = store
+                .cache
+                .ciphertext_chunk(&attachment_id, index)
+                .expect("cached chunk");
+            assert_eq!(
+                Some(&cached),
+                node.stored_chunk(&attachment_id, index),
+                "re-filled cache chunk must match the node bytes"
+            );
+        }
+        let offline = dir.path("resumed-offline.bin");
+        let exported = store
+            .export_attachment(&attachment_id, &FileToken::from_local_path(&offline))
+            .expect("offline export after resumed download");
+        assert_eq!(exported.written_bytes, source.len() as u64);
+        assert_eq!(fs::read(&offline).expect("read offline export"), source);
+    }
+
+    #[test]
+    fn collect_removes_only_unreferenced_cache_directories() {
+        let dir = TempDir::new("collect-gc");
+        let cache_root = dir.path("cache");
+        let store =
+            PersistedAttachmentStore::open(&cache_root, formal_store(&dir.path("chat.db")))
+                .expect("open persisted store");
+        // 两条有记录引用的附件。
+        let (source_a, _source_a) = upload_source(&dir, "gc-a.bin");
+        let (source_b, _source_b) = upload_source(&dir, "gc-b.bin");
+        let referenced_a = store
+            .import_file(&FileToken::from_local_path(&source_a), "gc-a.bin")
+            .expect("import a")
+            .attachment_id;
+        let referenced_b = store
+            .import_file(&FileToken::from_local_path(&source_b), "gc-b.bin")
+            .expect("import b")
+            .attachment_id;
+
+        // 孤儿缓存目录（合法 ID 形式、无记录引用）：带一层子目录，便于统计释放字节。
+        let orphan = "att-0123456789abcdef0123456789abcdef";
+        let orphan_dir = cache_root.join(orphan);
+        fs::create_dir_all(orphan_dir.join("nested")).expect("create orphan");
+        fs::write(orphan_dir.join("chunk-000000.bin"), vec![7u8; 100]).expect("write chunk");
+        fs::write(orphan_dir.join("nested").join("junk.bin"), vec![9u8; 23]).expect("write nested");
+        // 异常名字：不是合法附件 ID 形式，回收不得误删。
+        let abnormal = ["att-SHORT", "att-ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", "notes"];
+        for name in abnormal {
+            let path = cache_root.join(name);
+            fs::create_dir_all(&path).expect("create abnormal dir");
+            fs::write(path.join("keep.txt"), b"keep").expect("write abnormal file");
+        }
+        fs::write(cache_root.join("att-0123456789abcdef0123456789abcdef.txt"), b"x")
+            .expect("write stray file");
+
+        let report = store
+            .collect_unreferenced_attachments()
+            .expect("collect orphans");
+        assert_eq!(report.removed_directories, 1);
+        assert_eq!(report.freed_bytes, 123, "100 + 23 bytes freed");
+        assert!(!orphan_dir.exists(), "the orphan directory is removed");
+        // 有引用的目录保留（含其缓存块）。
+        for id in [&referenced_a, &referenced_b] {
+            assert!(cache_root.join(id).is_dir(), "referenced cache must survive");
+            assert!(
+                cache_root.join(id).join("chunk-000000.bin").is_file(),
+                "referenced chunks must survive"
+            );
+        }
+        // 异常名字与散落文件都不动。
+        for name in abnormal {
+            assert!(cache_root.join(name).is_dir(), "{name} must be untouched");
+            assert!(cache_root.join(name).join("keep.txt").is_file());
+        }
+        assert!(cache_root
+            .join("att-0123456789abcdef0123456789abcdef.txt")
+            .is_file());
+
+        // 幂等：第二次没有孤儿可删。
+        let again = store
+            .collect_unreferenced_attachments()
+            .expect("collect again");
+        assert_eq!(again.removed_directories, 0);
+        assert_eq!(again.freed_bytes, 0);
+        assert!(again.scanned_entries >= report.scanned_entries.saturating_sub(1));
+        // 删除附件记录后，其缓存目录成为孤儿，可被回收。
+        assert!(store.delete_attachment(&referenced_a).expect("delete record"));
+        fs::create_dir_all(cache_root.join(&referenced_a)).expect("recreate cache dir");
+        fs::write(cache_root.join(&referenced_a).join("chunk.bin"), b"abcde").expect("write");
+        let report = store
+            .collect_unreferenced_attachments()
+            .expect("collect after delete");
+        assert_eq!(report.removed_directories, 1);
+        assert_eq!(report.freed_bytes, 5);
+        assert!(!cache_root.join(&referenced_a).exists());
+        assert!(cache_root.join(&referenced_b).is_dir());
+    }
 
     #[test]
     fn download_fills_the_local_cache_for_offline_export() {

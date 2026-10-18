@@ -41,6 +41,8 @@ data class AttachmentHandlers(
     val updateExportPath: (String) -> Unit = {},
     val exportFile: (String) -> Unit = {},
     val cancel: (String) -> Unit = {},
+    val chooseImportFile: () -> Unit = {},
+    val chooseExportTarget: () -> Unit = {},
 ) {
     companion object {
         val None = AttachmentHandlers()
@@ -113,11 +115,18 @@ fun AttachmentPanel(
                     singleLine = true,
                     label = { Text("本机文件绝对路径（演示用输入框）") },
                 )
-                Button(
-                    onClick = handlers.importFile,
-                    enabled = state.ready && !state.busy && state.importPath.isNotBlank(),
-                    modifier = Modifier.semantics { contentDescription = "加密导入该文件" },
-                ) { Text("加密导入") }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(
+                        onClick = handlers.chooseImportFile,
+                        enabled = state.ready && !state.busy,
+                        modifier = Modifier.semantics { contentDescription = "打开文件选择器选择要导入的文件" },
+                    ) { Text("选择文件…", style = MaterialTheme.typography.labelMedium) }
+                    Button(
+                        onClick = handlers.importFile,
+                        enabled = state.ready && !state.busy && state.importPath.isNotBlank(),
+                        modifier = Modifier.semantics { contentDescription = "加密导入该文件" },
+                    ) { Text("加密导入") }
+                }
 
                 HorizontalDivider(color = Color(0xFFE1E6E1))
                 Text("本机附件（真实状态）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
@@ -157,6 +166,13 @@ fun AttachmentPanel(
                     singleLine = true,
                     label = { Text("导出目标绝对路径") },
                 )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(
+                        onClick = handlers.chooseExportTarget,
+                        enabled = state.ready && !state.busy,
+                        modifier = Modifier.semantics { contentDescription = "选择导出目标位置" },
+                    ) { Text("选择导出位置…", style = MaterialTheme.typography.labelMedium) }
+                }
                 state.attachments.lastOrNull()?.let { latest ->
                     Button(
                         onClick = { handlers.exportFile(latest.attachmentId) },

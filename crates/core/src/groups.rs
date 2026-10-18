@@ -50,7 +50,10 @@ pub const MAX_CREDENTIAL_BYTES: usize = 128;
 /// 本切片支持的群策略版本（尚无策略表；固定为 1 并随快照持久化）。
 pub const GROUP_POLICY_VERSION: u32 = 1;
 /// 快照记录格式版本（进入持久记录体，不可静默兼容旧版本）。
-const SNAPSHOT_VERSION: u8 = 2;
+///
+/// v3：增加 `pending_removed`（已本地生效但尚未被接受合并的移除）与
+/// `last_control_cleared`（最近一次被丢弃的控制提交，CRYPTO-008）。
+const SNAPSHOT_VERSION: u8 = 3;
 /// 快照记录的 storage group_id 命名空间前缀。
 const SNAPSHOT_GROUP_PREFIX: &str = "grpmeta/";
 /// 快照记录体上限（字节）。
@@ -249,8 +252,31 @@ pub struct GroupView {
     pub members: Vec<GroupMemberView>,
     /// pending 追加成员（声明身份；被接受后才会进入 `members`）。
     pub pending_members: Vec<GroupMemberView>,
+    /// 已移除但**尚未合并**的成员：接受移除提交后彻底消失，丢弃则恢复为正式成员。
+    pub pending_removed: Vec<GroupMemberView>,
     /// 未决控制提交（没有则为 `None`）。
     pub pending: Option<GroupPendingView>,
+    /// 最近一次被丢弃的控制提交（CRYPTO-008 的审计投影）。
+    pub last_control_cleared: Option<GroupControlClearedView>,
+}
+
+/// 被丢弃控制提交的投影（只含公开绑定信息与稳定原因码）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupControlClearedView {
+    /// 被丢弃的操作种类（`add_members` / `remove_members` / `self_update`）。
+    pub operation: String,
+    /// 提交基于的 epoch。
+    pub base_epoch: u64,
+    /// 提交本应到达的 epoch。
+    pub target_epoch: u64,
+    /// 提交摘要（小写 hex，可与节点/协调者记录核对）。
+    pub commit_digest: String,
+    /// 稳定原因码（`operator_discarded` / `node_rejected` / `coordinator_timeout` / `operator_cancelled` / `stale_control_head`）。
+    pub reason_code: String,
+    /// 调用方给的脱敏说明。
+    pub detail: String,
+    /// 丢弃时间（Unix 毫秒）。
+    pub cleared_at_ms: i64,
 }
 
 /// 持久快照记录体（storage 密封；本模块独占 `grpmeta/` 命名空间）。
@@ -268,6 +294,24 @@ struct GroupRecord {
     verified_log_hash: String,
     members: Vec<RecordMember>,
     pending_members: Vec<RecordMember>,
+    /// 已被移除（本地策略已生效）但**尚未合并**的成员：接受移除提交后清空，丢弃则恢复。
+    #[serde(default)]
+    pending_removed: Vec<RecordMember>,
+    /// 最近一次被丢弃的控制提交（CRYPTO-008）；只做审计，不参与策略版本。
+    #[serde(default)]
+    last_control_cleared: Option<RecordControlCleared>,
+}
+
+/// 被丢弃的控制提交（只含公开绑定信息与稳定原因码）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RecordControlCleared {
+    operation: String,
+    base_epoch: u64,
+    target_epoch: u64,
+    commit_digest: String,
+    reason_code: String,
+    detail: String,
+    cleared_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -298,15 +342,38 @@ impl GroupRecord {
         Digest::from_hex(&self.verified_log_hash)
             .map_err(|_| GroupError::corrupted("persisted log hash is malformed"))?;
         if self.members.is_empty()
-            || self.members.len() + self.pending_members.len() > MAX_GROUP_MEMBERS
+            || self.members.len() + self.pending_members.len() + self.pending_removed.len()
+                > MAX_GROUP_MEMBERS
         {
             return Err(GroupError::corrupted(
                 "persisted group member list is empty or oversized",
             ));
         }
+        if let Some(cleared) = &self.last_control_cleared {
+            if cleared.operation.is_empty() || cleared.operation.len() > 32 {
+                return Err(GroupError::corrupted(
+                    "persisted control-clear note has an unknown operation",
+                ));
+            }
+            if cleared.reason_code.is_empty() || cleared.reason_code.len() > 64 {
+                return Err(GroupError::corrupted(
+                    "persisted control-clear note has an invalid reason code",
+                ));
+            }
+            if cleared.commit_digest.len() != 64 {
+                return Err(GroupError::corrupted(
+                    "persisted control-clear note has a malformed commit digest",
+                ));
+            }
+        }
         let mut seen: Vec<&str> = Vec::new();
         let mut owners = 0usize;
-        for member in self.members.iter().chain(self.pending_members.iter()) {
+        for member in self
+            .members
+            .iter()
+            .chain(self.pending_members.iter())
+            .chain(self.pending_removed.iter())
+        {
             validate_credential(&member.credential)?;
             if seen.contains(&member.credential.as_str()) {
                 return Err(GroupError::corrupted(
@@ -493,10 +560,13 @@ fn apply_domain_policy(record: &mut GroupRecord, policy: &GroupSnapshot) -> Grou
     record.verified_sequence = policy.verified_sequence;
     record.verified_log_hash = policy.verified_log_hash.to_hex();
     let mut confirmed = Vec::with_capacity(record.members.len());
+    let mut removed = Vec::new();
     for member in &record.members {
         let account = account_id_for(&member.credential);
         let Some(updated) = policy.member(account) else {
-            // 已被移除：从正式成员里去掉（唯一群主不变量由下面的 validate 再兜一次）。
+            // 已被移除：本地策略立即生效（不出现在正式成员里），但保留在 pending_removed，
+            // 以便控制提交被接受后彻底删除、被丢弃时恢复（CRYPTO-007/008）。
+            removed.push(member.clone());
             continue;
         };
         let mut updated_member = member.clone();
@@ -505,6 +575,9 @@ fn apply_domain_policy(record: &mut GroupRecord, policy: &GroupSnapshot) -> Grou
         confirmed.push(updated_member);
     }
     record.members = confirmed;
+    if !removed.is_empty() {
+        record.pending_removed = removed;
+    }
     record.validate()
 }
 
@@ -555,6 +628,17 @@ fn project(
             pending: true,
         })
         .collect();
+    let pending_removed = record
+        .pending_removed
+        .iter()
+        .map(|member| GroupMemberView {
+            credential: member.credential.clone(),
+            role: role_of(member.role),
+            muted: member.muted,
+            is_local: member.is_local,
+            pending: false,
+        })
+        .collect();
     GroupView {
         group_id: record.group_id.clone(),
         name: record.name.clone(),
@@ -572,7 +656,20 @@ fn project(
         state_version,
         members,
         pending_members,
+        pending_removed,
         pending: pending.map(pending_view),
+        last_control_cleared: record
+            .last_control_cleared
+            .as_ref()
+            .map(|cleared| GroupControlClearedView {
+                operation: cleared.operation.clone(),
+                base_epoch: cleared.base_epoch,
+                target_epoch: cleared.target_epoch,
+                commit_digest: cleared.commit_digest.clone(),
+                reason_code: cleared.reason_code.clone(),
+                detail: cleared.detail.clone(),
+                cleared_at_ms: cleared.cleared_at_ms,
+            }),
     }
 }
 
@@ -767,6 +864,8 @@ pub fn create_group(
                 joined_sequence: 1,
             })
             .collect(),
+        pending_removed: Vec::new(),
+        last_control_cleared: None,
     };
     record.validate()?;
     // 建群时先自检策略快照不变量（全零头 + 唯一群主）。
@@ -1008,4 +1107,172 @@ pub fn rename_group(
     let saved = persist_snapshot(store, &record, record.mls_epoch)?;
     Ok(project(&record, record.mls_epoch, None, saved))
 }
+
+/// 从正式库恢复该群的本地 MLS 设备。
+///
+/// 接受/丢弃之后，调用方手里的内存设备可能已过期（丢弃只改库与恢复出的设备）：
+/// 需要继续治理时用本函数重新装载，绝不复用手持的旧状态。
+pub fn load_group_device(store: &Store, group_id: &str) -> GroupResult<MlsDevice> {
+    let (record, _) = load_record(store, group_id)?;
+    MlsDevice::import_from_store(store, &record.mls_group_key).map_err(|_| {
+        GroupError::corrupted("the persisted MLS group state could not be restored")
+    })
+}
+
+/// 丢弃原因 → 稳定原因码（crypto 的拒绝证据只接受静态短语）。
+fn rejection_code(reason: &str) -> &'static str {
+    match reason {
+        "node_rejected" | "coordinator_rejected" => "node_rejected",
+        "coordinator_timeout" | "timeout" => "coordinator_timeout",
+        "stale_control_head" | "stale_head" => "stale_control_head",
+        "operator_cancelled" | "cancelled" => "operator_cancelled",
+        _ => "operator_discarded",
+    }
+}
+
+/// 校验调用方给的丢弃说明（有界、无控制字符；只做诊断，绝不进入节点公开元数据）。
+fn validate_reason_detail(reason: &str) -> GroupResult<String> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_CREDENTIAL_BYTES {
+        return Err(GroupError::invalid_input(
+            "discard reason must be 1..=128 bytes",
+        ));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(GroupError::invalid_input(
+            "discard reason must not contain control characters",
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// 从正式库恢复的 pending 证据（与调用方设备交叉校验后才用于合并/丢弃）。
+fn persisted_pending(
+    store: &Store,
+    record: &GroupRecord,
+) -> GroupResult<(MlsDevice, PendingControl)> {
+    let device = MlsDevice::import_from_store(store, &record.mls_group_key).map_err(|_| {
+        GroupError::corrupted("the persisted MLS group state could not be restored")
+    })?;
+    let pending = device
+        .pending_control()
+        .map_err(GroupError::from)?
+        .ok_or_else(|| {
+            GroupError::new(
+                "PENDING_MISMATCH",
+                "no control commit is persisted for this group",
+            )
+        })?;
+    Ok((device, pending))
+}
+
+/// CRYPTO-007 接线：接受并合并该群当前的控制提交。
+///
+/// 语义（**本地接受证据 ≠ 节点回执**）：
+/// - 接受证据**只来自正式库**的持久 pending 记录（group/base_epoch/target_epoch/提交摘要），
+///   不臆造字段；只有在调用方设备持有**同一个**提交时才合并（不一致 → `STATE_CORRUPTED`）；
+/// - 合并成功后 epoch 前进到 `target_epoch`、pending 清空；
+///   `add_members` 的 pending 成员在此刻**正式入群**，`remove_members` 的待移除成员被彻底删除；
+/// - 合并失败（含第二次接受）保持 pending 与旧 epoch（无半更新）；
+/// - 本函数**不代表节点已接受**：真实部署必须先拿到节点/协调者的接受回执（NODE 侧），
+///   本轮把它作为本地一致性收口（见 groups.md 的限制说明）。
+pub fn accept_pending_control(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    group_id: &str,
+) -> GroupResult<GroupView> {
+    let (mut record, _) = load_record(store, group_id)?;
+    let group_key = device
+        .group_key()
+        .map_err(|_| GroupError::invalid_target("the local device has no MLS group"))?;
+    if group_key != record.mls_group_key {
+        return Err(GroupError::invalid_target(
+            "the local device is not in this group",
+        ));
+    }
+    let (_persisted, stored_pending) = persisted_pending(store, &record)?;
+    let live_pending = device
+        .pending_control()
+        .map_err(GroupError::from)?
+        .ok_or_else(|| {
+            GroupError::new(
+                "PENDING_MISMATCH",
+                "the local device holds no pending control commit",
+            )
+        })?;
+    if live_pending != stored_pending {
+        return Err(GroupError::corrupted(
+            "persisted and local pending control commits differ",
+        ));
+    }
+    let acceptance = stored_pending.acceptance();
+    let merged = device
+        .merge_accepted_pending(&acceptance, store)
+        .map_err(GroupError::from)?;
+    // 合并后的真实值：epoch 前进；pending 清空（记录里也不需要 pending 副本）。
+    record.mls_epoch = merged.new_epoch;
+    match merged.operation.code() {
+        "add_members" => {
+            // 追加成员在此刻正式入群（角色按创建时的声明）。
+            let promoted: Vec<RecordMember> = record.pending_members.drain(..).collect();
+            record.members.extend(promoted);
+        }
+        "remove_members" => {
+            // 移除在此刻彻底生效：待移除列表清空（成员不再回来）。
+            record.pending_removed.clear();
+        }
+        _ => {}
+    }
+    // 接受/合并是对既有策略记录的确认，不改变 policy_version（也不回退）。
+    let saved = persist_snapshot(store, &record, record.mls_epoch)?;
+    Ok(project(&record, merged.new_epoch, None, saved))
+}
+
+/// CRYPTO-008 接线：丢弃当前 pending 控制提交，回滚到上一完整状态。
+///
+/// 语义：
+/// - 拒绝证据同样只来自正式库的持久 pending 记录（绑定 group/base_epoch/提交摘要）；
+/// - 丢弃后 epoch **不变**，pending 清空；`policy_version 不回退`（本地策略记录保留），
+///   并写入 `last_control_cleared` 审计记录（操作/epoch/摘要/原因码/说明/时间）；
+/// - `add_members` 的 pending 成员从未入群 → 直接丢弃；`remove_members` 的待移除成员**恢复**为正式成员；
+/// - 丢弃失败（含没有 pending 时）保持现状，不留半更新。
+pub fn discard_pending_control(
+    store: &mut Store,
+    group_id: &str,
+    reason: &str,
+) -> GroupResult<GroupView> {
+    let detail = validate_reason_detail(reason)?;
+    let (mut record, _) = load_record(store, group_id)?;
+    let (mut device, stored_pending) = persisted_pending(store, &record)?;
+    let rejection = stored_pending.rejection(rejection_code(reason));
+    let discarded = device
+        .discard_rejected_pending(&rejection, store)
+        .map_err(GroupError::from)?;
+    if discarded.epoch != stored_pending.base_epoch {
+        return Err(GroupError::corrupted(
+            "discarding a control commit changed the local epoch",
+        ));
+    }
+    match discarded.operation.code() {
+        "add_members" => record.pending_members.clear(),
+        "remove_members" => {
+            // 回滚：本地策略已生效的移除被撤销，成员恢复为正式成员。
+            let restored: Vec<RecordMember> = record.pending_removed.drain(..).collect();
+            record.members.extend(restored);
+        }
+        _ => {}
+    }
+    record.last_control_cleared = Some(RecordControlCleared {
+        operation: discarded.operation.code().to_owned(),
+        base_epoch: stored_pending.base_epoch,
+        target_epoch: stored_pending.target_epoch,
+        commit_digest: hex_lower(&stored_pending.commit_digest),
+        reason_code: discarded.reason.to_owned(),
+        detail,
+        cleared_at_ms: now_ms(),
+    });
+    let saved = persist_snapshot(store, &record, record.mls_epoch)?;
+    Ok(project(&record, discarded.epoch, None, saved))
+}
+
 

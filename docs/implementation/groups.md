@@ -1,6 +1,6 @@
 # 小群创建、邀请与治理用例
 
-阶段：P3。状态：函数级设计；GROUPS-001 建群与 GROUPS-002 快照已实现（真实 OpenMLS + 正式加密库），成员治理的角色变更（`set_role`）与禁言（`set_muted`）也已实现（DOMAIN-002/004 策略层 + CRYPTO-005 控制提交）；移除成员（`remove_member`）与改名（`rename_group`）也已实现（同一条 DOMAIN-002/004 + CRYPTO-005 流程）；其余治理函数未开始。目标源码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)。
+阶段：P3。状态：函数级设计；GROUPS-001 建群与 GROUPS-002 快照已实现（真实 OpenMLS + 正式加密库），成员治理的角色变更（`set_role`）与禁言（`set_muted`）也已实现（DOMAIN-002/004 策略层 + CRYPTO-005 控制提交）；移除成员（`remove_member`）与改名（`rename_group`）也已实现（同一条 DOMAIN-002/004 + CRYPTO-005 流程）；控制提交的**接受合并（`accept_pending_control`）与丢弃回滚（`discard_pending_control`）**也已接线（CRYPTO-007/008）；其余治理函数未开始。目标源码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)。
 
 本章对应 GroupService 的完整业务入口。所有管理操作都是待确认票据；UI 读取正式快照与 pending 列表分别显示。邀请加入分为业务接受、KeyPackage 获取、正式 Commit、Welcome 投递四步。重加入需要当前成员明确授权，不直接从节点读取群密钥。
 
@@ -263,10 +263,13 @@ operation_status(ticket: OperationTicket) -> Result<GroupOperationStatus>
 
 **完成验收**：
 
-- [ ] 旧 head 重建显示同业务意图新尝试。
-- [ ] 节点离线永不 Accepted。
+- [ ] 旧 head 重建显示同业务意图新尝试。（未实现：没有 operation ticket 与 expected head CAS）
+- [x] 节点离线永不 Accepted。（本轮**不会**把本地接受当成节点接受：`SendStepView`/`GroupView` 的状态来自持久快照，节点回执仍未接线；见“控制提交接受与合并实现记录”的语义说明）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（状态投影侧）。`group_snapshot` 如实返回 `pending`（base/target epoch、added/removed、提交摘要）
+与 `last_control_cleared`（最近一次被丢弃的提交：操作/摘要/原因码/说明/时间），**不把本地接受伪装成节点接受**；
+`accept_pending_control` / `discard_pending_control` 负责把 pending 收口为合并或丢弃。待实现：通用 operation ticket、
+按节点日志对账（NODE-006/007）、跨设备撤销子任务展开。
 
 <a id="groups-008"></a>
 
@@ -712,13 +715,101 @@ cargo test --offline -p chat-core                            # 109 passed（既�
 
 ### 已知限制
 
-1. **控制提交未接受/合并**：与 set_role 相同——`merge_accepted_pending` 与节点回执未接线，本轮把“策略快照
-   已写入”视为本地生效，pending 如实报告。
-2. **一次只有一个治理操作在飞**：有未决提交时策略层与第二个 MLS 提交都显式拒绝（批量治理要等接受/合并）。
+1. **控制提交的收口已接线（见下一节）**：`accept_pending_control` / `discard_pending_control` 现在能把 pending
+   合并或丢弃；节点回执仍未接线（“本地接受证据 ≠ 节点回执”）。
+2. **一次只有一个治理操作在飞**：有未决提交时策略层与第二个 MLS 提交都显式拒绝；接受/合并或丢弃之后才能继续。
 3. **只能移除确认成员**：建群时追加的成员在被协调者接受前是 pending，不能被 `remove_member` 处理。
 4. **账户/设备标识仍是派生占位**（见上一节第 5 条）；移除按 MLS 凭据文本定位，账户目录接入后要改用真实 ID。
 5. **不联网**：不改节点群日志、不投递 Commit/Welcome；改名也不写节点公开元数据（名字只在本地密封快照里）。
 6. 待实现：按设备撤销（GROUPS-008）、转让群主（010）、退出（011）、解散（012）。
+
+## 控制提交接受与合并实现记录（accept_pending_control / discard_pending_control，2026-10-18，Windows x64）
+
+代码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)（同一文件，无新依赖）；测试：
+[crates/core/tests/groups_commit.rs](../../crates/core/tests/groups_commit.rs)（7 个用例，真实 OpenMLS + 临时正式加密库）。
+
+### 公开面
+
+~~~text
+pub fn accept_pending_control(device: &mut MlsDevice, store: &mut Store, group_id: &str) -> GroupResult<GroupView>
+pub fn discard_pending_control(store: &mut Store, group_id: &str, reason: &str) -> GroupResult<GroupView>
+pub fn load_group_device(store: &Store, group_id: &str) -> GroupResult<MlsDevice>   // 丢弃后重新装载设备
+~~~
+
+`GroupView` 新增 `pending_removed`（本地已移除但尚未合并的成员）与 `last_control_cleared`
+（最近一次被丢弃提交的审计投影：操作/base-target epoch/提交摘要/原因码/说明/时间）。
+
+### 关键语义
+
+1. **接受证据只来自正式库，不臆造**：`accept_pending_control` 先从库恢复一份设备、取出持久 pending 记录
+   （`PendingControl`：group_id/base_epoch/target_epoch/commit_digest），并要求调用方设备持有**同一个**提交
+   （不一致 → `STATE_CORRUPTED`；任一侧没有 pending → `PENDING_MISMATCH`）；之后才调用 CRYPTO-007
+   `merge_accepted_pending(&acceptance, store)`。
+2. **合并后的真实值**：epoch 前进到 `target_epoch`、pending 清空；`add_members` 的 pending 成员此刻
+   **正式入群**，`remove_members` 的待移除成员被彻底删除；`policy_version` 不变（接受是对既有策略记录的确认）。
+3. **丢弃 = 回滚到上一完整状态**：拒绝证据同样来自持久 pending 记录；epoch **不变**、pending 清空、
+   `policy_version 不回退`（本地策略记录保留），并写入 `last_control_cleared`；`add_members` 的 pending
+   成员直接丢弃（从未入群），`remove_members` 的待移除成员**恢复**为正式成员。
+4. **失败不留半状态**：没有 pending / 设备不属于该群 / 证据不匹配都在写入前被拒；merge 失败保持 pending 与旧
+   epoch（测试断言 `GroupView` 与失败前完全相等）。
+5. **丢弃后需要重新装载设备**：`discard_pending_control` 按任务签名只拿 store（权威侧是库），调用方手里的
+   内存设备仍持有旧 pending；继续治理前必须用 `load_group_device` 重新装载（否则 crypto 以
+   `INVALID_STATE_TRANSITION` 明确拒绝，不会静默错误推进）。
+
+### 语义边界（重要）
+
+**本地接受证据 ≠ 节点回执**：本轮把“本地持久 pending 记录”当作接受证据，用于把本地状态收口
+（epoch/成员/pending 一致）。它**不证明**节点已接受该 Commit，也没有按节点日志对账。真实部署必须先拿到
+节点/协调者回执（NODE-006/007 + 日志验证），再由上层调用本函数；否则本地 epoch 可能与节点日志不一致。
+“节点离线永不 Accepted”在本轮只做到“本地不伪造节点状态”。
+
+### 错误码（既有冻结码）
+
+| 情形 | code |
+|---|---|
+| 没有 pending（接受/丢弃） | `PENDING_MISMATCH` |
+| 调用方设备与库里的 pending 不一致 | `STATE_CORRUPTED` |
+| 调用方设备不属于该群 / 未知群 | `INVALID_TARGET` |
+| 群 ID 不是 PROTOCOL-001 文本 | `INVALID_ID` |
+| 丢弃原因非法（空/超长/控制字符） | `INVALID_INPUT` |
+| 合并/丢弃后 epoch 不符（crypto 检测） | `STALE_EPOCH` / `STATE_CORRUPTED` |
+| 持久化失败 | storage 冻结码（`STORAGE_*`） |
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test groups_commit   # 7 passed
+cargo test --offline -p chat-core                        # 118 passed（既有 109 全部继续通过；lib 内 36 个用例含并行任务新增）
+~~~
+
+### 证据（测试名 → 覆盖点）
+
+- `groups_commit::accept_merges_the_commit_and_advances_the_epoch`：改角色（pending self_update，base 1→target 2）→
+  接受后 **epoch 2**、pending 清空、`policy_version` 仍 2、角色保留、`state_version` 增长；设备侧 epoch 2 且无
+  pending；快照与返回值一致；**第二次接受 → `PENDING_MISMATCH` 且状态不变**；之后可继续治理（新提交 base_epoch = 2）。
+- `groups_commit::accept_without_pending_is_rejected_and_leaves_state`：没有 pending → `PENDING_MISMATCH`；
+  外来设备 → `INVALID_TARGET`；两次失败后 `GroupView` 与失败前完全相等。
+- `groups_commit::accept_promotes_pending_members_after_an_add_commit`：建群时追加 carol（pending add_members）→
+  接受后 carol 进入正式成员、pending 列表清空、epoch 2。
+- `groups_commit::discard_rolls_back_without_advancing_the_epoch`：移除 bob（pending remove_members）→ 丢弃后
+  **epoch 仍 1**、pending 清空、`policy_version` 保持 2、`last_control_cleared` 记录
+  remove_members/node_rejected/base1/target2/64 位摘要/说明，**bob 恢复为正式成员**；用 `load_group_device`
+  重新装载后再移除并接受 → epoch 2、bob 彻底消失。
+- `groups_commit::discard_of_an_add_commit_drops_the_pending_members`：丢弃 add_members 后 carol 从未入群、
+  pending 列表清空、原因码 coordinator_timeout。
+- `groups_commit::discard_without_pending_is_rejected_and_leaves_state`：没有 pending → `PENDING_MISMATCH`；
+  空/空白/控制字符原因 → `INVALID_INPUT`；失败后仍能正常准备提交并接受。
+- `groups_commit::accepted_state_survives_reopen`：接受后关闭库重开：epoch 2、无 pending、策略版本/控制头/成员一致。
+
+### 已知限制
+
+1. **本地接受 ≠ 节点接受**（见上文语义边界）：没有节点回执校验、没有日志对账；这是本轮最大的语义缺口。
+2. **丢弃后必须重新装载设备**（`load_group_device`），因为丢弃只改库与库恢复出的设备。
+3. **policy_version 不回退**：丢弃只回滚 MLS 提交与成员集合，策略版本按任务约定保留（审计需要）。
+4. **一次只有一个治理操作在飞**：接受或丢弃之后才能准备下一个提交。
+5. **不联网**：不接受对端 Commit（CRYPTO-006 `process_verified_entry` 未接线到 groups）、不投递 Welcome。
+
 
 
 

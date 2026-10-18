@@ -403,7 +403,41 @@ fun main() = application {
         }
     }
 
+    val filePicker = remember { runCatching { DesktopFilePicker(null) }.getOrNull() }
+
     val attachmentHandlers = AttachmentHandlers(
+        chooseImportFile = {
+            scope.launch {
+                val picker = filePicker ?: return@launch
+                runCatching { picker.chooseImportFile() }
+                    .onSuccess { chosen ->
+                        attachmentState = attachmentState.updateImportPath(chosen.path)
+                        attachmentState = attachmentState.copy(
+                            notice = "已选择 " + chosen.displayName + "（" + chosen.sizeBytes + " 字节，令牌 " +
+                                chosen.token.take(16) + "…）",
+                        )
+                    }
+                    .onFailure { error ->
+                        val code = (error as? PlatformFileException)?.code ?: "INVALID_FILE_TOKEN"
+                        if (code != chat.platform.KeyProtectionCodes.USER_AUTH_CANCELLED) {
+                            attachmentState = attachmentState.withError(code, error.message)
+                        }
+                    }
+            }
+        },
+        chooseExportTarget = {
+            scope.launch {
+                val picker = filePicker ?: return@launch
+                runCatching { picker.chooseExportTarget() }
+                    .onSuccess { chosen -> attachmentState = attachmentState.updateExportPath(chosen.path) }
+                    .onFailure { error ->
+                        val code = (error as? PlatformFileException)?.code ?: "INVALID_FILE_TOKEN"
+                        if (code != chat.platform.KeyProtectionCodes.USER_AUTH_CANCELLED) {
+                            attachmentState = attachmentState.withError(code, error.message)
+                        }
+                    }
+            }
+        },
         updateImportPath = { value -> attachmentState = attachmentState.updateImportPath(value) },
         importFile = {
             scope.launch {

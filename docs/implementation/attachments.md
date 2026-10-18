@@ -203,7 +203,7 @@ download_attachment(id: AttachmentId) -> Result<TransferTicket>
 - [x] 重排/替换/缺最后块失败：`attachments::tests::download_rejects_tampered_chunks_and_leaves_no_partial_file`（替换第 2 块 → 分块 AAD 认证失败 → ATTACHMENT_CORRUPTED，删除半成品、不产生目标文件与临时文件）、`download_works_after_restart_and_rejects_unknown_blobs`（节点缺块/未知 blob → ATTACHMENT_NOT_FOUND）、`download_rejects_a_wrong_manifest_before_reading_any_chunk`（与本地记录不一致的 manifest 在任何网络读取前被拒）。
 - [x] 断点续传（重启后只拉缺块）：`attachments::tests::download_resumes_after_restart_and_reads_only_missing_chunks`（第 3 块读取失败 → 前 2 块已解密写出并持久化前缀摘要 → 重开 store → 只读剩余 1 块、输出与原文字节一致、进度与半成品清理；半成品被篡改时拒绝续传并从头重下）。取消下载仍没有单独入口（取消走 ATTACHMENTS-007）。
 
-**实现状态**：已实现（编排 + 状态机 + 断点续传，Windows x64 实测）。`PersistedAttachmentStore::download_attachment(blob_id, expected_manifest, destination, &mut transport)`：只接受 available/downloading 记录；先用 expected_manifest 与本地持久化记录（块数/块大小/明文大小/密文摘要）比对，不一致在任何网络读取前 `ATTACHMENT_CORRUPTED`；按迁移 0008 的进度位图续传：跳过已确认块、追加写同目录半成品、每块成功后持久化“已确认位图 + 已写前缀的明文摘要”，续传前重新读取本地前缀并核对摘要（不符则丢弃进度从头重下）；全部块认证通过后校验**明文大小 + 明文 SHA-256**（从头开始的完整下载额外校验密文整文件摘要）再 rename；损坏类错误删除半成品与进度，传输类错误保留两者供续传；解密用进程内 FileKey，缺失时先从 `attachment_secrets` 恢复（重启后仍可下载），密钥记录确实缺失才 `ATTACHMENT_KEY_UNAVAILABLE`。下载成功后把**收到的分块密文原样**写入本地加密缓存（复用 import 的缓存目录/文件名与同一 FileKey，不重新生成密钥），并按缓存块重算密文摘要校验后才把记录标 available；此后 `attachment_status` 的 available_chunks 为满、`export_attachment` 不联网也能导出（见"下载写入本地缓存与终态进度清理"）。证据：`download_roundtrip_matches_the_original_plaintext`、`download_works_after_restart_and_rejects_unknown_blobs`、`download_resumes_after_restart_and_reads_only_missing_chunks`、`download_fills_the_local_cache_for_offline_export`、`failed_download_rolls_back_new_cache_chunks`、上面三条拒绝用例。限制：**续传完成的下载不写缓存**（前缀密文已不在内存，见"下载写入本地缓存与终态进度清理"的限制）；下载进度与半成品绑定同一目标路径（换目标目录视为新下载）；无 CAPABILITY_EXPIRED（下载能力令牌属 E2EE SecretDescriptor）；节点读取授权由 `NodeBlobTransport` 适配层承载（NODE-015：上传设备本人恒可读）。
+**实现状态**：已实现（编排 + 状态机 + 断点续传，Windows x64 实测）。`PersistedAttachmentStore::download_attachment(blob_id, expected_manifest, destination, &mut transport)`：只接受 available/downloading 记录；先用 expected_manifest 与本地持久化记录（块数/块大小/明文大小/密文摘要）比对，不一致在任何网络读取前 `ATTACHMENT_CORRUPTED`；按迁移 0008 的进度位图续传：跳过已确认块、追加写同目录半成品、每块成功后持久化“已确认位图 + 已写前缀的明文摘要”，续传前重新读取本地前缀并核对摘要（不符则丢弃进度从头重下）；全部块认证通过后校验**明文大小 + 明文 SHA-256**（从头开始的完整下载额外校验密文整文件摘要）再 rename；损坏类错误删除半成品与进度，传输类错误保留两者供续传；解密用进程内 FileKey，缺失时先从 `attachment_secrets` 恢复（重启后仍可下载），密钥记录确实缺失才 `ATTACHMENT_KEY_UNAVAILABLE`。下载成功后把**收到的分块密文原样**写入本地加密缓存（复用 import 的缓存目录/文件名与同一 FileKey，不重新生成密钥），并按缓存块重算密文摘要校验后才把记录标 available；此后 `attachment_status` 的 available_chunks 为满、`export_attachment` 不联网也能导出（见"下载写入本地缓存与终态进度清理"）。证据：`download_roundtrip_matches_the_original_plaintext`、`download_works_after_restart_and_rejects_unknown_blobs`、`download_resumes_after_restart_and_reads_only_missing_chunks`、`download_fills_the_local_cache_for_offline_export`、`failed_download_rolls_back_new_cache_chunks`、上面三条拒绝用例。续传完成的下载也会补齐缓存（前缀块从节点补读 + 逐块 AEAD 校验后写入，见"续传下载补齐缓存与本地缓存回收"）；下载进度与半成品绑定同一目标路径（换目标目录视为新下载）；无 CAPABILITY_EXPIRED（下载能力令牌属 E2EE SecretDescriptor）；节点读取授权由 `NodeBlobTransport` 适配层承载（NODE-015：上传设备本人恒可读）。
 
 <a id="attachments-006"></a>
 
@@ -300,10 +300,11 @@ collect_unreferenced_attachments(now: Time, budget: GcBudget) -> Result<GcReport
 
 **完成验收**：
 
-- [ ] 活跃上传/已接受消息引用不能删除。
+- [x] 有附件记录引用的缓存不删：`attachments::tests::collect_removes_only_unreferenced_cache_directories`（两条有记录的附件缓存目录原样保留，含其分块文件）。
+- [ ] 活跃上传/已接受消息引用不能删除。（本层只按附件记录引用判断；消息/任务级引用计数与"两阶段 GC 标记"未实现）
 - [ ] crash 后能继续回收。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：本地缓存回收部分已实现（Windows x64 实测）。`PersistedAttachmentStore::collect_unreferenced_attachments() -> CollectReport`：先短事务读出有记录引用的附件 ID 集合（storage 新增 `attachment_ids()`，只读 ID、不解密记录），再扫描缓存根下的目录——只处理名字符合 `att-<32hex>` 的目录，无引用才删除并统计释放字节；名字异常的目录/散落文件一律不动；扫描项数有界（`MAX_COLLECT_SCAN_ENTRIES = 10_000`）；返回 `{ removed_directories, freed_bytes, scanned_entries }`。幂等：无孤儿时返回 0。证据：`collect_removes_only_unreferenced_cache_directories`（只删孤儿、保留有引用目录、异常名字与文件不动、重复调用 0、删除记录后其目录变为孤儿可回收）。限制：不做 staging/取消/过期宽限期，不做消息引用计数，不记录两阶段 GC 标记；文件系统与 DB 不是原子的（先删文件再返回，失败下次幂等重做）。通过本函数用例不自动代表整个模块完成。
 
 ## 上传/下载接块传输端口实现记录（ATTACHMENTS-003 / 005，2026-10-18，Windows x64）
 
@@ -659,15 +660,67 @@ cargo test --offline -p chat-storage -p chat-core                # 90 + 109 全�
 
 ### 已知限制
 
-1. **续传完成的下载不写缓存**：前缀块的密文在上一轮没有保留（任务 38 只保留明文半成品），
-   当前实现只在 `skip == 0` 的完整下载里写缓存；续传成功后缓存仍为空，要离线 export 需要
-   重新完整下载一次（或等后续把半成品改成密文形态）。
+1. **续传下载会为缓存补读前缀块**：前缀密文在上一轮没有保留（任务 38 只保留明文半成品），
+   续传成功后从节点补读缺失前缀块、逐块 AEAD 校验并与本地已写明文比对后写缓存，因此续传
+   的读取次数 = 剩余块 + 缺失前缀块（见"续传下载补齐缓存与本地缓存回收"）；这一步失败时按
+   可重试错误处理，保留进度与半成品。
 2. 缓存保存的是**节点密文**而非本地重新加密：换节点/换上传者的密文布局时，缓存仍可用
    （解密只依赖 FileKey 与分块 AAD），但本地缓存与节点对象字节一一对应。
 3. 没有缓存 TTL/配额回收（ATTACHMENTS-008 未实现）；`purge_stale_transfer_progress` 只清进度，
    不清缓存块。
 4. 下载成功且目标文件写出后，缓存写入失败会整体报错（不会留下“目标在、缓存半份”的假成功）；
    此时目标文件已 rename 完成，属于可重试的本地 IO 失败。
+
+## 续传下载补齐缓存与本地缓存回收（R-44，2026-10-18，Windows x64）
+
+### 1) 续传下载也写缓存
+
+- 任何一次成功下载（含续传）之后，本地缓存都必须完整，才能离线 export。
+- 本次真正读取到的块：密文原样写入缓存（与清单字节一致）。
+- 续传跳过的前缀块：成功校验整文件明文摘要后，从节点**补读**每个缺失块 → 用同一 FileKey
+  逐块 AEAD 解密校验 → 与本地半成品对应区间逐字节比对 → 才写进缓存；任何不一致
+  `ATTACHMENT_CORRUPTED`。
+- 补读失败按可重试传输错误处理（保留进度/半成品，下次继续）；写完后
+  `finish_cached_download` 用缓存块重算整段密文摘要并与记录比对，一致才标 available。
+- 失败策略：终态失败回滚本次新写缓存块；可重试失败保留已校验的缓存块（续传不必重读）。
+
+### 2) ATTACHMENTS-008 本地缓存回收
+
+`PersistedAttachmentStore::collect_unreferenced_attachments() -> CollectReport`：
+短事务读「有记录引用的附件 ID 集合」→ 扫描缓存根目录，只对名字符合 `att-<32hex>` 且
+无记录引用的目录执行删除，返回 `{ removed_directories, freed_bytes, scanned_entries }`。
+名字异常的目录/散落文件不动；扫描项数有界；幂等（无孤儿时返回 0）。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --lib                          # 36 passed
+cargo test --offline -p chat-storage -p chat-core                # 90 + 118 全绿
+~~~
+
+### 证据
+
+- `attachments::tests::resumed_download_fills_the_cache_for_offline_export`：清空缓存 →
+  第 3 块读取失败（保留前 2 块缓存与进度）→ 再清空缓存模拟“前缀密文丢失” → 续传：
+  读取次数 = 3（1 个剩余块 + 2 个补读前缀块）、缓存块与节点密文逐字节一致、
+  `available_chunks == chunk_count`、**不联网也能 export** 且与原文一致。
+- `attachments::tests::collect_removes_only_unreferenced_cache_directories`：孤儿目录
+  （含嵌套子目录，123 字节）被删除并统计释放字节；有记录引用的两个目录与其分块保留；
+  异常名字目录（`att-SHORT`、大写 hex、`notes`）与散落文件都不动；重复调用 0；
+  删除附件记录后其目录变为孤儿并被回收。
+- 既有回归：`download_resumes_after_restart_and_reads_only_missing_chunks` 仍成立
+  （可重试失败保留缓存前缀块，续传只读剩余块）；`failed_download_rolls_back_new_cache_chunks`
+  仍成立（终态失败回滚本次新写块）。
+
+### 已知限制
+
+1. 续传补读会多一次前缀块的网络读取（只补缺失块，已有缓存的不重复读）。
+2. 回收只按「附件记录」判断引用：消息/任务级引用计数、staging 宽限期与两阶段 GC 标记仍未实现，
+   因此“活跃上传/已接受消息引用不能删除”尚未勾选。
+3. 回收不统计目录自身元数据开销，`freed_bytes` 只累计文件内容字节。
+4. 文件系统删除与 DB 不是同一事务：先删文件再更新计数，失败时下次幂等重做。
+
 
 
 

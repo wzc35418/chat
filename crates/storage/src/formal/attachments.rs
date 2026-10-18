@@ -452,6 +452,23 @@ impl Store {
         }
     }
 
+    /// 列出全部附件 ID（按 ID 升序，上限 MAX_ATTACHMENTS）：供缓存回收判断“有无记录引用”。
+    ///
+    /// 只返回 ID，不解密任何记录；坏记录不会阻塞回收扫描（回收只看 ID 引用）。
+    pub fn attachment_ids(&self) -> Result<Vec<String>> {
+        self.ensure_ready()?;
+        let mut statement = self.connection().prepare(
+            "SELECT attachment_id FROM attachments ORDER BY attachment_id ASC LIMIT ?1",
+        )?;
+        let rows =
+            statement.query_map([i64::from(MAX_ATTACHMENTS)], |row| row.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
+    }
+
     /// 读取一条附件记录；不存在返回 None，损坏返回 STATE_CORRUPTED。
     pub fn load_attachment(&self, attachment_id: &str) -> Result<Option<AttachmentRecord>> {
         self.ensure_ready()?;
