@@ -53,6 +53,8 @@ data class StoreHandlers(
     val syncStart: () -> Unit = {},
     val syncStop: () -> Unit = {},
     val syncRefresh: () -> Unit = {},
+    val loadMessageAttachments: () -> Unit = {},
+    val exportCard: (String) -> Unit = {},
 ) {
     companion object {
         val None = StoreHandlers()
@@ -320,6 +322,53 @@ fun LocalStorePanel(
                         style = MaterialTheme.typography.labelSmall,
                         color = Color(0xFF5F6B63),
                     )
+                }
+
+                HorizontalDivider(color = Color(0xFFE1E6E1))
+                HorizontalDivider(color = Color(0xFFE1E6E1))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("消息附件卡片", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                    TextButton(
+                        onClick = handlers.loadMessageAttachments,
+                        enabled = state.ready && !state.busy,
+                        modifier = Modifier.semantics { contentDescription = "读取当前会话消息的附件卡片" },
+                    ) { Text("读取附件", style = MaterialTheme.typography.labelMedium) }
+                }
+                if (state.messageCards.isEmpty()) {
+                    Text("还没有读取；读取后按消息展示附件（名称/大小/状态）。", style = MaterialTheme.typography.bodySmall)
+                } else {
+                    state.messageCards.entries.take(6).forEach { (messageId, cards) ->
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                "消息 " + messageId.take(14) + "…",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color(0xFF5F6B63),
+                            )
+                            if (cards.isEmpty()) {
+                                Text("（无附件）", style = MaterialTheme.typography.labelSmall, color = Color(0xFF5F6B63))
+                            } else {
+                                cards.forEach { card ->
+                                    Row(
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Text(
+                                            card.displayName + " · " + card.sizeLabel + " · " + card.stateLabel +
+                                                if (card.downloadable) "" else " · 不可下载",
+                                            style = MaterialTheme.typography.bodySmall,
+                                        )
+                                        TextButton(
+                                            onClick = { handlers.exportCard(card.attachmentId) },
+                                            enabled = state.ready && !state.busy,
+                                            modifier = Modifier.semantics {
+                                                contentDescription = "导出附件 " + card.displayName
+                                            },
+                                        ) { Text("导出", style = MaterialTheme.typography.labelSmall) }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 HorizontalDivider(color = Color(0xFFE1E6E1))

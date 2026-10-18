@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chat_core::group_node::{
-    ControlReceipt, accept_pending_control_with_receipt, submit_pending_control,
+    ControlIntent, ControlReceipt, accept_pending_control_with_receipt, submit_pending_control,
+    submit_pending_control_with_intent,
 };
 use chat_core::groups::{
     CreateGroupRequest, GroupBootstrapPeer, GroupView, create_group, group_snapshot, set_role,
@@ -511,4 +512,113 @@ fn submit_without_pending_control_fails_explicitly() {
     let _ = &harness.bob;
     let _ = &harness.dir;
     let _ = GroupId::parse(&harness.group_id()).expect("canonical group id");
+}
+#[test]
+fn transfer_ownership_publishes_transfer_metadata_and_is_accepted() {
+    let mut harness = Harness::new();
+    let group_id = harness.group_id();
+    // 群主转让给 bob：真实 MLS 控制提交（SelfUpdate），本地角色立刻降为 member。
+    let transferred = chat_core::groups::transfer_ownership(
+        &mut harness.alice,
+        &mut harness.store,
+        &group_id,
+        "alice",
+        "bob",
+    )
+    .expect("ownership transfers locally");
+    assert_eq!(transferred.epoch, 1, "preparing the commit does not advance the epoch");
+    assert_eq!(transferred.role, MemberRole::Member);
+    let pending = transferred.pending.as_ref().expect("pending control commit");
+    assert_eq!(pending.operation, "self_update");
+
+    // 显式声明“转让”——节点公开元数据必须是 transfer_ownership，而不是 set_role。
+    let receipt = submit_pending_control_with_intent(
+        &harness.alice,
+        &harness.store,
+        &group_id,
+        &harness.client,
+        &ControlIntent::TransferOwnership {
+            target_credential: "bob".to_owned(),
+        },
+    )
+    .expect("the node accepts the transfer");
+    assert_eq!(
+        receipt.candidate.control_metadata.as_ref().expect("metadata").operation,
+        "transfer_ownership"
+    );
+    assert_ne!(
+        receipt.candidate.control_metadata.as_ref().expect("metadata").target_digest,
+        hex_encode(&pending_commit_digest(&harness.alice)),
+        "the target digest must bind the declared target, not just the commit"
+    );
+    // 节点日志里落的也是 transfer_ownership。
+    let log = harness.node_log();
+    assert_eq!(log.len(), 1);
+    assert_eq!(
+        log[0].candidate.candidate.control_metadata.as_ref().expect("metadata").operation,
+        "transfer_ownership"
+    );
+
+    // 回执接受后 epoch 前进、群主易主。
+    let accepted = accept_pending_control_with_receipt(
+        &mut harness.alice,
+        &mut harness.store,
+        &group_id,
+        &receipt,
+    )
+    .expect("the bound receipt is accepted");
+    assert_eq!(accepted.epoch, 2);
+    assert_eq!(accepted.role, MemberRole::Member);
+    let bob = accepted
+        .members
+        .iter()
+        .find(|member| member.credential == "bob")
+        .expect("bob is a member");
+    assert_eq!(bob.role, MemberRole::Owner);
+}
+
+/// pending 提交摘要（测试里用来证明“目标摘要不是提交摘要”）。
+fn pending_commit_digest(device: &chat_crypto::engine::MlsDevice) -> [u8; 32] {
+    device
+        .pending_control()
+        .expect("pending query")
+        .expect("pending commit")
+        .commit_digest
+}
+
+#[test]
+fn legacy_submit_refuses_an_ambiguous_self_update() {
+    let mut harness = Harness::new();
+    let group_id = harness.group_id();
+    chat_core::groups::transfer_ownership(
+        &mut harness.alice,
+        &mut harness.store,
+        &group_id,
+        "alice",
+        "bob",
+    )
+    .expect("ownership transfers locally");
+    // 不声明语义的兼容入口无法区分“转让”与“管理员改角色” → 显式 UNSUPPORTED，且不触网。
+    let error = submit_pending_control(
+        &harness.alice,
+        &harness.store,
+        &group_id,
+        &harness.client,
+    )
+    .expect_err("an ambiguous self update must not be submitted");
+    assert_eq!(error.code(), "PROTOCOL_UNSUPPORTED");
+    assert!(harness.node_log().is_empty(), "nothing was appended");
+    // 显式声明后仍可正常提交。
+    let receipt = submit_pending_control_with_intent(
+        &harness.alice,
+        &harness.store,
+        &group_id,
+        &harness.client,
+        &ControlIntent::TransferOwnership {
+            target_credential: "bob".to_owned(),
+        },
+    )
+    .expect("declaring the intent works");
+    assert_eq!(harness.node_log().len(), 1);
+    let _ = receipt;
 }

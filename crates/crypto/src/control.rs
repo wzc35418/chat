@@ -95,6 +95,11 @@ pub enum ControlOperation {
     },
     /// 更新本机 leaf（密钥轮换）。
     SelfUpdate,
+    /// 本机自移除（主动退出群）：只移除本机设备，生成真实的 RemoveMembers 提交。
+    ///
+    /// 这是比普通 `RemoveMembers` 更窄的能力：不接受任何成员列表，只能作用于本机；
+    /// 普通 `RemoveMembers` 仍显式拒绝移除本机（安全边界不变）。
+    SelfRemoval,
 }
 
 /// 已准备但未被接受的控制提交。只含可发送的密文材料与公开绑定信息，不含密钥。
@@ -145,6 +150,47 @@ impl PendingControl {
     pub fn binds_epoch(&self, epoch: u64) -> bool {
         self.base_epoch == epoch
     }
+}
+
+
+/// 本机自移除提案（MLS 里唯一合法的"主动退出"原语）。
+///
+/// MLS 1.0 禁止成员提交移除自己的 Commit（OpenMLS 直接拒绝），自移除必须：
+/// 1. 本机生成"移除本机 leaf"的提案（本结构返回的 `proposal`，密文形式的 MLS 提案消息）；
+/// 2. 由群里另一名成员把该提案包进 Commit；
+/// 3. 本机处理那条 Commit（`process_verified_entry` 返回 `self_removed = true`）后
+///    才真正离群，此后不能加解密。
+///
+/// 本结构只暴露可转发的提案字节与绑定信息，不含任何密钥；epoch 不因它推进。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSelfRemoval {
+    /// MLS 群 ID（小写十六进制）。
+    pub group_id: String,
+    /// 生成提案时的本地 epoch（提案必须在该 epoch 被提交覆盖）。
+    pub base_epoch: u64,
+    /// 预期移除的成员数（恒为 1：只有本机）。
+    pub removed: u32,
+    /// 是否携带 Welcome（恒为 false：自移除不移入任何成员）。
+    pub has_welcome: bool,
+    /// 序列化的 MLS 提案消息（交给另一成员提交）。
+    pub proposal: Vec<u8>,
+    /// 提案摘要（绑定 group/base_epoch/提案字节，便于对端核对）。
+    pub proposal_digest: [u8; 32],
+}
+
+/// 自移除提案摘要的域分隔标签。
+const SELF_REMOVAL_DIGEST_DOMAIN: &[u8] = b"chat/crypto/self-removal-proposal/v1";
+
+fn self_removal_digest(group_id: &str, base_epoch: u64, proposal: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SELF_REMOVAL_DIGEST_DOMAIN);
+    hasher.update(group_id.as_bytes());
+    hasher.update(base_epoch.to_be_bytes());
+    hasher.update(proposal);
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(digest.as_slice());
+    bytes
 }
 
 /// 节点/协调者已接受该控制提交的证据。只含公开绑定字段，不含密钥。
@@ -344,6 +390,9 @@ pub enum ControlError {
     StateCorrupted(&'static str),
     /// 该条目种类不在 P0 控制切片内。
     UnsupportedEntry(&'static str),
+    /// 自移除不能用 `prepare_control` 生成提交（MLS 禁止成员提交移除自己），
+    /// 必须走 `prepare_self_removal` 生成 SelfRemove/Remove 提案，由另一成员提交。
+    SelfRemovalRequiresProposal,
     /// 正式存储写入失败。
     Storage(StorageError),
     /// 合并已发生，但提交后的快照写库失败（epoch 已推进，需要重试导出）。
@@ -374,6 +423,7 @@ impl ControlError {
             Self::InvalidCredential(_) => "INVALID_CREDENTIAL",
             Self::StateCorrupted(_) => "STATE_CORRUPTED",
             Self::UnsupportedEntry(_) => "UNSUPPORTED_ENTRY",
+            Self::SelfRemovalRequiresProposal => "SELF_REMOVAL_REQUIRES_PROPOSAL",
             Self::Storage(error) | Self::PersistAfterMerge(error) | Self::PersistAfterDiscard(error) => {
                 error.code()
             }
@@ -413,6 +463,9 @@ impl std::fmt::Display for ControlError {
             Self::InvalidCredential(detail) => write!(formatter, "invalid credential: {detail}"),
             Self::StateCorrupted(detail) => write!(formatter, "state corrupted: {detail}"),
             Self::UnsupportedEntry(detail) => write!(formatter, "unsupported entry: {detail}"),
+            Self::SelfRemovalRequiresProposal => formatter.write_str(
+                "MLS forbids a commit that removes self; prepare a self-removal proposal instead",
+            ),
             Self::Storage(error) => write!(formatter, "storage failure: {error}"),
             Self::PersistAfterMerge(error) => {
                 write!(formatter, "control commit merged but persisting it failed: {error}")
@@ -660,7 +713,12 @@ impl MlsDevice {
         }
     }
 
-    /// CRYPTO-005：准备一个控制提交（Add/Remove/SelfUpdate），保存为 pending 并持久化。
+    /// CRYPTO-005：准备一个控制提交（Add/Remove/SelfUpdate/SelfRemoval），保存为 pending 并持久化。
+    ///
+    /// - `SelfRemoval` 只移除本机设备，生成真实 RemoveMembers 提交（removed = 1、
+    ///   无 Welcome）；普通 `RemoveMembers` 仍然拒绝把本机设备列为移除目标。
+    /// - pending 的种类记为 `RemoveMembers`（它确实是一条 MLS RemoveMembers 提交），
+    ///   调用方用操作 context 区分"主动退出"与"被移除"。
     ///
     /// 关键不变量：本调用**不推进**本地 epoch；只有拿到接受证据并 merge 后才推进。
     ///
@@ -828,6 +886,13 @@ impl MlsDevice {
                         indices.len() as u32,
                     )
                 }
+                ControlOperation::SelfRemoval => {
+                    // MLS 1.0 明确禁止"成员提交移除自己"（OpenMLS: "The Commit tried to
+                    // remove self from the group. This is not possible."）。自移除只能以
+                    // 提案形式发起、由另一成员提交，因此这里把它引导到
+                    // `prepare_self_removal`，绝不伪造一条本地自移除提交。
+                    return Err(ControlError::SelfRemovalRequiresProposal);
+                }
                 ControlOperation::SelfUpdate => {
                     let bundle = group
                         .self_update(provider, signer, LeafNodeParameters::default())
@@ -929,6 +994,109 @@ impl MlsDevice {
         self.export_to_store(store)
             .map_err(storage_error)?;
         Ok(pending)
+    }
+
+    /// 本机自移除（CRYPTO-005 的 SelfRemoval 路径）：生成"移除本机 leaf"的 MLS 提案。
+    ///
+    /// 关键语义（为什么不是 Commit）：
+    /// - MLS 1.0 禁止一条 Commit 移除提交者自己（OpenMLS 报
+    ///   "The Commit tried to remove self from the group. This is not possible."），
+    ///   因此本地**无法**生成合法的自移除提交；
+    /// - 唯一合法的自移除原语是"本机对自己发起 Remove 提案"，再由群里另一名成员
+    ///   把该提案包进 Commit。本方法返回可转发的提案字节，并把提案写入本地 proposal store
+    ///   （随群状态快照一起持久化）；
+    /// - 本调用不推进 epoch、不动 pending 控制提交；返回后本机仍在群里（能收发），
+    ///   直到对端提交到达并被处理（`self_removed = true`）才真正离群。
+    ///
+    /// 前置条件：群已初始化、没有 pending 控制提交、本机是群里唯一的自己、epoch 未变。
+    pub fn prepare_self_removal(
+        &mut self,
+        store: &mut FormalStore,
+    ) -> Result<PendingSelfRemoval, ControlError> {
+        if let Some(existing) = self.pending_record() {
+            return Err(ControlError::PendingCommitExists {
+                base_epoch: existing.base_epoch,
+            });
+        }
+        let local_identity = self
+            .credential_handle()
+            .credential
+            .serialized_content()
+            .to_vec();
+        let base_epoch = self
+            .group_ref()
+            .map_err(|_| ControlError::GroupNotInitialized)?
+            .epoch()
+            .as_u64();
+        let proposal_bytes = {
+            let (provider, signer, group) = self
+                .control_parts_mut()
+                .map_err(|_| ControlError::GroupNotInitialized)?;
+            if group.pending_commit().is_some() {
+                return Err(ControlError::PendingMismatch(
+                    "the MLS group already holds an untracked pending commit",
+                ));
+            }
+            // 本机必须是群里唯一的自己（凭据身份唯一）。
+            let local_matches: Vec<Member> = group
+                .members()
+                .filter(|member| {
+                    member.credential.serialized_content() == local_identity.as_slice()
+                })
+                .collect();
+            match local_matches.as_slice() {
+                [_] => {}
+                [] => {
+                    return Err(ControlError::StateCorrupted(
+                        "the local device is not a member of the MLS group",
+                    ));
+                }
+                _ => {
+                    return Err(ControlError::StateCorrupted(
+                        "the local device appears more than once in the MLS group",
+                    ));
+                }
+            }
+            // leave_group 生成"移除本机 leaf"的提案（密文形式，符合本工程的 wire format）。
+            let proposal = group
+                .leave_group(provider, signer)
+                .map_err(|error| crypto_error("stage self-removal proposal", error))?;
+            proposal
+                .tls_serialize_detached()
+                .map_err(|error| crypto_error("serialize self-removal proposal", error))?
+        };
+        if proposal_bytes.is_empty() || proposal_bytes.len() > MAX_COMMIT_BYTES {
+            self.abandon_group();
+            return Err(ControlError::Crypto(
+                "self-removal proposal length is outside the supported bounds".to_owned(),
+            ));
+        }
+        // 关键不变量：生成提案不得改变本地 epoch。
+        let epoch_after = self
+            .group_ref()
+            .map_err(|_| ControlError::GroupNotInitialized)?
+            .epoch()
+            .as_u64();
+        if epoch_after != base_epoch {
+            self.abandon_group();
+            return Err(ControlError::Crypto(
+                "staging a self-removal proposal changed the local epoch".to_owned(),
+            ));
+        }
+        let group_id = self
+            .group_key()
+            .map_err(|error| crypto_error("read MLS group id", error))?;
+        let proposal_digest = self_removal_digest(&group_id, base_epoch, &proposal_bytes);
+        // 提案已进本地 proposal store：与群状态同一次快照落库。
+        self.export_to_store(store).map_err(storage_error)?;
+        Ok(PendingSelfRemoval {
+            group_id,
+            base_epoch,
+            removed: 1,
+            has_welcome: false,
+            proposal: proposal_bytes,
+            proposal_digest,
+        })
     }
 
     /// CRYPTO-007：提交被接受后合并 pending，并消费该提交的密钥。

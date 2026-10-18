@@ -48,6 +48,10 @@ data class PreviewStoreState(
     val sendStep: chat.api.SendStep? = null,
     /** 常驻同步状态（SyncFfi 快照）。 */
     val syncStatus: chat.api.SyncStatusView? = null,
+    /** 附件导出目标路径（附件面板与本面板共用；空表示未设置）。 */
+    val exportTarget: String = "",
+    /** 每条消息的附件卡片（来自 AttachmentFfi.records，不含正文）。 */
+    val messageCards: Map<String, List<chat.presentation.display.AttachmentCard>> = emptyMap(),
 )
 
 fun PreviewStoreState.opened(databasePath: String, notice: String): PreviewStoreState = copy(
@@ -195,3 +199,18 @@ fun PreviewStoreState.withSyncStatus(status: chat.api.SyncStatusView): PreviewSt
     },
     lastErrorCode = status.lastErrorCode,
 )
+
+/** 写入某条消息的附件卡片（空列表表示"查过，没有附件"）。 */
+fun PreviewStoreState.withMessageCards(
+    messageId: String,
+    cards: List<chat.presentation.display.AttachmentCard>,
+): PreviewStoreState {
+    val merged = LinkedHashMap(messageCards)
+    merged[messageId] = cards
+    return copy(
+        messageCards = merged,
+        busy = false,
+        notice = if (cards.isEmpty()) notice else "已加载 " + cards.size + " 个附件卡片（点击可导出）",
+    )
+}
+fun PreviewStoreState.updateExportTarget(value: String): PreviewStoreState = copy(exportTarget = value)

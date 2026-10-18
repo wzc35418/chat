@@ -43,7 +43,9 @@ import chat.presentation.preview.updateSendNodeId
 import chat.presentation.preview.updateSendNodePublicKey
 import chat.presentation.preview.updateSendNodeUrl
 import chat.presentation.preview.withSendStep
+import chat.presentation.preview.withMessageCards
 import chat.presentation.preview.withSyncStatus
+import chat.presentation.display.toCard
 import chat.presentation.preview.withCancel
 import chat.presentation.preview.withDraftStatus
 import chat.presentation.preview.withExported
@@ -423,6 +425,9 @@ fun main() = application {
 
     LaunchedEffect(Unit) { groupState = groupState.copy(ready = true) }
 
+    // 附件服务在后面创建（需要缓存目录），这里先留引用给早先定义的回调使用。
+    val attachmentServiceHolder = remember { mutableStateOf<chat.api.AttachmentService?>(null) }
+
     val storeHandlers = StoreHandlers(
         cancelLatestDraft = {
             scope.launch {
@@ -507,6 +512,52 @@ fun main() = application {
                     }
             }
         },
+        loadMessageAttachments = {
+            scope.launch {
+                val local = store ?: return@launch
+                val conversationId = storeState.selectedConversationId ?: return@launch
+                val attachmentService = attachmentServiceHolder.value ?: return@launch
+                storeState = storeState.beginBusy()
+                runCatching {
+                    val page = local.listMessages(conversationId, null, 20)
+                    var updated = storeState
+                    for (message in page.items) {
+                        val ids = runCatching { local.messageAttachmentIds(message.messageId) }.getOrDefault(emptyList())
+                        val cards = if (ids.isEmpty()) emptyList() else {
+                            runCatching { attachmentService.records(ids).map { it.toCard() } }.getOrDefault(emptyList())
+                        }
+                        updated = updated.withMessageCards(message.messageId, cards)
+                    }
+                    updated
+                }.onSuccess { storeState = it }
+                    .onFailure { error ->
+                        storeState = storeState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+        exportCard = { attachmentId ->
+            scope.launch {
+                val attachmentService = attachmentServiceHolder.value ?: return@launch
+                val target = storeState.exportTarget.trim()
+                if (target.isBlank()) {
+                    storeState = storeState.withError("INVALID_INPUT", "请先在附件面板填写导出目标路径")
+                    return@launch
+                }
+                runCatching { attachmentService.exportFile(attachmentId, target) }
+                    .onSuccess { written ->
+                        storeState = storeState.copy(busy = false, notice = "已导出 " + written + " 字节到 " + target)
+                    }
+                    .onFailure { error ->
+                        storeState = storeState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
         syncStart = { syncHandlers.start() },
         syncStop = { syncHandlers.stop() },
         syncRefresh = { syncHandlers.refresh() },
@@ -583,6 +634,7 @@ fun main() = application {
             )
         }.getOrNull()
     }
+    LaunchedEffect(attachmentService) { attachmentServiceHolder.value = attachmentService }
 
     LaunchedEffect(Unit) {
         attachmentState = if (attachmentService == null) {

@@ -165,8 +165,8 @@ cargo test --offline -p chat-storage -p chat-crypto           # 全绿（28 + 65
 
 ```powershell
 . .\tools\activate.ps1
-cargo test --offline -p chat-crypto --test mls_control   # 12 passed
-cargo test --offline -p chat-crypto                      # 40 passed（既有 28 个继续全绿）
+cargo test --offline -p chat-crypto --test mls_control   # 17 passed（含 5 个自移除用例）
+cargo test --offline -p chat-crypto                      # 49 passed（既有 44 继续全绿）
 ```
 
 已知限制：控制操作没有账户/角色授权与 control-head 对账（DOMAIN-004 与日志层未接入）；
@@ -325,6 +325,77 @@ prepare_application(input: AuthenticatedLocalEvent, tx: CryptoTransaction) -> Re
 **仍未实现**：真正在调用方 T2 事务内由 provider 直接加密并写 attempt/outbox（`TxnCryptoProvider`）、`PreparedWrite` 生成、外层候选签名与 SubmissionId 分配——因此“加密一次 + 同事务落盘”的完整语义尚不可用。
 
 <a id="crypto-005"></a>
+
+
+## 本机自移除（SelfRemoval）实现记录（R-59，2026-10-18，Windows x64）
+
+背景：上一轮 CRYPTO-005 的普通 `RemoveMembers` 明确拒绝把本机设备列为移除目标（安全边界），
+因此"主动退出群"只能做本地策略层退出，MLS 叶子仍留在群里。本轮在 crypto 侧补上显式的
+SelfRemoval 路径——但结论是：**MLS 1.0 不允许成员提交"移除自己"的 Commit**，自移除只能以
+提案形式发起、由另一名成员提交。
+
+### 证据（为什么没有"自移除提交"）
+
+- OpenMLS 0.9.1 运行时错误：`group.remove_members(provider, signer, &[own_leaf])` 返回
+  `CreateCommitError`：`"The Commit tried to remove self from the group. This is not possible."`
+  （源码 [commit_builder.rs 的 self_removed 检查](https://docs.rs/openmls/latest/openmls/group/enum.CreateCommitError.html)）。
+- OpenMLS 提供唯一合法的自移除原语：`MlsGroup::leave_group`（生成"移除本机 leaf"的
+  **Remove 提案**，需要一个由其他成员生成的 Commit 覆盖）与
+  `leave_group_via_self_remove`（SelfRemove 提案，要求 wire format 允许明文提案；
+  本工程的群配置是 PURE_CIPHERTEXT，因此不使用它）。
+
+### 落地行为
+
+- `ControlOperation::SelfRemoval` 进入 `prepare_control` 时返回稳定错误
+  `ControlError::SelfRemovalRequiresProposal`（code `SELF_REMOVAL_REQUIRES_PROPOSAL`）：
+  显式引导调用方走提案路径，**绝不伪造**一条本地自移除提交；epoch 不变、不产生 pending。
+- `MlsDevice::prepare_self_removal(store) -> PendingSelfRemoval`：
+  - 前置：群已初始化、无 pending 控制提交、本机在群里唯一、epoch 未变；
+  - 用 `leave_group` 生成真实的 MLS Remove 提案（密文形式，符合本工程 wire format），
+    有界校验后写入本地 proposal store，并随群状态快照（`export_to_store`）持久化；
+  - 返回 `PendingSelfRemoval { group_id, base_epoch, removed = 1, has_welcome = false,
+    proposal, proposal_digest }`：只含可转发的提案字节与绑定信息，不含密钥；
+  - **不推进 epoch**；本机仍算群成员，但 MLS 规则禁止在未提交 proposal 在途时继续发应用消息
+    （`create_message` 返回 PendingProposal，本轮测试断言该失败），对端当前 epoch 的消息仍可解密。
+- 完成路径（MLS 规定）：另一名成员把该提案包进 Commit → 本机 `process_verified_entry` 处理
+  该 Commit 得到 `self_removed = true`、epoch 前进；此后本机不能加密/发送、不能解密群消息。
+  本轮用"对端合法移除本机"的 Commit 验证了这条完成语义（不依赖本机提案，因为提案转发/
+  对端提案式提交尚未接入）。
+- 普通 `RemoveMembers` 仍拒绝移除本机（回归用例保留，错误码 `INVALID_STATE_TRANSITION`）。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-crypto --test mls_control   # 17 passed（新增 5 个自移除用例）
+cargo test --offline -p chat-crypto                      # 49 passed（既有 44 继续全绿）
+~~~
+
+### 证据（测试名 → 契约点）
+
+- `self_removal_proposal_is_staged_without_advancing_epoch`：提案非空、绑定同一 group/epoch，
+  `removed = 1`、`has_welcome = false`、有 32 字节提案摘要；epoch 不变、没有控制提交 pending；
+  提案在途时本机不能再发应用消息，但对端 epoch 1 的消息仍可解密。
+- `prepare_control_steers_self_removal_to_the_proposal_path`：`prepare_control(SelfRemoval)`
+  → `SELF_REMOVAL_REQUIRES_PROPOSAL`，epoch 不变、无 pending；随后提案路径可用。
+- `regular_remove_members_still_rejects_the_local_device`：只列本机、或本机混在合法目标里，
+  都返回 `INVALID_STATE_TRANSITION`；epoch 不变、无 pending（安全边界不放宽）。
+- `pending_control_commit_blocks_self_removal`：已有控制提交 pending 时提案被拒绝
+  （`INVALID_STATE_TRANSITION`），epoch 与 pending 均不变。
+- `peer_commit_removing_the_local_device_blocks_send_and_decrypt`：对端合法提交移除本机后，
+  本机处理得到 `self_removed = true`、epoch 前进；此后本机不能加密/发送、不能解密群消息，
+  对端继续正常工作。
+
+### 已知限制
+
+1. **没有"自移除提交"**（MLS 禁止）：本机生成的只是提案；真正移除必须由另一名成员提交。
+2. 提案的转发与"对端把提案包进 Commit"的控制流尚未在 crypto/core 接线（`process_verified_entry`
+   目前只处理 Commit 与 Application 消息，没有 Proposal 的处理/再提交入口）；因此端到端的
+   "我提议 → 对端提交 → 我离群"仍需上层编排（下一任务）。
+3. 本工程群配置是 PURE_CIPHERTEXT：不能使用 SelfRemove 提案（需要明文提案），本轮用 Remove
+   提案实现；若将来切到 mixed/plaintext wire format，可改走 `leave_group_via_self_remove`。
+4. 提案在途期间本机不能发应用消息（MLS 规则），调用方（core 的 leave 流程）应把该状态视为
+   "退出中"。
 
 ## CRYPTO-005 · prepare_control
 

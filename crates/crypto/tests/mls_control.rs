@@ -1083,6 +1083,191 @@ fn remove_member_commit_applies_consistently_on_all_devices() {
     assert!(bob.encrypt("被移除后发言").is_err());
 }
 
+
+#[test]
+fn self_removal_proposal_is_staged_without_advancing_epoch() {
+    let fixture = Fixture::new("self-remove-proposal");
+    let (mut alice, mut bob) = pair();
+    let group_key = alice.group_key().expect("group key");
+    let mut alice_store = fixture.open("alice");
+    alice.export_to_store(&mut alice_store).expect("export epoch 1");
+
+    let pending = alice
+        .prepare_self_removal(&mut alice_store)
+        .expect("prepare self-removal proposal");
+    assert_eq!(pending.group_id, group_key, "binds the same MLS group");
+    assert_eq!(pending.base_epoch, 1);
+    assert_eq!(pending.removed, 1, "only the local device is targeted");
+    assert!(!pending.has_welcome, "self removal never welcomes anyone");
+    assert!(!pending.proposal.is_empty(), "a real MLS proposal is staged");
+    assert_ne!(pending.proposal_digest, [0u8; 32], "proposal is digested");
+    // 关键不变量：生成提案不推进 epoch、不产生控制提交 pending。
+    assert_eq!(alice.epoch().expect("epoch"), 1);
+    assert!(
+        alice.pending_control().expect("pending").is_none(),
+        "a self-removal proposal is not a pending commit"
+    );
+    // MLS 规则：还有未提交的 proposal 时本机不能继续发应用消息（必须先被提交）。
+    assert!(
+        alice.encrypt("提案在途时发言").is_err(),
+        "a pending self-removal proposal blocks further application messages"
+    );
+    // 但本机仍是群成员：对端在当前 epoch 的消息仍可解密。
+    let peer_message = bob
+        .encrypt("提案在途时对端仍可发言")
+        .expect("peer still encrypts");
+    assert_eq!(
+        alice.decrypt(&peer_message, "Bob").expect("decrypt peer"),
+        "提案在途时对端仍可发言"
+    );
+}
+
+#[test]
+fn prepare_control_steers_self_removal_to_the_proposal_path() {
+    let fixture = Fixture::new("self-remove-steer");
+    let (mut alice, _bob) = pair();
+    let mut alice_store = fixture.open("alice");
+    alice.export_to_store(&mut alice_store).expect("export epoch 1");
+
+    // MLS 禁止成员提交移除自己：prepare_control 必须显式引导，而不是伪造提交。
+    let error = alice
+        .prepare_control(ControlOperation::SelfRemoval, &mut alice_store)
+        .expect_err("a self-removing commit is impossible in MLS");
+    assert_eq!(error_code(&error), "SELF_REMOVAL_REQUIRES_PROPOSAL");
+    assert_eq!(alice.epoch().expect("epoch"), 1, "no epoch advance");
+    assert!(alice.pending_control().expect("pending").is_none());
+    // 同一状态下提案路径可用。
+    let pending = alice
+        .prepare_self_removal(&mut alice_store)
+        .expect("proposal path works");
+    assert_eq!(pending.base_epoch, 1);
+    assert_eq!(pending.removed, 1);
+}
+
+#[test]
+fn regular_remove_members_still_rejects_the_local_device() {
+    let fixture = Fixture::new("self-remove-guard");
+    let (mut alice, _bob) = pair();
+    let mut alice_store = fixture.open("alice");
+    alice.export_to_store(&mut alice_store).expect("export alice");
+
+    // 安全边界不放宽：普通 remove_members 仍然不能移除本机（既有错误码）。
+    let error = alice
+        .prepare_control(
+            ControlOperation::RemoveMembers {
+                members: vec!["Alice".into()],
+            },
+            &mut alice_store,
+        )
+        .expect_err("remove_members must not remove the local device");
+    assert_eq!(error_code(&error), "INVALID_STATE_TRANSITION");
+    // 混在合法目标里同样拒绝（不静默丢弃本机）。
+    let error = alice
+        .prepare_control(
+            ControlOperation::RemoveMembers {
+                members: vec!["Bob".into(), "Alice".into()],
+            },
+            &mut alice_store,
+        )
+        .expect_err("the local device must be rejected inside a mixed list");
+    assert_eq!(error_code(&error), "INVALID_STATE_TRANSITION");
+    assert_eq!(alice.epoch().expect("epoch"), 1, "no epoch advance on rejection");
+    assert!(
+        alice.pending_control().expect("pending").is_none(),
+        "a rejected remove must not leave a pending commit"
+    );
+}
+
+#[test]
+fn pending_control_commit_blocks_self_removal() {
+    let fixture = Fixture::new("self-remove-pending");
+    let (mut alice, _bob) = pair();
+    let mut alice_store = fixture.open("alice");
+    alice.export_to_store(&mut alice_store).expect("export alice");
+
+    let pending = alice
+        .prepare_control(
+            ControlOperation::RemoveMembers {
+                members: vec!["Bob".into()],
+            },
+            &mut alice_store,
+        )
+        .expect("prepare remove bob");
+    assert_eq!(pending.removed, 1);
+    // 已有控制提交 pending：自移除提案必须显式拒绝。
+    let error = alice
+        .prepare_self_removal(&mut alice_store)
+        .expect_err("a pending commit blocks self removal");
+    assert_eq!(error_code(&error), "INVALID_STATE_TRANSITION");
+    assert_eq!(alice.epoch().expect("epoch"), 1);
+    assert!(alice.pending_control().expect("pending").is_some());
+}
+
+#[test]
+fn peer_commit_removing_the_local_device_blocks_send_and_decrypt() {
+    let fixture = Fixture::new("self-remove-completion");
+    let (mut alice, mut bob) = pair();
+    let group_key = alice.group_key().expect("group key");
+    let mut alice_store = fixture.open("alice");
+    let mut bob_store = fixture.open("bob");
+    alice.export_to_store(&mut alice_store).expect("export alice");
+    bob.export_to_store(&mut bob_store).expect("export bob");
+
+    // MLS 的自移除完成路径：另一名成员提交"移除本机"。这里由 Bob 合法地移除 Alice。
+    let pending = bob
+        .prepare_control(
+            ControlOperation::RemoveMembers {
+                members: vec!["Alice".into()],
+            },
+            &mut bob_store,
+        )
+        .expect("bob prepares alice's removal");
+
+    // Alice 处理该提交：epoch 前进且标记 self_removed。
+    let processed = alice
+        .process_verified_entry(&commit_entry(
+            &group_key,
+            1,
+            "Bob",
+            pending.commit.clone(),
+            CommitExpectation {
+                added: 0,
+                removed: 1,
+                updated: 0,
+            },
+        ))
+        .expect("alice processes her own removal");
+    match processed {
+        ProcessedEntry::Commit {
+            new_epoch,
+            removed,
+            self_removed,
+            ..
+        } => {
+            assert_eq!(new_epoch, 2);
+            assert_eq!(removed, 1);
+            assert!(self_removed, "alice must see that she is removed");
+        }
+        other => panic!("expected commit, got {other:?}"),
+    }
+    // 离群后：不能再加密/发送，也不能解密群消息。
+    assert!(
+        alice.encrypt("被移除后发言").is_err(),
+        "a removed device must not be able to send"
+    );
+    // Bob 合并后继续工作，Alice 无法读他的消息。
+    bob.merge_accepted_pending(&pending.acceptance(), &mut bob_store)
+        .expect("bob merges his removal commit");
+    assert_eq!(bob.epoch().expect("epoch"), 2);
+    let peer_message = bob.encrypt("只剩 Bob 在群里").expect("bob encrypts");
+    assert!(
+        alice.decrypt(&peer_message, "Bob").is_err(),
+        "a removed device must not decrypt group messages"
+    );
+    // Bob 侧仍能正常处理自己产生的密文以外的群内消息（此处只要求加密成功即可）。
+    assert!(!peer_message.is_empty());
+}
+
 #[test]
 fn key_package_and_member_inputs_are_validated() {
     let fixture = Fixture::new("inputs");

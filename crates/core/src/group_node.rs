@@ -19,6 +19,7 @@
 use std::fmt;
 
 use chat_crypto::control::{ControlOperationKind, PendingControl};
+use chat_domain::MemberRole;
 use chat_crypto::engine::MlsDevice;
 use chat_node_client::{NodeClient, NodeClientError, NodeClientErrorKind};
 use chat_node_services::canonical::{hex_decode, hex_encode, sha256_concat};
@@ -139,20 +140,44 @@ impl ControlReceipt {
     }
 }
 
-/// 把库里 pending 的控制提交作为控制候选条目提交到节点。
+/// 把库里 pending 的控制提交作为控制候选条目提交到节点（**兼容入口**）。
 ///
-/// 前置（**任何一步不满足都显式失败，不发请求**）：
-/// - `group_id` 是 PROTOCOL-001 群文本，且该群在本库里有持久快照；
-/// - 本机设备确实持有该群的 pending 控制提交，且快照 epoch 正好停在 pending 的 base_epoch；
-/// - pending 绑定的 MLS 群键与快照一致（防止把别的群的提交送到这个群）。
+/// 它只在能从本地快照**证明唯一语义**时提交：追加成员 → `invite`、移除成员 → `remove`、
+/// 本地仍是群主的 `SelfUpdate` → `set_role`（本切片里 `SelfUpdate` 的另一产出者是转让，
+/// 而转让会把发起人降级，所以“仍是群主”排除了它）。
 ///
-/// 候选的 CAS 字段（control head / policy_version / mls_epoch）**只取自节点 head**，不做本地推断；
-/// `submission_id` 由 (群, 提交摘要, base_epoch) 确定性派生，因此重复调用是幂等的。
+/// 其余情形（例如转让后的 `SelfUpdate`、或未来新增的 `SelfUpdate` 治理操作）**显式失败**
+/// （`PROTOCOL_UNSUPPORTED`），要求调用方改用 `submit_pending_control_with_intent` 声明语义——
+/// 绝不退化成“看起来像 set_role”。
 pub fn submit_pending_control(
     device: &MlsDevice,
     store: &Store,
     group_id: &str,
     client: &NodeClient,
+) -> ControlReceiptResult<ControlReceipt> {
+    let view = groups::group_snapshot(store, group_id)?;
+    let pending = require_pending(device)?;
+    let intent = infer_control_intent(&view, &pending)?;
+    submit_with_intent(device, store, group_id, client, &intent)
+}
+
+/// 与 `submit_pending_control` 相同，但由调用方**显式声明**提交语义（转让/退出/解散必须走这里）。
+pub fn submit_pending_control_with_intent(
+    device: &MlsDevice,
+    store: &Store,
+    group_id: &str,
+    client: &NodeClient,
+    intent: &ControlIntent,
+) -> ControlReceiptResult<ControlReceipt> {
+    submit_with_intent(device, store, group_id, client, intent)
+}
+
+fn submit_with_intent(
+    device: &MlsDevice,
+    store: &Store,
+    group_id: &str,
+    client: &NodeClient,
+    intent: &ControlIntent,
 ) -> ControlReceiptResult<ControlReceipt> {
     GroupId::parse(group_id).map_err(|_| {
         ControlReceiptError::new(ErrorCode::InvalidId.as_str(), "group id must be PROTOCOL-001 group text")
@@ -167,6 +192,8 @@ pub fn submit_pending_control(
             "the control commit exceeds the node candidate limit",
         ));
     }
+    // 公开元数据：先解析语义，任何不符都在触网之前失败。
+    let metadata = resolve_control_metadata(&view, &pending, intent, client.device_id())?;
     // 节点 head：候选的 CAS 值只来自这里（含节点身份，用于事后复核回执）。
     let head = fetch_head(client, group_id)?;
     if head.group_id != group_id {
@@ -188,7 +215,7 @@ pub fn submit_pending_control(
         mls_epoch: head.mls_epoch,
         encrypted_payload: hex_encode(&pending.commit),
         // PROTOCOL-004 要求控制候选**必须**带公开元数据（缺了会被协议层判为非法候选）。
-        control_metadata: Some(control_metadata_for(&pending)),
+        control_metadata: Some(metadata),
     };
     match append_candidate(client, &candidate)? {
         Ok(receipt) => {
@@ -346,29 +373,136 @@ fn check_binds_group(view: &GroupView, pending: &PendingControl) -> ControlRecei
     Ok(())
 }
 
-/// 控制候选的公开元数据（只含操作种类与摘要，不含成员身份或正文）。
+/// 控制提交的**公开语义声明**：决定节点元数据里写哪种操作。
 ///
-/// 映射依据是**本切片**里产生这些 pending 提交的治理操作：
+/// 为什么必须由调用方声明：CRYPTO-005 的 `ControlOperationKind` 只有 `AddMembers` /
+/// `RemoveMembers` / `SelfUpdate` 三种，而 `SelfUpdate` 同时承载改角色、转让群主、解散等多种
+/// 治理语义。**节点元数据不能靠猜**——猜错会让公开日志把“转让群主”写成“改角色”。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControlIntent {
+    /// 追加成员（邀请）。无具体目标 → 目标摘要用提交摘要。
+    Invite,
+    /// 移除成员。给了目标凭据就用它的摘要，否则用提交摘要（旧行为）。
+    RemoveMember { target_credential: Option<String> },
+    /// 改角色。同上。
+    SetRole { target_credential: Option<String> },
+    /// 转让群主：目标凭据摘要 + 本地设备必须已被降级（证明这次提交确实是转让）。
+    TransferOwnership { target_credential: String },
+    /// 本机退出（自移除）：只有 `RemoveMembers` 且恰好移除 1 人时成立，目标 = 本机摘要。
+    LeaveSelf,
+    /// 解散群：映射为 `dissolve`（PROTOCOL-004 有该枚举）。
+    Dissolve,
+}
+
+impl ControlIntent {
+    /// 该声明在给定 pending 上是否成立（不成立就显式失败，绝不“宽容映射”）。
+    fn compatible_with(&self, view: &GroupView, pending: &PendingControl) -> bool {
+        match self {
+            Self::Invite => pending.operation == ControlOperationKind::AddMembers,
+            Self::RemoveMember { .. } => pending.operation == ControlOperationKind::RemoveMembers,
+            Self::LeaveSelf => {
+                pending.operation == ControlOperationKind::RemoveMembers && pending.removed == 1
+            }
+            Self::SetRole { .. } => pending.operation == ControlOperationKind::SelfUpdate,
+            Self::TransferOwnership { .. } => {
+                // 转让会把发起人降级：本地角色仍是群主就不可能是转让。
+                pending.operation == ControlOperationKind::SelfUpdate
+                    && view.role != MemberRole::Owner
+            }
+            Self::Dissolve => pending.operation == ControlOperationKind::SelfUpdate,
+        }
+    }
+
+    /// 节点元数据里的操作文本（必须是节点 `control_operation` 认识的那 8 个之一）。
+    fn node_operation(&self) -> &'static str {
+        match self {
+            Self::Invite => "invite",
+            Self::RemoveMember { .. } | Self::LeaveSelf => "remove",
+            Self::SetRole { .. } => "set_role",
+            Self::TransferOwnership { .. } => "transfer_ownership",
+            Self::Dissolve => "dissolve",
+        }
+    }
+
+    /// 目标摘要：声明了目标凭据就用它的摘要，否则退回提交摘要（公开可算、不泄露身份）。
+    fn target_digest(&self, pending: &PendingControl, local_device_id: &str) -> String {
+        let credential = match self {
+            Self::RemoveMember {
+                target_credential: Some(credential),
+            }
+            | Self::SetRole {
+                target_credential: Some(credential),
+            }
+            | Self::TransferOwnership {
+                target_credential: credential,
+            } => Some(credential.as_str()),
+            // 自移除的目标就是本机设备。
+            Self::LeaveSelf => Some(local_device_id),
+            // 没有更具体的目标：用提交摘要（与旧行为一致，且不额外泄露）。
+            _ => None,
+        };
+        match credential {
+            Some(credential) => hex_encode(&control_target_digest(credential)),
+            None => hex_encode(&pending.commit_digest),
+        }
+    }
+}
+
+/// 目标凭据摘要的派生域（公开层只留摘要，不泄露成员凭据原文）。
+const CONTROL_TARGET_DOMAIN: &[u8] = b"chat/core/control-target/v1";
+
+fn control_target_digest(credential: &str) -> [u8; 32] {
+    sha256_concat(&[CONTROL_TARGET_DOMAIN, credential.as_bytes()])
+}
+
+/// 把“提交 + 公开语义声明”解析成节点元数据；不成立就显式失败。
 ///
-/// - `AddMembers` 只由建群/追加成员的邀请产生 → `invite`；
-/// - `RemoveMembers` 只由移除成员产生 → `remove`；
-/// - `SelfUpdate` 只由 GROUPS-003 改角色产生（`set_muted`/`rename_group` 是纯策略层，
-///   不产生 MLS 提交）→ `set_role`。
-///
-/// 若以后引入其它也会产生 `SelfUpdate` 的治理操作，这个映射必须随之扩展（否则公开元数据会
-/// 说错操作种类）——见 groups.md 的限制说明。
-///
-/// `target_digest` 用 pending 自带的提交摘要（`H(域 || group || base || target || commit)`）：
-/// 它已经是公开可计算的绑定值，不额外泄露目标账户/角色身份。
-fn control_metadata_for(pending: &PendingControl) -> CandidateControlMetadata {
-    let operation = match pending.operation {
-        ControlOperationKind::AddMembers => "invite",
-        ControlOperationKind::RemoveMembers => "remove",
-        ControlOperationKind::SelfUpdate => "set_role",
-    };
-    CandidateControlMetadata {
-        operation: operation.to_owned(),
-        target_digest: hex_encode(&pending.commit_digest),
+/// 失败码：声明与提交形态不符 → `INVALID_CANDIDATE`；调用方**没有声明**（无 intent 的兼容入口
+/// 推断不出唯一语义）→ `PROTOCOL_UNSUPPORTED`（显式“无法表达”，绝不退化成 set_role）。
+pub fn resolve_control_metadata(
+    view: &GroupView,
+    pending: &PendingControl,
+    intent: &ControlIntent,
+    local_device_id: &str,
+) -> ControlReceiptResult<CandidateControlMetadata> {
+    if !intent.compatible_with(view, pending) {
+        return Err(ControlReceiptError::new(
+            ErrorCode::InvalidCandidate.as_str(),
+            "the declared control intent is incompatible with the pending commit",
+        ));
+    }
+    Ok(CandidateControlMetadata {
+        operation: intent.node_operation().to_owned(),
+        target_digest: intent.target_digest(pending, local_device_id),
+    })
+}
+
+/// 无 intent 的兼容入口能推断出的语义（只覆盖**唯一可能**的形态，其余显式失败）。
+fn infer_control_intent(
+    view: &GroupView,
+    pending: &PendingControl,
+) -> ControlReceiptResult<ControlIntent> {
+    match pending.operation {
+        // 追加成员只有一个语义。
+        ControlOperationKind::AddMembers => Ok(ControlIntent::Invite),
+        // 移除成员只有一个语义（是否“自移除”无法从 pending 证明 → 不声明目标）。
+        ControlOperationKind::RemoveMembers => Ok(ControlIntent::RemoveMember {
+            target_credential: None,
+        }),
+        ControlOperationKind::SelfUpdate => {
+            // 本地设备仍是群主：转让会把发起人降级，因此只可能是改角色（本切片 SelfUpdate 的
+            // 另一种产出者是转让）。已经不是群主 → 无法区分“转让”与“管理员改角色”。
+            if view.role == MemberRole::Owner {
+                Ok(ControlIntent::SetRole {
+                    target_credential: None,
+                })
+            } else {
+                Err(ControlReceiptError::new(
+                    ErrorCode::ProtocolUnsupported.as_str(),
+                    "the control commit has no unambiguous public operation; declare the intent explicitly",
+                ))
+            }
+        }
     }
 }
 
@@ -517,49 +651,352 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chat_protocol::DeviceId;
 
-    fn pending() -> PendingControl {
+    fn pending(kind: ControlOperationKind, added: u32, removed: u32) -> PendingControl {
         PendingControl {
             group_id: "ab".repeat(16),
-            base_epoch: 3,
-            target_epoch: 4,
-            operation: chat_crypto::control::ControlOperationKind::SelfUpdate,
-            added: 0,
-            removed: 0,
+            base_epoch: 1,
+            target_epoch: 2,
+            operation: kind,
+            added,
+            removed,
             commit: vec![1, 2, 3, 4],
             welcome: None,
             commit_digest: [7_u8; 32],
         }
     }
 
+    /// 只关心 `role`（转让的兼容性检查用它）。
+    fn view(role: MemberRole) -> GroupView {
+        GroupView {
+            group_id: GroupId::from_bytes([0x11; 32]).encode(),
+            name: "meta".into(),
+            epoch: 1,
+            policy_version: 2,
+            control_head: "00".repeat(32),
+            role,
+            created_at_ms: 0,
+            mls_group_key: "ab".repeat(16),
+            state_version: 1,
+            members: Vec::new(),
+            pending_members: Vec::new(),
+            pending_removed: Vec::new(),
+            pending: None,
+            last_control_cleared: None,
+            dissolved: false,
+            dissolved_at_ms: None,
+            left_at_ms: None,
+        }
+    }
+
+    fn local() -> String {
+        "dev:1:".to_owned() + &"55".repeat(32)
+    }
+
     #[test]
     fn submission_ids_are_deterministic_and_bound_to_the_commit() {
         let group = "grp:1:".to_owned() + &"11".repeat(32);
-        let first = control_submission_id(&group, &pending());
-        let again = control_submission_id(&group, &pending());
+        let first = control_submission_id(&group, &pending(ControlOperationKind::SelfUpdate, 0, 0));
+        let again = control_submission_id(&group, &pending(ControlOperationKind::SelfUpdate, 0, 0));
         assert_eq!(first, again, "same pending must reuse the same submission id");
-        // 必须是 PROTOCOL-001 submission 文本。
         assert!(SubmissionId::parse(&first).is_ok());
-        // 换群 / 换 epoch / 换摘要都会换 id。
         let other_group = "grp:1:".to_owned() + &"22".repeat(32);
-        assert_ne!(first, control_submission_id(&other_group, &pending()));
-        let mut moved = pending();
+        assert_ne!(
+            first,
+            control_submission_id(&other_group, &pending(ControlOperationKind::SelfUpdate, 0, 0))
+        );
+        let mut moved = pending(ControlOperationKind::SelfUpdate, 0, 0);
         moved.base_epoch = 5;
         assert_ne!(first, control_submission_id(&group, &moved));
-        let mut other_commit = pending();
+        let mut other_commit = pending(ControlOperationKind::SelfUpdate, 0, 0);
         other_commit.commit_digest = [9_u8; 32];
         assert_ne!(first, control_submission_id(&group, &other_commit));
     }
 
+    /// 六种声明各自映射到哪个节点操作文本。
     #[test]
-    fn pending_errors_carry_frozen_codes() {
-        // 群标识非规范 → INVALID_ID（不会走到网络）。
-        let device = MlsDevice::new("unit-device").expect("device");
-        let dir = std::env::temp_dir();
-        let _ = (&dir, &device);
-        let error = ControlReceiptError::from(GroupError::from(
-            chat_crypto::control::ControlError::GroupNotInitialized,
-        ));
-        assert!(!error.code().is_empty());
+    fn intents_map_to_the_expected_node_operations() {
+        let owner_view = view(MemberRole::Owner);
+        let demoted_view = view(MemberRole::Member);
+        let cases: Vec<(ControlIntent, &str, MemberRole, PendingControl)> = vec![
+            (
+                ControlIntent::Invite,
+                "invite",
+                MemberRole::Owner,
+                pending(ControlOperationKind::AddMembers, 1, 0),
+            ),
+            (
+                ControlIntent::RemoveMember {
+                    target_credential: Some("bob".into()),
+                },
+                "remove",
+                MemberRole::Owner,
+                pending(ControlOperationKind::RemoveMembers, 0, 1),
+            ),
+            (
+                ControlIntent::LeaveSelf,
+                "remove",
+                MemberRole::Member,
+                pending(ControlOperationKind::RemoveMembers, 0, 1),
+            ),
+            (
+                ControlIntent::SetRole {
+                    target_credential: Some("bob".into()),
+                },
+                "set_role",
+                MemberRole::Owner,
+                pending(ControlOperationKind::SelfUpdate, 0, 0),
+            ),
+            (
+                ControlIntent::TransferOwnership {
+                    target_credential: "bob".into(),
+                },
+                "transfer_ownership",
+                MemberRole::Member,
+                pending(ControlOperationKind::SelfUpdate, 0, 0),
+            ),
+            (
+                ControlIntent::Dissolve,
+                "dissolve",
+                MemberRole::Owner,
+                pending(ControlOperationKind::SelfUpdate, 0, 0),
+            ),
+        ];
+        for (intent, expected, role, pending) in cases {
+            let constructed = match role {
+                MemberRole::Owner => &owner_view,
+                _ => &demoted_view,
+            };
+            let metadata = resolve_control_metadata(constructed, &pending, &intent, &local())
+                .unwrap_or_else(|error| panic!("{intent:?} must resolve: {}", error.code()));
+            assert_eq!(metadata.operation, expected, "intent {intent:?}");
+        }
+    }
+
+    /// 目标摘要：声明了目标凭据就用它的摘要；自移除用本机；否则退回提交摘要。
+    #[test]
+    fn target_digests_bind_the_declared_target() {
+        let owner_view = view(MemberRole::Owner);
+        let self_update = pending(ControlOperationKind::SelfUpdate, 0, 0);
+        let with_target = resolve_control_metadata(
+            &owner_view,
+            &self_update,
+            &ControlIntent::SetRole {
+                target_credential: Some("bob".into()),
+            },
+            &local(),
+        )
+        .expect("resolves");
+        assert_eq!(
+            with_target.target_digest,
+            hex_encode(&control_target_digest("bob"))
+        );
+        let without_target = resolve_control_metadata(
+            &owner_view,
+            &self_update,
+            &ControlIntent::SetRole { target_credential: None },
+            &local(),
+        )
+        .expect("resolves");
+        assert_eq!(without_target.target_digest, hex_encode(&self_update.commit_digest));
+        // 目标不同 → 摘要不同（不可跨目标重放）。
+        let other = resolve_control_metadata(
+            &owner_view,
+            &self_update,
+            &ControlIntent::SetRole {
+                target_credential: Some("carol".into()),
+            },
+            &local(),
+        )
+        .expect("resolves");
+        assert_ne!(with_target.target_digest, other.target_digest);
+        // 自移除的目标是本机设备摘要。
+        let removal = pending(ControlOperationKind::RemoveMembers, 0, 1);
+        let leave = resolve_control_metadata(
+            &view(MemberRole::Member),
+            &removal,
+            &ControlIntent::LeaveSelf,
+            &local(),
+        )
+        .expect("resolves");
+        assert_eq!(leave.operation, "remove");
+        assert_eq!(leave.target_digest, hex_encode(&control_target_digest(&local())));
+    }
+
+    /// 声明与提交形态不符 → 显式 INVALID_CANDIDATE（绝不硬套）。
+    #[test]
+    fn incompatible_intents_fail_explicitly() {
+        let owner_view = view(MemberRole::Owner);
+        let demoted_view = view(MemberRole::Member);
+        let add = pending(ControlOperationKind::AddMembers, 1, 0);
+        let remove = pending(ControlOperationKind::RemoveMembers, 0, 1);
+        let self_update = pending(ControlOperationKind::SelfUpdate, 0, 0);
+        let transfer = ControlIntent::TransferOwnership {
+            target_credential: "bob".into(),
+        };
+        let cases: Vec<(&str, &ControlIntent, &PendingControl, &GroupView)> = vec![
+            (
+                "set_role on an add commit",
+                &ControlIntent::SetRole { target_credential: None },
+                &add,
+                &owner_view,
+            ),
+            (
+                "invite on a self update",
+                &ControlIntent::Invite,
+                &self_update,
+                &owner_view,
+            ),
+            ("transfer on a remove commit", &transfer, &remove, &demoted_view),
+            (
+                "leave on a self update",
+                &ControlIntent::LeaveSelf,
+                &self_update,
+                &demoted_view,
+            ),
+            (
+                "dissolve on an add commit",
+                &ControlIntent::Dissolve,
+                &add,
+                &owner_view,
+            ),
+        ];
+        for (label, intent, pending, view) in cases {
+            let error = resolve_control_metadata(view, pending, intent, &local())
+                .expect_err(&format!("{label} must not resolve"));
+            assert_eq!(error.code(), "INVALID_CANDIDATE", "{label}");
+        }
+        // 自移除要求恰好移除 1 人。
+        let wide_removal = pending(ControlOperationKind::RemoveMembers, 0, 2);
+        assert_eq!(
+            resolve_control_metadata(
+                &demoted_view,
+                &wide_removal,
+                &ControlIntent::LeaveSelf,
+                &local()
+            )
+            .expect_err("two removals are not a self removal")
+            .code(),
+            "INVALID_CANDIDATE"
+        );
+        // 转让要求本地已被降级（本地仍是群主 → 不可能是一次转让）。
+        assert_eq!(
+            resolve_control_metadata(
+                &owner_view,
+                &self_update,
+                &ControlIntent::TransferOwnership {
+                    target_credential: "bob".into(),
+                },
+                &local()
+            )
+            .expect_err("the owner cannot transfer to themselves")
+            .code(),
+            "INVALID_CANDIDATE"
+        );
+    }
+
+    /// 无 intent 的兼容入口：只在唯一形态下推断，转让后的提交**显式失败**。
+    #[test]
+    fn legacy_inference_never_degrades_a_transfer_to_set_role() {
+        assert_eq!(
+            infer_control_intent(&view(MemberRole::Owner), &pending(ControlOperationKind::AddMembers, 1, 0))
+                .expect("invite"),
+            ControlIntent::Invite
+        );
+        assert_eq!(
+            infer_control_intent(
+                &view(MemberRole::Owner),
+                &pending(ControlOperationKind::RemoveMembers, 0, 1)
+            )
+            .expect("remove"),
+            ControlIntent::RemoveMember {
+                target_credential: None
+            }
+        );
+        // 仍是群主的 self update：只可能是改角色（旧行为，兼容 group_submit_control）。
+        assert_eq!(
+            infer_control_intent(&view(MemberRole::Owner), &pending(ControlOperationKind::SelfUpdate, 0, 0))
+                .expect("set_role"),
+            ControlIntent::SetRole {
+                target_credential: None
+            }
+        );
+        // 已经被降级的 self update：无法区分“转让”与“管理员改角色” → 显式 UNSUPPORTED。
+        let error = infer_control_intent(
+            &view(MemberRole::Member),
+            &pending(ControlOperationKind::SelfUpdate, 0, 0),
+        )
+        .expect_err("ambiguous self update must fail");
+        assert_eq!(error.code(), "PROTOCOL_UNSUPPORTED");
+    }
+
+    /// 映射出来的元数据必须是 PROTOCOL-004 能编码的合法控制元数据。
+    #[test]
+    fn mapped_metadata_is_expressible_by_protocol_004() {
+        let owner_view = view(MemberRole::Owner);
+        let demoted_view = view(MemberRole::Member);
+        let cases: Vec<(ControlIntent, MemberRole, PendingControl)> = vec![
+            (
+                ControlIntent::Invite,
+                MemberRole::Owner,
+                pending(ControlOperationKind::AddMembers, 1, 0),
+            ),
+            (
+                ControlIntent::RemoveMember { target_credential: None },
+                MemberRole::Owner,
+                pending(ControlOperationKind::RemoveMembers, 0, 1),
+            ),
+            (
+                ControlIntent::LeaveSelf,
+                MemberRole::Member,
+                pending(ControlOperationKind::RemoveMembers, 0, 1),
+            ),
+            (
+                ControlIntent::SetRole { target_credential: None },
+                MemberRole::Owner,
+                pending(ControlOperationKind::SelfUpdate, 0, 0),
+            ),
+            (
+                ControlIntent::TransferOwnership {
+                    target_credential: "bob".into(),
+                },
+                MemberRole::Member,
+                pending(ControlOperationKind::SelfUpdate, 0, 0),
+            ),
+            (
+                ControlIntent::Dissolve,
+                MemberRole::Owner,
+                pending(ControlOperationKind::SelfUpdate, 0, 0),
+            ),
+        ];
+        for (intent, role, pending) in cases {
+            let constructed = if role == MemberRole::Owner {
+                &owner_view
+            } else {
+                &demoted_view
+            };
+            let metadata = resolve_control_metadata(constructed, &pending, &intent, &local())
+                .unwrap_or_else(|error| panic!("{intent:?} must resolve: {}", error.code()));
+            let candidate = GroupCandidate {
+                protocol_major: 1,
+                protocol_minor: 0,
+                submission_id: SubmissionId::from_bytes([0x22; 32]).encode(),
+                group_id: GroupId::from_bytes([0x11; 32]).encode(),
+                author_device_id: DeviceId::from_bytes([0x33; 32]).encode(),
+                kind: KIND_CONTROL.to_owned(),
+                expected_control_head: "00".repeat(32),
+                policy_version: 1,
+                mls_epoch: 0,
+                encrypted_payload: hex_encode(b"commit"),
+                control_metadata: Some(metadata),
+            };
+            candidate
+                .to_unsigned(MAX_CONTROL_CANDIDATE_BYTES)
+                .unwrap_or_else(|error| {
+                    panic!("{intent:?} metadata must be protocol-expressible: {}", error.code())
+                });
+        }
     }
 }
+
