@@ -626,3 +626,84 @@ cargo test --offline -p chat-core   # 9 lib + 5 identity + 2 p0 + 9 send_orchest
 6. **无权限/附件/同步补齐**：DOMAIN-001 权限校验、DOMAIN-011 回复目标、附件依赖（ATTACHMENT_NOT_READY）、SYNC-008 补齐都未接入；本层也不产生 DraftChanged 事件（CORE-003 未实现）。
 7. **单写者**：`SendOrchestrator` 拥有独占的 `Store`，与 `ConversationCore` 不能同时打开同一库；两者合并到同一个 core 句柄的方式（让 `ConversationCore` 暴露 `&mut Store` 或把编排器作为其内部字段）留待 FFI 接线时确定。
 
+## 节点提交端口实现记录（NodeClientSubmitter，O 包，2026-10-18，Windows x64）
+
+实现位置：[crates/core/src/node_submitter.rs](../../crates/core/src/node_submitter.rs)（lib.rs 由 Lead 加一行 `pub mod node_submitter;`），测试：[crates/core/tests/node_submitter.rs](../../crates/core/tests/node_submitter.rs)。本轮把“发送编排”的可注入端口 `NodeSubmitter` 接到**真实节点**：客户端用 [crates/node-client](../../crates/node-client)（reqwest + Ed25519 + 一次性挑战），服务端是真实 [crates/node-api](../../crates/node-api) + [crates/node-services](../../crates/node-services)。编排状态机没有改动：调度决策仍由 `chat_sync::send::plan_submission` 给出。
+
+公开面：
+
+~~~text
+pub struct NodeClientSubmitter { .. }   // 一个实例绑定一个群 + 一台设备（签名钥在 NodeClient 里）
+impl NodeClientSubmitter {
+    pub fn new(client: NodeClient, group_id: impl Into<String>) -> SendResult<Self>;
+    pub fn with_page_limit(client: NodeClient, group_id: impl Into<String>, page_limit: u32) -> SendResult<Self>;
+    pub fn group_id(&self) -> &str;
+    pub fn metrics(&self) -> SubmitterMetrics;   // 可克隆计数句柄：在编排器之外断言“没有重发”
+    pub fn submit_calls(&self) -> u64;
+    pub fn query_calls(&self) -> u64;
+    pub fn last_receipt(&self) -> Option<AppendResult>;
+}
+impl NodeSubmitter for NodeClientSubmitter {
+    fn submit(&self, attempt: &SubmitAttempt) -> SendResult<SubmitOutcome>;
+    fn query(&self, submission_id: &str) -> SendResult<SubmitOutcome>;
+}
+pub struct SubmitterMetrics { .. }      // submit_calls / query_calls / last_receipt
+~~~
+
+`submit` 的真实链路：
+
+1. 校验 SubmissionId 是 PROTOCOL-001 文本、密文非空；
+2. `GET /v1/groups/{id}/head` 取节点**当前公开前置状态**（`control_head / policy_version / mls_epoch`），失败按三态映射；
+3. 用节点给出的这三个值 + `(SubmissionId, hex(密文))` 构造 PROTOCOL-004 候选（`kind = application`，作者=本设备），由 NodeClient 用设备私钥签名；
+4. `POST /v1/groups/{id}/entries` 追加；节点按 `(group, submission)` 去重，因此同 ID 同字节重试只返回原回执（不会产生第二条日志）；
+5. 回执必须绑定本次 `group/submission`，绑定失败按 `INVALID_RECEIPT_SCOPE` 显式失败；成功返回 `Accepted { detail: "node accepted seq=N" }`。
+
+`query` 的真实链路：读 head → 若 `seq == 0` 直接 `Unknown` → 否则按页扫描 `GET /v1/groups/{id}/log`，命中回执即 `Accepted`；扫描完仍未命中返回 **`Unknown`（绝不返回 `Rejected`）**——节点只保存“已接受”的条目，找不到不能推断为拒绝。分页不前进时 `STATE_CORRUPTED` 显式失败，不无限循环。
+
+三态映射（`classify`，节点错误码 → 结果）：
+
+|节点结果|映射|理由|
+|---|---|---|
+|成功（已分配 seq）|`Accepted`|回执绑定本次候选、节点签名（固定公钥时）已复核|
+|409 冲突（相异密文 / 群 ID 冲突 / stale head / stale epoch）|`Rejected`|同一次尝试永远不会被接受，必须由下一次 `prepare` 用新 SubmissionId 重建|
+|401 鉴权（INVALID_SIGNATURE / INVALID_CREDENTIAL / AUTH_* / DEVICE_REVOKED）|`Rejected`|换挑战或重试都不会变好|
+|403 权限（PERMISSION_DENIED / HISTORY_NOT_AUTHORIZED / INVALID_CAPABILITY）|`Rejected`|非成员/能力不足是永久失败|
+|404（GROUP_NOT_FOUND）|`Rejected`|目标不存在|
+|400（INVALID_REQUEST 等）与内容上限（PAYLOAD_TOO_LARGE）|`Rejected`|这份请求/密文本身不会被接受|
+|网络 / 超时 / 限流 / 节点 5xx / 无法解释的响应|`Unknown`|节点可能已写入：只允许按 ID 对账，绝不重发|
+|本地配置错误（NodeClientError::Config）或桥不可用|Err|本地故障，状态不变|
+
+同步/异步边界：`NodeSubmitter` 的方法是同步的，`NodeClient` 是异步的。`SubmitBridge` 用**一条独立线程 + current-thread 运行时**把同步调用桥到异步请求，因此：
+
+- 可以在任意上下文（包括已经是 tokio 运行时的调用方）里安全调用，不会触发“在运行时内阻塞”的 panic；
+- 桥线程在 Drop 时 join，避免残留线程继续跑网络请求；桥不可用时返回 `INTERNAL_FAILURE` 而不是把调用挂死。
+
+复现命令（全程离线，本轮实测）：
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core   # 14 lib + 6 identity + 5 node_submitter + 2 p0 + 9 send_orchestrator + 5 service = 41 passed
+~~~
+
+既有 30 个测试继续通过；本轮新增 10 个（5 个 lib 单元测试 + 5 个端到端）。`tests/identity.rs` 有 2 个既存的 `unused mut` 警告（不在本包写入范围，未改）。
+
+证据（测试名 → 覆盖的契约点）：
+
+- `node_submitter::real_node_accepts_the_orchestrated_send_and_persists_every_layer`：真节点链路 `begin_send → prepare → dispatch → Accepted`；草稿 accepted、attempt accepted、发送任务 complete、提交次数 1、加密次数 1；节点回执 `seq = 1` 且由节点签名；**节点日志里存的密文与本地耐久密文逐字节相同，且对端真实 OpenMLS 设备能解出原文**；节点 head 前进到 seq 1 并与回执 `log_hash` 一致。
+- `node_submitter::repeated_dispatch_after_acceptance_never_resubmits`：接受后重复 `dispatch` 返回 `idempotent = true`，提交次数恒为 1、零对账、零重新加密，节点日志仍只有一条。
+- `node_submitter::node_conflict_on_divergent_bytes_maps_to_rejected`：先用同一 SubmissionId 的相异字节让节点接受一条，再用真实密文提交同 ID → 节点 409 → `Rejected`；attempt rejected、发送任务 failed、草稿保留 queued、提交次数 1；节点日志仍只有相异那条；随后 `prepare` 用新 SubmissionId 重建并真实再加密一次。
+- `node_submitter::unreachable_node_maps_to_unknown_and_then_only_reconciles`：提交端点连不上 → `Unknown`（attempt unknown、草稿 queued）；再次调度只走 `query`，对账同样连不上则显式 `NETWORK_UNAVAILABLE` 上抛，提交次数恒为 1、加密次数恒为 1。
+- `node_submitter::query_reconciles_accepted_and_reports_unknown_for_missing_submission`：把本地投影置为“提交后崩溃”的 unknown（真实节点已接受）→ `dispatch` 只查询并按 SubmissionId 对账为 `Accepted`，提交次数不变；另一个节点从未收到的 SubmissionId 则始终返回 `Unknown`（不是 `Rejected`），两次调度都只查询、提交次数不变。
+- lib 单元测试：`conflicting_and_unauthorized_answers_are_rejected`、`transport_rate_limit_and_5xx_answers_are_unknown`、`local_configuration_failures_are_errors_not_outcomes`（三态映射表逐项断言）、`constructor_rejects_non_protocol_ids_and_bad_limits`（群 ID/分页上限有界拒绝）、`debug_output_omits_keys_and_client_internals`（日志不含签名钥/客户端内部）。
+
+已知限制（本切片不覆盖）：
+
+1. **一个实例绑定一个群**：`conversation → group` 的映射由上层在构造时确定（当前切片一会话一群）；多群需要多个实例或按群路由。
+2. **每次提交多一次往返**：候选的 CAS 字段只能来自节点 head（不本地推断），因此 `submit` 先 `get_head` 再 append。若两个写者之间的 head 发生变化（并发控制条目），本次会被映射为 `Rejected` 并由上层重建；更聪明的客户端应区分“stale head 可重读后重试”与“永久拒绝”。
+3. **MLS epoch 与节点声明不做交叉校验**：节点侧把 `mls_epoch/policy_version` 当 CAS 常量（见 node.md 的 NODE-006 限制），本层上传的是节点 head 的值；真实 MLS epoch 仍需“客户端验证过的控制应用路径”落地后才会与节点状态对齐。
+4. **`Unknown` 是保守取舍**：网络/超时/5xx 一律 `Unknown`（绝不重发）。若节点从未收到，对账只会一直返回 `Unknown`，草稿会停在对账窗口，需要上层（CORE-008 retry / CORE-009 cancel）介入；节点没有“从未收到”的正式回答。
+5. **`query` 是线性扫描**：节点没有按 SubmissionId 的查询端点，只能按页扫日志（`DEFAULT_QUERY_PAGE_LIMIT = 50`，上限 500）；大群 O(n) 往返。
+6. **回执不落库**：`Accepted` 的 seq/log_hash 只出现在 `SubmitOutcome.detail` 与诊断用的 `last_receipt()` 里，orchestrator 目前只落接受状态，不保存正式回执/序号；VerifiedAcceptedReceipt 的持久化留待 SYNC-009 接线。
+7. **无速率限制/退避**：API-005 未实现，限流映射为 `Unknown`，重试节奏完全由上层 worker 决定。
+8. **线程模型**：每个实例一条桥线程 + 一个 current-thread 运行时；同进程多群多实例时需要上层复用（线程池化）而不是无界创建。
+9. **节点信任**：只有 `NodeEndpoint::with_node_public_key` 固定公钥时才会验证挑战与回执签名；本测试按固定公钥运行，未固定的调用方只能依赖 node_id 绑定。

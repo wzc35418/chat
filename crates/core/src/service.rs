@@ -191,6 +191,18 @@ impl fmt::Debug for IdentityAccountInput {
     }
 }
 
+/// 可信恢复后的本机身份句柄：可签名/签发邀请（种子不离开 core）。
+///
+/// 故意不实现 Clone/Debug：私钥材料不复制、不打印。
+pub struct PersistedIdentity {
+    /// 账户（含根密钥，可签发邀请与设备凭据）。
+    pub account: LocalAccount,
+    /// 设备密钥（用于设备凭据/签名）。
+    pub device: DeviceKeys,
+    /// 设备 ID（已与库中记录核对一致）。
+    pub device_id: DeviceId,
+}
+
 /// 身份账户投影：**不含任何种子/私钥**，可直接交给 UI。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityAccountView {
@@ -654,6 +666,50 @@ impl ConversationCore {
             .save_identity_account(storage_input)
             .map_err(anyhow::Error::new)?;
         Ok(identity_account_view(record))
+    }
+
+    /// 可信恢复路径：从受保护存储读回种子并重建账户/设备句柄。
+    ///
+    /// 种子只在本函数内解码使用（解码缓冲立即清零），调用方拿到的是可签名的
+    /// [`LocalAccount`] 与 [`DeviceKeys`]；若派生出的账户/设备 ID 与库中记录不一致，
+    /// 说明记录被篡改或换了密钥，直接失败（绝不降级为“新身份”）。
+    pub fn open_persisted_identity(&self) -> anyhow::Result<Option<PersistedIdentity>> {
+        let guard = self.store_guard()?;
+        let store = guard.as_ref().ok_or_else(closed)?;
+        let Some(seeds) = store.load_identity_seeds().map_err(anyhow::Error::new)? else {
+            return Ok(None);
+        };
+        let account_seed: [u8; 32] = seeds
+            .account_seed
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid_input("stored account seed has an unexpected length"))?;
+        let device_seed: [u8; 32] = seeds
+            .device_seed
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid_input("stored device seed has an unexpected length"))?;
+        let created_at_ms = u64::try_from(seeds.created_at_ms.max(0))
+            .map_err(|_| invalid_input("stored created_at_ms is outside the supported range"))?;
+        let account = LocalAccount::from_seed(&seeds.display_name, created_at_ms, &account_seed)
+            .map_err(anyhow::Error::new)?;
+        let device = DeviceKeys::from_seed(&device_seed);
+        if account.account_id().encode() != seeds.account_id {
+            return Err(invalid_input(
+                "stored account seed does not match the persisted account id",
+            ));
+        }
+        let device_id = device.device_id(account.account_id());
+        if device_id.encode() != seeds.device_id {
+            return Err(invalid_input(
+                "stored device seed does not match the persisted device id",
+            ));
+        }
+        Ok(Some(PersistedIdentity {
+            account,
+            device,
+            device_id,
+        }))
     }
 
     /// 读取本机身份账户投影；未保存时返回 `None`。

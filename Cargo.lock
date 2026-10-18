@@ -543,13 +543,18 @@ name = "chat-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chat-crypto",
  "chat-domain",
  "chat-identity",
+ "chat-node-api",
+ "chat-node-client",
+ "chat-node-services",
  "chat-protocol",
  "chat-storage",
  "chat-sync",
  "chat-transport",
+ "ed25519-dalek 3.0.0",
  "serde",
  "serde_json",
  "sha2 0.11.1",

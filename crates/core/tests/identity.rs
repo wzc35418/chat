@@ -377,3 +377,56 @@ fn malformed_identity_inputs_and_closed_core_fail_explicitly() {
         "CORE_CLOSED"
     );
 }
+
+/// P1-02 可信恢复：写入种子后重开，能用库里的种子重建同一账户，并仍能签发邀请。
+#[test]
+fn persisted_identity_seeds_rebuild_the_same_account_after_reopen() {
+    let fixture = Fixture::new("trusted-path");
+    let view = {
+        let mut core = fixture.open();
+        core.save_identity_account(identity_input("恢复测试"))
+            .expect("save identity")
+    };
+
+    let mut core = fixture.open();
+    let identity = core
+        .open_persisted_identity()
+        .expect("open persisted identity")
+        .expect("identity should exist");
+    assert_eq!(identity.account.account_id().encode(), view.account_id);
+    assert_eq!(identity.device_id.encode(), view.device_id);
+    assert_eq!(
+        identity.account.fingerprint().grouped(),
+        view.fingerprint,
+        "恢复后的指纹必须与库中投影一致"
+    );
+
+    // 用恢复出来的根密钥签发邀请；能签出说明私钥确实被恢复（不是空壳账号）。
+    let node = chat_protocol::CoordinatorId::from_bytes([0x33; 32]);
+    let invite = identity
+        .account
+        .create_contact_invite(
+            &identity.device,
+            node,
+            chat_identity::InviteScope::ContactRequest,
+            CREATED_AT + 1_000,
+            60 * 60 * 1000,
+        )
+        .expect("recovered account must still be able to sign an invite");
+    assert!(invite.as_str().starts_with("inv1."));
+
+    // 换错主密钥必须打不开，也就读不到种子。
+    assert!(
+        fixture.open_with_key(OTHER_MASTER_KEY_HEX).is_err(),
+        "错误主密钥必须拒绝打开"
+    );
+
+    // 打开但不写入时也应恢复同一身份（读取路径稳定）。
+    drop(core);
+    let mut reopened = fixture.open();
+    let again = reopened
+        .open_persisted_identity()
+        .expect("reopen identity")
+        .expect("identity should still exist");
+    assert_eq!(again.account.account_id().encode(), view.account_id);
+}

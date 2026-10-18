@@ -13,10 +13,21 @@ chat-storage.workspace = true
 chat-transport.workspace = true
 chat-sync.workspace = true
 anyhow.workspace = true
-tokio.workspace = true
+# O 包：提交端口真实接节点时，桥线程需要带 IO 驱动的运行时（版本仍取自 workspace）。
+tokio = { workspace = true, features = ["net"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# O 包：真实节点 HTTP 客户端（crates/node-client 只在工作区内，按路径依赖）。
+chat-node-client = { path = "../node-client" }
+# O 包：候选/回执类型由节点服务 crate 定义，客户端与节点共用同一份定义。
+chat-node-services.workspace = true
+
+[dev-dependencies]
+# O 包端到端测试：在本进程外起真实 node-api 服务，需要 axum 与设备签名钥。
+chat-node-api.workspace = true
+axum.workspace = true
+ed25519-dalek.workspace = true
 
 [[bin]]
 name = "chat-p0"

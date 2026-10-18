@@ -149,6 +149,37 @@ pub struct IdentityAccountRecord {
     pub already_existed: bool,
 }
 
+/// 本机身份种子材料（可信恢复路径专用，不在普通投影里暴露）。
+pub struct IdentitySeedsRecord {
+    /// 账户 ID。
+    pub account_id: String,
+    /// 设备 ID。
+    pub device_id: String,
+    /// 显示名。
+    pub display_name: String,
+    /// 账户根密钥种子（32 字节）。
+    pub account_seed: Zeroizing<Vec<u8>>,
+    /// 设备密钥种子（32 字节）。
+    pub device_seed: Zeroizing<Vec<u8>>,
+    /// 创建时间（Unix 毫秒）。
+    pub created_at_ms: i64,
+    /// 最近更新时间（Unix 毫秒）。
+    pub updated_at_ms: i64,
+}
+
+impl std::fmt::Debug for IdentitySeedsRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IdentitySeedsRecord")
+            .field("account_id", &self.account_id)
+            .field("device_id", &self.device_id)
+            .field("display_name", &self.display_name)
+            .field("account_seed_len", &self.account_seed.len())
+            .field("device_seed_len", &self.device_seed.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// 联系人写入输入。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContactUpsertInput {
@@ -618,6 +649,25 @@ impl Store {
             }
             None => Ok(None),
         }
+    }
+
+    /// 读取本机身份**种子材料**：只供 core 的可信恢复路径使用。
+    ///
+    /// 与 [`load_identity_account`](Self::load_identity_account) 的区别：后者是脱敏投影，
+    /// 这里返回种子（`Zeroizing`，Debug 脱敏）。调用方不得把种子写入日志/普通 DTO/网络。
+    pub fn load_identity_seeds(&self) -> Result<Option<IdentitySeedsRecord>> {
+        self.ensure_ready()?;
+        Ok(load_identity_row(self.connection(), &self.key)?.map(
+            |(stored, created_at, updated_at)| IdentitySeedsRecord {
+                account_id: stored.account_id.clone(),
+                device_id: stored.device_id.clone(),
+                display_name: stored.display_name.clone(),
+                account_seed: Zeroizing::new(stored.account_seed.clone()),
+                device_seed: Zeroizing::new(stored.device_seed.clone()),
+                created_at_ms: created_at,
+                updated_at_ms: updated_at,
+            },
+        ))
     }
 
     /// 读取单个联系人（按对端账户 ID）；不存在返回 `None`。
