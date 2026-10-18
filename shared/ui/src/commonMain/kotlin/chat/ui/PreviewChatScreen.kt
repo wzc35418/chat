@@ -31,6 +31,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -72,6 +73,7 @@ import chat.presentation.preview.ComposerPresentation
 import chat.presentation.preview.PreviewChatState
 import chat.presentation.preview.PreviewContact
 import chat.presentation.preview.PreviewContactState
+import chat.presentation.preview.PreviewIdentityState
 import chat.presentation.preview.PreviewDraftSample
 import chat.presentation.preview.PreviewInviteStep
 import chat.presentation.preview.PreviewInviteValidation
@@ -113,8 +115,15 @@ private val PreviewErrorInk = Color(0xFF943C28)
  * 预览中的联系人、回执、“已送达”等字样均不得接入真实会话。
  */
 @Composable
-fun PreviewChatScreen(initialState: PreviewChatState = samplePreviewState()) {
+fun PreviewChatScreen(
+    initialState: PreviewChatState = samplePreviewState(),
+    identityState: PreviewIdentityState = PreviewIdentityState(),
+    identityHandlers: IdentityHandlers = IdentityHandlers.None,
+    initialIdentityOpen: Boolean = false,
+) {
     var state by remember { mutableStateOf(initialState) }
+    // 真实身份面板是独立浮层：默认关闭，由侧栏按钮打开；截图入口可指定初始打开。
+    var showIdentity by remember { mutableStateOf(initialIdentityOpen) }
 
     MaterialTheme(
         colorScheme = lightColorScheme(
@@ -149,6 +158,7 @@ fun PreviewChatScreen(initialState: PreviewChatState = samplePreviewState()) {
                                     onScenario = { state = state.applyScenario(it) },
                                     onSearch = { state = state.updateSearch(it) },
                                     onOpenInvite = { state = state.openInvite() },
+                                    onOpenIdentity = { showIdentity = true },
                                 )
                                 Box(Modifier.width(1.dp).fillMaxHeight().background(Color(0xFFE1E6E1)))
                                 ChatPane(
@@ -187,10 +197,26 @@ fun PreviewChatScreen(initialState: PreviewChatState = samplePreviewState()) {
                                     onScenario = { state = state.applyScenario(it) },
                                     onSearch = { state = state.updateSearch(it) },
                                     onOpenInvite = { state = state.openInvite() },
+                                    onOpenIdentity = { showIdentity = true },
                                 )
                             }
                         }
                     }
+                }
+            }
+            if (showIdentity) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color(0x66000000))
+                        .pointerInput(Unit) { detectTapGestures(onTap = { showIdentity = false }) }
+                        .semantics { contentDescription = "真实身份面板遮罩" },
+                ) {
+                    RealIdentityPanel(
+                        state = identityState,
+                        handlers = identityHandlers,
+                        onClose = { showIdentity = false },
+                    )
                 }
             }
             if (state.showInvite) {
@@ -249,6 +275,7 @@ private fun Sidebar(
     onScenario: (PreviewScenario) -> Unit,
     onSearch: (String) -> Unit,
     onOpenInvite: () -> Unit,
+    onOpenIdentity: () -> Unit,
 ) {
     Surface(modifier, color = Color.White) {
         Column(
@@ -309,6 +336,15 @@ private fun Sidebar(
                 contentPadding = PaddingValues(vertical = 10.dp),
             ) {
                 Text(UiCopy.PREVIEW_ADD_FRIEND)
+            }
+            OutlinedButton(
+                onClick = onOpenIdentity,
+                modifier = Modifier.fillMaxWidth().semantics {
+                    contentDescription = "打开真实身份（本机）面板"
+                },
+                contentPadding = PaddingValues(vertical = 8.dp),
+            ) {
+                Text("真实身份（本机）", style = MaterialTheme.typography.labelMedium)
             }
             Surface(color = PreviewCanvas, shape = RoundedCornerShape(10.dp)) {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {

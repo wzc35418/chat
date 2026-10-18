@@ -10,10 +10,21 @@ import chat.presentation.preview.advancePagingSample
 import chat.presentation.preview.applyScenario
 import chat.presentation.preview.fillSampleInviteToken
 import chat.presentation.preview.openInvite
+import chat.api.IdentityAccount
+import chat.bridge.createIdentityService
+import chat.presentation.display.presentContact
+import chat.presentation.display.presentInvitePreview
+import chat.presentation.preview.PreviewIdentityState
+import chat.presentation.preview.openWith
 import chat.presentation.preview.samplePreviewState
 import chat.presentation.preview.updateInviteText
 import chat.presentation.preview.validateInvite
+import chat.presentation.preview.unavailable
+import chat.presentation.preview.withContacts
+import chat.presentation.preview.withInvite
+import chat.presentation.preview.withPreview
 import chat.ui.PreviewChatScreen
+import kotlinx.coroutines.runBlocking
 import org.jetbrains.skia.EncodedImageFormat
 import java.io.File
 
@@ -82,9 +93,61 @@ fun main() {
         ),
     )
 
-    for (render in renders) {
+    val realIdentity = realIdentityState()
+    println("real identity state ready=" + realIdentity.ready + " contacts=" + realIdentity.contacts.size)
+    val identityRenders = listOf(
+        Render(
+            "preview-desktop-real-identity",
+            1024,
+            860,
+            base,
+            identityState = realIdentity,
+            identityOpen = true,
+        ),
+        Render(
+            "preview-compact-real-identity",
+            390,
+            844,
+            base,
+            identityState = realIdentity,
+            identityOpen = true,
+        ),
+    )
+
+    for (render in renders + identityRenders) {
         renderScene(render)
     }
+}
+
+/**
+ * 用**真实身份服务**构造面板状态：两个独立身份互相校验口令。
+ * 任何一步失败都退回“服务不可用”的显式状态，不伪造指纹或口令。
+ */
+private fun realIdentityState(): PreviewIdentityState {
+    val node = "node:1:" + "0a".repeat(32)
+    return runCatching {
+        runBlocking {
+            val alice = createIdentityService()
+            val bob = createIdentityService()
+            try {
+                val accountA = alice.create("本机账户", node)
+                bob.create("对方账户", node)
+                val inviteA = alice.createInvite(24L * 60 * 60 * 1000)
+                val inviteB = bob.createInvite(24L * 60 * 60 * 1000)
+                val summary = alice.previewInvite(inviteB.token)
+                val contact = alice.acceptInvite(inviteB.token, "对方")
+                var state = PreviewIdentityState().openWith(accountA)
+                state = state.withInvite(inviteA)
+                state = state.withPreview(presentInvitePreview(summary, System.currentTimeMillis()))
+                state = state.copy(pastedToken = inviteB.token)
+                state = state.withContacts(listOf(contact))
+                state
+            } finally {
+                runCatching { alice.close() }
+                runCatching { bob.close() }
+            }
+        }
+    }.getOrElse { error -> PreviewIdentityState().unavailable(error.message ?: "真实身份服务不可用") }
 }
 
 private data class Render(
@@ -93,12 +156,18 @@ private data class Render(
     val height: Int,
     val state: PreviewChatState,
     val fontScale: Float = 1f,
+    val identityState: PreviewIdentityState = PreviewIdentityState(),
+    val identityOpen: Boolean = false,
 )
 
 @OptIn(ExperimentalComposeUiApi::class)
 private fun renderScene(render: Render) {
     val scene = ImageComposeScene(render.width, render.height, Density(1f, render.fontScale)) {
-        PreviewChatScreen(initialState = render.state)
+        PreviewChatScreen(
+            initialState = render.state,
+            identityState = render.identityState,
+            initialIdentityOpen = render.identityOpen,
+        )
     }
     try {
         val image = scene.render()

@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 chat-core.workspace = true
+chat-identity.workspace = true
 chat-protocol.workspace = true
 uniffi.workspace = true
 thiserror.workspace = true

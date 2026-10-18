@@ -1,10 +1,100 @@
 # 可靠发送、信箱、日志补齐与生命周期
 
-阶段：P1 → P3。状态：函数级设计，尚未实现。目标源码：[crates/sync/src/engine.rs](../../crates/sync/src/engine.rs)。
+阶段：P1 → P3。状态：函数级设计；SYNC-003/004（发送调度决策）、SYNC-007（信箱顺序/去重/预算/ACK 记账）、SYNC-011（重试/退避策略）已实现并被自动化用例覆盖，其余函数未开始。目标源码：[crates/sync/src/engine.rs](../../crates/sync/src/engine.rs)。
 
 可靠性来自耐久队列，不依赖 Flow 或 WebSocket 是否在线。outbox 分开 Prepare、Append、PeerPretransfer、MailboxPut、DeliveryReceipt、MailboxAck、ControlRebuild 等任务。每群同一执行器串行推进密码学状态，多个群可以有界并行。
 
 返回类型与字段约束见 [类型字典](TYPES.md)，事务编号见 [事务和并发约定](TRANSACTIONS.md)，纵向流程见 [关键调用链](FLOWS.md)。所有 Result<T> 表示显式可恢复错误，不允许安全验证失败后继续推进。
+
+## 重试/信箱/发送调度实现记录（2026-10-18，Windows x64）
+
+本轮实现 sync 的**纯逻辑部分**（不连网、不连库、不 sleep），网络与持久化通过 trait/端口注入：
+
+- [crates/sync/src/error.rs](../../crates/sync/src/error.rs)：`SyncError`（冻结码 + 静态诊断键）与 `to_public_error`。
+- [crates/sync/src/clock.rs](../../crates/sync/src/clock.rs)：`Clock` trait、`FixedClock`（测试确定性）、`SystemClock`（生产）。
+- [crates/sync/src/ids.rs](../../crates/sync/src/ids.rs)：文本 ID 校验与**确定性 SubmissionId 派生**（PROTOCOL-001 强类型）。
+- [crates/sync/src/retry.rs](../../crates/sync/src/retry.rs)：SYNC-011 `schedule_retry` 与 `RetryLedger`。
+- [crates/sync/src/mailbox.rs](../../crates/sync/src/mailbox.rs)：SYNC-007 单页消费 + `MailboxPoller` 轮询状态机（`MailboxSource`/`AckSink` 端口）。
+- [crates/sync/src/send.rs](../../crates/sync/src/send.rs)：SYNC-003/SYNC-004 的 `plan_submission` 调度决策。
+- [crates/sync/src/engine.rs](../../crates/sync/src/engine.rs)：SYNC 编号与上述模块的映射，以及未实现项边界。
+
+依赖只来自根 `[workspace.dependencies]`（`chat-protocol`、`chat-domain`、`sha2`）。本轮同时**移除**了 chat-sync 里未使用的 `chat-storage`/`chat-transport` 依赖：它们会把其他 crate 的 clippy 告警带进本 crate 的验收命令，且本轮的纯逻辑不需要它们；接入 SYNC-002/005/006 时必须重新加入。
+
+### 错误码映射（码表取自 PROTOCOL-014，不新增码）
+
+计划书里的 `JOB_KEY_CONFLICT` / `PERMANENT_FAILURE` / `RETRY_BUDGET_EXHAUSTED` 不是码表条目，按下表表达：
+
+| 场景 | 冻结码 |
+|---|---|
+| 参数/策略非法（limit、worker、policy、负时钟、重建序号超预算） | `INVALID_TARGET` |
+| ID 文本非法（item/group/worker/draft） | `INVALID_ID` |
+| 失败序号从 1 起（attempt 0） | `INVALID_SEQUENCE` |
+| 页/条目/暂存/待 ACK 超上限 | `CONTENT_TOO_LARGE` |
+| 游标回退/无进展/页内位置乱序/落在游标之后的未知条目 | `INVALID_CURSOR` |
+| 同一 item id 内容不同（重复但内容冲突） | `INVALID_CANDIDATE` |
+| 乱序暂存满（需要先补日志） | `MISSING_LOG_ENTRIES` |
+| 投影不一致（尝试属于别的草稿、租约无持有者、草稿已接受但尝试未接受等） | `STATE_CORRUPTED` |
+| 草稿已取消、未知结果被强行重发 | `INVALID_STATE_TRANSITION` / `UNKNOWN_RESULT` |
+| 业务键冲突（计划书的 `JOB_KEY_CONFLICT`） | `INVALID_STATE_TRANSITION` |
+| 永久失败 / 重试预算耗尽（计划书的结果类别） | `RetryAction::PermanentFailure` / `RetryAction::RetryBudgetExhausted`，并保留根因冻结码 |
+| 网络/节点/限流/存储忙 | 原样传播（`NETWORK_UNAVAILABLE` / `NODE_UNAVAILABLE` / `RATE_LIMITED` / `STORAGE_LOCKED`） |
+
+### 重试策略（SYNC-011）
+
+固定参数（`RetryPolicy::DEFAULT`，全部可测）：基础 1 s、倍数 2、自动退避上限 60 s、抖动 ±20%、连续失败预算 8 次。语义：
+
+1. 错误先经 `chat_domain::classify_retry`（DOMAIN-010）分类，本层不发明分类。
+2. `ResendSameBytes` → 指数退避 `base × 2^(attempt-1)`（封顶 60 s），再施加由注入 `JitterSource` 抽样的 ±20% 抖动（抽样 0/500/1000 = 下界/中点/上界）。
+3. Retry-After 是**下界**：`delay = max(抖动后退避, clamp(retryAfter, 1, 300000))`，上限取 PROTOCOL-014 的 `MAX_RETRY_AFTER_MS`（5 分钟）。
+4. `QueryExisting`（结果未知）→ 只按原 SubmissionId 对账，仍给有界轮询延迟；`SyncThenRebuild`/`WaitForUser`/`PermanentFailure` → 无退避时刻。
+5. `attempt > max_attempts` → `RetryAction::RetryBudgetExhausted`（终态，保留根因码）。
+6. 连续失败计数用 `RetryLedger`：**唯一重置条件是正式成功证据**（`record_success`）；重启用 `RetryLedger::restore` 恢复计数，绝不归零。
+
+### 信箱轮询（SYNC-007）
+
+`MailboxPoller::tick(clock, source, ack)` 顺序：**先补 ACK → 再拉取 → 消费 → 记账 → 计算下一次时间**。
+
+- 游标：页面 `next.position` 只能前进；回退、非空页无进展、页内位置不递增、位置落在游标之后且 ID 未知 → `INVALID_CURSOR`，且状态不变。
+- 去重：保留窗口（4096 条）内的 item id 与内容指纹；相同 → 记重复、不重复投递；不同 → `INVALID_CANDIDATE`。
+- 乱序：群日志按 `group_seq` 连续推进；跳号先**耐久暂存**（同时 ACK，避免节点重发），缺号到达后按序提升；暂存上限 512，超限 `MISSING_LOG_ENTRIES` 并整页回滚。
+- 预算：单页 ≤100 条、单页 ≤1 MiB、单条 ≤64 KiB；跟踪群 ≤256；待 ACK 集合 ≤4096（满则背压）。
+- ACK 失败：保留待 ACK 集合、游标不回退、不重复投递；下一轮先重试 ACK（1 s 退避）。
+- 空页不空转：空页退避 30 s，非空页之间至少 1 s；时间未到返回 `Idle` 且**不调用数据源**；拉取失败按 1 s 起指数退避（封顶 60 s）。
+
+### 发送调度（SYNC-003 / SYNC-004）
+
+`plan_submission(draft, attempt, worker, now)` 是纯决策函数，输出下一步动作：
+
+- `Prepare`：新尝试；SubmissionId = SHA-256(域分隔 ‖ draft_id ‖ mls_epoch ‖ attempt_index) 的 PROTOCOL-001 强类型 ID，同一输入永远同 ID，因此重启/事务重试/二次调度都不会产生第二个 ID，也不会第二次加密。
+- `Resubmit`：已有耐久尝试且**租约已过期/未租用**，同 ID 同字节重发（`was_submitted` 仅诊断）。
+- `WaitForLease`：`lease_until_ms > now` 时禁止并发重发（含自己持有的情况），与 STORAGE-014 的租约语义一致。
+- `QueryExisting`：`unknown` 只对账——即使租约已过期也不重发、不重新加密。
+- `Release`：只有 `Accepted` 才释放；重复调度保持 Release。
+- `Rebuild`：`Rejected` 且草稿未取消 → `attempt_index + 1` 得到新 SubmissionId（先同步补齐，本函数不猜 epoch）；重建序号上限 64。
+- `Abandoned`：草稿已取消（已接受的尝试仍走 Release，不丢成功事实）。
+
+### 复现命令（全程离线，本轮实测）
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-sync    # 14 mailbox = ok / 9 retry = ok / 10 send = ok；lib 0 个
+cargo clippy --offline -p chat-sync  # 0 warning（lib + --all-targets 均无告警）
+```
+
+### 证据（测试名 → 契约点）
+
+- 重试/退避（`tests/retry_backoff.rs`，9 个）：`backoff_is_exponential_and_capped`（1/2/4/8/16/32/60/60 s 序列与上限）、`jitter_window_is_fixed_and_bounded`（0/500/1000 抽样 = 下界/中点/上界）、`retry_after_takes_priority_and_is_capped_at_five_minutes`（优先且 5 分钟上限、0 被夹到 1 ms）、`non_retryable_errors_are_terminal_without_a_delay`（权限/撤销/损坏/凭据/epoch 立即终态且保留根因码）、`unknown_results_only_reconcile_the_existing_submission`、`retry_budget_exhaustion_stops_automatic_retries`、`ledger_counts_failures_and_only_success_resets`（重启恢复计数、只有成功重置）、`malformed_policies_and_inputs_are_rejected`、`seeded_jitter_is_deterministic_and_stays_in_the_window`。
+- 信箱（`tests/mailbox_polling.rs`，14 个）：`ordered_items_are_delivered_and_the_cursor_advances`、`duplicate_pages_are_idempotent_and_not_redelivered`、`duplicate_item_id_with_different_content_is_rejected`、`out_of_order_log_entries_are_held_then_promoted_in_order`（先 2/3 后 1 → 交付 1/2/3）、`cursor_regression_and_no_progress_are_rejected`、`ack_failure_keeps_progress_and_is_retried`、`empty_pages_back_off_and_do_not_busy_loop`、`pull_failures_back_off_exponentially_and_keep_the_cursor`、`page_and_item_budgets_are_enforced_without_state_change`、`hold_buffer_is_bounded`、`tracked_group_slots_are_bounded`、`seed_group_aligns_the_expected_sequence`、`unknown_item_kinds_are_delivered_without_interpretation`、`malformed_ids_and_cursors_are_rejected`。
+- 发送调度（`tests/send_scheduling.rs`，10 个）：`first_scheduling_derives_one_submission_id_and_is_idempotent`、`derived_ids_are_stable_and_domain_separated`、`prepared_attempt_is_resubmitted_with_the_same_id_and_bytes`、`active_lease_blocks_concurrent_resend_until_it_expires`、`unknown_is_never_resent_even_after_lease_expiry`、`only_formal_acceptance_releases_the_attempt`、`rejection_rebuilds_with_a_new_submission_id`、`cancelled_draft_abandons_every_path`、`inconsistent_or_malformed_snapshots_are_rejected`、`the_plan_sequence_encrypts_exactly_once`（按计划推进 6 步：加密 1 次、重发 2 次、unknown 后只对账 2 次，最终 Release）。
+
+### 已知限制（本轮只对纯逻辑负责）
+
+1. **不验证 envelope**：SYNC-007 步骤 1-4（授权、Welcome 加入、日志补齐验证、毒性条目隔离）需要 CRYPTO/STORAGE 正式路径，本轮未接入；因此本层“已处理”只等于“已进入本机顺序/暂存”，不代表消息已验证或已到达用户。
+2. **耐久性契约**：ACK 语义要求 core 在同一事务里把条目写入耐久去重表（`inbox_dedup`，STORAGE-）后才允许 ACK；本状态机只保证顺序与记账，进程崩溃后的耐久恢复由 core 负责。
+3. **去重窗口有界**（4096 条）：被驱逐的 item id 若被节点重放，需要存储侧 `(conversation, event_id)` 去重兜底（计划书也说明外层 item ID 不作可信消息去重）。
+4. **群日志起点默认 1**：已加入设备必须先由 SYNC-008 补齐并把 verified head 通过 `seed_group` 对齐；本层不推断 `joined_seq`，也不主动补拉缺号（那是 SYNC-008）。
+5. **退避参数是固定取值**：正式配置来源（用户/系统预算）待 CONFIG/BRIDGE 接入；抖动来源生产必须由桥接层注入系统 RNG，本轮只提供 `FixedJitter`/`SeededJitter`。
+6. **未接入真实网络/数据库/MLS/时钟**：SYNC-001/002/005/006/008/009/010/012/013/014 未实现；因此本页的完成验收只勾选纯逻辑可证的两项（SYNC-003/004/007/011 的部分项），整体模块不计完成。
 
 ## 函数导航
 
@@ -119,10 +209,10 @@ prepare_draft_job(draft: DraftId) -> Result<AttemptId>
 
 **完成验收**：
 
-- [ ] 创建意图后被禁言应失败。
-- [ ] 同 job 重跑取得同 attempt。
+- [ ] 创建意图后被禁言应失败。（未验证：权限校验在 DOMAIN-001 + core 的正式状态里，本轮只实现调度决策，不做权限判定）
+- [x] 同 job 重跑取得同 attempt：`send_scheduling::first_scheduling_derives_one_submission_id_and_is_idempotent`（同一草稿同一 epoch/序号二次调度得到完全相同的 `Prepare` 与 SubmissionId）、`send_scheduling::the_plan_sequence_encrypts_exactly_once`（按计划推进只加密一次）。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（仅调度决策）。`plan_submission(draft, attempt, worker, now)` 见 [send.rs](../../crates/sync/src/send.rs)：新草稿 → `Prepare`（确定性 SubmissionId）、已有耐久尝试且租约过期 → `Resubmit`（同 ID 同字节）、租约有效 → `WaitForLease`、已接受 → `Release`、拒绝 → `Rebuild`（新 ID）、取消 → `Abandoned`。限制：不加密、不写库、不做权限校验；真实 T2 事务（`persist_prepared_attempt`）与 outbox 接入由 core 完成。
 
 <a id="sync-004"></a>
 
@@ -152,10 +242,10 @@ submit_attempt_job(attempt: AttemptId) -> Result<AttemptOutcome>
 
 **完成验收**：
 
-- [ ] 超时实际已成功恢复同 seq。
-- [ ] 同 ID 同 bytes 多次提交只接受一次。
+- [ ] 超时实际已成功恢复同 seq。（未验证：需要 TRANSPORT-006 `append_candidate` 与回执验证，本轮不连网）
+- [x] 同 ID 同 bytes 多次提交只接受一次：调度侧证据 `send_scheduling::prepared_attempt_is_resubmitted_with_the_same_id_and_bytes`（同 ID 重发不重新加密）、`send_scheduling::unknown_is_never_resent_even_after_lease_expiry`（未知结果只 `QueryExisting`，租约过期也不换新 ID）。节点侧“只接受一次”属于 NODE-003/协议去重，不在本 crate。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（决策与租约/未知语义）。`plan_submission` 保证 unknown → `QueryExisting`（不重发、不重新加密）、租约有效 → `WaitForLease`、成功 → `Release`，并提供 `reject_unknown_resend` 供绕过计划的调用方自检（`UNKNOWN_RESULT`）。限制：真实 append 调用、回执验证与 `STORAGE-008` 应用未接入。
 
 <a id="sync-005"></a>
 
@@ -254,10 +344,10 @@ consume_mailbox_page(page: MailboxPage) -> Result<MailboxConsumeResult>
 
 **完成验收**：
 
-- [ ] 先收到 seq 8 必须补1..7。
-- [ ] 坏条目不阻塞全设备但不能被当真消息。
+- [ ] 先收到 seq 8 必须补1..7。（部分：本轮先持久暂存 8 并在 1..7 到达后按序交付——`mailbox_polling::out_of_order_log_entries_are_held_then_promoted_in_order`；**主动补拉** 1..7 属于 SYNC-008 `catch_up_group`，未实现）
+- [ ] 坏条目不阻塞全设备但不能被当真消息。（部分：畸形页整页显式拒绝且不改变状态——`page_and_item_budgets_are_enforced_without_state_change`；未知类别只保留不解释——`unknown_item_kinds_are_delivered_without_interpretation`；逐条隔离/告警依赖 STORAGE-007 隔离事务，未实现）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（顺序/去重/预算/ACK 记账）。`MailboxPoller::tick(clock, source, ack)` 见 [mailbox.rs](../../crates/sync/src/mailbox.rs)：游标只前进、同 item id 幂等去重（内容冲突 `INVALID_CANDIDATE`）、乱序暂存（512 上限）并按序提升、单页/单条/总量/群数/待 ACK 五类上限、ACK 失败保留进度并重试、空页 30 s 退避不空转、拉取失败指数退避（证据见上文实现记录）。限制：不做 envelope 授权/MLS 验证与毒性条目隔离（依赖 CRYPTO-*/STORAGE-007，未接入）；耐久去重依赖 core 写 `inbox_dedup`。
 
 <a id="sync-008"></a>
 
@@ -389,10 +479,10 @@ schedule_retry(job: JobId, error: CoreError, now: Time) -> Result<RetrySchedule>
 
 **完成验收**：
 
-- [ ] 断网一小时不忙轮询。
-- [ ] 重启不把失败计数归零。
+- [x] 断网一小时不忙轮询：`retry_backoff::backoff_is_exponential_and_capped`（退避有 60 s 上限）、`retry_backoff::retry_budget_exhaustion_stops_automatic_retries`（预算耗尽即终态，不会无限重试）、`mailbox_polling::empty_pages_back_off_and_do_not_busy_loop`（时间未到不调用数据源）、`mailbox_polling::pull_failures_back_off_exponentially_and_keep_the_cursor`。
+- [x] 重启不把失败计数归零：`retry_backoff::ledger_counts_failures_and_only_success_resets`（`RetryLedger::restore` 保留计数；唯一重置条件是 `record_success`）。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（纯策略）。`schedule_retry(policy, attempt, input, jitter)` 与 `RetryLedger` 见 [retry.rs](../../crates/sync/src/retry.rs)：基础 1 s / 倍数 2 / 上限 60 s / 抖动 ±20% / 预算 8 次；先经 `chat_domain::classify_retry`（DOMAIN-010）分类；Retry-After 作为下界且夹到 `MAX_RETRY_AFTER_MS`（5 分钟）；不可重试错误立即终态并保留根因码。限制：退避参数固定为代码取值（正式配置来源待 CONFIG/BRIDGE 接入）；生产抖动必须由桥接层注入系统 RNG；本模块不 sleep、不写库（排期由 core 用短事务落盘）。
 
 <a id="sync-012"></a>
 

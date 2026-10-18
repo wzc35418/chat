@@ -1,6 +1,6 @@
 # FFI、回调、Flow 包装与资源生命周期
 
-阶段：P0 → P2。状态：函数级设计；BRIDGE-001/002/003/004/005 的通用编排尚未实现，本地存储竖直切片的 UniFFI 对象 `LocalStoreFfi` 已在 Windows x64 编译并实测（见“本地存储竖直切片（LocalStoreFfi）”）。目标源码：[crates/ffi/src/bridge.rs](../../crates/ffi/src/bridge.rs)（P0 临时实验对象）与 [crates/ffi/src/local_store.rs](../../crates/ffi/src/local_store.rs)（正式存储对象）。
+阶段：P0 → P2。状态：函数级设计；BRIDGE-001/002/003/004/005 的通用编排尚未实现，两个竖直切片的 UniFFI 对象已在 Windows x64 编译并实测：本地存储的 `LocalStoreFfi`（见“本地存储竖直切片（LocalStoreFfi）”）与身份/口令加好友的 `IdentityFfi`（见“身份与口令加好友竖直切片（IdentityFfi）”）。目标源码：[crates/ffi/src/bridge.rs](../../crates/ffi/src/bridge.rs)（P0 临时实验对象）、[crates/ffi/src/local_store.rs](../../crates/ffi/src/local_store.rs)（正式存储对象）与 [crates/ffi/src/identity_ffi.rs](../../crates/ffi/src/identity_ffi.rs)（身份/联系人对象）。
 
 真实生成绑定必须来自选定框架，P0 前不伪造 ABI。Kotlin 包装代码目标位于 shared/core-bridge/src/jvmMain 及 Android 对应 source set；Flow 只负责 UI 通知。Rust 原生方法不导出 Kotlin coroutine 或 Flow；秘密不作为普通 UI DTO。
 
@@ -329,3 +329,141 @@ cargo build --locked --offline -p chat-ffi   # 成功，Cargo.lock 未变化
 - `local_store::tests::failures_are_typed_with_stable_codes`：非规范会话 ID 与 `u64::MAX` 时间戳都返回 `FfiError::Store { code = "INVALID_INPUT", .. }`。
 
 已知限制：本对象只覆盖竖直切片，没有事件订阅（BRIDGE-003/004/006）、没有异步/suspend 包装（BRIDGE-007）、没有平台回调（BRIDGE-001 的完整形态）；`#[uniffi::Object]` 内部的 `std::sync::Mutex` 会串行化所有调用，调用方不要在 UI 线程做长分页循环。Kotlin/Android 真机尚未实测（本轮只验证 Rust 侧编译与单元测试）。
+
+## 身份与口令加好友竖直切片（IdentityFfi，Windows x64）
+
+实现位置：[crates/ffi/src/identity_ffi.rs](../../crates/ffi/src/identity_ffi.rs)（`uniffi::Object`）。
+与 `P0Core`、`LocalStoreFfi` 互不共享状态，但**复用同一个** `FfiError`（定义在
+[local_store.rs](../../crates/ffi/src/local_store.rs)，UniFFI 允许同一 error 类型服务多个对象），
+因此 Kotlin 侧仍然只 `catch (e: FfiException.Store)` 一处。方法名用 `shutdown`（不是 `close`），
+避免与生成代码的 `AutoCloseable.close()` 冲突。
+
+生成绑定的公开面（UniFFI 0.32，crate `chat-ffi`；与 Kotlin 侧逐字对接的形状）：
+
+~~~text
+#[derive(uniffi::Object)] IdentityFfi
+
+#[uniffi::constructor]
+IdentityFfi::create(display_name: String, node: String) -> Result<Arc<IdentityFfi>, FfiError>
+
+IdentityFfi::account() -> AccountView
+IdentityFfi::create_invite(ttl_ms: u64) -> Result<InviteView, FfiError>
+IdentityFfi::preview_invite(token: String) -> Result<InviteSummary, FfiError>
+IdentityFfi::accept_invite(token: String, display_name: String) -> Result<ContactView, FfiError>
+IdentityFfi::contacts() -> Vec<ContactView>
+IdentityFfi::confirm_identity_change(contact_id: String) -> Result<ContactView, FfiError>
+IdentityFfi::shutdown()
+~~~
+
+记录：
+
+- `AccountView { account_id, device_id, display_name, fingerprint }`。
+- `InviteView { token, invite_id, expires_at_ms: u64, account_id, device_id, fingerprint }`。
+- `InviteSummary { invite_id, account_id, device_id, fingerprint, node, expires_at_ms: u64 }`。
+- `ContactView { contact_id, account_id, display_name, fingerprint, state, can_send }`，
+  其中 `state` 是 identity 状态机的稳定名 `requested` | `accepted` | `declined` | `blocked` | `identity_changed`。
+
+字段语义（Kotlin 侧不要自行重新解释）：
+
+1. `node` 参数是 PROTOCOL-001 规范文本 `node:1:<64 位小写 hex>`（identity 的邀请正文绑定
+   `CoordinatorId`，因此不接受昵称式字符串；非法文本返回 `INVALID_ID`）。**同一对用户必须使用
+   同一个 node 字符串**：`accept_invite` 要求口令绑定的节点与本对象创建时传入的节点一致。
+2. `fingerprint` 是 IDENTITY-007 的分组展示形态：16 组 4 位大写 hex、单空格分隔（79 字符）。
+   只用于人工核对，不参与任何密码学判定。
+3. `invite_id` 是口令正文中 16 字节 nonce 的小写 hex（32 字符），本地去重/展示用；
+   `expires_at_ms` 与 `invite_id` 都来自**刚生成口令的验签回读**，不是本地推算值。
+4. `contact_id` 当前等于对端 `account_id`（v1 口令不携带独立请求 ID），必须原样回传给
+   `confirm_identity_change`。
+5. `display_name` 在 `ContactView` 里是**本地备注**：`inv1` 口令正文不携带对方昵称
+   （identity 的冻结布局只有账户/设备/节点/作用域/时间/nonce），所以对端昵称只能由 UI
+   在调用 `accept_invite` 时给出；传空串表示「未知」，UI 自行回退展示账户 ID 缩写，且不会
+   清空已有备注。非空值按显示名规则限制 1..=64 字节、无控制字符（超界 `INVALID_TARGET`）。
+6. `can_send` 只有在 `accepted` 且观测指纹等于固定信任锚时为 true；接受口令后只产生
+   `requested`（`can_send == false`），与 [界面契约](../design/CONTACT_INVITE_DESKTOP.md) 一致：
+   输入区只在 `accepted` 时启用。
+
+错误（复用 `FfiError::Store { code, reason }`；`code` 全部来自 identity 的 PROTOCOL-014 映射表，
+不新增码，见 [identity.md 的错误码映射](identity.md)）：
+
+| 场景 | code |
+|---|---|
+| 显示名非法、邀请有效期越界（0 / <60 s / >7 d / 溢出）、本地备注越界、自己的口令、未知 `contact_id`、跨节点接受 | `INVALID_TARGET` |
+| 口令签名被篡改（正文或签名） | `INVALID_SIGNATURE` |
+| 口令过期 | `CURSOR_EXPIRED` |
+| 联系人迁移非法（例如对 `requested` 调用 `confirm_identity_change`） | `INVALID_STATE_TRANSITION` |
+| 口令文本超长（>1024 字节） | `CONTENT_TOO_LARGE` |
+| 口令结构畸形 | `MALFORMED_FRAME` |
+| 口令版本前缀不是 `inv1` | `PROTOCOL_UNSUPPORTED` |
+| `node` 不是规范 ID 文本 | `INVALID_ID` |
+| 已 `shutdown` 后调用需要密钥的方法 | `CORE_CLOSED` |
+| 互斥锁被前一次 panic 中毒 | `CORE_PANICKED` |
+
+调用约定（Kotlin 侧必须遵守）：
+
+1. `create` 在**进程内**生成账户根密钥与设备密钥：不写库、不做系统密钥保护，进程退出即丢失
+   （等 PLATFORM-001/storage 集成）。因此 UI 不应把 `create` 当成「已持久化账户」。
+2. `account()` 与 `contacts()` 的签名没有 `Result`：它们返回**公开投影**，`shutdown` 后仍返回
+   关闭前快照（不伪造空值）。所有需要密钥的方法在 `shutdown` 后返回 `CORE_CLOSED`。
+3. `preview_invite` 只校验口令本身（验签 + 期限 + 结构），把 `node` 当**提示**展示；
+   真正阻断跨节点口令的是 `accept_invite`。两个入口共用 identity 的同一条校验链，
+   不存在「先解析、后验签」的旁路。
+4. 时间戳在 FFI 边界是 `u64`（Kotlin `ULong`）；内部时钟为系统 UTC 毫秒，测试注入固定时钟。
+5. 口令原文 `token` 只在返回值里出现：不得写日志、分析事件或错误详情（上表中的 `reason`
+   只含静态描述，不含口令内容）。
+
+复现命令（全程离线，本轮实测）：
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi            # 12 passed（10 个 IdentityFfi + 2 个既有 LocalStoreFfi）
+cargo build --locked --offline -p chat-ffi  # 成功
+cargo clippy --offline -p chat-ffi --all-targets  # chat-ffi 0 warnings
+~~~
+
+证据（`identity_ffi::tests::*`）：
+
+- `account_and_invite_round_trip_through_the_ffi_shape`：`create` → `account()`（acct/dev 前缀、
+  79 字符 / 16 组指纹）→ `create_invite(24 h)`（`inv1.` 前缀、32 位 hex `invite_id`、
+  `expires_at_ms == now + ttl`、账户/设备/指纹与账户视图一致）→ 对端 `preview_invite` 摘要逐字段一致，
+  且 preview 不产生联系人。
+- `projection_matches_the_frozen_identity_vectors`：账户种子 0x01 / 设备种子 0x11 的冻结向量
+  （`acct:1:804d17d8…`、`dev:1:a4ec09ed…`、指纹 `7EC8 C5E1 … 4742 8EB4`）与 identity 用
+  OpenSSL/Node 独立算出的结果完全一致，证明 FFI 只做投影、没有另造派生。
+- `production_constructor_uses_the_system_clock`：真实构造路径（系统时钟）→ 口令 → 对端 preview →
+  accept，端到端跑通。
+- `tampered_tokens_are_rejected_with_invalid_signature`：改签名末位 hex → `INVALID_SIGNATURE`
+  （preview 与 accept 都拒绝，且不产生联系人）。
+- `expired_invites_are_rejected_with_cursor_expired`：时钟推进到 `expires_at_ms` →
+  `CURSOR_EXPIRED`。
+- `self_invites_and_foreign_nodes_are_rejected_with_invalid_target`：自己的口令 → `INVALID_TARGET`；
+  跨节点口令 preview 可看（`node` 原样展示）、accept → `INVALID_TARGET`。
+- `accept_invite_creates_a_requested_contact_only`：accept 后联系人 `state == "requested"`、
+  `can_send == false`、`contact_id == 对端 account_id`、本地备注生效；同一口令重复粘贴**不产生重复申请**
+  且不丢备注。
+- `confirm_identity_change_rejects_illegal_calls`：`requested` → `INVALID_STATE_TRANSITION`；
+  未知账户与畸形句柄 → `INVALID_TARGET`。
+- `display_name_node_and_lifetime_bounds_are_enforced`：空/超长/含控制字符的显示名 → `INVALID_TARGET`；
+  空/非规范的 `node` → `INVALID_ID`；`ttl_ms` 0/1/59 999/7 d+1/`u64::MAX` → `INVALID_TARGET`，
+  60 000 与 7 d 通过；2048 字节口令 → `CONTENT_TOO_LARGE`、`inv2.` → `PROTOCOL_UNSUPPORTED`、
+  畸形结构 → `MALFORMED_FRAME`。
+- `shutdown_releases_keys_and_rejects_further_key_work`：`shutdown` 幂等；之后
+  `create_invite`/`preview_invite`/`accept_invite`/`confirm_identity_change` 全部 `CORE_CLOSED`；
+  `account()` 仍返回关闭前的公开快照。
+
+已知限制：
+
+- **不持久化**：账户、设备密钥、联系人与口令消费状态都只在本次进程内（storage/PLATFORM-001 集成后补）。
+  同一个进程里重启不了账户，也没有「我的口令」列表、撤销或一次性消费状态（identity 层同样未落盘）。
+- **节点不接受昵称式字符串**：`node` 必须是 `node:1:<64 位小写 hex>`；两侧必须使用同一字符串，
+  否则 `accept_invite` 返回 `INVALID_TARGET`。跨节点接受（设计稿把 node 当「提示」）留给后续
+  多节点路由任务。
+- **没有入站身份观测入口**：本切片只能通过口令建立 `requested` 联系人，没有任何入口把联系人推到
+  `accepted` 或 `identity_changed`（那需要 core 的握手/凭据事件）。因此 `confirm_identity_change`
+  当前只在「非法调用」路径上有测试；状态机本身（identity crate）已覆盖完整迁移。
+- 没有事件订阅（BRIDGE-003/004/006）、没有 suspend 包装（BRIDGE-007）；`Mutex` 串行化所有调用，
+  不要在 UI 线程做长循环。
+- **Cargo.lock 变化**：`chat-ffi` 的依赖列表新增 `chat-identity`（path 依赖，指向已在 lock 中的
+  工作区 crate），没有新增或改版本的外部包；`cargo build --locked` 通过。
+- Kotlin/Android 真机尚未实测（本轮只验证 Rust 侧编译与单元测试）。
+
+

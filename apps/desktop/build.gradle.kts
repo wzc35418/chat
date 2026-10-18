@@ -57,9 +57,11 @@ tasks.register<JavaExec>("presentationChecks") {
 
 tasks.register<JavaExec>("previewSnapshot") {
     group = "verification"
-    dependsOn("classes")
+    // 真实身份面板需要原生库与 JNA 路径（与 p0Snapshot 一致）。
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("chat.desktop.PreviewSnapshotKt")
+    systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
     systemProperty("java.awt.headless", "true")
     val previewTemp = rootProject.layout.buildDirectory.dir("tmp/previewSnapshot")
     systemProperty("java.io.tmpdir", previewTemp.get().asFile.absolutePath)
@@ -80,6 +82,17 @@ tasks.register<JavaExec>("localStoreSmoke") {
     val storeTemp = rootProject.layout.buildDirectory.dir("tmp/localStoreSmoke")
     systemProperty("java.io.tmpdir", storeTemp.get().asFile.absolutePath)
     doFirst { storeTemp.get().asFile.mkdirs() }
+}
+
+tasks.register<JavaExec>("identitySmoke") {
+    group = "verification"
+    description = "P1-02 竖直链路冒烟：Kotlin → UniFFI → crates/identity（真实口令/联系人状态机）。"
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.IdentitySmokeKt")
+    systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
 }
 
 tasks.register<JavaExec>("previewApp") {

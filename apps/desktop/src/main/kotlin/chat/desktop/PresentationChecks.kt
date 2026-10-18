@@ -6,6 +6,8 @@ import chat.api.MessageContent
 import chat.api.P0Core
 import chat.api.P0Delivery
 import chat.api.P0SessionInfo
+import chat.api.IdentityContact
+import chat.api.IdentityInviteSummary
 import chat.api.StoredConversation
 import chat.api.StoredDraft
 import chat.api.StoredMessage
@@ -27,8 +29,13 @@ import chat.presentation.display.DisplayQueryIntent
 import chat.presentation.display.DraftAction
 import chat.presentation.display.DraftEvidence
 import chat.presentation.display.DraftInteraction
+import chat.presentation.display.ContactStateUi
 import chat.presentation.display.DraftPhase
 import chat.presentation.display.ErrorAction
+import chat.presentation.display.InviteCheck
+import chat.presentation.display.presentContact
+import chat.presentation.display.presentInviteError
+import chat.presentation.display.presentInvitePreview
 import chat.presentation.display.FROZEN_AUTO_RETRY_CODES
 import chat.presentation.display.FROZEN_ERROR_CODES
 import chat.presentation.display.LayoutMode
@@ -120,6 +127,7 @@ fun main() = runBlocking {
     checkErrorPresentation()
     checkFrozenErrorCoverage()
     checkCoreProjection()
+    checkIdentityPresentation()
     checkPreviewStates()
     checkPreviewInviteValidation()
     checkConversationDisplayMerger()
@@ -371,6 +379,66 @@ private fun checkErrorPresentation() {
     val nonRetryableStorage = presentError(CoreFailure("STORAGE_FAILURE", false, null, null))
     check(nonRetryableStorage.action == ErrorAction.NONE)
     println("PASS DS-04 known/unknown/non-retryable error mapping")
+}
+
+private fun checkIdentityPresentation() {
+    val now = 1_700_000_000_000
+    val summary = IdentityInviteSummary(
+        inviteId = "inv-1",
+        accountId = "acct:1:" + "aa".repeat(32),
+        deviceId = "dev:1:" + "bb".repeat(32),
+        fingerprint = "7EC8 C5E1 A37C C538 AFCB A0B0 BD28 C9E1 5A4B 1A3E 53DC 0F18 BE09 6DF9 4742 8EB4",
+        node = "node-a.local",
+        expiresAtMillis = now + 30 * 60_000,
+    )
+    val valid = presentInvitePreview(summary, now)
+    check(valid.check == InviteCheck.VALID && valid.valid)
+    check(valid.fingerprint == summary.fingerprint) { "指纹必须原样展示，不能被截断或改写" }
+    check(valid.remainingMinutes == 30L)
+    check(valid.accountId == summary.accountId && valid.deviceId == summary.deviceId)
+
+    val expired = presentInvitePreview(summary.copy(expiresAtMillis = now - 1), now)
+    check(expired.check == InviteCheck.EXPIRED && !expired.valid)
+    check(expired.fingerprint == null) { "过期口令不得展示对方身份" }
+
+    // 错误码到可读结论的映射（不把失败说成成功）
+    check(presentInviteError("INVALID_SIGNATURE").check == InviteCheck.TAMPERED)
+    check(presentInviteError("CURSOR_EXPIRED").check == InviteCheck.EXPIRED)
+    check(presentInviteError("INVALID_TARGET").check == InviteCheck.WRONG_TARGET)
+    check(presentInviteError("INVALID_ID").check == InviteCheck.UNKNOWN)
+    val unknownError = presentInviteError("SOMETHING_NEW", "op-9")
+    check(unknownError.check == InviteCheck.UNKNOWN)
+    check(!unknownError.valid)
+    check(unknownError.title.isNotBlank() && unknownError.detail.contains("op-9"))
+
+    // 联系人状态：只有 accepted + 底层 canSend 才允许发送
+    fun contact(state: String, canSend: Boolean) = IdentityContact(
+        contactId = "c-" + state,
+        accountId = "acct:1:" + "cc".repeat(32),
+        displayName = "林然",
+        fingerprint = summary.fingerprint,
+        state = state,
+        canSend = canSend,
+    )
+    val accepted = presentContact(contact("accepted", true))
+    check(accepted.state == ContactStateUi.ACCEPTED && accepted.canSend)
+    check(accepted.blockingReason == null)
+
+    val requested = presentContact(contact("requested", false))
+    check(!requested.canSend && requested.blockingReason != null)
+
+    val changed = presentContact(contact("identity_changed", true))
+    check(changed.state == ContactStateUi.IDENTITY_CHANGED)
+    check(!changed.canSend) { "身份变化必须阻断发送，即使底层误报 canSend=true" }
+    check(changed.blockingReason?.contains("指纹") == true)
+
+    val declaredAcceptedButBlocked = presentContact(contact("accepted", false))
+    check(!declaredAcceptedButBlocked.canSend) { "底层 canSend=false 时不得放行" }
+
+    val unknownState = presentContact(contact("weird", true))
+    check(unknownState.state == ContactStateUi.UNKNOWN && !unknownState.canSend)
+
+    println("PASS P1-02 identity presentation: invite verify result, error mapping, identity-changed blocks send")
 }
 
 private fun checkCoreProjection() {
