@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["tools/rust-dependency-check", "crates/*", "apps/node"]
+members = ["tools/rust-dependency-check", "crates/*", "crates/plugins", "apps/node"]
 
 [workspace.package]
 edition = "2024"

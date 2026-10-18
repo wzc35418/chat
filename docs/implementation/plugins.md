@@ -1,6 +1,6 @@
 # 可信桌面插件、配置包、SDK 与示例
 
-阶段：P4。状态：函数级设计，尚未实现。目标源码：[desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt](../../desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt)。
+阶段：P4。状态：Kotlin 宿主生命周期（JAR 加载/安装事务/信任确认/主题配置，PLUGINS-001~013 的宿主侧）尚未实现；Rust **纯逻辑宿主核心**已实现于 [crates/plugins](../../crates/plugins)（清单 schema 校验、扩展点注册/分发、每插件私有命名空间存储，见下方「Rust 纯逻辑插件宿主核心」章节）。Kotlin 目标源码：[desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt](../../desktop/plugin-host/src/main/kotlin/chat/plugin/PluginHost.kt)。
 
 MVP 只有声明式配置与用户明确选择可信的 JVM 插件。SDK 权限是正常插件约定，ClassLoader 不提供恶意代码沙箱。插件安装升级下次启动生效；无后台全群监听或自动发送。包清单 schema 已建，两个示例仍需 P4 打包与宿主集成。
 
@@ -21,6 +21,102 @@ MVP 只有声明式配置与用户明确选择可信的 JVM 插件。SDK 权限�
 - [PLUGINS-011 disable_plugin](plugins.md#plugins-011)
 - [PLUGINS-012 remove_plugin](plugins.md#plugins-012)
 - [PLUGINS-013 load_theme_config](plugins.md#plugins-013)
+
+## Rust 纯逻辑插件宿主核心（chat-plugins，本轮实现）
+
+本轮只实现可独立验证的**纯逻辑层**：不引入 JVM/WASM 运行时，不解压 ZIP，不联网，无 `unsafe`，不执行任何插件代码。crate 为 `crates/plugins`（包名 `chat-plugins`，edition 2024，`#![forbid(unsafe_code)]`），是 workspace 成员。
+
+### 覆盖范围与文档函数的关系
+
+| 本轮交付 | API | 对应文档契约 |
+|---|---|---|
+| 清单解析/校验（插件 ID、版本、SDK/平台、所需能力、可注册扩展点、权限声明、入口类名） | `chat_plugins::parse_manifest` | PLUGINS-001 处理步骤 3「schema 验清单」（ZIP 读取/路径穿越/解压炸弹/签名核对未实现） |
+| 扩展点注册/注销/按扩展点查询 | `ExtensionPointRegistry`、`PluginHost::start/stop` | PLUGINS-002/003 的注册表子步骤（包复制、原子安装、目录扫描、ClassLoader 启动未实现） |
+| 调用分发（输入/输出上限、超时预算、幂等 operationId） | `PluginHost::dispatch` / `finish_dispatch` | PLUGINS-002/003 的调用分发子步骤；命令/消息操作的真实定义与执行分别在 PLUGINS-005/006 与 P4 宿主，未实现 |
+| 每插件命名空间键值隔离 | `PluginHost::data_*`、`PluginStorage` | PLUGINS-004 运行上下文与 PLUGINS-009 的插件私有偏好存储 |
+
+真正的 JAR 加载、信任模式选择、安装事务（staging/原子目录/重启生效）、安全模式发现、主题配置、UserActionToken、命令/消息操作定义、发送提案与设置表单渲染**仍未实现**，因此本文件中 PLUGINS-001~013 的「完成验收」勾选保持未勾。
+
+### 清单 schema（`schemaVersion: 1`）
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "notes.v1",
+  "version": "1.2.3",
+  "sdkVersion": 1,
+  "platform": "desktop",
+  "capabilities": ["PrivateStorage", "Command"],
+  "permissions": ["UserSelectedContent"],
+  "extensionPoints": ["Command"],
+  "entryClass": "com.example.notes.NotesPlugin"
+}
+```
+
+- **ID**：1–64 字节 ASCII，2–4 段点分；每段 1–32 字节，首字符小写字母，其余 `[a-z0-9-]` 且不以 `-` 结尾；保留首段 `core`/`sys`/`chat` 拒绝。
+- **version**：恰好三段十进制，无前导零，每段 ≤ 65535。
+- **sdkVersion**：必须等于宿主 `CURRENT_SDK_VERSION = 1`，否则 `SDK_INCOMPATIBLE`；`platform` 只接受 `desktop`，其它为 `UNSUPPORTED_PLATFORM`。
+- **capabilities**：`PrivateStorage`/`Command`/`MessageAction`/`SettingsPanel`；数量受 `maxCapabilities`（默认 16）限制，重复/未知显式拒绝。
+- **permissions**：`UserSelectedContent`/`ComposeDraft`（最多 4 个）；仅声明，不是沙箱。
+- **extensionPoints**：`Command`/`MessageAction`/`SettingsPanel`；每个扩展点必须同时声明其所需能力，否则 `CAPABILITY_NOT_DECLARED`；未知扩展点 `UNKNOWN_EXTENSION_POINT`，重复声明拒绝。
+- **entryClass**：1–256 字节 ASCII 点分 Java 类名，仅 `[A-Za-z0-9_.$]`，拒绝 `/`、`\`、`..`、首尾 `.`。
+- JSON 使用 `deny_unknown_fields`：未知字段与重复字段都拒绝；清单总长受 `maxManifestBytes`（默认 64 KiB）限制。
+
+### 生命周期、幂等与预算
+
+| 操作 | 语义 | 失败码 |
+|---|---|---|
+| `install_json` / `install` | 解析并安装；同一 ID 再次安装显式拒绝（本切片不做升级） | `PLUGIN_ID_CONFLICT`、`INVALID_PLUGIN_PACKAGE`、`CONTENT_TOO_LARGE` |
+| `start` | 按清单注册扩展点并签发 `PluginRuntime`；重复启动幂等，不重复注册；未安装拒绝 | `PLUGIN_NOT_INSTALLED` |
+| `dispatch` | 校验运行状态、该插件是否注册该扩展点、输入 ≤ `maxInputBytes`、截止时间未到；返回 `DispatchPlan`（实际执行由宿主负责）；同一 `operationId` 的相同请求幂等重放，不同请求冲突 | `PLUGIN_NOT_RUNNING`、`PLUGIN_NOT_REGISTERED`、`CONTENT_TOO_LARGE`、`PLUGIN_TASK_TIMEOUT`、`PLUGIN_OPERATION_CONFLICT` |
+| `finish_dispatch` | 校验输出 ≤ `maxOutputBytes`、未超过生效截止时间；相同输出重复完成幂等，不同输出冲突；未开始/已被清理的 operation 拒绝 | `CONTENT_TOO_LARGE`、`PLUGIN_TASK_TIMEOUT`、`PLUGIN_OPERATION_CONFLICT`、`PLUGIN_OPERATION_UNKNOWN` |
+| `stop` | 撤销全部注册项并清空该插件在途 operation；可重复，未安装拒绝 | `PLUGIN_NOT_INSTALLED` |
+| `uninstall` | 停止后按选择保留/删除私有数据；重复卸载幂等 | `PLUGIN_NOT_INSTALLED`（仅 stop） |
+
+- **超时预算**：请求截止时间早于等于当前时间 → `PLUGIN_TASK_TIMEOUT`；截止时间超出 `maxTimeoutMs` 时**只收紧不放宽**（生效截止时间 = now + maxTimeoutMs）。
+- **幂等缓存**是有界的：默认 64 条，超过后按 FIFO 淘汰最旧 operation；`stop`/注销会清空该插件在途 operation。
+- **私有存储隔离**：所有读写都以宿主签发的 `PluginRuntime` 绑定 ID 作为分区；同一键在不同插件下互不可见；键 ≤128 字节、值 ≤8 KiB、每插件 ≤256 条 / ≤64 KiB；超限失败**不产生部分写入**。
+- 所有预算由 `PluginLimits` 配置，可小于默认值但不得超过硬上限（1 MiB / 60 秒 / 1024 条），否则 `INVALID_PLUGIN_LIMITS`。
+
+### 插件层稳定错误码（登记）
+
+新增稳定码必须在协议层登记后才能进入 `chat_protocol::ErrorCode` 冻结码表；本表即插件模块的登记处。
+
+| 码 | 触发 | 可重试 | 与 PROTOCOL-014 关系 |
+|---|---|---|---|
+| `INVALID_PLUGIN_PACKAGE` | 清单 JSON/字段/ID/入口类名非法 | 否 | 插件新增码，未进冻结表 |
+| `PLUGIN_ID_CONFLICT` | 同 ID 重复安装 | 否 | 插件新增码 |
+| `SDK_INCOMPATIBLE` | sdkVersion 不匹配 | 否 | 插件新增码 |
+| `UNSUPPORTED_PLATFORM` | 平台不是 desktop | 否 | 插件新增码 |
+| `INVALID_PLUGIN_VERSION` | 版本字符串非法 | 否 | 插件新增码 |
+| `UNKNOWN_EXTENSION_POINT` | 清单声明未知扩展点 | 否 | 插件新增码 |
+| `UNKNOWN_CAPABILITY` | 清单声明未知能力 | 否 | 插件新增码 |
+| `UNKNOWN_PERMISSION` | 清单声明未知权限 | 否 | 插件新增码 |
+| `CAPABILITY_NOT_DECLARED` | 扩展点缺所需能力 / 使用私有存储未声明能力 | 否 | 插件新增码 |
+| `PLUGIN_NOT_INSTALLED` | 未安装即启动/停止 | 否 | 插件新增码 |
+| `PLUGIN_NOT_RUNNING` | 停止后仍用旧句柄调用 | 否 | 插件新增码 |
+| `PLUGIN_NOT_REGISTERED` | 未注册该扩展点（含注销后调用） | 否 | 插件新增码 |
+| `PLUGIN_STATE_CONFLICT` | 同插件注册集合冲突 | 否 | 插件新增码 |
+| `PLUGIN_OPERATION_CONFLICT` | 同 operationId 绑定不同请求/输出 | 否 | 插件新增码 |
+| `PLUGIN_OPERATION_UNKNOWN` | operation 未开始或已清理 | 否 | 插件新增码 |
+| `PLUGIN_TASK_TIMEOUT` | 截止时间已到/已超时 | 否 | 插件新增码 |
+| `CONTENT_TOO_LARGE` | 清单/输入/输出/存储值超限 | 否 | **复用已冻结码**（`ErrorCode::ContentTooLarge`，`frozen_code()` 可映射） |
+| `INVALID_STORAGE_KEY` | 存储键为空/超长/字符非法 | 否 | 插件新增码 |
+| `PLUGIN_STORAGE_QUOTA_EXCEEDED` | 私有存储条目/字节超配额 | 否 | 插件新增码 |
+| `INVALID_PLUGIN_LIMITS` | 宿主预算为 0 或超硬上限 | 否 | 插件新增码 |
+
+映射约定：插件错误一律不可自动重试；跨 FFI 暴露时，已有冻结码的 `CONTENT_TOO_LARGE` 可直接进入 `chat_protocol::map_error`，其余在协议层登记前映射为 `INTERNAL_FAILURE` 并保留本层码做诊断，禁止伪装成网络类可重试错误。
+
+### 验证证据
+
+`cargo test --offline -p chat-plugins`（2026-10-18）→ **36 passed / 0 failed**（lib 19 + `tests/host_lifecycle.rs` 17），`cargo clippy --offline -p chat-plugins --all-targets` 0 警告。
+
+- 清单：`manifest::tests::*`（非法 ID/版本、未知/重复字段、未知能力/权限/扩展点、缺能力、SDK/平台不兼容、入口类名、数量上限）。
+- 注册表：`registry::tests::repeated_registration_is_idempotent`、`conflicting_registration_set_is_rejected`、`unregister_is_idempotent_and_removes_all_points`、`query_returns_sorted_plugins_per_point`。
+- 生命周期：`host_lifecycle::start_registers_points_and_repeated_start_is_idempotent`、`stop_revokes_registrations_and_stale_runtime_is_rejected`、`uninstall_is_idempotent_and_can_keep_or_remove_data`、`start_and_stop_require_installed_plugin`。
+- 分发与边界：`dispatch_returns_bounded_plan_and_rejects_unregistered_points`、`input_and_output_sizes_are_bounded`、`timeout_budget_is_expired_and_clamped`、`operation_id_replay_is_idempotent_and_conflicts_are_rejected`、`stop_clears_in_flight_operations`、`a_plugin_cannot_finish_another_plugins_operation`。
+- 隔离与配额：`storage_is_isolated_per_plugin`、`storage_requires_declared_capability`、`storage_keys_values_and_quotas_are_enforced`、`storage::tests::quota_failure_does_not_create_partial_state`。
+- 错误码：`error::tests::codes_are_unique_and_stable`、`only_content_too_large_has_a_frozen_protocol_code`。
 
 <a id="plugins-001"></a>
 
@@ -54,7 +150,7 @@ suspend fun inspectPluginPackage(source: FileToken): PluginInspection
 - [ ] 路径穿越/解压炸弹拒绝。
 - [ ] 签名存在不被描述成安全保证。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（仅 Rust 纯逻辑子集：清单 schema 解析/校验，见上方「Rust 纯逻辑插件宿主核心」，证据 `cargo test --offline -p chat-plugins` → 36 passed，`manifest::tests::*`）。ZIP 有界读取、绝对路径/`../`/符号链接/重复条目拒绝、解压炸弹预算、jar 摘要与可选签名、SDK/平台核对提示均未实现，因此两项验收未勾选。
 
 <a id="plugins-002"></a>
 
@@ -88,7 +184,7 @@ suspend fun installTrustedPlugin(inspection: PluginInspection, choice: TrustedMo
 - [ ] 包在检查后替换拒绝。
 - [ ] 安装中崩溃不启用半包。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（Rust 纯逻辑子集：重复插件 ID 显式拒绝 `PLUGIN_ID_CONFLICT`；扩展点集合重复注册幂等、冲突 `PLUGIN_STATE_CONFLICT`；卸载幂等，证据见上方章节与 `host_lifecycle::install_rejects_duplicates_and_invalid_manifests`、`registry::tests::repeated_registration_is_idempotent`）。staging 复制、原子完成包目录、pending install、重启生效与来源摘要复核未实现，验收项未勾选。
 
 <a id="plugins-003"></a>
 
@@ -121,7 +217,7 @@ suspend fun discoverPlugins(safeMode: Boolean): PluginCatalog
 - [ ] 安全模式下恶意/崩溃插件入口不会调用。
 - [ ] 不兼容保留可移除记录。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（Rust 纯逻辑子集：安装后按扩展点查询 `ExtensionPointRegistry::query`、启动时按清单注册；证据 `host_lifecycle::start_registers_points_and_repeated_start_is_idempotent`）。安装目录扫描、禁用标记、safeMode 跳过执行、入口兼容检查、懒加载目录与可移除记录未实现，验收项未勾选。
 
 <a id="plugins-004"></a>
 
@@ -155,7 +251,7 @@ suspend fun startPlugin(id: PluginId): PluginRuntime
 - [ ] 重复 start 不重复注册。
 - [ ] 共享依赖冲突可诊断。
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：部分实现（Rust 纯逻辑子集：`PluginHost::start` 重复启动幂等且不重复注册；`PluginRuntime` 绑定插件 ID；私有命名空间存储隔离与配额，证据 `start_registers_points_and_repeated_start_is_idempotent`、`storage_is_isolated_per_plugin`、`storage_keys_values_and_quotas_are_enforced`）。JAR ClassLoader 加载、start 回调、Registration 所有权追踪、初始化异常清理、共享依赖冲突诊断未实现，验收项未勾选。
 
 <a id="plugins-005"></a>
 

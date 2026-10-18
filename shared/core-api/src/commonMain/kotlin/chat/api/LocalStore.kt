@@ -99,5 +99,20 @@ interface LocalStore {
     /** 轮询核心事件（CORE-003）：拉取式，无订阅回调；溢出时 resyncRequired=true。 */
     suspend fun pollEvents(sinceSeq: Long, limit: Int): StoreEventBatch
 
+    /** 配置发送用节点（只保存配置，不发请求）。 */
+    suspend fun configureSendNode(endpointUrl: String, nodeId: String, nodePublicKeyHex: String?)
+
+    /** 准备并加密（落 attempt/outbox），返回真实状态。 */
+    suspend fun sendPrepare(draftId: String): SendStep
+
+    /** 提交到节点；未配置节点时抛带稳定码的异常。 */
+    suspend fun sendDispatch(draftId: String): SendStep
+
+    /** 重试（可重试失败才推进；已接受/结果未知不重发）。 */
+    suspend fun sendRetry(draftId: String): SendStep
+
+    /** 对账（只查询，不重发）。 */
+    suspend fun sendReconcile(draftId: String): SendStep
+
     suspend fun close()
 }

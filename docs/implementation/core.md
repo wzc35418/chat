@@ -952,4 +952,65 @@ cargo test --offline -p chat-core                        # lib 15（含 stub_por
 
 证据：`cargo test --offline -p chat-core` → 76 passed（26 lib + 7 cancel_events + 5 draft_status_events + 6 identity + 5 node_submitter + 2 p0 + 6 attachment_transport + 14 send_orchestrator + 5 service；既有 70 个继续通过）；`--test attachment_transport` 6 passed（真节点上传/下载往返、断链可重试、节点重启后仍可下载、配额/鉴权码保真、多块被节点策略拒绝）。
 
+## 发送链路接真实节点（SND，task-33，2026-10-18，Windows x64）
+
+代码：[crates/core/src/send_runtime.rs](../../crates/core/src/send_runtime.rs)（新增）+ [crates/core/src/service.rs](../../crates/core/src/service.rs) 的 `ConversationCore` 发送入口；
+测试：[crates/core/tests/send_runtime.rs](../../crates/core/tests/send_runtime.rs)（5 个，真 axum 节点 + 真 OpenMLS + 持久 MLS 群状态 + 持久身份）。
+
+分层（不重写任何发送语义）：
+
+- `SendRuntime` = `SendService`（编排/三态/租约/事件）+ `NodeClientSubmitter`（NODE-006，真节点）+ `MlsDeviceEngine`（真实 OpenMLS 设备，群状态从正式库恢复）；
+- `MlsDeviceEngine::restore(store, mls_group_key)`：群状态不存在 → `INVALID_STATE_TRANSITION`；存在但重建失败/群键不一致 → `STATE_CORRUPTED`（绝不退化成空群）；
+- 设备签名钥来自**持久身份**（`Store::load_identity_seeds` 的设备种子 → `signing_key_from_seed`，与 identity 用同一派生函数），因此节点看到的 `dev:1:…` 与本地身份一致；
+- 协议群 ID = `grp:1:sha256("chat/send/protocol-group/v1" || MLS 群键)`（本切片约定：整条链路可由持久 MLS 群状态推导，Kotlin 不额外传群参数）；
+- 打开失败时 **Store 句柄原样返回**（`SendOpenError { error, store: Some(..) }`），只有最后一步 `SendService::new` 会消费句柄；`ConversationCore` 因此能在“未入库身份 / 未加入群 / 节点配置非法”之后继续可用。
+
+内核入口（都在 `ConversationCore`）：
+
+| 方法 | 语义 | 未配置节点 |
+|---|---|---|
+| `configure_send_node(endpoint_url, node_id, node_public_key_hex)` | 只保存配置，**不发请求** | — |
+| `configure_send_group(mls_group_key)` | 显式指定 MLS 群（不设置时自动绑定本库唯一的持久 MLS 群；0 个/多个显式失败） | — |
+| `send_prepare(draft_id)` | 必要时**恰好加密一次** | `NODE_UNAVAILABLE` |
+| `send_dispatch(draft_id)` | 真节点提交，只走三态 | `NODE_UNAVAILABLE` |
+| `send_retry(draft_id)` | 拒绝后重建（新 SubmissionId） | `NODE_UNAVAILABLE` |
+| `send_reconcile(draft_id)` | 按 SubmissionId 对账（绝不重发） | `NODE_UNAVAILABLE` |
+
+返回 `SendStepView { draft_id, status, submission_id, attempt_index, detail, settled }`：`status` 取执行后的真实草稿状态（queued/prepared/submitted/accepted/rejected/unknown/cancelled/failed）；`settled = false` 表示结果未定（仍需对账、禁止重发）；`detail` 是静态说明（无正文/密钥/URL）。每个 `send_*` 结束后把本次运行时产生的事件并入 `poll_events` 的总线，且**无论成败都把 Store 句柄放回**。
+
+错误码（全部来自 PROTOCOL-014 冻结表，不新造码）：
+
+| 情形 | 码 |
+|---|---|
+| 未配置节点 | `NODE_UNAVAILABLE` |
+| 草稿不存在 | `INVALID_TARGET` |
+| 草稿 ID 结构非法（含空格等） | `INVALID_INPUT` |
+| 本机身份未入库 / MLS 群未加入 / 群歧义 | `INVALID_STATE_TRANSITION`（群歧义为 `INVALID_TARGET`） |
+| MLS 群状态损坏或群键不一致 | `STATE_CORRUPTED` |
+| 节点/网络失败 | 由 `NodeClientSubmitter` 三态映射（拒绝 → rejected；未知 → unknown 且只对账） |
+
+复现命令（全程离线，节点在进程内起真 axum 服务）：
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test send_runtime   # 5 passed
+cargo test --offline -p chat-core -p chat-ffi           # 81 + 25 passed
+~~~
+
+证据：
+
+- `send_runtime::prepare_and_dispatch_reach_the_node_with_the_durable_ciphertext`：建草稿 → prepare（attempt 0、settled）→ dispatch（accepted）→ 节点日志**恰好一条**且绑定该 SubmissionId → **节点日志密文与本地耐久密文逐字节一致**（关掉内核后只读打开同一库取 `message_attempts.immutable_ciphertext`）→ 对端真 OpenMLS 设备解出原文；已接受后 retry/reconcile 都不再重发（日志仍一条）。
+- `send_runtime::repeated_dispatch_is_idempotent_and_never_resends`：重复 dispatch 幂等，节点没有第二条日志且密文字节不变。
+- `send_runtime::unconfigured_node_fails_explicitly_and_the_handle_stays_usable`：未配置 → `NODE_UNAVAILABLE`（四个动作），库与草稿仍可用；配置后同一条草稿能真的准备成功。
+- `send_runtime::unknown_draft_is_rejected_before_any_network_call`：未知草稿 → `INVALID_TARGET`，节点日志为空（一次网络提交都没有）。
+- `send_runtime::missing_identity_or_mls_group_fails_explicitly`：未入库身份 / 无 MLS 群 / 指定群键不存在都显式失败（`INVALID_STATE_TRANSITION`），且句柄已放回（状态查询与新建草稿仍可用）。
+
+已知限制：
+
+1. **会话→群映射是本切片的派生约定**（协议群 ID 由 MLS 群键派生），不是持久映射表；多会话/多群需要 storage 的正式映射（后续任务）。
+2. **MLS 群键发现用了只读查询**（`mls_group_state.group_id` 明文列），因为 storage 目前没有“列出群状态”的正式 API；库里有多于一个群时必须显式 `configure_send_group`。
+3. **群成员/epoch 推进**（加入新设备、epoch 前进后重新导出）不在本切片：运行时每次操作都从库里最新快照恢复，因此加密前必须已导出当前 epoch 的群状态。
+4. **没有后台发送 worker**：`dispatch` 是同步的一次尝试（租约/退避语义沿用编排层），重试由调用方按 `settled`/`can_retry` 驱动。
+
+
 

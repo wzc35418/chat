@@ -3,6 +3,7 @@ package chat.bridge
 import chat.api.DraftCancelOutcome
 import chat.api.LocalStore
 import chat.api.LocalStoreException
+import chat.api.SendStep
 import chat.api.StoreEvent
 import chat.api.StoreEventBatch
 import chat.api.StoredConversation
@@ -145,6 +146,31 @@ class NativeLocalStore : LocalStore {
         )
     }
 
+
+    override suspend fun configureSendNode(
+        endpointUrl: String,
+        nodeId: String,
+        nodePublicKeyHex: String?,
+    ): Unit = withStore { store ->
+        store.configureSendNode(endpointUrl, nodeId, nodePublicKeyHex)
+    }
+
+    override suspend fun sendPrepare(draftId: String): SendStep = withStore { store ->
+        store.sendPrepare(draftId).toSendStep()
+    }
+
+    override suspend fun sendDispatch(draftId: String): SendStep = withStore { store ->
+        store.sendDispatch(draftId).toSendStep()
+    }
+
+    override suspend fun sendRetry(draftId: String): SendStep = withStore { store ->
+        store.sendRetry(draftId).toSendStep()
+    }
+
+    override suspend fun sendReconcile(draftId: String): SendStep = withStore { store ->
+        store.sendReconcile(draftId).toSendStep()
+    }
+
     override suspend fun close(): Unit = withContext(NonCancellable) {
         mutex.withLock {
             withContext(Dispatchers.IO) {
@@ -191,4 +217,13 @@ private fun uniffi.chat_ffi.MessageRowView.toStoredMessage() = StoredMessage(
     body = body,
     mine = mine,
     createdAtMillis = createdAtMs.toLong(),
+)
+
+private fun uniffi.chat_ffi.SendStepView.toSendStep() = SendStep(
+    draftId = draftId,
+    status = status,
+    submissionId = submissionId,
+    attemptIndex = attemptIndex?.toInt(),
+    detail = detail,
+    settled = settled,
 )

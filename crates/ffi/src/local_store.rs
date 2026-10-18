@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use chat_core::core_events::{CoreEvent, EventBatch as CoreEventBatch};
 use chat_core::send_orchestrator::CancelOutcome;
+use chat_core::send_runtime::SendStepView as CoreSendStepView;
 use chat_core::service::{
     self, ConversationCore, ConversationPageView as CoreConversationPageView,
     ConversationView as CoreConversationView, DraftView as CoreDraftView,
@@ -181,6 +182,26 @@ pub struct EventBatchFfi {
     pub resync_required: bool,
 }
 
+/// 发送链路单步结果（SND）：状态 + SubmissionId + 尝试序号（**不含正文/密钥**）。
+///
+/// `settled = false` 表示结果尚未确定（仍需 reconcile，禁止重发）；调用方不得把
+/// 未确定的结果当成已送达。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct SendStepView {
+    /// 本地草稿 ID（原样回传）。
+    pub draft_id: String,
+    /// 有效状态：queued / prepared / submitted / accepted / rejected / unknown / cancelled / failed。
+    pub status: String,
+    /// 最新尝试的 SubmissionId（尚无尝试时为空）。
+    pub submission_id: Option<String>,
+    /// 最新尝试的重建序号（0 表示首次尝试）。
+    pub attempt_index: Option<u32>,
+    /// 人类可读的静态说明（不含正文/密钥/URL）。
+    pub detail: String,
+    /// 该结果是否已确定（false = 仍需对账，禁止重发）。
+    pub settled: bool,
+}
+
 /// 正式加密存储对象。
 #[derive(uniffi::Object)]
 pub struct LocalStoreFfi {
@@ -324,6 +345,60 @@ impl LocalStoreFfi {
         Ok(cancel_view(outcome))
     }
 
+    /// SND：保存发送节点配置（**只保存，不发任何请求**）。
+    ///
+    /// 端点必须是可解析的 http(s) 地址；`node_public_key_hex` 给出时必须是 64 位十六进制。
+    /// 未配置时所有 `send_*` 返回稳定错误码 `NODE_UNAVAILABLE`，不伪造成功。
+    pub fn configure_send_node(
+        &self,
+        endpoint_url: String,
+        node_id: String,
+        node_public_key_hex: Option<String>,
+    ) -> Result<(), FfiError> {
+        let mut core = self.lock()?;
+        core.configure_send_node(&endpoint_url, &node_id, node_public_key_hex.as_deref())
+            .map_err(|error| failure!(error))?;
+        Ok(())
+    }
+
+    /// SND：显式指定发送所用的 MLS 群键（不设置时自动绑定本库唯一的持久 MLS 群）。
+    pub fn configure_send_group(&self, mls_group_key: String) -> Result<(), FfiError> {
+        let mut core = self.lock()?;
+        core.configure_send_group(&mls_group_key)
+            .map_err(|error| failure!(error))?;
+        Ok(())
+    }
+
+    /// SND：prepare（必要时恰好加密一次；未配置节点/未加入群时显式失败）。
+    pub fn send_prepare(&self, draft_id: String) -> Result<SendStepView, FfiError> {
+        let mut core = self.lock()?;
+        let view = core.send_prepare(&draft_id).map_err(|error| failure!(error))?;
+        Ok(send_step_view(view))
+    }
+
+    /// SND：dispatch（真实节点；只走三态，结果未知绝不算成功）。
+    pub fn send_dispatch(&self, draft_id: String) -> Result<SendStepView, FfiError> {
+        let mut core = self.lock()?;
+        let view = core.send_dispatch(&draft_id).map_err(|error| failure!(error))?;
+        Ok(send_step_view(view))
+    }
+
+    /// SND：retry（被拒绝后重建，使用新的 SubmissionId）。
+    pub fn send_retry(&self, draft_id: String) -> Result<SendStepView, FfiError> {
+        let mut core = self.lock()?;
+        let view = core.send_retry(&draft_id).map_err(|error| failure!(error))?;
+        Ok(send_step_view(view))
+    }
+
+    /// SND：reconcile（结果未知时按 SubmissionId 对账；绝不重发）。
+    pub fn send_reconcile(&self, draft_id: String) -> Result<SendStepView, FfiError> {
+        let mut core = self.lock()?;
+        let view = core
+            .send_reconcile(&draft_id)
+            .map_err(|error| failure!(error))?;
+        Ok(send_step_view(view))
+    }
+
     /// CORE-003（最小切片）：按单调序号读取内核事件。
     ///
     /// 事件只含 ID 与稳定状态文本（绝不含正文/密钥）；重复 poll 幂等；游标早于缓冲
@@ -430,6 +505,17 @@ fn cancel_view(outcome: CancelOutcome) -> CancelViewFfi {
             outcome: "cancel_unknown".to_owned(),
             submission_id: Some(submission_id),
         },
+    }
+}
+
+fn send_step_view(view: CoreSendStepView) -> SendStepView {
+    SendStepView {
+        draft_id: view.draft_id,
+        status: view.status,
+        submission_id: view.submission_id,
+        attempt_index: view.attempt_index,
+        detail: view.detail,
+        settled: view.settled,
     }
 }
 

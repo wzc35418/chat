@@ -551,4 +551,81 @@ cargo clippy --offline -p chat-ffi --all-targets  # chat-ffi 0 warnings
   既有版本 `rand 0.10.3`，无新增或改版本的外部包）；`cargo build --locked` 通过。
 - Kotlin/Android 真机尚未实测（本轮只验证 Rust 侧编译与单元测试）。
 
+## 发送链路 FFI 契约（LocalStoreFfi.send_*，task-33，2026-10-18，Windows x64）
+
+代码：[crates/ffi/src/local_store.rs](../../crates/ffi/src/local_store.rs)（薄封装）+ [crates/core/src/send_runtime.rs](../../crates/core/src/send_runtime.rs)（装配与状态机入口）；
+测试：[crates/ffi/tests/send_contract.rs](../../crates/ffi/tests/send_contract.rs)（5 个，纯 FFI 契约，不需要真节点）。
+
+### 方法（Kotlin 侧按此命名，均已 `#[uniffi::export]`）
+
+~~~text
+// 只保存节点配置，不发任何请求；端点必须是可解析的 http(s) 地址
+configure_send_node(endpoint_url: String, node_id: String, node_public_key_hex: String?) -> Result<(), FfiError>
+// 可选：显式指定发送所用的 MLS 群键（不设置时自动绑定本库唯一的持久 MLS 群）
+configure_send_group(mls_group_key: String) -> Result<(), FfiError>
+
+send_prepare(draft_id: String)   -> Result<SendStepView, FfiError>
+send_dispatch(draft_id: String)  -> Result<SendStepView, FfiError>
+send_retry(draft_id: String)     -> Result<SendStepView, FfiError>
+send_reconcile(draft_id: String) -> Result<SendStepView, FfiError>
+~~~
+
+### 返回投影
+
+~~~text
+record SendStepView {
+    draft_id: String,                 // 原样回传
+    status: String,                   // queued/prepared/submitted/accepted/rejected/unknown/cancelled/failed
+    submission_id: String?,           // 最新尝试的 SubmissionId
+    attempt_index: u32?,              // 重建序号（0 = 首次尝试）
+    detail: String,                   // 静态说明（无正文/密钥/URL）
+    settled: bool,                    // false = 结果未定，仍需 reconcile，禁止重发
+}
+~~~
+
+语义要点：
+
+- `send_prepare` 会真实加密（**恰好一次**）并落 T2 尝试；`send_dispatch` 才真正提交节点；
+  `send_retry` 只在“被拒绝/失败”后重建新 SubmissionId；`send_reconcile` 只按原 SubmissionId 查询，**绝不重发**。
+- `settled = false` 的三种典型来源：节点结果未知（`unknown`）、租约/退避未到期、仍需对账；
+  UI 不得把未确定结果画成“已发送成功”。
+- 每次调用结束后内核会发布 `draft_changed` 事件（可 `poll_events` 取），并**无论成败都把 Store 句柄放回**。
+
+### 错误码（FfiError::Store.code，全部来自冻结码表）
+
+| 情形 | code |
+|---|---|
+| 未配置节点（所有 `send_*`） | `NODE_UNAVAILABLE` |
+| 草稿不存在 | `INVALID_TARGET` |
+| 草稿 ID 结构非法 | `INVALID_INPUT` |
+| 本机身份未入库 / MLS 群未加入 / 指定群不存在 | `INVALID_STATE_TRANSITION` |
+| 库里多个 MLS 群且未显式选群 | `INVALID_TARGET` |
+| MLS 群状态损坏 | `STATE_CORRUPTED` |
+| 节点端拒绝/未知 | 通过 `SendStepView.status` 表达（`rejected` / `unknown`），只有本地故障才抛错 |
+| 已关闭 | `CORE_CLOSED` |
+
+### 证据
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi --test send_contract   # 5 passed
+cargo test --offline -p chat-ffi -p chat-core           # 25 + 81 passed
+~~~
+
+- `send_contract::send_steps_require_a_configured_node`：未配置时四个动作都返回 `NODE_UNAVAILABLE`，草稿状态仍可查询（对象没被破坏）。
+- `send_contract::configure_send_node_validates_without_contacting_the_network`：坏 URL → `INVALID_TARGET`；坏公钥 → `INVALID_SIGNATURE`；空/超长群键 → `INVALID_INPUT`；合法配置成功且不联网。
+- `send_contract::configured_but_unenrolled_database_fails_explicitly`：配置了节点但库未入库身份 → `INVALID_STATE_TRANSITION`，随后 `is_open()` 为真、状态查询与新建草稿仍可用。
+- `send_contract::unknown_draft_is_rejected_with_a_precise_code`：未知草稿 → `INVALID_TARGET`；含空格的畸形 ID → `INVALID_INPUT`。
+- `send_contract::send_after_shutdown_reports_closed`：`shutdown()` 后 `CORE_CLOSED`。
+
+真节点侧证据见 [core.md 的“发送链路接真实节点”](core.md)：节点日志密文与本地耐久密文逐字节一致、重复 dispatch 零重发。
+
+已知限制：
+
+1. **没有后台发送 worker**：`send_dispatch` 是同步的一次尝试，UI 需要按 `settled` 决定是否继续/对账（不要在 UI 线程阻塞长任务）。
+2. **群绑定是本切片约定**（协议群 ID 由 MLS 群键派生）；多群场景需显式 `configure_send_group`。
+3. `configure_send_node` 只保存配置：不验证节点可达性，也不注册设备；设备注册/建群仍由既有流程完成。
+4. 附件与正文的联合发送（引用块）不在本轮；`send_dispatch` 只提交正文条目。
+
+
 

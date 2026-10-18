@@ -42,6 +42,7 @@ use crate::send_orchestrator::{
     CancelOutcome, CryptoEngine, EncryptedPayload, NodeSubmitter, SendResult, SubmitAttempt,
     SubmitOutcome,
 };
+use crate::send_runtime::{MAX_MLS_GROUP_KEY_BYTES, SendNodeConfig, SendRuntime, SendStep, SendStepView};
 use chat_storage::formal::{
     MASTER_KEY_BYTES, MAX_ID_BYTES, MAX_SESSION_TITLE_BYTES, KeyProvenance, MessageContent,
     MessageOrigin, MessageView, PageCursor, ProtectedStorageKey, SessionSummary, StorageError,
@@ -558,6 +559,10 @@ pub struct ConversationCore {
     store: Mutex<Option<Store>>,
     /// 内核事件总线（有界、单调序号）：`cancel_draft` 与 `close` 发布，`poll_events` 读取。
     events: Mutex<EventBus>,
+    /// 发送节点配置（SND）：只保存，不发请求；`None` = 未配置，send_* 显式失败。
+    send_node: Mutex<Option<SendNodeConfig>>,
+    /// MLS 群键覆盖（SND）：`None` = 自动绑定本库唯一的持久 MLS 群。
+    send_group: Mutex<Option<String>>,
 }
 
 impl fmt::Debug for ConversationCore {
@@ -717,6 +722,8 @@ impl ConversationCore {
             database_path: database_path.to_owned(),
             store: Mutex::new(Some(store)),
             events: Mutex::new(events),
+            send_node: Mutex::new(None),
+            send_group: Mutex::new(None),
         })
     }
 
@@ -804,6 +811,138 @@ impl ConversationCore {
             }
         }
         outcome
+    }
+
+    /// SND：保存节点配置（只保存，不发任何请求；重复配置覆盖上一次）。
+    ///
+    /// 端点必须是可解析的 http(s) 地址；`node_public_key_hex` 给出时必须是 64 位十六进制。
+    /// 之后 `send_prepare`/`send_dispatch`/`send_retry`/`send_reconcile` 会用它装配真实运行时。
+    pub fn configure_send_node(
+        &mut self,
+        endpoint_url: &str,
+        node_id: &str,
+        node_public_key_hex: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let config = SendNodeConfig::new(endpoint_url, node_id, node_public_key_hex)
+            .map_err(anyhow::Error::new)?;
+        let mut guard = self.send_node.lock().map_err(|_| closed())?;
+        *guard = Some(config);
+        Ok(())
+    }
+
+    /// SND：显式指定发送所用的 MLS 群键（不设置时自动绑定本库唯一的持久 MLS 群）。
+    ///
+    /// 群键是 MLS group id 的小写十六进制（不透明标识，不是密钥材料）。
+    pub fn configure_send_group(&mut self, mls_group_key: &str) -> anyhow::Result<()> {
+        if mls_group_key.is_empty() || mls_group_key.len() > MAX_MLS_GROUP_KEY_BYTES {
+            return Err(invalid_input(
+                "mls group key must be a bounded identifier",
+            ));
+        }
+        let mut guard = self.send_group.lock().map_err(|_| closed())?;
+        *guard = Some(mls_group_key.to_owned());
+        Ok(())
+    }
+
+    /// SND：当前是否已配置发送节点（不联网、不改状态）。
+    pub fn send_node_configured(&self) -> bool {
+        self.send_node
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+    }
+
+    /// SND：prepare（必要时恰好加密一次），返回状态投影。
+    pub fn send_prepare(&mut self, draft_id: &str) -> anyhow::Result<SendStepView> {
+        self.run_send_step(draft_id, SendStep::Prepare)
+    }
+
+    /// SND：dispatch（真实节点；只走三态，绝不把未知当成功）。
+    pub fn send_dispatch(&mut self, draft_id: &str) -> anyhow::Result<SendStepView> {
+        self.run_send_step(draft_id, SendStep::Dispatch)
+    }
+
+    /// SND：retry（拒绝后重建，新 SubmissionId）。
+    pub fn send_retry(&mut self, draft_id: &str) -> anyhow::Result<SendStepView> {
+        self.run_send_step(draft_id, SendStep::Retry)
+    }
+
+    /// SND：reconcile（结果未知时按 SubmissionId 对账）。
+    pub fn send_reconcile(&mut self, draft_id: &str) -> anyhow::Result<SendStepView> {
+        self.run_send_step(draft_id, SendStep::Reconcile)
+    }
+
+    /// SND 单步执行：装配真实运行时 → 执行 → 把本次事件并入内核总线 → **放回 Store 句柄**。
+    ///
+    /// 未配置节点时直接 `NODE_UNAVAILABLE`（不碰 Store、不联网）；装配失败时把句柄放回并
+    /// 原样返回错误码（身份未入库 / MLS 群未加入 / 群歧义 / 节点配置非法）。
+    fn run_send_step(
+        &mut self,
+        draft_id: &str,
+        step: SendStep,
+    ) -> anyhow::Result<SendStepView> {
+        validate_local_draft_id(draft_id)?;
+        let config = {
+            let guard = self.send_node.lock().map_err(|_| closed())?;
+            guard.clone().ok_or_else(|| {
+                anyhow::Error::new(SyncError::new(
+                    ErrorCode::NodeUnavailable,
+                    "the send node is not configured",
+                ))
+            })?
+        };
+        // 草稿必须存在：在装配 MLS/节点之前拒掉“未知草稿”，错误码更精确。
+        {
+            let guard = self.store_guard()?;
+            let store = guard.as_ref().ok_or_else(closed)?;
+            let exists = store
+                .read_draft(draft_id)
+                .map_err(anyhow::Error::new)?
+                .is_some();
+            if !exists {
+                return Err(anyhow::Error::new(SyncError::new(
+                    ErrorCode::InvalidTarget,
+                    "draft does not exist",
+                )));
+            }
+        }
+        let group_hint = {
+            let guard = self.send_group.lock().map_err(|_| closed())?;
+            guard.clone()
+        };
+        let store = {
+            let mut guard = self.store_guard()?;
+            guard.take().ok_or_else(closed)?
+        };
+        let mut runtime = match SendRuntime::open(store, &config, group_hint.as_deref()) {
+            Ok(runtime) => runtime,
+            Err(failure) => {
+                let crate::send_runtime::SendOpenError { error, store } = failure;
+                if let Some(store) = store {
+                    let mut guard = self.store_guard()?;
+                    *guard = Some(store);
+                }
+                return Err(error);
+            }
+        };
+        let step_result = runtime.step(draft_id, step);
+        // 本次运行时产生的事件（序号从 0 开始，因为 service 是本次新建的实例）。
+        let mut produced = Vec::new();
+        if let Ok(batch) = runtime.poll_events(0, MAX_EVENT_BATCH) {
+            produced = batch.events;
+        }
+        let store = runtime.into_store().ok_or_else(closed)?;
+        {
+            let mut guard = self.store_guard()?;
+            *guard = Some(store);
+        }
+        {
+            let mut bus = self.events_guard()?;
+            for event in produced {
+                bus.push(event);
+            }
+        }
+        step_result
     }
 
     /// CORE-003 的最小切片：按单调序号读取内核事件（不改变任何状态，重复读取幂等）。

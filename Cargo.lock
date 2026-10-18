@@ -702,6 +702,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chat-plugins"
+version = "0.1.0"
+dependencies = [
+ "chat-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "chat-protocol"
 version = "0.1.0"
 dependencies = [
