@@ -65,6 +65,8 @@ pub enum SealPurpose {
     AttachmentSecret,
     /// `attachment_transfer_progress.protected_progress`：断点续传进度（位图 + 会话/blob + 前缀摘要）。
     AttachmentTransferProgress,
+    /// `plugin_kv.value`：插件私有键值（PLUGINS-004 的持久化形式）。
+    PluginKv,
 }
 
 impl SealPurpose {
@@ -85,6 +87,7 @@ impl SealPurpose {
             Self::AttachmentRecord => b"attachment-record",
             Self::AttachmentSecret => b"attachment-secret",
             Self::AttachmentTransferProgress => b"attachment-transfer-progress",
+            Self::PluginKv => b"plugin-kv",
         }
     }
 }

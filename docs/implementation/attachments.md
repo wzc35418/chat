@@ -435,6 +435,66 @@ cargo test --offline -p chat-core                                # 76 passed（�
 5. **一个 transport 绑定一个群 + 一条 source 条目**：多附件（不同 source seq）需要按消息构造 transport 或多绑定表；本轮按“一消息一附件一组”的切片构造。
 6. **节点授权需先有本设备的已接受日志条目**：附件上传前必须已有一条本设备条目（测试用 append 真实写入），不存在“先传附件再发消息”的路径。
 
+## SECD 实现记录：附件密钥描述符随消息投递（2026-10-19，Windows x64）
+
+源码 [crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)（编解码 + 采用）与
+[crates/core/src/attachment_message.rs](../../crates/core/src/attachment_message.rs)（落库）；
+测试 [crates/core/tests/attachment_descriptor.rs](../../crates/core/tests/attachment_descriptor.rs)。
+
+解决的问题：FileKey 以前只在本机（迁移 0007），其它设备拿到同一条附件消息也解不开。现在把
+**chat-crypto 的 E2EE SecretDescriptor** 放进受 MLS 加密的消息正文里随消息投递。
+
+### 消息体（只在 MLS 内层，绝不进明文日志）
+
+`@json
+{ "kind": "chat.attachment.v1", "attachment_id": "att-<hex>", "file_id": "<32 hex>",
+  "plain_size": 123, "content_digest": "<64 hex>", "ciphertext_bytes": 456,
+  "chunk_bytes": 262144, "chunk_count": 2, "ciphertext_digest": "<64 hex>",
+  "secret_descriptor": "<hex>", "binding": "<64 hex>" }
+`@
+
+- 发送侧 `PersistedAttachmentStore::encode_attachment_message_body(attachment_id, wrapping_key)`：
+  从 0007 取 FileKey、用 `seal_secret_descriptor` 封装（AAD = attachment_id），把清单 + 描述符 +
+  绑定摘要序列化成 JSON（正文由调用方放进 `ApplicationContent::Text`，受 MLS 加密）。
+- 绑定(`binding`)：`SHA-256(域 ‖ attachment_id ‖ file_id ‖ ciphertext_bytes ‖ plain_size ‖
+  content_digest ‖ chunk_bytes ‖ chunk_count ‖ ciphertext_digest)` —— 描述符/清单任一字段被改都会
+  在落库前失败。
+- 接收侧 `adopt_attachment_message(body, wrapping_key)`：绑定校验 → `open_secret_descriptor`（AAD =
+  attachment_id）→ 已存在则逐字段核对并幂等返回 → 写附件记录 + 0007 密钥记录 → 之后
+  `download_attachment` 用本机 FileKey 逐块认证解密。失败**零写入**（写入阶段的失败会删记录级联删密钥）。
+- 落库两阶段（存储是单写者独占，附件库与内核不能同时持句柄）：先在附件库 `adopt`，再用
+  `apply_attachment_message_event(core, event, attachment_id)` 写消息与引用；描述符不可用一定发生在
+  任何消息写入之前。
+
+### 错误语义
+
+| 情形 | 码 |
+|---|---|
+| 描述符缺失/打不开（换会话/换 epoch/被篡改） | `ATTACHMENT_KEY_UNAVAILABLE` |
+| 绑定不符（清单/摘要被改）、消息体畸形 | `ATTACHMENT_CORRUPTED` |
+| 旧式 `ApplicationContent::Attachment`（无描述符）在独立库解析不到引用 | `ATTACHMENT_NOT_FOUND@（行为与 SECD 之前一致） |
+| 旧式引用本机有记录但无 FileKey（下载/导出） | `ATTACHMENT_KEY_UNAVAILABLE` |
+
+### 证据（`cargo test --offline -p chat-core --test attachment_descriptor`，真 MLS + 两个独立库）
+
+- `another_store_can_decrypt_the_attachment_with_the_descriptor`：A 导入/上传 + 生成消息体；**B 在全新库里**
+  仅凭消息体 + 会话包装密钥采用描述符、落消息与引用，随后独立下载并解密，导出内容与 A 的明文逐字节一致。
+- `tampered_descriptor_or_manifest_is_rejected_without_writes`：改密文摘要 → `ATTACHMENT_CORRUPTED`；
+  改描述符字节 / 换会话包装密钥 → `ATTACHMENT_KEY_UNAVAILABLE`；三种情况都**没有**留下附件记录。
+- `legacy_attachment_reference_without_descriptor_cannot_be_downloaded`：旧式引用在本机（有解析端口）行为不变，
+  在独立库被显式拒绝；本机无记录/无密钥时 `ATTACHMENT_NOT_FOUND`（下载路径对应 `ATTACHMENT_KEY_UNAVAILABLE`）。
+
+### 已知限制
+
+1. **包装密钥仍是 P0 派生**：MLS exporter 未接线（crypto 无导出 application secret 的入口），
+   `attachment_message_wrapping_key(conversation_id, mls_epoch)` 用域分隔 SHA-256 派生。描述符只经 MLS 密文传输，
+   机密性来自 MLS；该密钥提供“同会话同 epoch 绑定 + 换会话/epoch 打不开”的纵深防御。exporter 接线后必须替换，
+   且**必须**同步换掉测试里的派生期望。
+2. 明文摘要（`content_digest`）与明文大小进入消息体（按 TYPES.md 允许进入 E2EE 内层与本地记录），
+   因此接收方在下载前就知道明文大小/摘要；它们不是秘密，但也不得进入节点公开清单。
+3. 单附件：协议内层事件目前只允许一个附件引用；消息体也按单附件建模。
+4. 采用后记录状态为 `downloading`，完成下载/导出后由既有状态机继续推进；本轮不改上传/下载状态机。
+
 ## 附件上传/下载接 FFI（ATT-U，2026-10-18，Windows x64）
 
 代码：[crates/ffi/src/attachments_ffi.rs](../../crates/ffi/src/attachments_ffi.rs)（UniFFI 薄封装）+ [crates/core/src/attachment_node.rs](../../crates/core/src/attachment_node.rs)（装配：持久身份 → 设备凭据 → `NodeBlobTransport` → ATTACHMENTS-003/005 编排）；

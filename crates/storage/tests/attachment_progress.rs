@@ -113,7 +113,11 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 fn attachment_progress_roundtrip_is_idempotent_and_directional() {
     let fixture = Fixture::new("roundtrip");
     let mut store = fixture.open();
-    assert_eq!(store.schema_version(), 9, "0008 progress + 0009 message attachments");
+    assert_eq!(
+        store.schema_version(),
+        10,
+        "0008 progress + 0009 message attachments + 0010 plugins"
+    );
     store
         .save_attachment(attachment("att-progress", 3))
         .expect("save attachment");

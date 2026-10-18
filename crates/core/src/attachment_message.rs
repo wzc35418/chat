@@ -137,3 +137,73 @@ pub fn apply_authenticated_application_event(
         sent_at_ms,
     })
 }
+
+/// SECD：把**已由描述符复现**的附件消息落成正式消息。
+///
+/// 分工（存储是单写者独占：附件库与内核不能同时持句柄）：
+///
+/// 1. 调用方先用 [`crate::attachments::PersistedAttachmentStore::adopt_attachment_message`]
+///    在附件库里核对绑定、开箱描述符、写附件记录与 0007 密钥记录；
+/// 2. 再用本函数（内核句柄）把消息与引用落库。
+///
+/// 因此“描述符不可用/被篡改”一定发生在任何消息写入之前（绝不留半状态）。
+pub fn apply_attachment_message_event(
+    core: &mut ConversationCore,
+    event: &AuthenticatedEvent,
+    attachment_id: &str,
+) -> anyhow::Result<AppliedApplicationMessage> {
+    let plain = event.event();
+    let ApplicationContent::Text { text } = &plain.content else {
+        return Err(anyhow::Error::new(AttachmentError::AttachmentCorrupted(
+            "attachment descriptor event must carry a text body",
+        )));
+    };
+    let body = crate::attachments::parse_attachment_message_body(text)?
+        .ok_or_else(|| {
+            anyhow::Error::new(AttachmentError::AttachmentCorrupted(
+                "message body is not an attachment descriptor body",
+            ))
+        })?;
+    if body.attachment_id != attachment_id {
+        return Err(anyhow::Error::new(AttachmentError::AttachmentCorrupted(
+            "adopted attachment does not match the message body",
+        )));
+    }
+    let conversation_id = plain.conversation_id.encode();
+    let author_account = plain.account_id.encode();
+    let author_device = plain.device_id.encode();
+    let sent_at_ms = plain.sent_at_unix_ms;
+    let created_at_ms = i64::try_from(sent_at_ms).map_err(|_| {
+        anyhow::Error::new(chat_sync::SyncError::new(
+            chat_sync::ErrorCode::InvalidTarget,
+            "event timestamp is out of the supported range",
+        ))
+    })?;
+    let mine = match core.load_identity_account() {
+        Ok(Some(identity)) => identity.account_id == author_account,
+        Ok(None) => false,
+        Err(error) => return Err(error),
+    };
+    let message_id = message_id_for_event(event);
+    let input = VerifiedEntryInput {
+        conversation_id: conversation_id.clone(),
+        title: String::new(),
+        message_id: message_id.clone(),
+        author_account: author_account.clone(),
+        author_device: author_device.clone(),
+        body: ATTACHMENT_ONLY_BODY.to_owned(),
+        mine,
+        created_at_ms,
+    };
+    let row = core.apply_verified_entry_with_attachments(input, vec![attachment_id.to_owned()])?;
+    Ok(AppliedApplicationMessage {
+        message_id: row.message_id,
+        conversation_id: row.conversation_id,
+        body: row.body,
+        attachment_ids: vec![attachment_id.to_owned()],
+        author_account,
+        author_device,
+        mine,
+        sent_at_ms,
+    })
+}

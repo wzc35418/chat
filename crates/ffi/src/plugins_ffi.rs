@@ -19,6 +19,9 @@ use chat_plugins::{
     parse_manifest,
 };
 use chat_protocol::OperationId;
+use chat_storage::formal::{
+    KeyProvenance, ProtectedStorageKey, StoreOptions, open_store,
+};
 
 use crate::local_store::FfiError;
 
@@ -40,6 +43,32 @@ fn core_closed() -> FfiError {
     FfiError::Store {
         code: "CORE_CLOSED".to_owned(),
         reason: "the plugin host object is closed".to_owned(),
+    }
+}
+
+/// 主密钥（64 位十六进制 → 32 字节）；错误密钥绝不被"修正"。
+fn decode_master_key(text: &str) -> Result<[u8; 32], FfiError> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 64 {
+        return Err(invalid_input(
+            "master key must be exactly 64 hexadecimal characters",
+        ));
+    }
+    let mut key = [0_u8; 32];
+    for (index, slot) in key.iter_mut().enumerate() {
+        let high = decode_nibble(bytes[index * 2])?;
+        let low = decode_nibble(bytes[index * 2 + 1])?;
+        *slot = (high << 4) | low;
+    }
+    Ok(key)
+}
+
+fn decode_nibble(byte: u8) -> Result<u8, FfiError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(invalid_input("master key must be hexadecimal")),
     }
 }
 
@@ -141,11 +170,36 @@ fn plan_view(plan: &DispatchPlan) -> DispatchPlanViewFfi {
     }
 }
 
+/// 插件在库里的状态文本。
+const STATE_INSTALLED: &str = "installed";
+const STATE_RUNNING: &str = "running";
+const STATE_STOPPED: &str = "stopped";
+/// 保留数据的卸载：行留着但标记为未安装（KV 保留，重装后仍可读）。
+const STATE_UNINSTALLED: &str = "uninstalled";
+
 struct Inner {
     host: PluginHost,
     limits: PluginLimits,
     runtimes: BTreeMap<String, PluginRuntime>,
     closed: bool,
+    /// 持久化模式下的正式库（`None` = 纯内存模式）。
+    store: Option<chat_storage::formal::Store>,
+    /// 打开时因清单损坏被跳过的行数（持久化模式；不静默丢弃）。
+    skipped_on_load: u32,
+}
+
+fn storage_failure(error: chat_storage::formal::StorageError) -> FfiError {
+    let code = if error.to_string().contains("byte limit")
+        || error.to_string().contains("entry limit")
+    {
+        "PLUGIN_STORAGE_QUOTA_EXCEEDED"
+    } else {
+        error.code()
+    };
+    FfiError::Store {
+        code: code.to_owned(),
+        reason: error.to_string(),
+    }
 }
 
 /// 插件宿主 FFI 对象（纯内存：每个实例一个独立的宿主状态）。
@@ -176,6 +230,21 @@ impl PluginsFfi {
         OperationId::parse(text).map_err(|_| invalid_input("operation id must be PROTOCOL-001 operation text"))
     }
 
+    /// 持久化模式的能力门：插件必须已安装且声明了 PrivateStorage。
+    fn require_private_storage(inner: &Inner, plugin: &PluginId) -> Result<(), FfiError> {
+        let manifest = inner.host.manifest(plugin).ok_or_else(|| FfiError::Store {
+            code: "PLUGIN_NOT_INSTALLED".to_owned(),
+            reason: "plugin is not installed".to_owned(),
+        })?;
+        if !manifest.has_capability(chat_plugins::PluginCapability::PrivateStorage) {
+            return Err(FfiError::Store {
+                code: "CAPABILITY_NOT_DECLARED".to_owned(),
+                reason: "required capability is not declared".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// 取已启动插件的运行时句柄（未启动 → `PLUGIN_NOT_RUNNING`）。
     fn runtime<'a>(
         inner: &'a Inner,
@@ -201,8 +270,63 @@ impl PluginsFfi {
                 limits,
                 runtimes: BTreeMap::new(),
                 closed: false,
+                store: None,
+                skipped_on_load: 0,
             }),
         })
+    }
+
+    /// 打开**持久化模式**：把已安装清单与插件私有 KV 落到正式加密库。
+    ///
+    /// - 库必须已存在且主密钥正确（storage 冻结码）；
+    /// - 库里已安装的插件会被重新装回宿主（**运行状态不恢复**：重开后在 @stopped@ 状态，
+    ///   需要上层再 @start@）；
+    /// - 清单损坏的行会被跳过并计数（@skipped`），绝不静默丢弃。
+    #[uniffi::constructor]
+    pub fn open(database_path: String, master_key_hex: String) -> Result<Arc<Self>, FfiError> {
+        let store = open_store(
+            StoreOptions::new(&database_path, KeyProvenance::Raw32),
+            ProtectedStorageKey::from_bytes(decode_master_key(&master_key_hex)?),
+        )
+        .map_err(storage_failure)?;
+        let host = PluginHost::with_default_limits();
+        let limits = host.limits();
+        let mut inner = Inner {
+            host,
+            limits,
+            runtimes: BTreeMap::new(),
+            closed: false,
+            store: None,
+            skipped_on_load: 0,
+        };
+        let rows = store.load_plugins().map_err(storage_failure)?;
+        for row in rows {
+            if row.state == STATE_UNINSTALLED {
+                // 保留数据的卸载：行留着（KV 保留），但不装回宿主。
+                continue;
+            }
+            match parse_manifest(&row.manifest_json, &inner.limits) {
+                Ok(manifest) => {
+                    if inner.host.install(manifest).is_err() {
+                        inner.skipped_on_load = inner.skipped_on_load.saturating_add(1);
+                    }
+                }
+                Err(_) => inner.skipped_on_load = inner.skipped_on_load.saturating_add(1),
+            }
+        }
+        inner.store = Some(store);
+        Ok(Arc::new(Self {
+            inner: Mutex::new(inner),
+        }))
+    }
+
+    /// 打开时被跳过的损坏清单行数（纯内存模式恒为 0）。
+    pub fn skipped_on_load(&self) -> Result<u32, FfiError> {
+        let inner = self.lock()?;
+        if inner.closed {
+            return Err(core_closed());
+        }
+        Ok(inner.skipped_on_load)
     }
 
     /// 校验清单 JSON（不安装、不执行）。
@@ -223,7 +347,12 @@ impl PluginsFfi {
         }
         let manifest = parse_manifest(&manifest_json, &inner.limits).map_err(failure)?;
         let plugin_id = manifest.id.as_str().to_owned();
-        inner.host.install(manifest).map_err(failure)?;
+        inner.host.install(manifest.clone()).map_err(failure)?;
+        if let Some(store) = inner.store.as_mut() {
+            store
+                .upsert_plugin(&plugin_id, &manifest_json, STATE_INSTALLED)
+                .map_err(storage_failure)?;
+        }
         Ok(plugin_id)
     }
 
@@ -235,6 +364,11 @@ impl PluginsFfi {
             return Err(core_closed());
         }
         let runtime = inner.host.start(&plugin).map_err(failure)?;
+        if let Some(store) = inner.store.as_mut() {
+            store
+                .set_plugin_state(&plugin_id, STATE_RUNNING)
+                .map_err(storage_failure)?;
+        }
         inner.runtimes.insert(plugin_id, runtime);
         Ok(())
     }
@@ -294,6 +428,13 @@ impl PluginsFfi {
             return Err(core_closed());
         }
         let stopped = inner.host.stop(&plugin).map_err(failure)?;
+        if stopped {
+            if let Some(store) = inner.store.as_mut() {
+                store
+                    .set_plugin_state(&plugin_id, STATE_STOPPED)
+                    .map_err(storage_failure)?;
+            }
+        }
         inner.runtimes.remove(&plugin_id);
         Ok(stopped)
     }
@@ -310,6 +451,19 @@ impl PluginsFfi {
             .uninstall(&plugin, remove_data)
             .map_err(failure)?;
         inner.runtimes.remove(&plugin_id);
+        if removed {
+            if let Some(store) = inner.store.as_mut() {
+                if remove_data {
+                    // 真删行：plugin_kv 随外键级联一起清空。
+                    store.delete_plugin(&plugin_id).map_err(storage_failure)?;
+                } else {
+                    // 保留数据：行留着但标记为未安装（KV 不动，重装后仍可读）。
+                    store
+                        .set_plugin_state(&plugin_id, STATE_UNINSTALLED)
+                        .map_err(storage_failure)?;
+                }
+            }
+        }
         Ok(removed)
     }
 
@@ -323,6 +477,13 @@ impl PluginsFfi {
         let inner = self.lock()?;
         if inner.closed {
             return Err(core_closed());
+        }
+        // 持久化模式：能力仍要声明（清单来自宿主），值直接从库里读（重开后也能读）。
+        if let Some(store) = inner.store.as_ref() {
+            Self::require_private_storage(&inner, &plugin)?;
+            return store
+                .plugin_kv_get(plugin.as_str(), &key)
+                .map_err(storage_failure);
         }
         let runtime = Self::runtime(&inner, &plugin)?;
         inner
@@ -343,6 +504,14 @@ impl PluginsFfi {
         let mut inner = self.lock()?;
         if inner.closed {
             return Err(core_closed());
+        }
+        if inner.store.is_some() {
+            // 持久化模式：能力先由宿主校验（清单/安装态/能力），再由库做有界配额。
+            Self::require_private_storage(&inner, &plugin)?;
+            let store = inner.store.as_mut().expect("checked above");
+            return store
+                .plugin_kv_set(plugin.as_str(), &key, &value)
+                .map_err(storage_failure);
         }
         let runtime = Self::runtime(&inner, &plugin)?.clone();
         inner
@@ -407,6 +576,8 @@ impl PluginsFfi {
             }
         }
         inner.runtimes.clear();
+        // 释放正式库句柄（独占写者）：这样同一个库可以被重新 open。
+        inner.store = None;
         inner.closed = true;
     }
 }

@@ -26,13 +26,16 @@ use chat_crypto::attachment::{
     chunk_context_for, chunk_count, chunk_plain_length, decrypt_attachment_chunk,
     encrypt_attachment_chunk,
 };
-use chat_crypto::secret_descriptor::{SecretDescriptor, seal_secret_descriptor};
+use chat_crypto::secret_descriptor::{
+    SecretDescriptor, open_secret_descriptor, seal_secret_descriptor,
+};
 use chat_storage::formal::{
     AppliedEntry, AttachmentProgress as StoredTransferProgress,
     AttachmentProgressInput as PersistedProgressInput, AttachmentRecordInput as PersistedAttachmentInput,
     AttachmentSecretInput as PersistedAttachmentSecretInput, StorageError, Store as FormalStore,
     VerifiedEntryInput,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4402,3 +4405,321 @@ mod tests {
 
 }
 
+// ============================================================================
+// SECD：附件密钥描述符随消息投递（跨设备/跨实例下载）
+// ============================================================================
+
+/// 附件消息体的 kind 文本（进 E2EE 内层事件正文，不进明文日志）。
+pub const ATTACHMENT_MESSAGE_KIND: &'static str = "chat.attachment.v1";
+/// 包装密钥派生域。
+pub const ATTACHMENT_WRAPPING_KEY_DOMAIN: &[u8] = b"chat/core/attachment-wrapping-key/v1";
+/// 描述符绑定摘要的派生域。
+pub const ATTACHMENT_BINDING_DOMAIN: &[u8] = b"chat/core/attachment-message-binding/v1";
+/// 附件消息体上限（只放清单 + 描述符）。
+pub const MAX_ATTACHMENT_MESSAGE_BODY_BYTES: usize = 8 * 1024;
+
+/// 附件消息体：把 FileKey 的 E2EE 描述符与公开清单一起投递给同群设备。
+///
+/// 只出现在 MLS 内层事件正文里（加密），描述符本身仍是不透明密封字节；打开需要包装密钥
+/// （见 [attachment_message_wrapping_key]）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentMessageBody {
+    /// 固定 kind（拒绝其它形态，避免把任意 JSON 当附件）。
+    pub kind: String,
+    /// 本地附件 ID（att-<hex>，也是描述符 AAD）。
+    pub attachment_id: String,
+    /// 协议层文件对象 ID 的字节（小写 hex）。
+    pub file_id: String,
+    /// 密文总字节数。
+    pub ciphertext_bytes: u64,
+    /// 分块大小（字节）。
+    pub chunk_bytes: u32,
+    /// 分块总数。
+    pub chunk_count: u32,
+    /// 明文总字节数。
+    pub plain_size: u64,
+    /// 明文摘要（小写 hex）；只允许出现在 E2EE 内层与本地记录里。
+    pub content_digest: String,
+    /// 展示文件名（只作展示，不参与路径拼接）。
+    pub display_name: String,
+    /// 密文摘要（小写 hex）。
+    pub ciphertext_digest: String,
+    /// 密封的 FileKey 描述符（小写 hex）。
+    pub secret_descriptor: String,
+    /// 绑定摘要：文件 ID + 密文清单字段（描述符是被绑定的一方，不参与计算）。
+    pub binding: String,
+}
+
+/// 附件消息体的包装密钥（P0 派生）。
+///
+/// **限制**：MLS exporter 尚未接线（crypto 没有导出 application secret 的入口），因此这里用
+/// 会话 + epoch 的域分隔派生；描述符只经 MLS 密文传输，机密性来自 MLS，本密钥提供的是
+/// “同会话同 epoch 绑定”的纵深防御（换会话/换 epoch 打不开）。exporter 接线后必须替换。
+pub fn attachment_message_wrapping_key(conversation_id: &str, mls_epoch: u64) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ATTACHMENT_WRAPPING_KEY_DOMAIN);
+    hasher.update((conversation_id.len() as u32).to_be_bytes());
+    hasher.update(conversation_id.as_bytes());
+    hasher.update(mls_epoch.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(digest.as_slice());
+    key
+}
+
+/// 计算绑定摘要：把描述符绑定到文件 ID 与密文清单（摘要/大小/分块参数）。
+pub fn attachment_message_binding(body: &AttachmentMessageBody) -> AttachmentResult<[u8; 32]> {
+    let file_id = decode_hex_field(&body.file_id, "attachment message file id")?;
+    let digest = decode_hex_field(&body.ciphertext_digest, "attachment message ciphertext digest")?;
+    let mut hasher = Sha256::new();
+    hasher.update(ATTACHMENT_BINDING_DOMAIN);
+    hasher.update((body.attachment_id.len() as u32).to_be_bytes());
+    hasher.update(body.attachment_id.as_bytes());
+    hasher.update((file_id.len() as u32).to_be_bytes());
+    hasher.update(&file_id);
+    hasher.update(body.ciphertext_bytes.to_be_bytes());
+    hasher.update(body.plain_size.to_be_bytes());
+    hasher.update((body.content_digest.len() as u32).to_be_bytes());
+    hasher.update(body.content_digest.as_bytes());
+    hasher.update(body.chunk_bytes.to_be_bytes());
+    hasher.update(body.chunk_count.to_be_bytes());
+    hasher.update((digest.len() as u32).to_be_bytes());
+    hasher.update(&digest);
+    let out = hasher.finalize();
+    let mut binding = [0u8; 32];
+    binding.copy_from_slice(out.as_slice());
+    Ok(binding)
+}
+
+fn decode_hex_field(text: &str, what: &'static str) -> AttachmentResult<Vec<u8>> {
+    if text.is_empty() || text.len() % 2 != 0 || text.len() > 1024 {
+        return Err(AttachmentError::AttachmentCorrupted(what));
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks(2) {
+        let hi = hex_value(pair[0]).ok_or(AttachmentError::AttachmentCorrupted(what))?;
+        let lo = hex_value(pair[1]).ok_or(AttachmentError::AttachmentCorrupted(what))?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// 解析附件消息体：不是本形态返回 Ok(None)（普通文本消息照旧）；是本形态但字段不合法
+/// 返回显式错误（不猜、不降级）。
+pub fn parse_attachment_message_body(text: &str) -> AttachmentResult<Option<AttachmentMessageBody>> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Ok(None);
+    };
+    let Some(kind) = value.get("kind").and_then(|kind| kind.as_str()) else {
+        return Ok(None);
+    };
+    if kind != ATTACHMENT_MESSAGE_KIND {
+        return Ok(None);
+    }
+    if text.len() > MAX_ATTACHMENT_MESSAGE_BODY_BYTES {
+        return Err(AttachmentError::ContentTooLarge);
+    }
+    let body: AttachmentMessageBody = serde_json::from_value(value)
+        .map_err(|_| AttachmentError::AttachmentCorrupted("attachment message body is malformed"))?;
+    validate_attachment_id(&body.attachment_id)?;
+    if body.file_id.len() != 32 {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "attachment message file id must be 32 hex characters",
+        ));
+    }
+    if body.ciphertext_digest.len() != 64 {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "attachment message ciphertext digest must be 64 hex characters",
+        ));
+    }
+    if body.display_name.is_empty() || body.display_name.len() > MAX_DISPLAY_NAME_BYTES {
+        return Err(AttachmentError::InvalidDisplayName);
+    }
+    if body.content_digest.len() != 64 {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "attachment message content digest must be 64 hex characters",
+        ));
+    }
+    if body.ciphertext_bytes == 0 || body.chunk_count == 0 || body.chunk_bytes == 0 {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "attachment message manifest fields must be non-zero",
+        ));
+    }
+    Ok(Some(body))
+}
+
+impl PersistedAttachmentStore {
+    /// 发送侧：把清单 + FileKey 描述符打包成消息体 JSON（放进 E2EE 内层正文，不进明文日志）。
+    pub fn encode_attachment_message_body(
+        &self,
+        attachment_id: &str,
+        wrapping_key: &[u8; 32],
+    ) -> AttachmentResult<String> {
+        validate_attachment_id(attachment_id)?;
+        let record = self
+            .attachment_record(attachment_id)?
+            .ok_or(AttachmentError::AttachmentNotFound)?;
+        let manifest = self.cache.attachment_manifest(attachment_id)?;
+        let secret = {
+            let store = self.lock_store()?;
+            store
+                .load_attachment_secret(attachment_id)
+                .map_err(AttachmentError::from)?
+        };
+        let Some(secret) = secret else {
+            return Err(AttachmentError::KeyUnavailable(
+                "the file key is not persisted for this attachment",
+            ));
+        };
+        if secret.file_key.len() != 32 {
+            return Err(AttachmentError::AttachmentCorrupted(
+                "stored file key has an invalid length",
+            ));
+        }
+        let mut file_key = [0u8; 32];
+        file_key.copy_from_slice(secret.file_key.as_slice());
+        let key = FileKey::try_from_slice(&file_key);
+        file_key.fill(0);
+        let key = key?;
+        let descriptor = seal_secret_descriptor(wrapping_key, attachment_id, &key)?;
+        let mut body = AttachmentMessageBody {
+            kind: ATTACHMENT_MESSAGE_KIND.to_owned(),
+            attachment_id: attachment_id.to_owned(),
+            file_id: hex(&secret.file_id),
+            ciphertext_bytes: manifest.ciphertext_bytes,
+            plain_size: manifest.plain_size,
+            display_name: record.display_name.clone(),
+            content_digest: record.content_digest.clone(),
+            chunk_bytes: manifest.chunk_size,
+            chunk_count: manifest.chunk_count,
+            ciphertext_digest: manifest.ciphertext_digest.clone(),
+            secret_descriptor: hex(descriptor.as_bytes()),
+            binding: String::new(),
+        };
+        let _ = &record;
+        let binding = attachment_message_binding(&body)?;
+        body.binding = hex(&binding);
+        serde_json::to_string(&body)
+            .map_err(|_| AttachmentError::InternalFailure("attachment message body encode failed"))
+    }
+
+    /// 接收侧：用描述符 + 包装密钥独立复现附件记录与 FileKey（不依赖发送方本地库）。
+    ///
+    /// 顺序：绑定校验 → 描述符开箱（AAD = attachment_id）→ 已存在则逐字段核对（幂等）→
+    /// 写附件记录 + 0007 密钥记录 → 恢复进程内缓存。任何一步失败都不留半状态。
+    pub fn adopt_attachment_message(
+        &mut self,
+        body: &AttachmentMessageBody,
+        wrapping_key: &[u8; 32],
+    ) -> AttachmentResult<String> {
+        if body.kind != ATTACHMENT_MESSAGE_KIND {
+            return Err(AttachmentError::AttachmentCorrupted(
+                "attachment message kind is not supported",
+            ));
+        }
+        validate_attachment_id(&body.attachment_id)?;
+        // 1) 绑定校验：清单/描述符被篡改时先失败，绝不落库。
+        let expected = attachment_message_binding(body)?;
+        let declared = decode_hex_field(&body.binding, "attachment message binding")?;
+        if declared.len() != 32 || declared.as_slice() != expected.as_slice() {
+            return Err(AttachmentError::AttachmentCorrupted(
+                "attachment message binding does not match its manifest",
+            ));
+        }
+        let file_id_bytes = decode_hex_field(&body.file_id, "attachment message file id")?;
+        if file_id_bytes.len() != 16 {
+            return Err(AttachmentError::AttachmentCorrupted(
+                "attachment message file id must be 16 bytes",
+            ));
+        }
+        let ciphertext_digest =
+            decode_hex_field(&body.ciphertext_digest, "attachment message ciphertext digest")?;
+        if ciphertext_digest.len() != 32 {
+            return Err(AttachmentError::AttachmentCorrupted(
+                "attachment message ciphertext digest must be 32 bytes",
+            ));
+        }
+        // 2) 描述符开箱：失败 = 本机拿不到密钥（换会话/epoch 或描述符被篡改）。
+        let descriptor_bytes =
+            decode_hex_field(&body.secret_descriptor, "attachment message descriptor")?;
+        let descriptor = SecretDescriptor::from_bytes(descriptor_bytes).map_err(|_| {
+            AttachmentError::KeyUnavailable("attachment message descriptor is not valid")
+        })?;
+        let key = open_secret_descriptor(wrapping_key, &body.attachment_id, &descriptor).map_err(
+            |_| {
+                AttachmentError::KeyUnavailable(
+                    "attachment message descriptor cannot be opened with this conversation key",
+                )
+            },
+        )?;
+        let file_key = key.copy_bytes();
+        let mut file_key_bytes = [0u8; 32];
+        file_key_bytes.copy_from_slice(file_key.as_slice());
+        // 3) 已存在就逐字段核对（幂等；不一致 = 冲突，拒绝）。
+        if let Some(existing) = self.attachment_record(&body.attachment_id)? {
+            // 清单字段必须逐项一致（摘要/分块参数）；尺寸在记录里由明文大小推导，
+            // 因此只核对可比较的持久化字段。
+            let matches = existing.chunk_size == body.chunk_bytes
+                && existing.chunk_count == body.chunk_count
+                && existing.ciphertext_digest == body.ciphertext_digest;
+            if !matches {
+                return Err(AttachmentError::AttachmentCorrupted(
+                    "existing attachment record does not match the message descriptor",
+                ));
+            }
+            return Ok(body.attachment_id.clone());
+        }
+        // 4) 落库：先附件记录、再 0007 密钥记录；失败回滚（删记录级联删密钥）。
+        let input = PersistedAttachmentInput {
+            attachment_id: body.attachment_id.clone(),
+            state: AttachmentState::Downloading.code().to_owned(),
+            plain_size: body.plain_size,
+            chunk_size: body.chunk_bytes,
+            chunk_count: body.chunk_count,
+            content_digest: body.content_digest.clone(),
+            ciphertext_digest: body.ciphertext_digest.clone(),
+            display_name: body.display_name.clone(),
+            created_at_ms: now_ms(),
+        };
+        let secret = PersistedAttachmentSecretInput {
+            attachment_id: body.attachment_id.clone(),
+            file_id: {
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&file_id_bytes);
+                id
+            },
+            file_key: file_key_bytes.to_vec(),
+            created_at_ms: now_ms(),
+        };
+        let mut secret = secret;
+        let attempted = (|| -> AttachmentResult<()> {
+            let mut store = self.lock_store()?;
+            store.save_attachment(input)?;
+            store.save_attachment_secret(PersistedAttachmentSecretInput {
+                attachment_id: secret.attachment_id.clone(),
+                file_id: secret.file_id,
+                file_key: secret.file_key.clone(),
+                created_at_ms: secret.created_at_ms,
+            })?;
+            Ok(())
+        })();
+        secret.file_key.fill(0);
+        file_key_bytes.fill(0);
+        if let Err(error) = attempted {
+            // 半状态清理：记录级联删密钥，确保“失败不留可下载的半成品”。
+            if let Ok(mut store) = self.lock_store() {
+                let _ = store.delete_attachment(&body.attachment_id);
+            }
+            return Err(error);
+        }
+        Ok(body.attachment_id.clone())
+    }
+}

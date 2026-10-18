@@ -770,173 +770,66 @@ cargo test --offline -p chat-core -p chat-ffi        # 118 + 36 passed
 
 代码：[crates/ffi/src/groups_ffi.rs](../../crates/ffi/src/groups_ffi.rs)（+2 方法、+4 记录）+
 [crates/core/src/service.rs](../../crates/core/src/service.rs) 的 `ConversationCore::group_submit_control` /
-`group_accept_with_receipt`；测试：[crates/ffi/tests/groups_ffi_receipt.rs](../../crates/ffi/tests/groups_ffi_receipt.rs)
-（3 个用例，**真 axum 节点 + 真 OpenMLS + 真临时库**，全程经 FFI）。
-
-### 新增公开面
+## 插件宿主持久化（PluginsFfi.open，2026-10-18）
 
 ~~~text
-group_submit_control(group_id, endpoint_url, node_id, node_public_key_hex: String?) -> ControlReceiptFfi
-group_accept_with_receipt(group_id, receipt: ControlReceiptFfi) -> GroupViewFfi
-
-ControlReceiptFfi { receipt: ControlAppendFfi, candidate: ControlCandidateFfi, head: ControlHeadFfi }
-ControlAppendFfi  { group_id, submission_id, author_device_id, seq, candidate_hash, previous_hash,
-                    log_hash, accepted_at, node_id, node_public_key, signature }
-ControlCandidateFfi { protocol_major, protocol_minor, submission_id, group_id, author_device_id, kind,
-                      expected_control_head, policy_version, mls_epoch, encrypted_payload,
-                      operation: String?, target_digest: String? }
-ControlHeadFfi    { group_id, coordinator_id, seq, log_hash, control_head, policy_version, mls_epoch,
-                    node_id, node_public_key, signature }
+PluginsFfi::open(database_path, master_key_hex) -> Arc<PluginsFfi>   // 持久化模式（正式加密库）
+PluginsFfi::new() -> Arc<PluginsFfi>                                  // 纯内存（不变）
+skipped_on_load() -> u32
 ~~~
 
-全部是**公开材料**（节点回执/候选/head 本来就是公开字段），没有私钥、没有明文正文。
-
-### 接线要点
-
-- **设备身份复用持久身份**：`group_submit_control` 从库里的 `load_identity_seeds` 派生设备签名钥
-  （与 identity 同一派生函数），节点看到的设备 ID 与库里一致；未入库身份 → `INVALID_STATE_TRANSITION`。
-- **证据三要素一起回传**：`ControlReceiptFfi` 必须把回执 + 候选原文 + 提交时的 head 一起交回
-  `group_accept_with_receipt`；只给回执无法证明"它绑定的就是这个 pending 提交"。
-- **三重校验在 core 侧重做**：候选密文逐字节等于本机 pending Commit、节点验签、日志链摘要重算；
-  任一不符显式失败且 epoch/成员/pending 不变。
-- **`node_public_key_hex` 可选**：给了就固定节点公钥（提交时），回执验签仍以回执自带的 head 公钥为准。
-
-### 错误码（冻结）
-
-| 情形 | code |
-|---|---|
-| 节点不可达 / 超时 | `NODE_UNAVAILABLE` |
-| 回执不属于该群、绑定别的提交或别的节点、链摘要不符 | `INVALID_RECEIPT_SCOPE` |
-| 回执/head 节点签名无效、候选摘要不符 | `INVALID_SIGNATURE` |
-| 候选正文不是本机 pending 的 Commit、候选结构非法 | `INVALID_CANDIDATE` |
-| 没有 pending / pending 与快照不符 | `PENDING_MISMATCH` / `STALE_EPOCH` |
-| 未入库身份 / 已关闭 / 端点不可解析 | `INVALID_STATE_TRANSITION` / `CORE_CLOSED` / `INVALID_TARGET` |
-
-### 复现命令（全程离线；测试内起真实 loopback 节点）
-
-~~~powershell
-. .\tools\activate.ps1
-cargo test --offline -p chat-ffi --test groups_ffi_receipt   # 3 passed
-cargo test --offline -p chat-core -p chat-ffi                # 155 + 39 passed（既有 151 + 36 全部继续通过）
-~~~
-
-### 证据
-
-- `groups_ffi_receipt::submit_and_accept_with_a_real_node_receipt`：建群（本地凭据 = 持久身份设备 ID，
-  同一设备已在节点登记、群也已在节点建立）→ `group_set_role` 产生 pending self_update（epoch 1）→
-  `group_submit_control` 拿到真回执（`seq >= 1`、`submission_id` 是 `sub:1:…`、候选 kind=control、
-  operation=set_role、head 属于该节点/该群）→ `group_accept_with_receipt` 后 **epoch 2**、pending 清空、
-  bob 变 admin、快照与返回值一致；再接受同一份回执 → `PENDING_MISMATCH` 且快照不变。
-- `groups_ffi_receipt::forged_receipts_are_rejected_without_advancing_the_epoch`：改日志链摘要 →
-  `INVALID_SIGNATURE`；改节点签名 → `INVALID_SIGNATURE`；换密文 → `INVALID_CANDIDATE`；
-  三次拒绝后快照仍是 pending 的 epoch 1，最后真回执仍能推进到 epoch 2（失败不是破坏性的）。
-- `groups_ffi_receipt::unreachable_node_fails_explicitly_and_leaves_state`：指向 `127.0.0.1:1` →
-  `NODE_UNAVAILABLE`，快照（epoch/pending）完全不变；换真节点后提交 + 接受成功。
-
-### 已知限制
-
-1. **同步阻塞**：提交走同步桥（独立线程 + 独立运行时），在 FFI 的 `Mutex` 内串行执行；不要在 UI 线程做长循环。
-2. **pending 的来源**：本实现里 `rename` 是纯策略层（无 MLS 提交），能产生 pending 的治理操作目前是
-   改角色 / 移除成员 / 建群追加成员；测试因此用 `group_set_role` 产生 pending。
-3. **节点侧群/成员标识是另一套命名空间**：节点用"节点设备 ID"，MLS 用凭据文本；测试必须两侧都登记
-   （节点建群 + 设备注册），生产由 NODE 侧流程负责，本轮不自动同步。
-4. **只做提交与接受**：不拉取/不对账别人的条目（SYNC 侧）、不重试队列、不投递 Welcome。
-5. `node_public_key_hex` 只影响提交时的端点固定；回执验签用回执自带公钥（这是 NODE-006 的既定语义）。
-
-## 常驻同步 FFI 契约（SyncFfi，2026-10-18，Windows x64）
-
-代码：[crates/ffi/src/sync_ffi.rs](../../crates/ffi/src/sync_ffi.rs)（新，薄封装 core 的 `SyncRuntime`）；
-测试：[crates/ffi/tests/sync_ffi.rs](../../crates/ffi/tests/sync_ffi.rs)（3 个用例，真 axum 节点 + 真临时库 + 全程经 FFI）。
-
-### 对象与方法
-
-~~~text
-SyncFfi::open(database_path, master_key_hex, endpoint_url, node_id, node_public_key_hex, group_id)
-    -> Arc<SyncFfi>      // 构造：装配 NodeClient + 校验游标；**不启动**
-start() -> SyncStatusFfi
-stop() -> SyncStatusFfi
-status() -> SyncStatusFfi
-is_open() -> bool        group_id() -> String        shutdown()
-SyncStatusFfi { state, applied_total, last_error_code, next_attempt_at_ms,
-                resync_required, rounds, stopped_reason }
-~~~
-
-### 接线要点
-
-- **设备身份复用持久身份**：open 时从库里 `load_identity_seeds` 派生设备签名钥（与 identity 同一派生函数），
-  因此节点看到的设备 ID 与库里一致；未入库身份 → `INVALID_STATE_TRANSITION`。
-- **游标先校验**：该群拉取游标未初始化 → `INVALID_STATE_TRANSITION`（起点必须来自可信回执）。
-- **open 不启动**：start 之前 status 恒为 idle（applied_total 0）；start 才起常驻线程。
-- **库锁不跨调用持有**：装配完立刻释放库句柄，运行时自己开/关库；stop 后交回的句柄也立刻释放。
-- **状态全是标量**：计数/稳定码/时间戳，不含任何密钥或正文。
-
-### 错误码（冻结）
-
-| 情形 | code |
-|---|---|
-| 已关闭 | `CORE_CLOSED` |
-| 未入库身份 / 游标未初始化 / 重复 start | `INVALID_STATE_TRANSITION` |
-| 主密钥/端点/公钥/群 ID 非法 | `INVALID_INPUT` / `INVALID_TARGET` |
-| 库打不开、密钥错、库损坏 | storage 冻结码（`STORAGE_*`） |
-| 运行时启动失败/节点不可达 | `NODE_UNAVAILABLE` |
-| 运行时内部失败 | `INTERNAL_FAILURE` |
-
-### 复现命令
-
-~~~powershell
-. .\tools\activate.ps1
-cargo test --offline -p chat-ffi --test sync_ffi   # 3 passed
-cargo test --offline -p chat-ffi                   # 42 passed（既有 39 继续通过）
-~~~
-
-### 证据
-
-- `sync_ffi::open_is_idle_until_start_and_status_tracks_applied_entries`：open 后 idle/applied_total 0 →
-  节点追加 2 条 → start 后 applied_total >= 2、rounds >= 1、无错误码 → stop 后 stopped/stop_requested →
-  停止后再追加一条，applied_total 不增长。
-- `sync_ffi::uninitialized_cursor_fails_explicitly_on_open`：无本地游标的群 → `INVALID_STATE_TRANSITION`。
-- `sync_ffi::shutdown_is_idempotent_and_closes_the_object`：shutdown 后 is_open=false、start/stop/status →
-  `CORE_CLOSED`，库锁释放（另一个写者可重新打开），二次 shutdown 无副作用。
-
-### 已知限制
-
-1. **单群单运行时**：对象绑定一个群；同群多运行时无互斥（core 侧既有语义）。
-2. **轮询式状态**：没有事件回调，界面按需 `status()`。
-3. **同步阻塞**：start/stop/status 在 FFI `Mutex` 内串行；stop 会等当前那一轮网络请求结束。
-4. **运行期间库被运行时独占**：同一库的其它 FFI 对象（LocalStore/Groups/Attachments）要等 stop/shutdown。
-5. `node_public_key_hex` 必填（运行时拒绝未固定节点公钥的配置）。
-6. 本对象只暴露 start/stop/status，不含待办队列/重试策略（那属 core 运行时内部）。
-
-## 自移除提案编排 FFI（GroupFfi.group_prepare_leave / group_process_proposal / group_commit_proposals，2026-10-18）
-
-~~~text
-group_prepare_leave(group_id) -> LeaveProposalFfi
-group_process_proposal(group_id, epoch, sender_identity, payload: Vec<u8>) -> ProposalViewFfi
-group_commit_proposals(group_id) -> GroupViewFfi
-
-LeaveProposalFfi { group_id, base_epoch, epoch, removed, has_welcome, proposal: Vec<u8>,
-                   proposal_digest, leaving_at_ms, state_version }
-ProposalViewFfi  { kind, by, epoch, targets, proposals_pending }
-~~~
-
-- 全部纯数据（提案字节可转发，无密钥）；`GroupViewFfi` 新增 `dissolved / dissolved_at_ms / left_at_ms / leaving_at_ms`。
-- 设备照旧用 `load_group_device` 从持久库恢复；错误码沿用 groups 的冻结码。
-- 测试：[crates/ffi/tests/groups_proposal_ffi.rs](../../crates/ffi/tests/groups_proposal_ffi.rs)（3 个，真双设备两库，全程经 FFI）。
-
-错误码：`PERMISSION_DENIED`（群主发起）、`INVALID_STATE_TRANSITION`（已解散/重复发起/已有 pending）、
-`STALE_EPOCH` / `MISSING_LOG_ENTRIES`（乱序）、`INVALID_CIPHERTEXT`（作者不符）、
-`NO_PENDING_PROPOSALS` / `PENDING_COMMIT_EXISTS`、`INVALID_CANDIDATE`（空 payload）。
-
-已知限制：提案字节需由上层转发（本轮不投递）；一个对象同时只允许一条 pending 提交；
-对端处理提案后仍需本机处理那条 Commit 才会 `self_removed`。
+- 依赖 storage 迁移 **0010_plugins**（plugins / plugin_kv，值密封存储）；
+- 打开时把已安装清单装回宿主，**运行状态不恢复**（stopped，需上层再 `start`）；
+- install/start/stop/uninstall 会写 `plugins.state`；uninstall(`remove_data=false`) 只把行标记
+  `uninstalled`（**保留 KV**），`true` 删行并级联清 KV；
+- 持久化模式下 `storage_get/storage_set` 走库（能力门仍要求已安装 + `PrivateStorage`），
+  因此重开后未 start 也能读回 KV；配额越界 → `PLUGIN_STORAGE_QUOTA_EXCEEDED` 且不写入；
+- 清单损坏行跳过并计入 `skipped_on_load`；`shutdown` 释放库句柄（同库可重新 open）。
+- 测试：[crates/ffi/tests/plugins_ffi_persist.rs](../../crates/ffi/tests/plugins_ffi_persist.rs)（4 个，真临时库）。
 
 复现命令：
 
 ~~~powershell
 . .\tools\activate.ps1
-cargo test --offline -p chat-ffi --test groups_proposal_ffi   # 3 passed
-cargo test --offline -p chat-core -p chat-ffi                  # 170 + 45 passed
+cargo test --offline -p chat-ffi --test plugins_ffi_persist   # 4 passed
+cargo test --offline -p chat-storage -p chat-ffi               # 94 + 57 passed
+
+## 常驻同步 FFI 契约（SyncFfi，2026-10-18，Windows x64）
+
+~~~text
+SyncFfi::open(database_path, master_key_hex, endpoint_url, node_id, node_public_key_hex, group_id)
+    -> Arc<SyncFfi>      // 构造：装配 NodeClient + 校验游标；**不启动**
+start() -> SyncStatusFfi      stop() -> SyncStatusFfi      status() -> SyncStatusFfi
+is_open() -> bool             group_id() -> String          shutdown()
+SyncStatusFfi { state, applied_total, last_error_code, next_attempt_at_ms, resync_required,
+                rounds, stopped_reason }
 ~~~
+
+- 设备身份复用持久身份（`load_identity_seeds`）；未入库身份 → `INVALID_STATE_TRANSITION`；
+- 游标未初始化 → `INVALID_STATE_TRANSITION`；`open` 不启动（status 恒为 idle）；
+- `start` 重建配置（NodeClient 被运行时消费）；`stop` 幂等并保留最后状态
+  （stopped_reason=`stop_requested`）；`shutdown` 幂等，之后一律 `CORE_CLOSED` 并释放库锁；
+- 错误码：`CORE_CLOSED` / `INVALID_STATE_TRANSITION` / `INVALID_INPUT` / `INVALID_TARGET` /
+  storage 冻结码 / `NODE_UNAVAILABLE` / `INTERNAL_FAILURE`；
+- 测试：[crates/ffi/tests/sync_ffi.rs](../../crates/ffi/tests/sync_ffi.rs)（3 个，真 axum 节点 + 真库）。
+  限制：单群单运行时、状态轮询式、启动/停止同步阻塞、运行期间库被运行时独占、`node_public_key_hex` 必填。
+
+## 自移除提案编排 FFI（GroupFfi.group_prepare_leave / group_process_proposal / group_commit_proposals，2026-10-18）
+
+~~~text
+group_prepare_leave(group_id) -> LeaveProposalFfi
+group_process_proposal(group_id, epoch, sender_identity, payload) -> ProposalViewFfi
+group_commit_proposals(group_id) -> GroupViewFfi
+LeaveProposalFfi { group_id, base_epoch, epoch, removed, has_welcome, proposal, proposal_digest,
+                   leaving_at_ms, state_version }
+ProposalViewFfi  { kind, by, epoch, targets, proposals_pending }
+~~~
+
+- 纯数据（提案字节可转发）；`GroupViewFfi` 含 `dissolved / dissolved_at_ms / left_at_ms / leaving_at_ms`；
+- 错误码：`PERMISSION_DENIED`（群主发起）、`INVALID_STATE_TRANSITION`（已解散/重复发起/已有 pending）、
+  `STALE_EPOCH` / `MISSING_LOG_ENTRIES`、`INVALID_CIPHERTEXT`、`NO_PENDING_PROPOSALS` /
+  `PENDING_COMMIT_EXISTS`、`INVALID_CANDIDATE`；
+- 测试：[crates/ffi/tests/groups_proposal_ffi.rs](../../crates/ffi/tests/groups_proposal_ffi.rs)（3 个）。
 
 ## 群列表 FFI（GroupFfi.group_list，2026-10-18）
 
@@ -946,57 +839,27 @@ GroupListFfi   { groups: Vec<GroupSummaryFfi>, skipped: u32 }
 GroupSummaryFfi{ group_id, name, epoch, role, policy_version, dissolved, left, pending }
 ~~~
 
-- 纯数据（角色是 `owner`/`admin`/`member` 文本），不含密钥或正文；
-- 按最近写入时间倒序（storage 保证），一次最多 256 个群；
-- 读不出来的条目会计入 `skipped`，不抛出也不静默丢弃；
-- 已关闭 → `CORE_CLOSED`。
-- 测试：[crates/ffi/tests/groups_list_ffi.rs](../../crates/ffi/tests/groups_list_ffi.rs)（1 个，真库经 FFI）。
+- 纯数据；按最近写入时间倒序、一次最多 256 个群；读不出来的条目计入 `skipped`（不抛出、不静默丢）；
+- 已关闭 → `CORE_CLOSED`；测试：[crates/ffi/tests/groups_list_ffi.rs](../../crates/ffi/tests/groups_list_ffi.rs)（1 个）。
 
-## 插件宿主 FFI（PluginsFfi，2026-10-18）
-
-纯内存宿主：不加载/不执行任何插件代码。
+## 插件宿主 FFI（PluginsFfi，纯内存，2026-10-18）
 
 ~~~text
 PluginsFfi::new() -> Arc<PluginsFfi>
-manifest_validate(manifest_json) -> ManifestViewFfi
-install(manifest_json) -> String
-start(plugin_id) -> ()          dispatch(plugin_id, extension_point, operation_id, input,
-                                        now_unix_ms, deadline_unix_ms) -> DispatchPlanViewFfi
+manifest_validate(manifest_json) -> ManifestViewFfi      install(manifest_json) -> String
+start(plugin_id) -> ()                                   dispatch(plugin_id, extension_point,
+    operation_id, input, now_unix_ms, deadline_unix_ms) -> DispatchPlanViewFfi
 finish_dispatch(plugin_id, operation_id, output, now_unix_ms) -> ()
-stop(plugin_id) -> bool        uninstall(plugin_id, remove_data) -> bool
-storage_get(plugin_id, key) -> Vec<u8>?        storage_set(plugin_id, key, value) -> ()
-list_plugins() -> Vec<PluginInfoFfi>           is_open() -> bool        shutdown()
-
-ManifestViewFfi { plugin_id, version, sdk_version, platform, entry_class,
-                  capabilities, permissions, extension_points }
-DispatchPlanViewFfi { plugin_id, extension_point, operation_id, input_bytes,
-                      output_limit_bytes, deadline_unix_ms, timeout_ms }
-PluginInfoFfi { plugin_id, running, extension_points }
+stop(plugin_id) -> bool                                  uninstall(plugin_id, remove_data) -> bool
+storage_get(plugin_id, key) -> Vec<u8>?                  storage_set(plugin_id, key, value) -> ()
+list_plugins() -> Vec<PluginInfoFfi>                     is_open() -> bool      shutdown()
 ~~~
 
-- 错误码原样透出 `chat-plugins` 的稳定码（`FfiError::Store { code }`）：`PLUGIN_ID_CONFLICT` /
-  `PLUGIN_NOT_INSTALLED` / `PLUGIN_NOT_RUNNING` / `PLUGIN_NOT_REGISTERED` /
-  `CAPABILITY_NOT_DECLARED` / `CONTENT_TOO_LARGE` / `PLUGIN_OPERATION_CONFLICT` /
-  `PLUGIN_OPERATION_UNKNOWN` / `PLUGIN_TASK_TIMEOUT` / `INVALID_STORAGE_KEY` /
-  `PLUGIN_STORAGE_QUOTA_EXCEEDED` / `UNKNOWN_EXTENSION_POINT`；已关闭 → `CORE_CLOSED`。
-- `dispatch` **只出计划**（预算 + 绑定），不调用插件；`finish_dispatch` 只校验输出/截止时间/幂等。
-- 存储读写需要 `PrivateStorage` 能力，且每个插件只看自己的命名空间。
+- `dispatch` **只出计划**（预算 + 绑定），不调用插件；`finish_dispatch` 只校验输出/截止时间/幂等；
+- 错误码原样透出 `chat-plugins` 稳定码（`PLUGIN_ID_CONFLICT` / `PLUGIN_NOT_RUNNING` /
+  `PLUGIN_NOT_REGISTERED` / `CAPABILITY_NOT_DECLARED` / `CONTENT_TOO_LARGE` /
+  `PLUGIN_OPERATION_CONFLICT` / `PLUGIN_OPERATION_UNKNOWN` / `UNKNOWN_EXTENSION_POINT`）；
+- 存储读写需要 `PrivateStorage` 能力且只看自己的命名空间；
 - 测试：[crates/ffi/tests/plugins_ffi.rs](../../crates/ffi/tests/plugins_ffi.rs)（7 个，纯内存）。
-  契约与证据见 [plugins.md 的“插件宿主接 FFI”](plugins.md)。
 
-复现命令：
-
-~~~powershell
-. .\tools\activate.ps1
-cargo test --offline -p chat-ffi --test plugins_ffi   # 7 passed
-cargo test --offline -p chat-ffi                       # 53 passed（既有 46 继续通过）
 ~~~
-
-
-
-
-
-
-
-
-

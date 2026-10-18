@@ -618,3 +618,32 @@ cargo test --offline -p chat-ffi                       # 53 passed（既有 46 �
 3. **一次 start 一个句柄**：重启需先 stop/uninstall。
 4. **超时只是计划预算**：`dispatch` 只收紧截止时间，不启动计时器。
 5. 未知扩展点名 → `UNKNOWN_EXTENSION_POINT`；能力/权限文本未知 → `INVALID_PLUGIN_PACKAGE`。
+### 持久化模式（PluginsFfi::open，2026-10-18 续）
+
+~~~text
+PluginsFfi::open(database_path, master_key_hex) -> Arc<PluginsFfi>   // 持久化模式
+PluginsFfi::new() -> Arc<PluginsFfi>                                  // 纯内存（行为不变）
+skipped_on_load() -> u32                                              // 打开时跳过的损坏清单行数
+~~~
+
+- 依赖 storage 迁移 **0010_plugins**：`plugins(id, manifest_json, state, installed_at_ms, updated_at_ms)`
+  + `plugin_kv(plugin_id, key, value, updated_at_ms)`（值**密封**存储，`SealPurpose::PluginKv`）；
+- 打开时把库里已安装的清单重新装回宿主；**运行状态不恢复**（重开后在 stopped，需上层再 start）；
+- 生命周期与存储都会落库：install → `installed`；start → `running`；stop → `stopped`；
+  uninstall(remove_data=true) → 删行（`plugin_kv` 随外键级联清空）；
+  uninstall(remove_data=false) → 行标记 `uninstalled`（**KV 保留**，重装后仍可读）；
+- 持久化模式下 `storage_get/`storage_set` 直接读写库（能力门仍要求已安装 + 声明 `PrivateStorage`），
+  因此**重开后即使没 start 也能读回 KV**；配额由 storage 侧执行（单值 64 KiB / 512 条 / 1 MiB 总量），
+  越界映射成 `PLUGIN_STORAGE_QUOTA_EXCEEDED` 且不写入；
+- 清单损坏的行在打开时**跳过并计数**（`skipped_on_load`），不静默丢弃；
+- `shutdown` 会释放库句柄（独占写者），因此同一个库可以重新 `open`。
+
+证据：[crates/ffi/tests/plugins_ffi_persist.rs](../../crates/ffi/tests/plugins_ffi_persist.rs)（4 个，真临时加密库）：
+`install_and_kv_survive_a_reopen`（安装→写 KV→shutdown→重开仍列出、KV 可读、running 不恢复、可再 start 覆盖写）、
+`uninstall_with_or_without_data_removal`（false 保留 KV 供重装读取；true 连行一起删、KV 清空）、
+`quota_exceeded_is_rejected_and_not_written`（64 KiB+1 → `PLUGIN_STORAGE_QUOTA_EXCEEDED` 且读回为空）、
+`corrupted_manifest_rows_are_skipped_and_counted`（损坏行 skip=1，其它插件照常可用）。
+
+持久化模式的已知限制：① 运行状态不恢复（要靠上层重新 start）；② `delete_data=false` 会留下
+`uninstalled` 行（KV 占配额直到 true 卸载或重装后清理）；③ 配额是 storage 侧的硬边界，
+与纯内存模式宿主自己的配额数值可能不同；④ 一次最多 256 行插件（`MAX_PLUGIN_ROWS`）。

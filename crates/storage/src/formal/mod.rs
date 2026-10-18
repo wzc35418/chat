@@ -19,6 +19,7 @@ mod identity;
 mod mls_state;
 mod migrations;
 mod outbox_lease;
+mod plugins;
 mod query;
 mod seal;
 
@@ -50,6 +51,11 @@ pub use mls_state::{
     MlsRecordInput, MlsRecordRecord, MlsWriteCheckpoint,
 };
 pub use migrations::MigrationReport;
+pub use plugins::{
+    MAX_PLUGIN_ID_BYTES, MAX_PLUGIN_KEY_BYTES, MAX_PLUGIN_KV_ENTRIES, MAX_PLUGIN_KV_TOTAL_BYTES,
+    MAX_PLUGIN_KV_VALUE_BYTES, MAX_PLUGIN_MANIFEST_BYTES, MAX_PLUGIN_ROWS, MAX_PLUGIN_STATE_BYTES,
+    PluginRecord,
+};
 pub use outbox_lease::{
     JobOutcome, JobResult, JobState, LeasedJob, MAX_CLAIM_BATCH, MAX_CLAIM_BATCH_BYTES,
     MAX_DIAGNOSTIC_CHARS, OUTBOX_LEASE_MS, OUTBOX_RETRY_BASE_MS, OUTBOX_RETRY_MAX_MS,

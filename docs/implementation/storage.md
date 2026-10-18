@@ -974,4 +974,53 @@ cargo test --offline -p chat-storage   # 94 passed
 `limit=2` 截断、其它前缀为空、全量倒序）；`corrupted_entries_are_skipped_and_reported` 用非群快照正文
 验证"列表只回键、正文由 core 解析并计入 skipped"。
 
+## 插件宿主持久化（迁移 0010_plugins，2026-10-18，Windows x64）
+
+~~~text
+-- 0010_plugins.sql
+CREATE TABLE plugins (
+    id TEXT PRIMARY KEY NOT NULL,
+    manifest_json TEXT NOT NULL,
+    state TEXT NOT NULL,
+    installed_at_ms INTEGER NOT NULL CHECK (installed_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0)
+);
+CREATE TABLE plugin_kv (
+    plugin_id TEXT NOT NULL REFERENCES plugins(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value BLOB NOT NULL,          -- 密封（SealPurpose::PluginKv，AAD 绑定 plugin_id + key）
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+    PRIMARY KEY (plugin_id, key)
+);
+~~~
+
+Store API（[crates/storage/src/formal/plugins.rs](../../crates/storage/src/formal/plugins.rs)）：
+
+~~~text
+upsert_plugin(id, manifest_json, state) -> PluginRecord      // 幂等；保留首次安装时间
+load_plugins() -> Vec<PluginRecord>                          // 安装时间升序，最多 256
+set_plugin_state(id, state) -> ()                            // 不存在 → INVALID_INPUT
+delete_plugin(id) -> bool                                    // plugin_kv 随外键级联清空
+plugin_kv_get(plugin_id, key) -> Vec<u8>?
+plugin_kv_set(plugin_id, key, value) -> ()                   // 有界配额，越界 INVALID_INPUT
+plugin_kv_delete_all(plugin_id) -> u64
+~~~
+
+- **值加密**：`plugin_kv.value` 用 `SealPurpose::PluginKv` 封装，AAD 绑定 `plugin_id` 与 `key`，
+  跨插件/跨键都不能互换（换 key 解密会失败）；
+- **有界配额**：单值 ≤ 64 KiB、每插件 ≤ 512 条、每插件总量 ≤ 1 MiB（按密封值计，是保守上界）；
+  越界显式 `INVALID_INPUT`，绝不截断；条数统计在事务内完成（不会写出半条）；
+- **级联**：删 `plugins` 行会级联删除 `plugin_kv`（`delete_data=true` 的卸载语义）；
+  保留数据的卸载由上层把状态标记为 `uninstalled`（行与 KV 都留着）；
+- 迁移版本：schema 从 9 → **10**；`crates/storage/tests` 里断言目标版本的三个用例已同步更新。
+
+复现：
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-storage   # 94 passed
+cargo test --offline -p chat-ffi       # 57 passed
+~~~
+
+
 

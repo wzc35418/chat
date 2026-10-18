@@ -101,7 +101,11 @@ fn seed_message(store: &Store, message_id: &str) {
 fn message_attachment_refs_are_idempotent_and_cascade() {
     let fixture = Fixture::new("refs");
     let mut store = fixture.open();
-    assert_eq!(store.schema_version(), 9, "0009 adds message attachments");
+    assert_eq!(
+        store.schema_version(),
+        10,
+        "0009 adds message attachments + 0010 plugins"
+    );
     store
         .save_attachment(attachment("att-ref", "imported", 1_000))
         .expect("save attachment");
