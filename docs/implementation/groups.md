@@ -834,6 +834,30 @@ cargo test --offline -p chat-core                        # 128 passed（本记�
 
 ## 禁言 / 改名自动准备控制提交（GROUPS-016，2026-10-19，Windows x64）
 
+### 服务层与 FFI 收口（task-84，2026-10-19）
+
+GROUPS-016 只加了新入口；本轮把**调用方**切过去，界面上改名/禁言已经会准备提交：
+
+- `crates/core/src/service.rs`：`group_set_muted` / `group_rename` 改走 `with_group_device` +
+  `set_muted_with_commit(.., local_only = false)` / `rename_group_with_commit(.., false)`；
+  返回的 `GroupView.pending` 就是准备好的 `SelfUpdate` 提交（epoch 在准备阶段不推进）。
+- `crates/ffi/src/groups_ffi.rs`：签名不变，`GroupViewFfi.pending` 自动反映该提交（`group_view` 已映射
+  `pending`），接受仍走 `group_accept_pending`。
+- `crates/node-services/src/group.rs`：不调用旧入口（它只把 `"set_muted"` / `"rename"` 文本映射成
+  控制操作码用于日志元数据），因此无需改动。
+- 旧入口 `groups::set_muted` / `groups::rename_group` 保留为**纯本地别名**（等价于
+  `*_with_commit(.., local_only = true)`，只是不需要设备），文档已标注；没有调用方再依赖它们的“无提交”
+  语义来同步对端。
+
+顺序语义提醒：改名/禁言准备好提交后，**再次**发起策略变更会得到 `INVALID_STATE_TRANSITION`，必须先用
+`accept_pending_control`（FFI：`group_accept_pending`）接受或 `discard_pending_control` 丢弃。
+
+验证证据（`cargo test --offline -p chat-core -p chat-ffi -p chat-node-services`）：**208 + 60 + 90 passed**，
+其中 `chat-ffi::groups_ffi::create_snapshot_rename_mute_and_remove_through_ffi` 已按新契约更新：
+改名 → pending base1→target2 → 接受（epoch 2）→ 同名幂等（pv/state_version 不动）→ 禁言 → pending →
+接受（epoch 3、muted 保持）→ 移除 → pending base3→target4 → 接受（epoch 4、pv 4）。
+
+
 GROUPS-015 已能让禁言与群名随控制提交传播，但发送侧仍要协调者手工准备一个 `SelfUpdate` 提交。
 本轮收口：新增**设备感知**的变更入口，策略变更的同时准备真实 MLS 控制提交。
 

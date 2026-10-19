@@ -691,9 +691,9 @@ GroupFfi::open(database_path, master_key_hex, node: String?) -> Arc<GroupFfi>   
 group_create(name, local_credential, bootstrap_credential, members: Vec<GroupMemberInputFfi>) -> GroupViewFfi
 group_snapshot(group_id) -> GroupViewFfi
 group_set_role(group_id, actor_credential, target_credential, role) -> GroupViewFfi   // role: owner/admin/member
-group_set_muted(group_id, actor_credential, target_credential, muted) -> GroupViewFfi
+group_set_muted(group_id, actor_credential, target_credential, muted) -> GroupViewFfi  // 策略 + 自更新提交（pending）
 group_remove_member(group_id, actor_credential, target_credential) -> GroupViewFfi
-group_rename(group_id, actor_credential, new_name) -> GroupViewFfi
+group_rename(group_id, actor_credential, new_name) -> GroupViewFfi                     // 策略 + 自更新提交（pending）
 group_accept_pending(group_id) -> GroupViewFfi      // 接受并合并控制提交（CRYPTO-007）
 group_discard_pending(group_id, reason) -> GroupViewFfi  // 丢弃回滚（CRYPTO-008）
 node() -> String?    is_open() -> bool    shutdown()
@@ -716,6 +716,10 @@ pending `GroupPendingFfi { operation, base_epoch, target_epoch, added, removed, 
   （未入库身份 → `INVALID_STATE_TRANSITION`）；非空时用调用方给的凭据文本。
 - **角色是稳定文本**（`owner`/`admin`/`member`）；未知文本 → `INVALID_INPUT`；
   传 `owner` 会被 domain 拒绝（`PERMISSION_DENIED`，只能走转让）。
+- **改名/禁言也会准备控制提交**（GROUPS-016）：`group_rename` / `group_set_muted` 走 core 的
+  `*_with_commit(local_only = false)`——策略立即生效、同时准备一个 `SelfUpdate` 提交（`GroupViewFfi.pending`
+  如实报告 `base_epoch → target_epoch`），**epoch 在准备阶段不推进**；接受仍走 `group_accept_pending`。
+  因此这两次调用之后、接受之前，再发起第二次策略变更会得到 `INVALID_STATE_TRANSITION`。
 
 ### 错误码（`FfiError::Store.code`，全部冻结码）
 
@@ -736,13 +740,15 @@ pending `GroupPendingFfi { operation, base_epoch, target_epoch, added, removed, 
 ~~~powershell
 . .\tools\activate.ps1
 cargo test --offline -p chat-ffi --test groups_ffi   # 6 passed
-cargo test --offline -p chat-core -p chat-ffi        # 118 + 36 passed
+cargo test --offline -p chat-core -p chat-ffi -p chat-node-services   # 208 + 60 + 90 passed
 ~~~
 
 - `groups_ffi::create_snapshot_rename_mute_and_remove_through_ffi`：建群（epoch 1/owner/全零控制头/两成员）→
-  快照逐字段一致 → 改名（pv 2、同名幂等不改 state_version）→ 禁言（pv 3、muted=true）→ 移除（pv 4、
-  正式成员只剩 alice、pending_removed=[bob]、pending.operation=remove_members base1→target2）→
-  接受（epoch 2、pending 与 pending_removed 清空、pv 仍 4）→ 快照一致。
+  快照逐字段一致 → 改名（pv 2、**pending self_update base1→target2**、epoch 仍 1）→ 接受（epoch 2、名字保持、
+  pending 清空）→ 同名幂等（pv 与 state_version 都不动）→ 禁言（pv 3、muted=true、pending 自更新）→
+  接受（epoch 3、muted 保持）→ 移除（pv 4、正式成员只剩 alice、pending_removed=[bob]、
+  pending.operation=remove_members base3→target4）→ 接受（epoch 4、pending 与 pending_removed 清空、pv 仍 4）
+  → 快照一致。
 - `groups_ffi::role_change_accept_and_discard_through_ffi`：改角色（pv 2、pending self_update）→ 丢弃
   （epoch 1、pending 清空、pv 不回退、审计 remove 记录 self_update/node_rejected/base1→target2、角色保留）→
   改回 member（pv 3、base_epoch 仍 1）→ 接受（epoch 2、角色 member）。

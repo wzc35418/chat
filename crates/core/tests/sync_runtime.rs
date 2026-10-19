@@ -181,7 +181,7 @@ fn group_creation(group_id: &str) -> GroupCreation {
 /// 在指定端口上可反复启停的真实节点（同一个库、同一个身份）。
 struct FileNode {
     _dir: FixtureDir,
-    port: u16,
+    port: std::cell::Cell<u16>,
     db_path: PathBuf,
     public_key: [u8; 32],
     supervisor: SigningKey,
@@ -198,7 +198,7 @@ impl FileNode {
         let db_path = dir.0.join("node.db");
         Self {
             _dir: dir,
-            port,
+            port: std::cell::Cell::new(port),
             db_path,
             public_key,
             supervisor: SigningKey::from_bytes(&[11_u8; 32]),
@@ -206,7 +206,7 @@ impl FileNode {
     }
 
     fn address(&self) -> String {
-        format!("127.0.0.1:{}", self.port)
+        format!("127.0.0.1:{}", self.port.get())
     }
 
     fn endpoint(&self) -> NodeEndpoint {
@@ -237,8 +237,24 @@ impl FileNode {
         .expect("node service opens");
         let state = AppState::new(service, Arc::new(NodeFixedClock::new(NOW_S)));
         let router = build_router(state);
-        let listener =
-            std::net::TcpListener::bind(self.address()).expect("bind the reserved port");
+        // 预留端口到真正绑定之间有竞态（Windows 上还可能落进排除端口段 → 10013），
+        // 因此允许重新挑端口并更新地址，避免测试偶发失败。
+        let mut listener = None;
+        for _ in 0..16 {
+            match std::net::TcpListener::bind(self.address()) {
+                Ok(bound) => {
+                    listener = Some(bound);
+                    break;
+                }
+                Err(_) => {
+                    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+                    let fresh = probe.local_addr().expect("addr").port();
+                    drop(probe);
+                    self.port.set(fresh);
+                }
+            }
+        }
+        let listener = listener.expect("bind the reserved port");
         listener.set_nonblocking(true).expect("nonblocking listener");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let handle = std::thread::spawn(move || {
@@ -877,5 +893,4 @@ fn stop_halts_outbox_at_a_task_boundary() {
     assert!(handle.view().is_stopped());
     server.stop();
 }
-
 

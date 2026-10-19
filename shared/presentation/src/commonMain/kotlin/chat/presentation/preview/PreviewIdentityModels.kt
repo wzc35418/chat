@@ -23,6 +23,10 @@ data class PreviewIdentityState(
     val lastErrorCode: String? = null,
     val busy: Boolean = false,
     val ready: Boolean = false,
+    /** IDENTITY-013 恢复文件导出用的口令（仅本机内存，不落日志）。 */
+    val recoveryPassphrase: String = "",
+    /** 最近一次恢复导出结果提示。 */
+    val recoveryNotice: String? = null,
 )
 
 /** 打开真实身份：显示脱敏账户信息。 */
@@ -78,4 +82,14 @@ fun PreviewIdentityState.unavailable(reason: String): PreviewIdentityState = cop
     contacts = emptyList(),
     preview = null,
     notice = "本机身份服务不可用：" + reason,
+)
+fun PreviewIdentityState.updateRecoveryPassphrase(value: String): PreviewIdentityState = copy(
+    recoveryPassphrase = value,
+    lastErrorCode = null,
+)
+
+fun PreviewIdentityState.withRecoveryExported(bytes: Int, target: String): PreviewIdentityState = copy(
+    busy = false,
+    recoveryNotice = "已导出恢复文件 " + bytes + " 字节到 " + target + "（不含主密钥，旧库数据仍不可读）",
+    lastErrorCode = null,
 )

@@ -42,6 +42,8 @@ data class IdentityHandlers(
     val previewInvite: () -> Unit = {},
     val acceptInvite: () -> Unit = {},
     val refreshContacts: () -> Unit = {},
+    val updateRecoveryPassphrase: (String) -> Unit = {},
+    val exportRecovery: () -> Unit = {},
 ) {
     companion object {
         val None = IdentityHandlers()
@@ -136,6 +138,31 @@ fun RealIdentityPanel(
                     style = MaterialTheme.typography.labelSmall,
                     color = Color(0xFFB3261E),
                 )
+
+                HorizontalDivider(color = Color(0xFFE1E6E1))
+                Text("身份恢复（IDENTITY-013）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "恢复文件只含身份（账户/设备种子），不含主密钥；旧库消息与附件仍不可读。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF5F6B63),
+                )
+                OutlinedTextField(
+                    value = state.recoveryPassphrase,
+                    onValueChange = handlers.updateRecoveryPassphrase,
+                    label = { Text("恢复口令（≥8 字节）") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = handlers.exportRecovery,
+                        enabled = !state.busy && state.recoveryPassphrase.length >= 8,
+                        modifier = Modifier.semantics { contentDescription = "导出身份恢复文件" },
+                    ) { Text("导出恢复文件", style = MaterialTheme.typography.labelMedium) }
+                }
+                state.recoveryNotice?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall)
+                }
 
                 HorizontalDivider(color = Color(0xFFE1E6E1))
 

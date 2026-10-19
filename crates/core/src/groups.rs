@@ -1087,8 +1087,11 @@ pub fn set_role(
     Ok(project(&record, record.mls_epoch, Some(&pending), saved))
 }
 
-/// GROUPS-004：设置成员禁言（纯策略层，无 MLS 控制提交）。
+/// GROUPS-004：设置成员禁言（**纯本地别名**，等价于 `set_muted_with_commit(.., local_only = true)`）。
 ///
+///
+/// **不再产生 MLS 控制提交**：自 GROUPS-016 起，需要把禁言同步到对端的调用方必须走
+/// `set_muted_with_commit`（core 的 service/FFI 已切到该入口）；本函数保留给纯本地场景。
 /// 顺序：读快照 → 拒绝“有未决控制提交”（避免策略头与 commit 顺序不一致）→
 /// DOMAIN-002 判权限（群主/管理员；不能禁言自己；目标必须是成员）→
 /// DOMAIN-004 计算新 `policy_version`/`control_head` → 快照写回 `muted`。
@@ -1195,12 +1198,13 @@ pub fn rename_group_with_commit(
     validate_name(new_name)?;
     let (mut record, state_version) = load_record(store, group_id)?;
     reject_dissolved(&record)?;
-    // 同名幂等：不写库、不推进策略版本、不准备提交。
-    if record.name == new_name {
-        return Ok(project(&record, record.mls_epoch, None, state_version));
-    }
     let snapshot = domain_snapshot(&record)?;
     ensure_device_matches_group(device, &record, snapshot.mls_epoch)?;
+    // 同名幂等：不写库、不推进策略版本、不准备提交；视图如实报告**已有**的 pending。
+    if record.name == new_name {
+        let existing = device.pending_control().map_err(GroupError::from)?;
+        return Ok(project(&record, record.mls_epoch, existing.as_ref(), state_version));
+    }
     let actor_index = member_index(&record, actor_credential)?;
     let actor = actor_of(&record, actor_index);
     let operation = GroupOperation::Rename {
@@ -1339,7 +1343,11 @@ pub fn remove_member(
     Ok(project(&record, record.mls_epoch, Some(&pending), saved))
 }
 
-/// GROUPS-006：修改群名（群主或管理员；纯策略层，无 MLS 成员变化）。
+/// GROUPS-006：修改群名（**纯本地别名**，等价于 `rename_group_with_commit(.., local_only = true)`）。
+///
+/// **不再产生 MLS 控制提交**：自 GROUPS-016 起，需要把改名同步到对端的调用方必须走
+/// `rename_group_with_commit`（core 的 service/FFI 已切到该入口）；本函数保留给纯本地场景。
+/// 下面描述的是纯策略层的既有语义。
 ///
 /// - 名称 1..=64 字节、无控制字符、首尾无空白（否则 `INVALID_INPUT`）；
 /// - **同名幂等无操作**：名称未变时直接返回当前快照，不写库、不推进策略版本；

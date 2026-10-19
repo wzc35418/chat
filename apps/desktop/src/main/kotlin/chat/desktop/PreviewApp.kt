@@ -64,6 +64,8 @@ import chat.ui.AttachmentHandlers
 import chat.ui.GroupHandlers
 import chat.ui.IdentityHandlers
 import chat.presentation.preview.updateManifest
+import chat.presentation.preview.updateRecoveryPassphrase
+import chat.presentation.preview.withRecoveryExported
 import chat.presentation.preview.withError
 import chat.presentation.preview.withInstalled
 import chat.presentation.preview.withPlan
@@ -261,6 +263,31 @@ fun main() = application {
             }
         },
         refreshContacts = { scope.launch { refreshContacts() } },
+        updateRecoveryPassphrase = { value -> identityState = identityState.updateRecoveryPassphrase(value) },
+        exportRecovery = {
+            scope.launch {
+                val service = identity ?: return@launch
+                val picker = runCatching { DesktopFilePicker(null) }.getOrNull() ?: return@launch
+                val passphrase = identityState.recoveryPassphrase
+                identityState = identityState.copy(busy = true, lastErrorCode = null)
+                runCatching {
+                    val bundle = service.exportRecoveryBundle(passphrase)
+                    val chosen = picker.chooseExportTarget("identity-recovery.chatrecovery")
+                    File(chosen.path).writeBytes(bundle)
+                    bundle.size to chosen.path
+                }.onSuccess { (bytes, target) ->
+                    identityState = identityState.withRecoveryExported(bytes, target)
+                }.onFailure { error ->
+                    identityState = identityState.copy(
+                        busy = false,
+                        notice = error.message ?: "导出失败",
+                        lastErrorCode = (error as? IdentityException)?.code
+                            ?: (error as? LocalStoreException)?.code
+                            ?: "UNKNOWN_RESULT",
+                    )
+                }
+            }
+        },
     )
 
     // 群与身份共用同一个加密库（独占单写者）：进入群操作前先关闭身份服务，

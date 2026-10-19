@@ -103,27 +103,43 @@ fn create_snapshot_rename_mute_and_remove_through_ffi() {
     let snapshot = groups.group_snapshot(group_id.clone()).expect("snapshot");
     assert_eq!(snapshot, created);
 
-    // 改名：策略版本 +1，无 MLS 提交。
+    // 改名：策略版本 +1，并准备真实 MLS 自更新提交（pending，epoch 不推进）。
     let renamed = groups
         .group_rename(group_id.clone(), "alice".to_owned(), "FFI 改名".to_owned())
         .expect("rename");
     assert_eq!(renamed.name, "FFI 改名");
     assert_eq!(renamed.policy_version, 2);
-    assert!(renamed.pending.is_none());
-    // 同名幂等：版本不再推进。
+    assert_eq!(renamed.epoch, 1, "preparing the commit does not advance the epoch");
+    let rename_pending = renamed.pending.as_ref().expect("rename prepares a commit");
+    assert_eq!(rename_pending.base_epoch, 1);
+    assert_eq!(rename_pending.target_epoch, 2);
+    // 接受后 epoch +1、名字保持、pending 清空。
+    let after_rename = groups
+        .group_accept_pending(group_id.clone())
+        .expect("accept the rename commit");
+    assert_eq!(after_rename.epoch, 2);
+    assert_eq!(after_rename.name, "FFI 改名");
+    assert!(after_rename.pending.is_none());
+    // 同名幂等：版本与状态版本不再推进（此时没有 pending）。
     let same = groups
         .group_rename(group_id.clone(), "alice".to_owned(), "FFI 改名".to_owned())
         .expect("same-name rename");
     assert_eq!(same.policy_version, 2);
-    assert_eq!(same.state_version, renamed.state_version);
+    assert_eq!(same.state_version, after_rename.state_version);
+    assert!(same.pending.is_none());
 
-    // 禁言：策略层，布尔往返。
+    // 禁言：策略层 + 自更新提交（同一条提交路径），布尔往返。
     let muted = groups
         .group_set_muted(group_id.clone(), "alice".to_owned(), "bob".to_owned(), true)
         .expect("mute");
     assert!(member(&muted, "bob").muted);
     assert_eq!(muted.policy_version, 3);
-
+    assert!(muted.pending.is_some(), "mute prepares a commit");
+    let after_mute = groups
+        .group_accept_pending(group_id.clone())
+        .expect("accept the mute commit");
+    assert_eq!(after_mute.epoch, 3);
+    assert!(member(&after_mute, "bob").muted, "muted survives the acceptance");
     // 移除：真实 MLS 移除提交，进入 pending，目标从正式成员消失。
     let removed = groups
         .group_remove_member(group_id.clone(), "alice".to_owned(), "bob".to_owned())
@@ -140,14 +156,14 @@ fn create_snapshot_rename_mute_and_remove_through_ffi() {
     let pending = removed.pending.as_ref().expect("pending removal commit");
     assert_eq!(pending.operation, "remove_members");
     assert_eq!(pending.removed, 1);
-    assert_eq!(pending.base_epoch, 1);
-    assert_eq!(pending.target_epoch, 2);
+    assert_eq!(pending.base_epoch, 3);
+    assert_eq!(pending.target_epoch, 4);
 
     // 接受：epoch 前进、pending 清空、被移除者彻底消失。
     let accepted = groups
         .group_accept_pending(group_id.clone())
         .expect("accept pending");
-    assert_eq!(accepted.epoch, 2);
+    assert_eq!(accepted.epoch, 4);
     assert!(accepted.pending.is_none());
     assert!(accepted.pending_removed.is_empty());
     // 策略版本：建群 1 → 改名 2 → 禁言 3 → 移除 4；接受只是确认，不改版本。

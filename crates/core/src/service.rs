@@ -1455,7 +1455,10 @@ impl ConversationCore {
         })
     }
 
-    /// GROUPS-004：设置成员禁言（纯策略层，无 MLS 提交）。
+    /// GROUPS-016：设置成员禁言（策略变更 + 真实 MLS 自更新控制提交，pending 随视图返回）。
+    ///
+    /// 走 `set_muted_with_commit(local_only = false)`：提交准备好但 epoch 不推进；调用方用
+    /// `group_accept_pending` 接受，或把该提交投递给对端（对端按 `policy_sync` 应用）。
     pub fn group_set_muted(
         &mut self,
         group_id: &str,
@@ -1463,10 +1466,17 @@ impl ConversationCore {
         target_credential: &str,
         muted: bool,
     ) -> anyhow::Result<GroupView> {
-        let mut guard = self.store_guard()?;
-        let store = guard.as_mut().ok_or_else(closed)?;
-        crate::groups::set_muted(store, group_id, actor_credential, target_credential, muted)
-            .map_err(anyhow::Error::new)
+        self.with_group_device(group_id, |device, store| {
+            crate::groups::set_muted_with_commit(
+                device,
+                store,
+                group_id,
+                actor_credential,
+                target_credential,
+                muted,
+                false,
+            )
+        })
     }
 
     /// GROUPS-005：移除确认成员（真实 MLS 移除提交 + pending）。
@@ -1481,17 +1491,26 @@ impl ConversationCore {
         })
     }
 
-    /// GROUPS-006：改名（同一套名称校验；同名幂等）。
+    /// GROUPS-016：改名（同一套名称校验；同名幂等；策略变更 + 真实 MLS 自更新控制提交）。
+    ///
+    /// 走 `rename_group_with_commit(local_only = false)`：pending 随视图返回，epoch 在准备好提交时
+    /// 不推进；接受后 epoch 恰好 +1。
     pub fn group_rename(
         &mut self,
         group_id: &str,
         actor_credential: &str,
         new_name: &str,
     ) -> anyhow::Result<GroupView> {
-        let mut guard = self.store_guard()?;
-        let store = guard.as_mut().ok_or_else(closed)?;
-        crate::groups::rename_group(store, group_id, actor_credential, new_name)
-            .map_err(anyhow::Error::new)
+        self.with_group_device(group_id, |device, store| {
+            crate::groups::rename_group_with_commit(
+                device,
+                store,
+                group_id,
+                actor_credential,
+                new_name,
+                false,
+            )
+        })
     }
 
     /// 接受并合并当前控制提交（CRYPTO-007；本地接受证据 ≠ 节点回执）。

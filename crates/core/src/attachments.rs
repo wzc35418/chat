@@ -4742,9 +4742,42 @@ impl PersistedAttachmentStore {
 // ============================================================================
 
 /// 附件元数据的紧凑编码版本（写进 PROTOCOL-009 字段 57，≤512 字节）。
+///
+/// - v1：老格式，**不含展示名**（解析时回退占位名 `ATTACHMENT_METADATA_DISPLAY_NAME`）；
+/// - v2：在描述符之后增加 `name_len(1) ‖ display_name`（UTF-8 ≤128 字节）。
+///
+/// 新写入一律用 v2；v1 字节仍然可解析（向后兼容），因此老客户端发来的附件不会失效。
 pub const ATTACHMENT_METADATA_VERSION: u8 = 1;
+/// 带展示名的元数据版本。
+pub const ATTACHMENT_METADATA_VERSION_DISPLAY_NAME: u8 = 2;
+/// 字段 57 里展示名的字节上限（UTF-8）。
+pub const MAX_ATTACHMENT_METADATA_DISPLAY_NAME_BYTES: usize = 128;
 /// 附件元数据上限（与协议字段上限一致）。
 pub const MAX_ATTACHMENT_METADATA_BYTES: usize = 512;
+
+/// 清洗展示名：过滤 ASCII 控制字符（含 DEL）、裁剪首尾空白；空名回退占位。
+///
+/// 只做"可展示性"清洗，不做路径处理：展示名永远不参与路径拼接。
+pub fn sanitize_metadata_display_name(name: &str) -> String {
+    let filtered: String = name
+        .chars()
+        .filter(|character| !character.is_ascii_control())
+        .collect();
+    let trimmed = filtered.trim();
+    if trimmed.is_empty() {
+        return ATTACHMENT_METADATA_DISPLAY_NAME.to_owned();
+    }
+    trimmed.to_owned()
+}
+
+/// 编码前的展示名规则：清洗后超过 128 字节 → 显式拒绝（绝不静默截断）。
+pub fn metadata_display_name_for_encode(name: &str) -> AttachmentResult<String> {
+    let clean = sanitize_metadata_display_name(name);
+    if clean.len() > MAX_ATTACHMENT_METADATA_DISPLAY_NAME_BYTES {
+        return Err(AttachmentError::ContentTooLarge);
+    }
+    Ok(clean)
+}
 
 /// 用 **MLS exporter** 派生附件包装密钥（当前写入路径）。
 ///
@@ -4815,8 +4848,11 @@ pub fn encode_attachment_metadata(body: &AttachmentMessageBody) -> AttachmentRes
             "attachment metadata binding must be 32 bytes",
         ));
     }
-    let mut out = Vec::with_capacity(128 + descriptor.len());
-    out.push(ATTACHMENT_METADATA_VERSION);
+    // 展示名：清洗 + 有界（超长显式拒绝），空名回退占位。
+    let display_name = metadata_display_name_for_encode(&body.display_name)?;
+    let name_bytes = display_name.as_bytes();
+    let mut out = Vec::with_capacity(160 + descriptor.len() + name_bytes.len());
+    out.push(ATTACHMENT_METADATA_VERSION_DISPLAY_NAME);
     out.extend_from_slice(&file_id);
     out.extend_from_slice(&body.plain_size.to_be_bytes());
     out.extend_from_slice(&body.ciphertext_bytes.to_be_bytes());
@@ -4826,6 +4862,8 @@ pub fn encode_attachment_metadata(body: &AttachmentMessageBody) -> AttachmentRes
     out.extend_from_slice(&ciphertext_digest);
     out.extend_from_slice(&(descriptor.len() as u16).to_be_bytes());
     out.extend_from_slice(&descriptor);
+    out.push(u8::try_from(name_bytes.len()).map_err(|_| AttachmentError::ContentTooLarge)?);
+    out.extend_from_slice(name_bytes);
     out.extend_from_slice(&binding);
     if out.len() > MAX_ATTACHMENT_METADATA_BYTES {
         return Err(AttachmentError::ContentTooLarge);
@@ -4841,7 +4879,10 @@ pub fn parse_attachment_metadata(metadata: &[u8]) -> AttachmentResult<Attachment
             "attachment metadata has an invalid length",
         ));
     }
-    if metadata[0] != ATTACHMENT_METADATA_VERSION {
+    let version = metadata[0];
+    if version != ATTACHMENT_METADATA_VERSION
+        && version != ATTACHMENT_METADATA_VERSION_DISPLAY_NAME
+    {
         return Err(AttachmentError::AttachmentCorrupted(
             "attachment metadata has an unsupported version",
         ));
@@ -4885,6 +4926,31 @@ pub fn parse_attachment_metadata(metadata: &[u8]) -> AttachmentResult<Attachment
     }
     let descriptor = &metadata[cursor..cursor + descriptor_len];
     cursor += descriptor_len;
+    // v2：描述符之后是展示名（长度前缀 u8）；v1：没有名字，回退占位名。
+    let mut display_name = ATTACHMENT_METADATA_DISPLAY_NAME.to_owned();
+    if version == ATTACHMENT_METADATA_VERSION_DISPLAY_NAME {
+        if metadata.len() < cursor + 1 + 32 {
+            return Err(AttachmentError::AttachmentCorrupted(
+                "attachment metadata display name length is missing",
+            ));
+        }
+        let name_len = usize::from(metadata[cursor]);
+        cursor += 1;
+        if name_len > MAX_ATTACHMENT_METADATA_DISPLAY_NAME_BYTES
+            || metadata.len() < cursor + name_len + 32
+            || metadata.len() != cursor + name_len + 32
+        {
+            return Err(AttachmentError::AttachmentCorrupted(
+                "attachment metadata display name length is invalid",
+            ));
+        }
+        let name_bytes = &metadata[cursor..cursor + name_len];
+        cursor += name_len;
+        let name = std::str::from_utf8(name_bytes).map_err(|_| {
+            AttachmentError::AttachmentCorrupted("attachment metadata display name is not UTF-8")
+        })?;
+        display_name = sanitize_metadata_display_name(name);
+    }
     let binding = &metadata[cursor..cursor + 32];
     let attachment_id = format!(
         "{}{}",
@@ -4910,8 +4976,8 @@ pub fn parse_attachment_metadata(metadata: &[u8]) -> AttachmentResult<Attachment
             "attachment metadata manifest fields must be non-zero",
         ));
     }
-    // 展示名不在协议字段里：落库时用固定占位（原始文件名不进公开元数据）。
-    body.display_name = ATTACHMENT_METADATA_DISPLAY_NAME.to_owned();
+    // v2 用字段里的展示名（已清洗）；v1 保持占位名。
+    body.display_name = display_name;
     Ok(body)
 }
 

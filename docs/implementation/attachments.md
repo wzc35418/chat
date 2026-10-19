@@ -608,3 +608,70 @@ ADR 见 [docs/design/FILE_KEY_PERSISTENCE.md](../design/FILE_KEY_PERSISTENCE.md)
 - **legacy 兼容**：v1 legacy 描述符仍可解析/打开（`SecretDescriptor::is_legacy()`），exporter 派生的 v2 才用于新写入。
 - **验证**：`cargo test -p chat-core` → 196 passed（新增 3：描述符只出现在 57 字段且正文不含密钥材料、跨设备独立下载解密逐字节一致、exporter 前置不满足时显式失败且零写入）。
 - **限制**：export_key 要求"当前 epoch 已持久化"；未做多 epoch 密钥历史（v2 描述符只能用写入时 epoch 的 exporter 值打开）；旧消息仍走正文路径。
+## 字段 57 承载展示名（ATTACHMENTS metadata v2，2026-10-18，Windows x64）
+
+背景：协议字段 57（`attachment_metadata`）此前没有文件名，对端显示名是固定占位 `attachment`。
+
+代码：[crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)（紧贴既有 EXPD 段定点改动）；
+测试：[crates/core/tests/attachment_display_name.rs](../../crates/core/tests/attachment_display_name.rs)（4 个，真双设备两库）。
+
+### 布局（版本化）
+
+~~~text
+v1（老格式，仍可解析）：version=1 ‖ file_id(16) ‖ plain_size(8) ‖ ciphertext_bytes(8)
+    ‖ chunk_bytes(4) ‖ chunk_count(4) ‖ content_digest(32) ‖ ciphertext_digest(32)
+    ‖ descriptor_len(2) ‖ descriptor ‖ binding(32)
+v2（新写入）：同 v1，但在 descriptor 之后、binding 之前插入
+    name_len(1) ‖ display_name(UTF-8 ≤128 字节)
+~~~
+
+- 解析器接受 v1 与 v2：**v1 没有名字 → 回退占位名** `attachment`（老客户端发的附件不会失效）；
+  新写入一律 v2，带清洗后的名字。
+- 名字长度前缀 u8 + 总长上限 `MAX_ATTACHMENT_METADATA_BYTES = 512` 双重校验；
+  超长（含名字 129 字节）**显式拒绝** `CONTENT_TOO_LARGE`，绝不静默截断。
+- v2 解析要求"名字段 + binding 恰好到字节末尾"（`metadata.len() == cursor + name_len + 32`），
+  多一字节少一字节都按 `ATTACHMENT_CORRUPTED` 拒绝。
+
+### 名字清洗
+
+`sanitize_metadata_display_name(name)`：过滤 **ASCII 控制字符**（含 ``）、裁剪首尾空白、
+空名回退 `attachment`；`metadata_display_name_for_encode` 在此基础上超过 128 字节 → 显式拒绝。
+名字**只作展示**，永不参与路径拼接。
+
+### 接收侧
+
+`parse_attachment_metadata` 把（清洗后的）名字写进 `AttachmentMessageBody.display_name`，
+`adopt_attachment_metadata` → `adopt_attachment_message` 落 0007 附件记录，
+因此对端 `attachment_record(id).display_name` 就是发送方的文件名。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test attachment_display_name   # 4 passed
+cargo test --offline -p chat-core                                   # 212 passed（既有 208 继续通过）
+~~~
+
+### 证据
+
+- `attachment_display_name::chinese_display_name_survives_the_cross_device_metadata_path`：
+  中文名 `会议纪要.txt` 编码进字段 57 → 本机解析一致 → 对端（独立库 B + exporter 密钥）采用后
+  附件记录的 `display_name` 一致。
+- `attachment_display_name::a_name_of_128_bytes_is_accepted_and_129_is_rejected`：128 字节接受并可回读；
+  129 字节 → `CONTENT_TOO_LARGE`；清洗函数同样拒绝超长。
+- `attachment_display_name::legacy_metadata_without_a_name_falls_back_to_the_placeholder`：
+  去掉名字段、版本改回 1 后仍能解析，展示名回退 `attachment`。
+- `attachment_display_name::control_characters_are_filtered_and_blank_names_fall_back`：
+  `\t \n \u{7f}` 被过滤、首尾空白裁剪（`  a\tb\nc\u{7f}.txt  ` → `abc.txt`）；
+  纯空白 → `attachment`；对端落库的展示名是清洗后的 `报告.pdf`。
+
+### 已知限制
+
+1. **名字占用字段 57 的预算**：描述符很大（接近 256 字节上限）时，长名字会让总长超过 512 字节而被拒绝
+   （显式 `CONTENT_TOO_LARGE`，不是静默截断）。
+2. **只做清洗不做规范化**：不做 Unicode NFC/NFKC 归一，不同归一形式会被视为不同名字（显示无碍）。
+3. **路径分隔符不拦**：`sanitize` 只过滤控制字符；文件名里的 `/` 或 `\` 原样保留（展示用，
+   永不参与路径拼接；落库前的 `validate_display_name` 仍会拒绝分隔符）。
+4. **老客户端收不到名字**：v2 字段对 v1 解析器是新版本，会按"不支持版本"拒绝——需要老客户端升级
+   才能读新消息的字段 57（v1 解析器只认 version=1）。
+
