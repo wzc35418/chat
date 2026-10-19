@@ -166,6 +166,13 @@ fun GroupPanel(
                                 style = MaterialTheme.typography.labelSmall,
                                 color = Color(0xFF5F6B63),
                             )
+                            if (summary.revokedDevicesCount > 0) {
+                                Text(
+                                    "已撤销 " + summary.revokedDevicesCount + " 台设备",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color(0xFFB3261E),
+                                )
+                            }
                         }
                     }
                 }

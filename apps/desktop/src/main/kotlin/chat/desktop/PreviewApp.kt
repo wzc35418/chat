@@ -548,6 +548,7 @@ fun main() = application {
                                     dissolved = it.dissolved,
                                     left = it.left,
                                     pending = it.pending,
+                                    revokedDevicesCount = it.revokedDevicesCount,
                                 )
                             },
                             list.skipped,

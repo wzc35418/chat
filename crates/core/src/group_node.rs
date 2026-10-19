@@ -603,6 +603,155 @@ pub fn submit_proposal_entry(
     })
 }
 
+// ---------------------------------------------------------------- GROUPS-019 邀请投递
+
+/// 邀请条目的提交标识派生域（同群同 blob 永远同一 SubmissionId → 节点侧天然幂等）。
+const INVITE_SUBMISSION_DOMAIN: &[u8] = b"chat/core/invite-submission/v1";
+
+/// 邀请提交的成功回执（只含公开绑定信息，节点签名已在提交路径校验）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InviteReceiptView {
+    /// 节点分配的提交标识（重复提交返回同一个）。
+    pub submission_id: String,
+    /// 节点日志序号。
+    pub seq: u64,
+    /// 该条目之后的日志链摘要。
+    pub log_hash: String,
+    /// 节点身份。
+    pub node_id: String,
+}
+
+/// GROUPS-019：把一个邀请 blob 作为**应用条目**提交到节点，返回真实回执（绝不伪造）。
+///
+/// 语义与 [`submit_proposal_entry`] 一致：
+/// - 先取节点公开 head，CAS 字段只取节点值；
+/// - `submission_id` 由 (群, blob 摘要) 确定性派生 → 重复提交幂等；
+/// - 节点返回 `SUBMISSION_ID_CONFLICT` 时按 submission 对账取回**原回执**；
+/// - 回执范围（群/提交/作者/节点身份）与节点签名全部校验。
+///
+/// 长度：blob 格式允许 Welcome ≤64 KiB，但节点单条候选上限更严（本层按
+/// `MAX_CONTROL_CANDIDATE_BYTES` 先拒），避免把一定被拒的候选发到节点。
+pub fn submit_group_invite(
+    client: &NodeClient,
+    group_id: &str,
+    blob: &groups::GroupInviteBlob,
+) -> ControlReceiptResult<InviteReceiptView> {
+    GroupId::parse(group_id).map_err(|_| {
+        ControlReceiptError::new(
+            ErrorCode::InvalidId.as_str(),
+            "group id must be PROTOCOL-001 group text",
+        )
+    })?;
+    let payload = blob.encode()?;
+    if payload.is_empty() || payload.len() > MAX_CONTROL_CANDIDATE_BYTES {
+        return Err(ControlReceiptError::new(
+            ErrorCode::InvalidCandidate.as_str(),
+            "the invite blob is outside the node candidate bounds",
+        ));
+    }
+    let head = fetch_head(client, group_id)?;
+    if head.group_id != group_id {
+        return Err(ControlReceiptError::new(
+            ErrorCode::InvalidReceiptScope.as_str(),
+            "node head is for another group",
+        ));
+    }
+    let digest = sha256_concat(&[INVITE_SUBMISSION_DOMAIN, group_id.as_bytes(), &payload]);
+    let candidate = GroupCandidate {
+        protocol_major: 1,
+        protocol_minor: 0,
+        submission_id: SubmissionId::from_bytes(digest).encode(),
+        group_id: group_id.to_owned(),
+        author_device_id: client.device_id().to_owned(),
+        kind: KIND_APPLICATION.to_owned(),
+        expected_control_head: head.control_head.clone(),
+        policy_version: head.policy_version,
+        mls_epoch: head.mls_epoch,
+        encrypted_payload: hex_encode(&payload),
+        control_metadata: None,
+    };
+    let receipt = match append_candidate(client, &candidate)? {
+        Ok(receipt) => receipt,
+        Err(error) if error.node_code() == Some("SUBMISSION_ID_CONFLICT") => {
+            reconcile_submission(client, group_id, &candidate.submission_id)?
+                .map(|(_, receipt)| receipt)
+                .ok_or_else(|| ControlReceiptError::from(error))?
+        }
+        Err(error) => return Err(ControlReceiptError::from(error)),
+    };
+    if receipt.group_id != group_id
+        || receipt.submission_id != candidate.submission_id
+        || receipt.author_device_id != candidate.author_device_id
+    {
+        return Err(ControlReceiptError::new(
+            ErrorCode::InvalidReceiptScope.as_str(),
+            "the receipt does not bind this invite submission",
+        ));
+    }
+    if receipt.node_id != head.node_id || receipt.node_public_key != head.node_public_key {
+        return Err(ControlReceiptError::new(
+            ErrorCode::InvalidReceiptScope.as_str(),
+            "the receipt was issued by another node",
+        ));
+    }
+    let node_public_key = hex_decode::<32>("node public key", &head.node_public_key)
+        .map_err(|error| ControlReceiptError::new(error.code(), "node public key is malformed"))?;
+    receipt
+        .verify(&node_public_key)
+        .map_err(|error| ControlReceiptError::new(error.code(), "the node receipt signature is invalid"))?;
+    Ok(InviteReceiptView {
+        submission_id: receipt.submission_id,
+        seq: receipt.seq,
+        log_hash: receipt.log_hash,
+        node_id: receipt.node_id,
+    })
+}
+
+/// GROUPS-019：从群日志取回**最近**一条可解析的邀请 blob（没有则 `None`）。
+///
+/// 只读最近 `MAX_RECONCILE_PAGES` 页；解析失败/版本不支持的条目被跳过（它们不是邀请），
+/// 但**不会**把错误当成“没有邀请”——页/网络错误显式返回。
+pub fn fetch_group_invite(
+    client: &NodeClient,
+    group_id: &str,
+) -> ControlReceiptResult<Option<groups::GroupInviteBlob>> {
+    GroupId::parse(group_id).map_err(|_| {
+        ControlReceiptError::new(
+            ErrorCode::InvalidId.as_str(),
+            "group id must be PROTOCOL-001 group text",
+        )
+    })?;
+    let mut after = 0_u64;
+    let mut found: Option<groups::GroupInviteBlob> = None;
+    for _ in 0..MAX_RECONCILE_PAGES {
+        let page = block_on_node(client, |client| {
+            Box::pin(async move {
+                client
+                    .fetch_log(group_id, after, RECONCILE_PAGE_LIMIT)
+                    .await
+                    .map_err(ControlReceiptError::from)
+            })
+        })?;
+        for entry in &page.entries {
+            let candidate = &entry.candidate.candidate;
+            if candidate.kind != KIND_APPLICATION {
+                continue;
+            }
+            let Ok(bytes) = hex_decode::<64>( "invite payload", &candidate.encrypted_payload) else {
+                continue;
+            };
+            if let Ok(blob) = groups::GroupInviteBlob::decode(&bytes) {
+                found = Some(blob);
+            }
+        }
+        if !page.has_more || page.next_after <= after {
+            break;
+        }
+        after = page.next_after;
+    }
+    Ok(found)
+}
+
 /// 提案提交回执的公开投影。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProposalSubmission {
@@ -894,6 +1043,8 @@ mod tests {
             left_at_ms: None,
             leaving_at_ms: None,
             revoked_devices: Vec::new(),
+            // 另一位队友新增的字段（GROUPS-019c 播种计数）：本夹具不关心。
+            seeded_revoked_devices: 0,
         }
     }
 

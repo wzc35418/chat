@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chat_core::groups::{
     CreateGroupRequest, GroupBootstrapPeer, GroupView, PeerEntryInput, PeerEntryOutcome,
-    create_group_with_welcome, group_join_from_welcome, group_list, group_process_peer_entry,
-    group_snapshot,
+    create_group, create_group_with_welcome, group_join_from_welcome, group_list,
+    group_process_peer_entry, group_snapshot, seed_revoked_devices_from_registry,
 };
 use chat_crypto::control::{CommitExpectation, WelcomeAcceptance};
 use chat_crypto::engine::MlsDevice;
@@ -133,6 +133,111 @@ impl Fixture {
     }
 }
 
+
+#[test]
+fn creating_a_group_seeds_the_account_revocation_set() {
+    let dir = FixtureDir::new();
+    let mut store = open(&dir);
+    // 账户（alice）在建群**之前**已经有撤销设备。
+    store
+        .revoke_device("alice", "dev:1:seeded-aaa", 1_700_000_000_000)
+        .expect("revoke for alice");
+    let mut alice = MlsDevice::new("alice").expect("alice");
+    let bob = MlsDevice::new("bob").expect("bob");
+    let request = CreateGroupRequest::new("seed-group", "alice");
+    let peer = GroupBootstrapPeer {
+        credential: "bob".to_owned(),
+        device: &bob,
+    };
+    let (view, _welcome) = create_group_with_welcome(&mut alice, &peer, &mut store, &request)
+        .expect("create group");
+    // 建群成功后**自动播种**：视图直接带计数与集合。
+    assert_eq!(view.seeded_revoked_devices, 1);
+    assert_eq!(view.revoked_devices, vec!["dev:1:seeded-aaa".to_owned()]);
+    let snapshot = group_snapshot(&store, &view.group_id).expect("snapshot");
+    assert_eq!(snapshot.revoked_devices, vec!["dev:1:seeded-aaa".to_owned()]);
+    // 列表侧计数同步。
+    let list = group_list(&store).expect("group list");
+    assert_eq!(list.skipped, 0);
+    assert_eq!(list.groups[0].revoked_devices_count, 1);
+
+    // 无 Welcome 版本同样自动播种。
+    let mut alice2 = MlsDevice::new("alice").expect("alice2");
+    let request2 = CreateGroupRequest::new("seed-group-2", "alice");
+    let view2 = create_group(&mut alice2, &peer, &mut store, &request2).expect("create group 2");
+    assert_eq!(view2.seeded_revoked_devices, 1);
+    assert_eq!(view2.revoked_devices, vec!["dev:1:seeded-aaa".to_owned()]);
+
+    // 入群路径：bob 的账户也有撤销设备 → 入群后立即播种。
+    // （每组用全新设备：Welcome 的 key package 只能用一次。）
+    let dir_b = FixtureDir::new();
+    let mut store_b = open(&dir_b);
+    store_b
+        .revoke_device("bob", "dev:1:seeded-bbb", 1_700_000_000_000)
+        .expect("revoke for bob");
+    let mut alice3 = MlsDevice::new("alice").expect("alice3");
+    let mut bob3 = MlsDevice::new("bob").expect("bob3");
+    let peer3 = GroupBootstrapPeer {
+        credential: "bob".to_owned(),
+        device: &bob3,
+    };
+    let request3 = CreateGroupRequest::new("seed-group-3", "alice");
+    let (view3, welcome3) =
+        create_group_with_welcome(&mut alice3, &peer3, &mut store, &request3).expect("create 3");
+    let acceptance3 = WelcomeAcceptance {
+        group_id: view3.mls_group_key.clone(),
+        expected_epoch: view3.epoch,
+        members: vec!["alice".to_owned(), "bob".to_owned()],
+    };
+    let joined = group_join_from_welcome(
+        &mut bob3,
+        &mut store_b,
+        "seed-group-3",
+        &welcome3,
+        &acceptance3,
+        "bob",
+        "alice",
+    )
+    .expect("bob joins");
+    assert_eq!(joined.seeded_revoked_devices, 1);
+    assert_eq!(joined.revoked_devices, vec!["dev:1:seeded-bbb".to_owned()]);
+    let joined_snapshot = group_snapshot(&store_b, &joined.group_id).expect("snapshot b");
+    assert_eq!(joined_snapshot.revoked_devices, vec!["dev:1:seeded-bbb".to_owned()]);
+}
+
+#[test]
+fn a_seeding_failure_does_not_block_group_creation() {
+    let dir = FixtureDir::new();
+    let mut store = open(&dir);
+    // 两个成员的撤销集合合计 80 条 > 快照上限 64：播种必须显式失败、且**不写盘**。
+    for index in 0..40 {
+        store
+            .revoke_device("alice", &format!("dev:1:a{index:03}"), 1_700_000_000_000)
+            .expect("revoke for alice");
+        store
+            .revoke_device("bob", &format!("dev:1:b{index:03}"), 1_700_000_000_000)
+            .expect("revoke for bob");
+    }
+    let mut alice = MlsDevice::new("alice").expect("alice");
+    let bob = MlsDevice::new("bob").expect("bob");
+    let request = CreateGroupRequest::new("seed-fail-group", "alice");
+    let peer = GroupBootstrapPeer {
+        credential: "bob".to_owned(),
+        device: &bob,
+    };
+    // 建群本身必须成功（播种失败只记录、不阻断）。
+    let (view, _welcome) = create_group_with_welcome(&mut alice, &peer, &mut store, &request)
+        .expect("group creation must not fail because of seeding");
+    assert_eq!(view.seeded_revoked_devices, 0, "the failed seeding reports 0");
+    let snapshot = group_snapshot(&store, &view.group_id).expect("snapshot");
+    assert!(snapshot.revoked_devices.is_empty(), "nothing was written");
+    // 单独播种同样显式失败，且仍然不写盘。
+    let error = seed_revoked_devices_from_registry(&mut store, &view.group_id)
+        .expect_err("seeding over the limit fails explicitly");
+    assert_eq!(error.code(), "INVALID_INPUT");
+    let after = group_snapshot(&store, &view.group_id).expect("snapshot after failed seeding");
+    assert!(after.revoked_devices.is_empty());
+}
 #[test]
 fn a_revocation_commit_reaches_the_peer_snapshot() {
     let mut fixture = Fixture::new();

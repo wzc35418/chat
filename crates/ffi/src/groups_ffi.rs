@@ -161,6 +161,8 @@ pub struct GroupViewFfi {
     pub left_at_ms: Option<i64>,
     /// 本机已提交自移除提案的时间（Unix 毫秒；未提交为 `None`）。
     pub leaving_at_ms: Option<i64>,
+    /// 建群/入群时自动播种的已撤销设备条数（其它路径恒为 0）。
+    pub seeded_revoked_devices: u32,
 }
 
 fn member_view(member: &GroupMemberView) -> GroupMemberFfi {
@@ -216,6 +218,7 @@ fn group_view(view: GroupView) -> GroupViewFfi {
         dissolved_at_ms: view.dissolved_at_ms,
         left_at_ms: view.left_at_ms,
         leaving_at_ms: view.leaving_at_ms,
+        seeded_revoked_devices: view.seeded_revoked_devices,
     }
 }
 

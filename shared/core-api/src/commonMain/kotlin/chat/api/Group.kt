@@ -78,6 +78,8 @@ data class GroupSummaryEntry(
     val mutedMembers: Int = 0,
     /** 是否有一条**对端**提案等本机打包。 */
     val pendingProposal: Boolean = false,
+    /** 本机快照里已传播的设备撤销条数。 */
+    val revokedDevicesCount: Int = 0,
 )
 
 data class GroupList(

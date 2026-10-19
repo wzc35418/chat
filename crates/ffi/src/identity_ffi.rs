@@ -401,6 +401,26 @@ fn device_failure(error: chat_identity::devices::DeviceError) -> FfiError {
     state_error(error.code(), &detail)
 }
 
+/// 对所有群播种一次账户级撤销集合，返回新增条数合计（单个群失败不阻断）。
+fn seed_all_groups(store: &mut chat_storage::formal::Store) -> Result<u32, FfiError> {
+    let listed = chat_core::groups::group_list(store).map_err(group_failure)?;
+    let mut seeded = 0_u32;
+    for summary in listed.groups {
+        if let Ok(added) =
+            chat_core::groups::seed_revoked_devices_from_registry(store, &summary.group_id)
+        {
+            seeded = seeded.saturating_add(u32::try_from(added).unwrap_or(u32::MAX));
+        }
+    }
+    Ok(seeded)
+}
+
+/// 群层错误 → FFI 错误（稳定码原样透出）。
+fn group_failure(error: chat_core::groups::GroupError) -> FfiError {
+    let detail = error.to_string();
+    state_error(error.code(), &detail)
+}
+
 fn storage_failure(error: chat_storage::formal::StorageError) -> FfiError {
     let detail = error.to_string();
     state_error(error.code(), &detail)
@@ -899,6 +919,15 @@ impl IdentityFfi {
         }))
     }
 
+    /// GROUPS-CTRLREV：对库里**所有群**播种一次账户级撤销集合，返回新增条数合计。
+    ///
+    /// - 身份恢复导入后调用（把恢复回来的撤销集合灌进已有群快照）；
+    /// - 幂等：并集没有新增时返回 0（也不写盘）；
+    /// - 单个群失败（快照损坏等）**不阻断**其它群，只是不计入合计。
+    pub fn seed_revoked_devices_for_all_groups(&self) -> Result<u32, FfiError> {
+        self.with_store(|store, _local| seed_all_groups(store))
+    }
+
     /// IDENTITY-011：登记一台设备（幂等；公钥必须是 32 字节 hex）。
     ///
     /// - 需要持久化身份（否则 `INVALID_STATE_TRANSITION`）；
@@ -1077,6 +1106,8 @@ impl IdentityFfi {
         let mut store = open_formal_store(&database, &master_key_hex)?;
         let view = chat_identity::recovery::import_recovery_bundle(&mut store, &bundle, &passphrase)
             .map_err(recovery_failure)?;
+        // CTRLREV：恢复导入成功后对库里已有的群各播种一次（失败只记录、不阻断导入）。
+        let _ = seed_all_groups(&mut store);
         Ok(RecoveryImportViewFfi {
             account_id: view.account_id,
             device_id: view.device_id,

@@ -77,6 +77,7 @@ data class GroupSummary(
     val pending: Boolean,
     val mutedMembers: Int = 0,
     val pendingProposal: Boolean = false,
+    val revokedDevicesCount: Int = 0,
 )
 
 fun GroupSummary.statusLabel(): String = when {

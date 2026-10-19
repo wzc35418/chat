@@ -283,6 +283,11 @@ pub struct GroupView {
     pub leaving_at_ms: Option<i64>,
     /// CTRLREV：本机视角的已撤销设备 ID 列表（升序去重；不含任何密钥）。
     pub revoked_devices: Vec<String>,
+    /// 建群/入群时**自动播种**进来的已撤销设备条数（其它路径恒为 0）。
+    ///
+    /// 播种失败不会阻断建群/入群：这里就是 0，快照保持未播种状态，可稍后用
+    /// [`seed_revoked_devices_from_registry`] 重试。
+    pub seeded_revoked_devices: u32,
 }
 
 /// 被丢弃控制提交的投影（只含公开绑定信息与稳定原因码）。
@@ -795,6 +800,13 @@ pub fn seed_revoked_devices_from_registry(store: &mut Store, group_id: &str) -> 
     }
     let before = record.revoked_devices.len();
     merge_revoked_devices(&mut record.revoked_devices, &incoming);
+    // 播种也要守住快照的撤销集合上限（对端条目路径同样 ≤ MAX_REVOKED_DEVICES）：
+    // 多个成员的撤销集合并起来可能超过上限，此时**显式失败、不写盘**，绝不写出越界快照。
+    if record.revoked_devices.len() > MAX_REVOKED_DEVICES {
+        return Err(GroupError::invalid_input(
+            "seeded revocation set exceeds the snapshot limit",
+        ));
+    }
     let added = record.revoked_devices.len().saturating_sub(before);
     if added == 0 {
         // 幂等：并集没有新增 → 不写盘（也不推进 state_version）。
@@ -804,6 +816,28 @@ pub fn seed_revoked_devices_from_registry(store: &mut Store, group_id: &str) -> 
     let _ = persist_snapshot(store, &record, record.mls_epoch)?;
     let _ = state_version;
     Ok(added)
+}
+
+/// 建群/入群后的自动播种：把账户级撤销集合并进新群快照。
+///
+/// **失败只记录、不阻断**：建群/入群已经成功，播种错误不会回滚任何东西；
+/// 视图里的 `seeded_revoked_devices` 因此为 0，快照保持未播种，可稍后重试。
+fn seed_after_creation(store: &mut Store, view: &mut GroupView) {
+    match seed_revoked_devices_from_registry(store, &view.group_id) {
+        Ok(added) => {
+            view.seeded_revoked_devices = u32::try_from(added).unwrap_or(u32::MAX);
+            if added > 0 {
+                // 播种确实写盘了：把并集后的集合投影回视图（不让调用方看到旧值）。
+                if let Ok((record, _)) = load_record(store, &view.group_id) {
+                    view.revoked_devices = record.revoked_devices;
+                }
+            }
+        }
+        Err(_error) => {
+            // 只记录语义：计数保持 0（调用方看到"没播种"，而不是"播种成功 0 条"）。
+            view.seeded_revoked_devices = 0;
+        }
+    }
 }
 
 /// CTRLREV：把本次声明的撤销设备并入快照集合（并集 + 去重 + 升序；重复提交幂等）。
@@ -879,6 +913,8 @@ fn project(
         left_at_ms: (record.left_at_ms > 0).then_some(record.left_at_ms),
         leaving_at_ms: (record.leaving_at_ms > 0).then_some(record.leaving_at_ms),
         revoked_devices: record.revoked_devices.clone(),
+        // 只有建群/入群路径会显式写入播种条数（见 seed_after_creation）。
+        seeded_revoked_devices: 0,
         last_control_cleared: record
             .last_control_cleared
             .as_ref()
@@ -1127,8 +1163,11 @@ pub fn create_group_with_welcome(
     let saved = persist_snapshot(store, &record, epoch)?;
     // 建群后把本机与已知对端的凭据写进目录（凭据 → 真实账户/设备映射）。
     sync_credential_directory(store, &record)?;
+    // CTRLREV：建群成功后**自动播种**账户级撤销集合（失败不阻断建群）。
+    let mut view = project(&record, epoch, pending.as_ref(), saved);
+    seed_after_creation(store, &mut view);
 
-    Ok((project(&record, epoch, pending.as_ref(), saved), welcome))
+    Ok((view, welcome))
 }
 
 /// GROUPS-001（无 Welcome 版本）：建群并丢弃引导 Welcome（投递由上层负责）。
@@ -2290,14 +2329,17 @@ pub fn group_join_from_welcome(
     let saved = persist_snapshot(store, &record, record.mls_epoch)?;
     // 入群后把本机与已知成员写进凭据目录（真实账户/设备映射的来源）。
     sync_credential_directory(store, &record)?;
-    Ok(project(&record, joined.epoch, None, saved))
+    // CTRLREV：入群成功后**自动播种**（失败不阻断入群）。
+    let mut view = project(&record, joined.epoch, None, saved);
+    seed_after_creation(store, &mut view);
+    Ok(view)
 }
 /// 入群邀请元数据（由**已验证**的邀请/控制日志给出；本层只做一致性与权限校验）。
 ///
 /// 字段与 Welcome 的真实内容必须一致：`mls_group_id` + `epoch` + `members` 直接进 `WelcomeAcceptance`，
 /// 由 crypto 逐项复核；`group_id` 必须等于由 `mls_group_id` 推导出的协议群文本（本地可算，因此可在
 /// 加入之前就拒绝自相矛盾的邀请）。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupInviteMeta {
     /// 协议群文本（`grp:1:<64 hex>`）。
     pub group_id: String,
@@ -2417,6 +2459,156 @@ pub fn accept_group_invite(
         ));
     }
     Ok(view)
+}
+
+// ---------------------------------------------------------------- GROUPS-019 邀请投递（blob）
+
+/// 邀请 blob 的格式版本（只增不改：新版本必须能被旧版本显式拒绝）。
+pub const GROUP_INVITE_BLOB_VERSION: u8 = 1;
+/// Welcome 的字节上限（格式层；节点提交路径另有更严的候选长度上限）。
+pub const MAX_GROUP_INVITE_WELCOME_BYTES: usize = 64 * 1024;
+
+/// 一条可投递的入群邀请：邀请元数据 + Welcome 字节。
+///
+/// 编码是**确定性**的（固定字段顺序、大端长度前缀），因此同一邀请永远得到同一份字节，
+/// 可安全用于节点侧按提交 ID 去重。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupInviteBlob {
+    /// 邀请元数据（加入前逐项校验）。
+    pub meta: GroupInviteMeta,
+    /// MLS Welcome 字节（加入的凭据）。
+    pub welcome: Vec<u8>,
+}
+
+impl GroupInviteBlob {
+    /// 构造并立即校验（非法邀请在编码之前就失败）。
+    pub fn new(meta: GroupInviteMeta, welcome: Vec<u8>) -> GroupResult<Self> {
+        let blob = Self { meta, welcome };
+        blob.validate()?;
+        Ok(blob)
+    }
+
+    /// 校验元数据自洽与 Welcome 长度（与 [`accept_group_invite`] 的前置检查同一套规则）。
+    pub fn validate(&self) -> GroupResult<()> {
+        if self.welcome.is_empty() {
+            return Err(GroupError::invalid_input("the invite welcome must not be empty"));
+        }
+        if self.welcome.len() > MAX_GROUP_INVITE_WELCOME_BYTES {
+            return Err(GroupError::new(
+                "CONTENT_TOO_LARGE",
+                "the invite welcome exceeds 64 KiB",
+            ));
+        }
+        let meta = &self.meta;
+        parse_group_id(&meta.group_id)?;
+        if meta.mls_group_id.trim().is_empty() || meta.mls_group_id.len() > 128 {
+            return Err(GroupError::invalid_input("the invite MLS group id is malformed"));
+        }
+        validate_name(&meta.name)?;
+        validate_credential(&meta.inviter_credential)?;
+        validate_credential(&meta.owner_credential)?;
+        validate_credential(&meta.invitee_credential)?;
+        if meta.members.is_empty() {
+            return Err(GroupError::invalid_input("the invite must name at least one member"));
+        }
+        if meta.epoch == 0 {
+            return Err(GroupError::invalid_input("the invite epoch must be >= 1"));
+        }
+        for member in &meta.members {
+            validate_credential(member)?;
+        }
+        let has_member = |credential: &str| meta.members.iter().any(|member| member == credential);
+        if !has_member(&meta.invitee_credential) {
+            return Err(GroupError::invalid_input(
+                "the invite must include the invited credential in its members",
+            ));
+        }
+        if !has_member(&meta.owner_credential) {
+            return Err(GroupError::invalid_input(
+                "the invite must include the owner credential in its members",
+            ));
+        }
+        if meta.invitee_credential == meta.owner_credential {
+            return Err(GroupError::invalid_input(
+                "the invited credential must not be the owner",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 确定性编码：`version(1) | welcome_len(u32 BE) | welcome | meta_len(u32 BE) | meta_json`。
+    pub fn encode(&self) -> GroupResult<Vec<u8>> {
+        self.validate()?;
+        let meta = serde_json::to_vec(&self.meta)
+            .map_err(|_| GroupError::invalid_input("the invite metadata is not serializable"))?;
+        let mut out = Vec::with_capacity(1 + 4 + self.welcome.len() + 4 + meta.len());
+        out.push(GROUP_INVITE_BLOB_VERSION);
+        out.extend_from_slice(
+            &u32::try_from(self.welcome.len())
+                .map_err(|_| GroupError::invalid_input("welcome length is out of range"))?
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(&self.welcome);
+        out.extend_from_slice(
+            &u32::try_from(meta.len())
+                .map_err(|_| GroupError::invalid_input("metadata length is out of range"))?
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(&meta);
+        Ok(out)
+    }
+
+    /// 解码并校验（版本不符 / 长度不符 / 元数据非法都显式失败，绝不部分接受）。
+    pub fn decode(bytes: &[u8]) -> GroupResult<Self> {
+        if bytes.len() < 9 {
+            return Err(GroupError::new(
+                "MALFORMED_FRAME",
+                "the invite blob is truncated",
+            ));
+        }
+        if bytes[0] != GROUP_INVITE_BLOB_VERSION {
+            return Err(GroupError::new(
+                "PROTOCOL_UNSUPPORTED",
+                "the invite blob version is not supported",
+            ));
+        }
+        let welcome_len = u32::from_be_bytes(bytes[1..5].try_into().expect("4 bytes"));
+        let welcome_len = usize::try_from(welcome_len)
+            .map_err(|_| GroupError::invalid_input("welcome length is out of range"))?;
+        let welcome_end = 5usize
+            .checked_add(welcome_len)
+            .ok_or_else(|| GroupError::invalid_input("welcome length overflows"))?;
+        if welcome_end > MAX_GROUP_INVITE_WELCOME_BYTES {
+            return Err(GroupError::new(
+                "CONTENT_TOO_LARGE",
+                "the invite welcome exceeds 64 KiB",
+            ));
+        }
+        if bytes.len() < welcome_end + 4 {
+            return Err(GroupError::new(
+                "MALFORMED_FRAME",
+                "the invite blob is truncated",
+            ));
+        }
+        let welcome = bytes[5..welcome_end].to_vec();
+        let meta_len = u32::from_be_bytes(
+            bytes[welcome_end..welcome_end + 4].try_into().expect("4 bytes"),
+        );
+        let meta_len = usize::try_from(meta_len)
+            .map_err(|_| GroupError::invalid_input("metadata length is out of range"))?;
+        let meta_end = (welcome_end + 4)
+            .checked_add(meta_len)
+            .ok_or_else(|| GroupError::invalid_input("metadata length overflows"))?;
+        if meta_end != bytes.len() {
+            return Err(GroupError::new(
+                "MALFORMED_FRAME",
+                "the invite blob has trailing bytes",
+            ));
+        }
+        let meta: GroupInviteMeta = serde_json::from_slice(&bytes[welcome_end + 4..meta_end])
+            .map_err(|_| GroupError::invalid_input("the invite metadata is malformed"))?;
+        Self::new(meta, welcome)
+    }
 }
 
 /// GROUPS-010：转让群主（仅现群主；目标是确认成员且不是自己）。
