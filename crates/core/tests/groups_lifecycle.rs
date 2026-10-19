@@ -133,11 +133,12 @@ fn transfer_swaps_roles_and_advances_policy_version() {
     .expect("owner transfers ownership");
     // 角色互换 + 策略版本递增 + 真实控制提交（pending，epoch 不前进）。
     assert_eq!(fixture.role_of(&transferred, "bob"), MemberRole::Owner);
-    assert_eq!(fixture.role_of(&transferred, "alice"), MemberRole::Member);
+    // 原群主降 **admin**（DOMAIN-004 与节点 transfer_ownership 元数据统一）。
+    assert_eq!(fixture.role_of(&transferred, "alice"), MemberRole::Admin);
     assert_eq!(transferred.policy_version, before.policy_version + 1);
     assert_ne!(transferred.control_head, before.control_head);
     assert_eq!(transferred.epoch, 1, "transferring does not advance the epoch");
-    assert_eq!(transferred.role, MemberRole::Member, "the local device is no longer owner");
+    assert_eq!(transferred.role, MemberRole::Admin, "the local device is no longer owner");
     let pending = transferred.pending.as_ref().expect("pending control commit");
     assert_eq!(pending.operation, "self_update");
     assert_eq!(pending.base_epoch, 1);
@@ -149,7 +150,7 @@ fn transfer_swaps_roles_and_advances_policy_version() {
     assert_eq!(accepted.epoch, 2);
     assert!(accepted.pending.is_none());
     assert_eq!(fixture.role_of(&accepted, "bob"), MemberRole::Owner);
-    assert_eq!(fixture.role_of(&accepted, "alice"), MemberRole::Member);
+    assert_eq!(fixture.role_of(&accepted, "alice"), MemberRole::Admin);
     assert_eq!(fixture.snapshot(), accepted);
 
     // 关库重开：转让结果落盘。

@@ -278,7 +278,9 @@ pub fn apply_policy_operation(
         GroupOperation::TransferOwnership { target } => {
             for member in &mut policy.members {
                 if member.account_id == before.owner {
-                    member.role = MemberRole::Member;
+                    // 与 GROUPS 实现/节点 transfer_ownership 元数据一致：原群主降 **admin**
+                    // （DOMAIN-004 早期草稿降 member 会造成公开语义分叉）。
+                    member.role = MemberRole::Admin;
                 } else if member.account_id == *target {
                     member.role = MemberRole::Owner;
                 }

@@ -425,4 +425,27 @@ enforce_join_visibility(member: MembershipWindow, requested: SequenceRange) -> R
 - [ ] 合法恢复材料不包含旧正文密钥。（本层只返回正文/附件可见范围；控制链恢复材料与附件密钥由 crypto/attachments 层实现，本轮未实现，未勾选）
 
 **实现状态**：已实现（`visibility.rs::enforce_join_visibility`）。证据：`join_visibility_hides_history_before_joining`（joined=11 时 1..100 → 11..100；1..10 → HISTORY_NOT_AUTHORIZED；边界 11..11 通过）、`left_members_do_not_see_later_content`（joined=5/left=9 → 5..8；9..100 拒绝；畸形窗口/请求显式失败）。附件复用同一序号授权边界，控制链恢复范围由调用方另行授权。
+## 转让后原群主降为 admin（DOMAIN-004/007 对齐，2026-10-18）
+
+背景：DOMAIN-004 早期把转让后原群主降 **member**，而 GROUPS 实现与节点 `transfer_ownership`
+控制元数据按 **admin** 表达——这是公开语义分叉。
+
+### 改动
+
+- `apply_policy_operation`（transfer_ownership 分支）：原群主 `Owner → Admin`、目标 → Owner；
+  唯一群主不变量不变（transfer 前后各恰好一个 owner）。
+- `validate_ownership_transfer` 的 `role_changes` 同步改为 `Owner → Admin`（与候选快照一致）。
+- 文档与用例注释一并更新（不再出现"降为普通成员"）。
+
+### 证据
+
+- `domain_rules::transfer_ownership_demotes_to_admin`（新）：转让后 owner 唯一、原群主是 admin；
+- `domain_rules::ownership_transfer_is_single_explicit_operation`：role_changes 第二条现在是 `Owner → Admin`；
+- `control_rules::role_mute_rename_and_transfer_apply_exactly`：候选快照里原群主角色断言改为 admin。
+- 复现：`cargo test --offline -p chat-domain` → 44 passed（既有 43 继续通过）。
+
+### 语义后果
+
+admin 仍能管理普通成员、仍可被群主降级/移除，但**不能**任命群主（那只能走 `TransferOwnership`）。
+
 

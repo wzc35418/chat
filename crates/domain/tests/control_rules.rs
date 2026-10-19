@@ -303,7 +303,7 @@ fn role_mute_rename_and_transfer_apply_exactly() {
         },
     );
     assert!(apply_policy_operation(&before, &op).is_ok());
-    // 转让：目标成为唯一群主，原群主降为普通成员且不退出。
+    // 转让：目标成为唯一群主，原群主降为 **admin** 且不退出（与 GROUPS/节点元数据统一）。
     let target = account(3);
     let op = validate_ownership_transfer(&before, actor(1, 11), target).expect("transfer");
     let proposed = apply_policy_operation(&before, &op).expect("apply");
@@ -314,7 +314,7 @@ fn role_mute_rename_and_transfer_apply_exactly() {
     );
     assert_eq!(
         proposed.policy.member(account(1)).unwrap().role,
-        MemberRole::Member
+        MemberRole::Admin
     );
     assert_eq!(proposed.policy.owner_count(), 1);
     assert!(proposed.device_changes.added.is_empty());

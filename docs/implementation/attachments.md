@@ -435,6 +435,78 @@ cargo test --offline -p chat-core                                # 76 passed（�
 5. **一个 transport 绑定一个群 + 一条 source 条目**：多附件（不同 source seq）需要按消息构造 transport 或多绑定表；本轮按“一消息一附件一组”的切片构造。
 6. **节点授权需先有本设备的已接受日志条目**：附件上传前必须已有一条本设备条目（测试用 append 真实写入），不存在“先传附件再发消息”的路径。
 
+## 两阶段回收与崩溃恢复（ATTACHMENTS-008 存储侧，2026-10-19，Windows x64）
+
+以前只有缓存目录回收（`collect_unreferenced_attachments`，纯本地文件系统）。本轮补**正式库**的两阶段回收：
+先计划（只读）→ 再标记（`gc_pending`）→ 再删除，任何一步中断都能重入。
+
+代码：[crates/storage/src/formal/attachments.rs](../../crates/storage/src/formal/attachments.rs)（存储实现 + 迁移 0012）、
+[crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)（薄封装）；
+测试：[crates/core/tests/attachment_gc.rs](../../crates/core/tests/attachment_gc.rs)（5 个）+ storage 的 outbox 护栏用例。
+
+### 迁移 0012
+
+```sql
+ALTER TABLE attachments ADD COLUMN gc_pending INTEGER NOT NULL DEFAULT 0 CHECK (gc_pending IN (0, 1));
+ALTER TABLE attachments ADD COLUMN gc_pending_at INTEGER NOT NULL DEFAULT 0 CHECK (gc_pending_at >= 0);
+CREATE INDEX attachments_gc_pending ON attachments(gc_pending, created_at, attachment_id);
+```
+
+删除 `attachments` 行时，`attachment_secrets` / `attachment_chunks` / `attachment_transfer_progress` /
+`message_attachments` 由既有外键 `ON DELETE CASCADE` 一并清除（不需要逐表删）。
+
+### 公开面
+
+```text
+// storage
+plan_attachment_gc(now_ms, grace_ms, limit) -> AttachmentGcPlan
+execute_attachment_gc(plan) -> AttachmentGcReport
+pending_attachment_gc(limit) -> Vec<String>
+
+// core 薄封装（候选上限 MAX_ATTACHMENT_GC_BATCH = 256）
+chat_core::attachments::{plan_attachment_gc(store, now_ms, grace_ms),
+                         execute_attachment_gc(store, plan), pending_attachment_gc(store)}
+```
+
+计划字段：`candidates`（ID + created_at）、`blobs`、`secrets`、`progress_rows`、`bytes`
+以及保留原因计数 `skipped_referenced` / `skipped_within_grace` / `skipped_outbox` 与 `truncated`。
+
+### 语义
+
+1. **候选条件**（全部满足）：无 `message_attachments` 引用、无 `outbox_jobs.payload_ref` 引用、
+   `created_at <= now - grace_ms`。宽限期内或仍被引用的对象一律保留（只计数，不动）。
+2. **计划是只读的**：`plan_attachment_gc` 不改任何行，因此崩溃后重新计划会得到同样的候选。
+3. **先标记再删除**：`execute_attachment_gc` 第一阶段 `UPDATE ... SET gc_pending = 1`（已标记的行不重复标记），
+   第二阶段 `DELETE ... WHERE gc_pending = 1`。删除失败（进程崩溃）时行仍是 `gc_pending = 1`，
+   下一次计划**仍会选中它**，因此可重入。
+4. **幂等**：对同一份计划再执行一次 → `marked = 0`、`removed = 0`、`skipped = 候选数`（不会重复删除）。
+5. **有界**：单次计划最多 `limit`（≤ `MAX_ATTACHMENT_GC_BATCH`）条，超出时 `truncated = true`；
+   调用方处理完这批再计划下一批。
+
+### 证据（`cargo test --offline -p chat-storage -p chat-core`）
+
+- `attachment_gc::referenced_attachments_are_kept_and_expired_unreferenced_ones_are_reclaimed`：
+  被消息引用的附件保留（`skipped_referenced = 1`），无引用且超期的被回收，且密钥/进度行一起消失。
+- `attachment_gc::attachments_within_the_grace_window_are_kept`：宽限期内 `candidates` 为空、`skipped_within_grace = 1`；
+  把 `now` 推过宽限期后可回收。
+- `attachment_gc::a_planned_but_unexecuted_gc_is_replanned_and_then_completes`：只计划不执行 → 再计划仍包含同一候选 →
+  执行 → 再计划为空、无残留 `gc_pending`。
+- `attachment_gc::executing_the_same_plan_twice_is_idempotent`：第二次 `marked = 0 / removed = 0 / skipped = 1`。
+- `attachment_gc::the_plan_is_bounded_and_truncation_is_reported`：`limit = 2` 时只选 2 条并 `truncated = true`，
+  执行后剩余 4 条仍可被下一批计划选中。
+- `attachments_records::attachment_gc_plan_keeps_attachments_referenced_by_outbox_jobs`：`outbox_jobs.payload_ref`
+  指向的附件被保留（`skipped_outbox = 1`、`candidates` 为空）。
+
+### 已知限制
+
+1. **只回收正式库记录**：磁盘上的密文块缓存目录由既有的 `collect_unreferenced_attachments` 负责，
+   两者尚未串成一个“记录删了顺带删缓存目录”的事务（缓存回收是幂等的，可以先记录后缓存）。
+2. **outbox 引用按 `payload_ref` 精确匹配**：如果将来有 job 用别的方式引用附件（例如 payload 内嵌 ID），
+   需要扩展护栏 SQL。
+3. **没有后台调度**：计划/执行由调用方驱动（定期维护任务），没有内置定时器；
+   宽限期由调用方给定（建议 ≥ 一小时，覆盖令牌/任务的最长生命周期）。
+4. **候选上限 256**（`MAX_ATTACHMENT_GC_BATCH`）：大批量回收需要多轮。
+
 ## EXPD 实现记录：exporter 包装密钥 + 协议字段 57（2026-10-19，Windows x64）
 
 源码 [crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)、

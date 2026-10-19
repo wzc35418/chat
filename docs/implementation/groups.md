@@ -1372,6 +1372,36 @@ cargo test --offline -p chat-core                            # 180 passed（既�
    如果策略层要改成"降为 member"，需要同时改这里与节点元数据语义。
 4. **声明必须在合并前成立**：目标在声明时还不是确认成员就整体失败（不会"合并后再补"）。
 5. **一次提交只同步一个策略操作**（声明是单个 `ControlIntent`）。
+## DOMAIN-004 与节点角色语义对齐（2026-10-18）
+
+- 原群主转让后降 **admin**——现在由 `chat-domain` 的候选策略直接给出，core 不再需要"事后把发送者
+  改成 admin"来纠正候选（该覆盖仍然保留，作为对旧候选的向后兼容，见 `group_process_peer_entry`）。
+- 本地路径 `transfer_ownership` 与回执路径 `accept_pending_control(_with_receipt)` 现在都直接
+  得到 `Admin`（此前分别是 admin / member，造成"接受后角色回退"的假象）。
+- 节点公开元数据的映射（**已冻结文本**）：
+
+  | 领域意图 | 节点 `control_metadata.operation` | MLS 形态 |
+  |---|---|---|
+  | `ControlIntent::SetRole` | `set_role` | `SelfUpdate` |
+  | `ControlIntent::TransferOwnership` | `transfer_ownership` | `SelfUpdate` |
+  | `ControlIntent::LeaveSelf` | `leave` | 提案（成员自移除） |
+  | `ControlIntent::Dissolve` | `dissolve` | 无提交（本地策略） |
+  | `ControlIntent::Invite` / `RemoveMember` | `invite` / `remove` | `AddMembers` / `RemoveMembers` |
+
+  说明：MLS 把"纯角色变更"表达为 `SelfUpdate`，因此 `set_role` 与 `transfer_ownership` 在 MLS 层
+  是同一种提交，靠节点元数据的操作文本区分；这也是旧客户端只发 `SelfUpdate` 时会被判
+  `INVALID_CONTROL_RESULT`（"ambiguous self update"）的原因。
+
+### 证据
+
+- `groups_lifecycle::transfer_swaps_roles_and_advances_policy_version`：转让后快照 alice = admin、
+  bob = owner；回执接受后仍是 admin。
+- `groups_role_sync::transfer_demotes_the_former_owner_to_admin_and_the_new_owner_can_remove_them`（新）：
+  本地与对端快照逐项角色一致、owner 唯一、**降级后的 admin 可被新群主移除**。
+- `group_node::transfer_ownership_publishes_transfer_metadata_and_is_accepted`：节点元数据是
+  `transfer_ownership`、接受后原群主 admin。
+- 复现：`cargo test --offline -p chat-core` → 232 passed（既有 226 继续通过）。
+
 
 
 

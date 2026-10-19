@@ -57,3 +57,13 @@ Android APK 位于 `apps/android/build/outputs/apk/debug/android-debug.apk`。�
 这是 P0 技术验证，不是完整聊天产品。当前界面中的两设备位于同一进程并通过回环 UDP 通信；另有独立文件 SQLite 实验验证发送意图、准备任务、MLS 与固定密文 outbox 的原子事务和进程崩溃恢复，独立节点库验证接受日志/投递任务原子性与未知结果重试。正式协调节点、离线信箱、生产持久化链路、加密数据库和可信插件宿主仍未实现。其他模块保留工程边界和接口；`chat-node` 明确提示未实现并退出。
 
 完整 P0 仍需 Android/Linux 实际运行、跨物理设备互操作、完整崩溃矩阵、系统密钥保护及自托管 NAT/relay 验证。局部测试通过不代表完整 P0 通过。
+
+## 构建前磁盘检查（2026-10-19 事故后固化）
+
+**事故**：D: 盘写满（free=0）时，写入工具"先截断再写"导致 `crates/node-services/src/group.rs` 尾部丢失约 200 行；同时出现 `link.exe` LNK1318 与 `os error 112`。
+
+**规则**：
+1. 大规模编辑或整仓构建前先跑 `pwsh tools/check-disk.ps1`（可用 < 6 GB 时会以退出码 2 失败）。
+2. 需要清理时用 `pwsh tools/check-disk.ps1 -Clean`（删 `target/debug/incremental` 与 `deps/.fingerprint`，二者都可安全重建）。
+3. 见到 `os error 112` 或 `link.exe` LNK1318，**先查磁盘**，不要当代码 bug 排查。
+4. 长文件（>1500 行的 Kotlin/文档/源码）一律只用定点 edit 或末尾追加，不要整文件重写。

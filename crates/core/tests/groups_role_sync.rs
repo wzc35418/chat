@@ -123,6 +123,14 @@ impl Fixture {
         )
         .expect("transfer ownership");
         assert!(pending.pending.is_some());
+        // 应用后的候选策略：原群主必须是 **admin**（DOMAIN-004 与节点元数据统一）。
+        let after = group_snapshot(&self.store_a, &self.group_id).expect("snapshot after transfer");
+        let former = after
+            .members
+            .iter()
+            .find(|member| member.credential == "alice")
+            .expect("former owner still a member");
+        assert_eq!(former.role, MemberRole::Admin);
         let commit = self
             .alice
             .pending_control()
@@ -132,7 +140,8 @@ impl Fixture {
         let accepted = accept_pending_control(&mut self.alice, &mut self.store_a, &self.group_id)
             .expect("accept the transfer");
         assert_eq!(accepted.epoch, 2);
-        assert_eq!(accepted.role, MemberRole::Member);
+        // DOMAIN-004 与 GROUPS/节点统一：原群主降 **admin**（不是 member）。
+        assert_eq!(accepted.role, MemberRole::Admin);
         let mut input = PeerEntryInput::new(self.group_id.clone(), 1, "alice", commit.clone());
         input.policy_intent = Some(ControlIntent::TransferOwnership {
             target_credential: "bob".to_owned(),
@@ -356,3 +365,68 @@ fn set_role_declaration_syncs_the_target_role() {
     assert_eq!(role_of(&view, "alice"), MemberRole::Owner, "owner stays owner");
     assert_eq!(view.policy_version, before.policy_version + 1);
 }
+#[test]
+fn transfer_demotes_the_former_owner_to_admin_and_the_new_owner_can_remove_them() {
+    let mut fixture = Fixture::new();
+    let group_id = fixture.group_id.clone();
+    // A（原群主）转让给 B：本地快照立即是「目标 owner + 原群主 admin」。
+    let (_commit, input) = fixture.transfer_to_bob();
+    let local = group_snapshot(&fixture.store_a, &group_id).expect("alice snapshot");
+    assert_eq!(role_of(&local, "bob"), MemberRole::Owner);
+    assert_eq!(role_of(&local, "alice"), MemberRole::Admin);
+    assert_eq!(
+        local
+            .members
+            .iter()
+            .filter(|member| member.role == MemberRole::Owner)
+            .count(),
+        1,
+        "the owner stays unique after the transfer"
+    );
+
+    // B 处理对端提交：两侧语义一致（都看到 bob owner / alice admin）。
+    let _ = group_process_peer_entry(&mut fixture.bob, &mut fixture.store_b, &input)
+        .expect("bob merges the transfer");
+    let peer = group_snapshot(&fixture.store_b, &group_id).expect("bob snapshot");
+    assert_eq!(role_of(&peer, "bob"), MemberRole::Owner);
+    assert_eq!(role_of(&peer, "alice"), MemberRole::Admin);
+    assert_eq!(
+        peer.members
+            .iter()
+            .filter(|member| member.role == MemberRole::Owner)
+            .count(),
+        1
+    );
+    // 两端一致断言：双方对「谁是 owner / 谁是 admin」的结论必须逐项相同。
+    let mut local_roles: Vec<(String, MemberRole)> = local
+        .members
+        .iter()
+        .map(|member| (member.credential.clone(), member.role))
+        .collect();
+    let mut peer_roles: Vec<(String, MemberRole)> = peer
+        .members
+        .iter()
+        .map(|member| (member.credential.clone(), member.role))
+        .collect();
+    local_roles.sort();
+    peer_roles.sort();
+    assert_eq!(local_roles, peer_roles, "both sides agree on every role");
+
+    // 降为 admin 的原群主仍可被移除（新群主发起）：admin 不是不可移除的。
+    let removed = chat_core::groups::remove_member(
+        &mut fixture.bob,
+        &mut fixture.store_b,
+        &group_id,
+        "bob",
+        "alice",
+    )
+    .expect("the new owner removes the former owner");
+    assert!(
+        !removed
+            .members
+            .iter()
+            .any(|member| member.credential == "alice"),
+        "the former owner is removed from the confirmed membership"
+    );
+}
+

@@ -1616,4 +1616,260 @@ impl Store {
         }
     }
 }
+// ==== 两阶段回收（迁移 0012_attachment_gc.sql，ATTACHMENTS-008） ====
 
+/// 单次回收计划的候选上限（有界：计划不会无界膨胀）。
+pub const MAX_ATTACHMENT_GC_BATCH: usize = 256;
+
+/// 回收计划的候选（只含不透明 ID 与创建时间，不含任何内容/密钥）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentGcCandidate {
+    /// 附件 ID。
+    pub attachment_id: String,
+    /// 附件创建时间（Unix 毫秒；宽限期按它计算）。
+    pub created_at_ms: i64,
+}
+
+/// 回收计划：**只选不做**（可安全重复执行）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AttachmentGcPlan {
+    /// 候选附件。
+    pub candidates: Vec<AttachmentGcCandidate>,
+    /// 候选附件记录数（= candidates.len()）。
+    pub blobs: u32,
+    /// 候选里带密钥记录的条数。
+    pub secrets: u32,
+    /// 候选里的传输进度行数。
+    pub progress_rows: u32,
+    /// 候选附件明文总字节数（对外报告用，不读内容）。
+    pub bytes: u64,
+    /// 因仍有消息引用而保留的条数。
+    pub skipped_referenced: u32,
+    /// 因仍在宽限期内而保留的条数。
+    pub skipped_within_grace: u32,
+    /// 因有 outbox/job 引用而保留的条数。
+    pub skipped_outbox: u32,
+    /// 是否因为上限而截断（true 表示还有候选未进计划）。
+    pub truncated: bool,
+}
+
+/// 回收执行报告。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AttachmentGcReport {
+    /// 本次标记（gc_pending = 1）的行数。
+    pub marked: u32,
+    /// 本次真正删除的附件记录数。
+    pub removed: u32,
+    /// 计划里的候选已不存在（上一轮已删）或未标记成功的条数。
+    pub skipped: u32,
+}
+
+impl Store {
+    /// 计算回收计划：**只看不写**。
+    ///
+    /// 候选条件（全部满足）：
+    /// - 没有 `message_attachments` 引用；
+    /// - 没有 `outbox_jobs.payload_ref` 引用（进行中的上传/投递任务）；
+    /// - `created_at` 早于 `now_ms - grace_ms`（宽限期内一律保留）；
+    /// - 已标记未删除的行（`gc_pending = 1`，上一次执行中断）**仍然进入候选**，因此可重入。
+    ///
+    /// 只读：不修改任何行，因此崩溃后重新计划会得到同样的候选（直到 execute 成功）。
+    pub fn plan_attachment_gc(
+        &self,
+        now_ms: i64,
+        grace_ms: i64,
+        limit: usize,
+    ) -> Result<AttachmentGcPlan> {
+        self.ensure_ready()?;
+        if now_ms < 0 || grace_ms < 0 {
+            return Err(StorageError::InvalidInput(
+                "attachment gc window must be non-negative".to_owned(),
+            ));
+        }
+        let limit = limit.min(MAX_ATTACHMENT_GC_BATCH).max(1);
+        let cutoff = now_ms.saturating_sub(grace_ms);
+        let connection = self.connection();
+        let mut plan = AttachmentGcPlan::default();
+        // 保留原因计数（候选之外的行）。
+        let (within_grace, outbox_only): (i64, i64) = connection
+            .query_row(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN a.created_at > ?1 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN a.created_at <= ?1
+                                      AND EXISTS (SELECT 1 FROM outbox_jobs o WHERE o.payload_ref = a.attachment_id)
+                                 THEN 1 ELSE 0 END), 0)
+                   FROM attachments a",
+                [cutoff],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(StorageError::from)?;
+        plan.skipped_within_grace = u32::try_from(within_grace).unwrap_or(u32::MAX);
+        plan.skipped_outbox = u32::try_from(outbox_only).unwrap_or(u32::MAX);
+        // 候选：宽限期外 + 无消息引用 + 无 outbox 引用（已标记未删的行同样入选）。
+        let mut statement = connection
+            .prepare(
+                "SELECT a.attachment_id, a.created_at, a.plain_size,
+                        (SELECT COUNT(*) FROM attachment_secrets s WHERE s.attachment_id = a.attachment_id),
+                        (SELECT COUNT(*) FROM attachment_transfer_progress p WHERE p.attachment_id = a.attachment_id)
+                   FROM attachments a
+                  WHERE a.created_at <= ?1
+                    AND NOT EXISTS (SELECT 1 FROM message_attachments m WHERE m.attachment_id = a.attachment_id)
+                    AND NOT EXISTS (SELECT 1 FROM outbox_jobs o WHERE o.payload_ref = a.attachment_id)
+                  ORDER BY a.created_at ASC, a.attachment_id ASC
+                  LIMIT ?2",
+            )
+            .map_err(StorageError::from)?;
+        let row_limit = i64::try_from(limit.saturating_add(1))
+            .map_err(|_| StorageError::InvalidInput("attachment gc limit".to_owned()))?;
+        let rows = statement
+            .query_map(params![cutoff, row_limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(StorageError::from)?;
+        let mut seen = 0usize;
+        for row in rows {
+            let (attachment_id, created_at, plain_size, secrets, progress) =
+                row.map_err(StorageError::from)?;
+            seen += 1;
+            if seen > limit {
+                plan.truncated = true;
+                break;
+            }
+            plan.candidates.push(AttachmentGcCandidate {
+                attachment_id,
+                created_at_ms: created_at,
+            });
+            plan.blobs = plan.blobs.saturating_add(1);
+            plan.secrets = plan.secrets.saturating_add(u32::try_from(secrets).unwrap_or(0));
+            plan.progress_rows = plan
+                .progress_rows
+                .saturating_add(u32::try_from(progress).unwrap_or(0));
+            plan.bytes = plan
+                .bytes
+                .saturating_add(u64::try_from(plain_size).unwrap_or(0));
+        }
+        // 仍被消息引用、但宽度期已过的条数（诊断用）。
+        let referenced: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM attachments a
+                  WHERE a.created_at <= ?1
+                    AND EXISTS (SELECT 1 FROM message_attachments m WHERE m.attachment_id = a.attachment_id)",
+                [cutoff],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)?;
+        plan.skipped_referenced = u32::try_from(referenced).unwrap_or(u32::MAX);
+        Ok(plan)
+    }
+
+    /// 执行回收计划：**先标记（gc_pending = 1）再删除**，可重入。
+    ///
+    /// - 已经不存在（上一轮删除成功/重复执行）的候选计入 `skipped`，不会重复删除；
+    /// - 标记后删除失败（进程崩溃）时，下一次 `plan_attachment_gc` 仍会选中该行；
+    /// - 删除附件行时密钥/块/进度/消息引用由外键级联清除。
+    pub fn execute_attachment_gc(&mut self, plan: &AttachmentGcPlan) -> Result<AttachmentGcReport> {
+        self.ensure_ready()?;
+        let mut report = AttachmentGcReport::default();
+        if plan.candidates.is_empty() {
+            return Ok(report);
+        }
+        let marked_at = now_ms();
+        for candidate in &plan.candidates {
+            validate_attachment_id(&candidate.attachment_id)?;
+        }
+        // 第一阶段：标记（幂等：已标记的行保持原时间戳）。
+        let mut transaction = self.begin_transaction(WriteScope::attachments())?;
+        let mark_outcome = (|| -> Result<u32> {
+            let mut marked = 0u32;
+            for candidate in &plan.candidates {
+                let updated = transaction
+                    .transaction
+                    .execute(
+                        "UPDATE attachments SET gc_pending = 1, gc_pending_at = ?2
+                          WHERE attachment_id = ?1 AND gc_pending = 0",
+                        params![candidate.attachment_id, marked_at],
+                    )
+                    .map_err(StorageError::from)?;
+                if updated > 0 {
+                    transaction.note(1);
+                    marked = marked.saturating_add(1);
+                }
+            }
+            Ok(marked)
+        })();
+        let marked = match mark_outcome {
+            Ok(marked) => {
+                commit_transaction(transaction)?;
+                marked
+            }
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                return Err(error);
+            }
+        };
+        report.marked = marked;
+        // 第二阶段：删除（只删已标记的行；已删除的候选自动计入 skipped）。
+        let mut transaction = self.begin_transaction(WriteScope::attachments())?;
+        let delete_outcome = (|| -> Result<u32> {
+            let mut removed = 0u32;
+            for candidate in &plan.candidates {
+                let deleted = transaction
+                    .transaction
+                    .execute(
+                        "DELETE FROM attachments WHERE attachment_id = ?1 AND gc_pending = 1",
+                        params![candidate.attachment_id],
+                    )
+                    .map_err(StorageError::from)?;
+                if deleted > 0 {
+                    transaction.note(deleted);
+                    removed = removed.saturating_add(u32::try_from(deleted).unwrap_or(0));
+                }
+            }
+            Ok(removed)
+        })();
+        match delete_outcome {
+            Ok(removed) => {
+                commit_transaction(transaction)?;
+                report.removed = removed;
+                let planned = u32::try_from(plan.candidates.len()).unwrap_or(u32::MAX);
+                report.skipped = planned.saturating_sub(removed);
+                Ok(report)
+            }
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                Err(error)
+            }
+        }
+    }
+
+    /// 已标记待删除的附件 ID（崩溃恢复诊断用；最多 `limit` 条）。
+    pub fn pending_attachment_gc(&self, limit: usize) -> Result<Vec<String>> {
+        self.ensure_ready()?;
+        let limit = limit.min(MAX_ATTACHMENT_GC_BATCH).max(1);
+        let row_limit = i64::try_from(limit)
+            .map_err(|_| StorageError::InvalidInput("attachment gc limit".to_owned()))?;
+        let connection = self.connection();
+        let mut statement = connection
+            .prepare(
+                "SELECT attachment_id FROM attachments WHERE gc_pending = 1
+                  ORDER BY gc_pending_at ASC, attachment_id ASC LIMIT ?1",
+            )
+            .map_err(StorageError::from)?;
+        let rows = statement
+            .query_map([row_limit], |row| row.get::<_, String>(0))
+            .map_err(StorageError::from)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(StorageError::from)?);
+        }
+        Ok(out)
+    }
+}

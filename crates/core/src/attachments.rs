@@ -5063,3 +5063,39 @@ impl PersistedAttachmentStore {
         ))
     }
 }
+
+// ============================================================================
+// 两阶段回收（ATTACHMENTS-008 存储侧；core 只做薄封装）
+// ============================================================================
+
+/// 计算附件回收计划（**只读**：不标记、不删除）。
+///
+/// 只选“无消息引用、无 outbox 引用、且超过宽限期”的附件；已标记未删除的行（上次执行中断）
+/// 仍会进入计划，因此崩溃后可重入。
+pub fn plan_attachment_gc(
+    store: &FormalStore,
+    now_ms: i64,
+    grace_ms: i64,
+) -> AttachmentResult<chat_storage::formal::AttachmentGcPlan> {
+    store
+        .plan_attachment_gc(now_ms, grace_ms, MAX_ATTACHMENT_GC_BATCH)
+        .map_err(AttachmentError::from)
+}
+
+/// 执行回收计划（先标记 `gc_pending` 再删除；幂等、可重入、不重复删除)。
+pub fn execute_attachment_gc(
+    store: &mut FormalStore,
+    plan: &chat_storage::formal::AttachmentGcPlan,
+) -> AttachmentResult<chat_storage::formal::AttachmentGcReport> {
+    store.execute_attachment_gc(plan).map_err(AttachmentError::from)
+}
+
+/// 当前已标记待删除的附件（崩溃恢复诊断用；最多 `MAX_ATTACHMENT_GC_BATCH` 条）。
+pub fn pending_attachment_gc(store: &FormalStore) -> AttachmentResult<Vec<String>> {
+    store
+        .pending_attachment_gc(MAX_ATTACHMENT_GC_BATCH)
+        .map_err(AttachmentError::from)
+}
+
+/// 单次回收计划的候选上限（与 storage 侧一致）。
+pub const MAX_ATTACHMENT_GC_BATCH: usize = chat_storage::formal::MAX_ATTACHMENT_GC_BATCH;

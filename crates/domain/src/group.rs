@@ -415,8 +415,11 @@ pub fn validate_owner_exit(snapshot: &GroupSnapshot, actor: AccountId) -> Result
 
 /// DOMAIN-007：授权群主转让。
 ///
-/// 结果是「目标成为唯一群主、原群主降为普通成员」的单一操作；转让不会让原群主
+/// 结果是「目标成为唯一群主、原群主降为 **admin**」的单一操作；转让不会让原群主
 /// 自动退出。旧群主重试时按当前快照重新校验，若已不是群主则 `PERMISSION_DENIED`。
+///
+/// 为什么降为 admin 而不是普通成员：GROUPS 实现与节点控制元数据（`transfer_ownership`）都
+/// 按"原群主保留管理权"表达；DOMAIN 早期草稿降 member 会造成公开语义分叉，本模块统一为 admin。
 pub fn validate_ownership_transfer(
     snapshot: &GroupSnapshot,
     actor: Actor,
@@ -466,7 +469,8 @@ pub fn validate_ownership_transfer(
         RoleChange {
             account_id: actor.account_id,
             from: Some(MemberRole::Owner),
-            to: MemberRole::Member,
+            // 统一为 admin：与 GROUPS 实现/节点转移元数据一致（见本函数文档）。
+            to: MemberRole::Admin,
         },
     ];
     Ok(AuthorizedGroupOperation {

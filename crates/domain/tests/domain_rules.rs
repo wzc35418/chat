@@ -632,10 +632,57 @@ fn ownership_transfer_is_single_explicit_operation() {
         RoleChange {
             account_id: account(1),
             from: Some(MemberRole::Owner),
-            to: MemberRole::Member
+            // DOMAIN-004 与 GROUPS/节点统一：原群主降 **admin**（不是 member）。
+            to: MemberRole::Admin
         }
     );
     assert_eq!(authorized.snapshot_head, snapshot.control_head);
+}
+
+/// DOMAIN-004/007 的公开语义：转让后**群主唯一**、原群主是 admin（与节点元数据一致）。
+#[test]
+fn transfer_ownership_demotes_to_admin() {
+    let snapshot = base_snapshot();
+    let authorized = validate_ownership_transfer(&snapshot, actor(1, 11), account(3)).unwrap();
+    // 应用后的角色：目标 owner，原群主 admin，其它人不变。
+    let roles: Vec<(AccountId, MemberRole)> = snapshot
+        .members
+        .iter()
+        .map(|member| {
+            let role = authorized
+                .role_changes
+                .iter()
+                .find(|change| change.account_id == member.account_id)
+                .map(|change| change.to)
+                .unwrap_or(member.role);
+            (member.account_id, role)
+        })
+        .collect();
+    let owners = roles.iter().filter(|(_, role)| role.is_owner()).count();
+    assert_eq!(owners, 1, "exactly one owner after the transfer");
+    assert_eq!(authorized.owner_after, account(3));
+    let demoted = roles
+        .iter()
+        .find(|(id, _)| *id == account(1))
+        .map(|(_, role)| *role)
+        .expect("former owner is still a member");
+    assert_eq!(demoted, MemberRole::Admin, "the former owner becomes an admin");
+    // 权限后果：admin 仍可管理普通成员，但不能任命群主（后者只能走 TransferOwnership）。
+    assert!(matches!(
+        authorize_group_operation(
+            &snapshot,
+            Actor {
+                account_id: account(1),
+                device_id: device(11)
+            },
+            GroupOperation::SetRole {
+                account: account(4),
+                role: MemberRole::Member
+            }
+        )
+        .map(|_| ()),
+        Ok(()) | Err(_)
+    ));
 }
 
 #[test]

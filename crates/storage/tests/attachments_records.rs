@@ -105,8 +105,8 @@ fn attachment_record_roundtrip_is_idempotent_and_ordered() {
     let mut store = fixture.open();
     assert_eq!(
         store.schema_version(),
-        11,
-        "0005 attachments, 0006 device credentials, 0007 secrets, 0008 progress, 0009 refs, 0010 plugins, 0011 credential directory"
+        12,
+        "0005 attachments, 0006 device credentials, 0007 secrets, 0008 progress, 0009 refs, 0010 plugins, 0011 credential directory, 0012 attachment gc"
     );
 
     let saved = store.save_attachment(input("att-1234", "staging")).expect("save");
@@ -405,12 +405,47 @@ fn attachment_migration_is_applied_once_and_keeps_previous_tables() {
     let fixture = Fixture::new("migration");
     {
         let store = fixture.open();
-        assert_eq!(store.schema_version(), 11);
+        assert_eq!(store.schema_version(), 12);
     }
     let store = fixture.open();
-    assert_eq!(store.schema_version(), 11);
-    assert_eq!(rows(&store, "schema_migrations"), 11);
+    assert_eq!(store.schema_version(), 12);
+    assert_eq!(rows(&store, "schema_migrations"), 12);
     // 0001~0004 的既有表仍可用（这里抽查 0004 的 MLS 状态表与 0002 的密钥校验表）。
     assert_eq!(rows(&store, "mls_group_state"), 0);
     assert_eq!(rows(&store, "store_key_check"), 1);
+}
+
+/// 回收计划的 outbox 引用护栏：`outbox_jobs.payload_ref` 指向的附件必须保留，
+/// 否则进行中的上传/投递任务会丢掉自己的附件记录。
+#[test]
+fn attachment_gc_plan_keeps_attachments_referenced_by_outbox_jobs() {
+    let fixture = Fixture::new("gc-outbox");
+    let attachment_id = "att-00112233445566778899aabbccddeeff";
+    {
+        let mut store = fixture.open();
+        store
+            .save_attachment(input(attachment_id, "imported"))
+            .expect("save attachment");
+    }
+    {
+        // 直接写一条 outbox 任务指向该附件（真实写路径需要完整发送请求，这里只验护栏 SQL）。
+        let connection = fixture.raw();
+        connection
+            .execute(
+                "INSERT INTO outbox_jobs (job_id, dedup_key, kind, payload_ref, conversation_id, depends_on, state, retry_count, retry_at, lease_owner, lease_until, lease_version, cancel_requested) VALUES ('job-1', 'dedup-1', 'attachment_upload', ?1, NULL, NULL, 'pending', 0, 0, NULL, 0, 0, 0)",
+                [attachment_id],
+            )
+            .expect("insert outbox job");
+    }
+    let store = fixture.open();
+    let plan = store
+        .plan_attachment_gc(1_800_000_000_000, 0, 16)
+        .expect("plan");
+    assert!(
+        plan.candidates.is_empty(),
+        "outbox-referenced attachments must be kept"
+    );
+    assert_eq!(plan.skipped_outbox, 1, "the outbox reference is the reason it is kept");
+    assert_eq!(plan.skipped_within_grace, 0, "the attachment is past the grace window");
+    assert!(store.pending_attachment_gc(16).expect("pending").is_empty());
 }

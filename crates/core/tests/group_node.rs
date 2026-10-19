@@ -517,7 +517,7 @@ fn submit_without_pending_control_fails_explicitly() {
 fn transfer_ownership_publishes_transfer_metadata_and_is_accepted() {
     let mut harness = Harness::new();
     let group_id = harness.group_id();
-    // 群主转让给 bob：真实 MLS 控制提交（SelfUpdate），本地角色立刻降为 member。
+    // 群主转让给 bob：真实 MLS 控制提交（SelfUpdate），本地角色立刻降为 **admin**。
     let transferred = chat_core::groups::transfer_ownership(
         &mut harness.alice,
         &mut harness.store,
@@ -527,7 +527,7 @@ fn transfer_ownership_publishes_transfer_metadata_and_is_accepted() {
     )
     .expect("ownership transfers locally");
     assert_eq!(transferred.epoch, 1, "preparing the commit does not advance the epoch");
-    assert_eq!(transferred.role, MemberRole::Member);
+    assert_eq!(transferred.role, MemberRole::Admin);
     let pending = transferred.pending.as_ref().expect("pending control commit");
     assert_eq!(pending.operation, "self_update");
 
@@ -568,7 +568,8 @@ fn transfer_ownership_publishes_transfer_metadata_and_is_accepted() {
     )
     .expect("the bound receipt is accepted");
     assert_eq!(accepted.epoch, 2);
-    assert_eq!(accepted.role, MemberRole::Member);
+    // 原群主降 **admin**（DOMAIN-004 与节点 transfer_ownership 元数据统一）。
+    assert_eq!(accepted.role, MemberRole::Admin);
     let bob = accepted
         .members
         .iter()
