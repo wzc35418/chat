@@ -67,3 +67,23 @@ Android APK 位于 `apps/android/build/outputs/apk/debug/android-debug.apk`。�
 2. 需要清理时用 `pwsh tools/check-disk.ps1 -Clean`（删 `target/debug/incremental` 与 `deps/.fingerprint`，二者都可安全重建）。
 3. 见到 `os error 112` 或 `link.exe` LNK1318，**先查磁盘**，不要当代码 bug 排查。
 4. 长文件（>1500 行的 Kotlin/文档/源码）一律只用定点 edit 或末尾追加，不要整文件重写。
+
+
+## 快速开始（2026-10-19）
+
+前置：Windows x64、项目内工具链（`. .\tools\activate.ps1`）、D: 至少 6 GB 空闲。
+
+```powershell
+cd D:\AgentProject\chat
+. .\tools\activate.ps1
+powershell -ExecutionPolicy Bypass -File tools\check-disk.ps1     # 磁盘不足会以退出码 2 失败
+
+# 一键：建演示种子 -> 起本地节点 -> 轮询 /v1/health -> 打印粘贴用配置
+powershell -ExecutionPolicy Bypass -File tools\demo.ps1
+# 另开一个窗口：
+.\gradlew.bat :apps:desktop:previewApp --offline --max-workers=1
+```
+
+- 节点默认监听 `http://127.0.0.1:8080`；`demo.ps1 -Stop` 停止，`-Preview` 顺带起预览。
+- 人工测试步骤见 [docs/manual-test-guide.md](docs/manual-test-guide.md)（身份 → 恢复文件 → 发送 → 附件 → 群治理 → 同步 → 插件 P4 → 通知）。
+- 全量回归：`cargo test --offline --workspace` + `gradlew :apps:desktop:presentationChecks ... pluginJvmSmoke`（见指南第 12 节）。

@@ -17,6 +17,7 @@
 
 pub mod contact;
 pub mod device;
+pub mod devices;
 pub mod error;
 pub mod invite;
 pub mod keys;
@@ -28,6 +29,10 @@ pub use contact::{Contact, ContactState, IdentityUpdate};
 pub use device::{
     CapabilitySet, DeviceCapability, DeviceCredential, RevocationSet, VerifiedDevice,
     create_device_credential, verify_credential,
+};
+pub use devices::{
+    DeviceEntry, DeviceError, DeviceResult, device_is_revoked, local_identity_present,
+    load_device, register_device, revoke_registered_device, registered_devices,
 };
 pub use error::{IdentityError, Result, StorageErrorKind};
 pub use invite::{

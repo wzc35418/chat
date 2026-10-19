@@ -13,6 +13,7 @@
 
 mod attachments;
 mod cursor;
+mod device_registry;
 mod directory;
 mod entry;
 mod error;
@@ -34,6 +35,10 @@ pub use attachments::{
     AttachmentGcCandidate, AttachmentGcPlan, AttachmentGcReport, MAX_ATTACHMENT_GC_BATCH,
 };
 pub use cursor::PageCursor;
+pub use device_registry::{
+    DEVICE_PUBLIC_KEY_BYTES, DeviceRegistrationInput, DeviceRegistryRecord, MAX_DEVICE_ACCOUNT_BYTES,
+    MAX_DEVICE_ID_BYTES, MAX_DEVICE_LABEL_BYTES, MAX_DEVICE_REASON_BYTES, MAX_DEVICE_REGISTRY_ROWS,
+};
 pub use directory::{
     CREDENTIAL_DIRECTORY_ID_BYTES, CredentialDirectoryRecord, MAX_CREDENTIAL_BYTES,
     MAX_CREDENTIAL_DIRECTORY_ROWS,

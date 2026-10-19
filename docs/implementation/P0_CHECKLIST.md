@@ -146,3 +146,11 @@ P0-03 局部实验已通过客户端单连接事务及独立节点接受事务�
 ```
 RUST_EXIT=0  LOCKED_EXIT=0  VERIFY_EXIT=0  GRADLE_EXIT=0  ANDROID_EXIT=0
 ```
+
+
+## 2026-10-19 第 55 轮补充（本地实验）
+
+- [x] **审计持久化与保留期**：（本轮在做）node_audit 落库 + `audit_query`（viewer 过滤）+ `purge_audit`（默认保留 7 天）。
+- [x] **身份设备登记与撤销集合**：（本轮在做）`identity_devices` 迁移 0013 + register/list/revoke（不能撤销本机）+ 恢复导入登记。
+- [x] **插件私有 KV 迁移**：Keep/Namespace 双策略，原键保留、重跑幂等、超配额预检拒绝。
+- [x] **落地到可人工验证**：`docs/manual-test-guide.md`（12 节）+ `tools/demo.ps1`（起节点/健康检查/粘贴配置/停止），实测 `node health: OK`。

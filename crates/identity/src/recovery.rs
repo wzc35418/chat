@@ -465,6 +465,13 @@ pub fn import_recovery_bundle(
         created_at_ms,
     };
     store.save_identity_account(input)?;
+    // IDENTITY-011：恢复后把本机设备登记进设备集合（**历史行保留**，撤销过的设备不会复活）。
+    store.upsert_identity_device(&formal::DeviceRegistrationInput {
+        device_id: payload.device_id.clone(),
+        account_id: payload.account_id.clone(),
+        device_public_key: *device_key,
+        label: payload.display_name.clone(),
+    })?;
     Ok(RecoveryIdentityView {
         account_id: payload.account_id,
         device_id: payload.device_id,

@@ -10,6 +10,21 @@ use std::collections::VecDeque;
 
 /// 审计事件容量上限。
 pub const AUDIT_CAPACITY: usize = 1024;
+/// 审计保留期默认值（7 天，毫秒）。
+pub const AUDIT_DEFAULT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+/// 审计查询条数上限。
+pub const AUDIT_QUERY_MAX_LIMIT: u32 = 200;
+/// 单次清理的最大条数。
+pub const AUDIT_PURGE_MAX_BATCH: usize = 512;
+
+/// 本次 `audit_tail` 读取的数据来源（便于调用方标注“内存/落库”）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditSource {
+    /// 内存环形缓冲。
+    Memory,
+    /// 持久化表（内存为空时的回退读）。
+    Persisted,
+}
 
 /// 审计结果分类。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +183,27 @@ impl AuditLog {
     pub fn clear(&mut self) {
         self.events.clear();
     }
+}
+
+/// 把数据库里的错误码字符串驻留成 `&'static str`。
+///
+/// 常用码只有几十个（`NodeError::code()` 的全集），因此驻留表大小有界：
+/// 同一个码只泄漏一次，之后复用同一份静态字符串；不会随事件数量增长。
+pub fn intern_code(value: &str) -> &'static str {
+    use std::sync::{Mutex, OnceLock};
+    static INTERNED: OnceLock<Mutex<std::collections::HashSet<&'static str>>> = OnceLock::new();
+    let table = INTERNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut guard = match table.lock() {
+        Ok(guard) => guard,
+        // 锁中毒时退化为一次性泄漏（不影响正确性，只会多一份副本）。
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(existing) = guard.get(value) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(value.to_owned().into_boxed_str());
+    guard.insert(leaked);
+    leaked
 }
 
 #[cfg(test)]

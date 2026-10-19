@@ -994,3 +994,49 @@ purge_expired_revocations(now_ms) -> u64    // 保留期 REVOCATION_RETENTION_SE
 2. 没有按种类/设备的过滤查询，只有 `tail(limit)`；需要结构化检索时应接外部日志。
 3. 时间由宿主时钟（`AppState::now`）给出，固定时钟测试下时间戳是可控的（非安全时间）。
 
+## NODE-018 · 审计持久化与保留期（2026-10-19，Windows x64）
+
+审计此前只在内存，进程重启即丢。本轮落库并加保留期（只存元数据，仍不含正文/令牌/密钥）。
+
+### 迁移
+
+`migrations/0009_node_audit.sql`（**注意：任务书写的是 0008，但 0008 已被
+`0008_capability_revoke_authorization.sql` 占用，因此用 0009**）：
+
+    node_audit(id, kind, at_ms, device_id, group_id, outcome, code, request_id)
+      outcome CHECK IN ('ok','denied','failed')
+    索引 1：node_audit_at_ms(at_ms)               -- 按时间扫描/保留期删除
+    索引 2：node_audit_device_at_ms(device_id, at_ms) -- 按设备 + 时间过滤
+
+### 接口（`NodeService` 追加）
+
+    record_audit_persisted(event) -> NodeResult<()>      // 入内存环 + 落库（关闭审计时都不写）
+    audit_query(limit<=200, since_ms, kind?, viewer_device?) -> NodeResult<Vec<AuditEvent>>
+    purge_audit(older_than_ms, limit<=512) -> NodeResult<u64>   // 返回删除条数
+    audit_persisted_count() -> NodeResult<u64>
+    audit_tail_with_source(limit) -> NodeResult<(Vec<AuditEvent>, AuditSource)>
+
+常量：`AUDIT_DEFAULT_RETENTION_MS = 7 天`、`AUDIT_QUERY_MAX_LIMIT = 200`、`AUDIT_PURGE_MAX_BATCH = 512`；
+`AuditSource { Memory, Persisted }` 标注本次读取来源。
+
+语义：
+
+1. **查询**：`since_ms` 只保留不早于阈值；`kind` 精确匹配；`viewer_device` 过滤为「本设备事件 或 节点级事件（`device_id IS NULL`）」，顺序固定为 `at_ms ASC, id ASC`；`limit` 越界（0 或 >200）返回 `INVALID_CONFIG`，不静默夹取。
+2. **保留期**：`purge_audit` 单次最多删 512 条（即使传更大值也被夹到上限），按 `at_ms` 从旧到新删除；默认保留期 7 天（调用方传 `now - AUDIT_DEFAULT_RETENTION_MS`）。
+3. **关闭审计**：`set_audit_enabled(false)` 后既不写库也不读库——`record_audit_persisted` 是 no-op，`audit_query`/`audit_persisted_count` 返回空/0，`audit_tail_with_source` 返回空且不伪造；重新打开后也看不到关闭期间的事件（确实没写）。
+4. **重启回退**：启动后内存为空，`audit_tail_with_source` 回退读库并标 `AuditSource::Persisted`；内存非空时用内存并标 `Memory`。
+5. **错误码驻留**：DB 里存的是文本，读出时用 `audit::intern_code` 驻留成 `&'static str`（码集合有界，不随事件数量增长）。
+
+### 证据（`cargo test --offline -p chat-node-services`，新增 4 例）
+
+- `audit_persistence::persisted_events_survive_a_restart_and_keep_order`：落库 3 条 → 关闭重开 → `audit_tail_with_source` 返回 3 条（`Persisted`）、时间顺序保持；
+- `audit_persistence::query_filters_by_since_kind_and_viewer_device`：`since_ms`/`kind`/viewer 三种过滤正确（其它设备事件不可见），`limit` 0 与 201 被拒、200 通过；
+- `audit_persistence::purge_respects_the_threshold_and_the_batch_cap`：800 条老事件 + 2 条新事件，第一次删除恰好 512（单批上限），第二次删剩余 288，新事件保留；
+- `audit_persistence::disabled_audit_neither_writes_nor_reads`：关闭后写是 no-op、读为空、计数为 0；重开后只有关闭前那条。
+
+### 已知限制
+
+1. **没有自动清理定时器**：`purge_audit` 需要调用方按调度触发（默认保留期常量已给出）。
+2. 查询没有游标分页：只有 `limit` + `since_ms`，取更早数据需要反向逼近。
+3. DB 里的 `code` 是文本，读回时驻留；未知码会被驻留为新的静态字符串（码集合本身有界）。
+

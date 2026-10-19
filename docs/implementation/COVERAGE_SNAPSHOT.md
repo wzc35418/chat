@@ -129,3 +129,10 @@
 3. **PRESENTATION 用例层收敛**：界面仍以面板/样例为主，未收敛为单一用例入口
 4. **OS 凭据库 + 后台收消息通知接线**
 5. 多节点撤销同步、凭据目录与真实身份账户交叉校验
+
+
+## 2026-10-19 第 55 轮（当前基线）
+
+- Rust：**1034 passed / 0 failed**；Gradle 11 个任务（含 pluginSmoke/pluginJvmSmoke）；Android APK 绿；verify PASS。
+- 迁移：storage 0001–0013、node-services 0001–0008。
+- 新增可人工验证入口：`docs/manual-test-guide.md` + `tools/demo.ps1`。

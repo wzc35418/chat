@@ -176,7 +176,7 @@ fn open_store_configures_durable_single_writer_store() {
     let fixture = Fixture::new();
     let store = fixture.open();
 
-    assert_eq!(store.schema_version(), 12);
+    assert_eq!(store.schema_version(), 13);
     assert_eq!(store.store_version().unwrap(), 0);
     let journal: String = store
         .connection()
@@ -199,8 +199,8 @@ fn open_store_configures_durable_single_writer_store() {
 
     // 重复启动必须幂等：不重复执行迁移，也不新增密钥校验记录。
     let store = fixture.open();
-    assert_eq!(store.schema_version(), 12);
-    assert_eq!(rows(&store, "schema_migrations"), 12);
+    assert_eq!(store.schema_version(), 13);
+    assert_eq!(rows(&store, "schema_migrations"), 13);
     assert_eq!(rows(&store, "store_key_check"), 1);
 }
 
@@ -843,7 +843,7 @@ fn migration_checksum_mismatch_fails_closed() {
     let fixture = Fixture::new();
     {
         let store = fixture.open();
-    assert_eq!(store.schema_version(), 12);
+    assert_eq!(store.schema_version(), 13);
     }
     {
         let connection = fixture.raw();
@@ -866,7 +866,7 @@ fn too_new_schema_version_is_rejected() {
     let fixture = Fixture::new();
     {
         let store = fixture.open();
-    assert_eq!(store.schema_version(), 12);
+    assert_eq!(store.schema_version(), 13);
     }
     {
         let connection = fixture.raw();
@@ -908,7 +908,7 @@ fn empty_store_without_key_check_record_can_be_initialised_again() {
     let fixture = Fixture::new();
     {
         let store = fixture.open();
-    assert_eq!(store.schema_version(), 12);
+    assert_eq!(store.schema_version(), 13);
     }
     {
         let connection = fixture.raw();

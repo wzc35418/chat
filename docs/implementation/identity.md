@@ -793,6 +793,47 @@ RecoveryImportViewFfi { account_id, device_id, account_public_key, device_public
 FFI 侧已知限制：① `open_recovery_target` 的 `account()` 在导入前只是占位值（不可信，已注释）；
 ② 导入后必须重开对象才能用身份（不会自动重建句柄）；③ 导出要求先持久化打开——纯 `create()` 内存身份
 无法导出（它没有库，也就没有可恢复的落盘身份）。
+## 设备登记与撤销集合（IDENTITY-011/012 落库，2026-10-18）
+
+~~~text
+chat_identity::devices::register_device(store, device_id, account_id, public_key, label) -> DeviceEntry
+chat_identity::devices::registered_devices(store, account_id, include_revoked) -> Vec<DeviceEntry>
+chat_identity::devices::revoke_registered_device(store, account_id, device_id, local_device_id, reason, now_ms) -> bool
+chat_identity::devices::device_is_revoked(store, device_id) -> bool
+chat_identity::devices::load_device(store, device_id) -> Option<DeviceEntry>
+DeviceEntry { device_id, account_id, device_public_key(hex), label, added_at_ms,
+              revoked_at_ms, revoked_reason }        // is_revoked() 便捷方法
+DeviceError::code() -> DEVICE_SELF_REVOKE / INVALID_INPUT / 身份层冻结码 / storage 冻结码
+~~~
+
+- **幂等登记**：同设备重复登记只刷新公钥/label 与更新时间，**首次登记时间保留**；
+- **撤销单向**：已撤销设备**不会**因重新登记而复活（upsert 不碰 revoked 字段）；重复撤销返回 `false`
+  且保留首次撤销时间与原因；
+- **不能撤销本机** → `DEVICE_SELF_REVOKE`（换机只能走恢复流程）；跨账户撤销 → `INVALID_INPUT`；
+- **默认列表隐藏已撤销**，`include_revoked = true` 时连历史行一起返回（撤销不删行）。
+
+存储层见 [storage.md 的“设备登记与撤销集合”](storage.md)（迁移 0013 `identity_devices`）。
+
+恢复文件导入（IDENTITY-014）现在会在 `import_recovery_bundle` 成功后**登记本机设备**
+（label = 恢复的显示名），历史设备行保留。
+
+### 证据
+
+[crates/identity/tests/devices.rs](../../crates/identity/tests/devices.rs)（5 个，真临时加密库）：
+登记/列出/幂等（重复登记不新增行、公钥被刷新、首次时间保留）；撤销后 `is_revoked=true`、
+默认列表只剩未撤销的那台、`include_revoked` 能看到撤销时间与原因、重复撤销返回 false 且时间不变、
+重新登记不复活；撤销本机 `DEVICE_SELF_REVOKE`；重启后撤销状态与 label/原因都在；
+多账户隔离且跨账户撤销被拒（对方设备不受影响）。
+
+复现：`cargo test --offline -p chat-identity -p chat-storage` → **157 passed**
+（既有 56 / 95 继续通过）。
+
+### 已知限制
+
+1. **撤销只影响本地登记集合**：不会自动广播到其它设备/节点（跨设备撤销同步未做）；
+2. **设备公钥不校验与 device_id 的自洽**：由上层（凭据/凭据目录）保证；
+3. **每账户上限 512 台**（`MAX_DEVICE_REGISTRY_ROWS`），越界显式 `INVALID_INPUT`。
+
 
 
 

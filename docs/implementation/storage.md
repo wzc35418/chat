@@ -1094,6 +1094,40 @@ pub const STATE_UNINSTALLED: &str = "uninstalled";
   `limit == 0` 或超过 256 → 显式 `INVALID_INPUT`。
 
 复现：`cargo test --offline -p chat-storage -p chat-ffi` → 166 passed（既有 95 / 66 继续通过）。
+## 设备登记与撤销集合（迁移 0013，2026-10-18）
+
+~~~sql
+CREATE TABLE identity_devices (
+    device_id TEXT PRIMARY KEY NOT NULL,
+    account_id TEXT NOT NULL,
+    device_public_key BLOB NOT NULL CHECK (length(device_public_key) = 32),
+    label TEXT NOT NULL,
+    added_at_ms INTEGER NOT NULL CHECK (added_at_ms >= 0),
+    revoked_at_ms INTEGER,
+    revoked_reason TEXT,
+    CHECK ((revoked_at_ms IS NULL) = (revoked_reason IS NULL))
+);
+CREATE INDEX identity_devices_account ON identity_devices(account_id);
+~~~
+
+~~~text
+upsert_identity_device(&mut self, &DeviceRegistrationInput) -> DeviceRegistryRecord
+list_identity_devices(&self, account_id, include_revoked) -> Vec<DeviceRegistryRecord>
+revoke_identity_device(&mut self, device_id, reason, now_ms) -> bool
+identity_device_is_revoked(&self, device_id) -> bool
+load_identity_device(&self, device_id) -> Option<DeviceRegistryRecord>
+MAX_DEVICE_REGISTRY_ROWS = 512;  DEVICE_PUBLIC_KEY_BYTES = 32
+~~~
+
+- **幂等 upsert**：冲突时只更新 `account_id/device_public_key/label`，**保留** `added_at_ms` 与
+  `revoked_at_ms/revoked_reason`（撤销不可逆）；
+- 上限只对**新设备**生效（重复登记始终可用，避免撤销/重装卡死）；
+- 撤销是单条 `UPDATE ... WHERE revoked_at_ms IS NULL`：幂等、保留首次时间；
+- 列表默认过滤 `revoked_at_ms IS NULL`，`include_revoked` 时按 `added_at_ms, device_id` 升序返回；
+- schema 版本 12 → **13**（既有测试里的版本断言已同步更新）。
+
+复现：`cargo test --offline -p chat-storage -p chat-identity` → 157 passed（既有 95 / 56 继续通过）。
+
 
 
 

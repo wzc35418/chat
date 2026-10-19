@@ -34,6 +34,7 @@ const MIGRATION_0005: &str = include_str!("../migrations/0005_retention_capabili
 const MIGRATION_0006: &str = include_str!("../migrations/0006_domain_operation.sql");
 const MIGRATION_0007: &str = include_str!("../migrations/0007_capability_revocations.sql");
 const MIGRATION_0008: &str = include_str!("../migrations/0008_capability_revoke_authorization.sql");
+const MIGRATION_0009: &str = include_str!("../migrations/0009_node_audit.sql");
 const MIGRATION_CHECKSUM_SLOT: &str = ":checksum";
 
 /// 节点鉴权与注册策略。所有字段在启动时校验，不接受 0 或越界配置。
@@ -298,6 +299,141 @@ impl NodeService {
     /// 清空审计记录（保留容量与开关；运维/测试用）。
     pub fn clear_audit(&mut self) {
         self.audit.clear();
+    }
+
+    // ------------------------------------------------- NODE-018 审计持久化与保留期
+
+    /// 记录一条审计并**落库**（关闭审计时既不入内存也不写库）。
+    pub fn record_audit_persisted(&mut self, event: AuditEvent) -> NodeResult<()> {
+        if !self.audit.enabled() {
+            return Ok(());
+        }
+        self.connection.execute(
+            "INSERT INTO node_audit (kind, at_ms, device_id, group_id, outcome, code, request_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                &event.kind,
+                i64::try_from(event.at_ms).unwrap_or(i64::MAX),
+                &event.device_id,
+                &event.group_id,
+                event.outcome.as_str(),
+                event.code,
+                &event.request_id,
+            ],
+        )?;
+        // 内存环形与落库保持一致（同一条事件两处都有）。
+        self.audit.record(event);
+        Ok(())
+    }
+
+    /// 持久化审计查询：按时间阈值、种类与**可见设备**过滤，返回最旧的在前。
+    ///
+    /// - `limit`：1..=200（越界返回 `INVALID_REQUEST`，不静默夹取）；
+    /// - `since_ms`：只返回 `at_ms >= since_ms`；
+    /// - `kind`：可选种类精确匹配；
+    /// - `viewer_device`：可见性过滤——本设备事件或节点级事件（`device_id IS NULL`）。
+    pub fn audit_query(
+        &self,
+        limit: u32,
+        since_ms: u64,
+        kind: Option<&str>,
+        viewer_device: Option<&str>,
+    ) -> NodeResult<Vec<AuditEvent>> {
+        if limit == 0 || limit > crate::audit::AUDIT_QUERY_MAX_LIMIT {
+            return Err(NodeError::InvalidConfig("audit limit must be within 1..=200"));
+        }
+        if !self.audit.enabled() {
+            // 关闭审计时不返回任何记录（不读库、也不伪造）。
+            return Ok(Vec::new());
+        }
+        let since = i64::try_from(since_ms).unwrap_or(i64::MAX);
+        let mut statement = self.connection.prepare(
+            "SELECT kind, at_ms, device_id, group_id, outcome, code, request_id
+             FROM node_audit
+             WHERE at_ms >= ?1 AND (?2 IS NULL OR kind = ?2)
+               AND (?3 IS NULL OR device_id IS NULL OR device_id = ?3)
+             ORDER BY at_ms ASC, id ASC
+             LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![since, kind, viewer_device, i64::from(limit)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (kind, at_ms, device_id, group_id, outcome, code, request_id) = row?;
+            events.push(AuditEvent {
+                kind,
+                at_ms: u64::try_from(at_ms).map_err(|_| NodeError::StorageUnavailable)?,
+                device_id,
+                group_id,
+                outcome: match outcome.as_str() {
+                    "ok" => crate::audit::AuditOutcome::Ok,
+                    "denied" => crate::audit::AuditOutcome::Denied,
+                    _ => crate::audit::AuditOutcome::Failed,
+                },
+                code: code.as_deref().map(crate::audit::intern_code),
+                request_id,
+            });
+        }
+        Ok(events)
+    }
+
+    /// 清理早于 `older_than_ms` 的审计（单次最多 512 条），返回删除条数。
+    pub fn purge_audit(&mut self, older_than_ms: u64, limit: usize) -> NodeResult<u64> {
+        let batch = limit.clamp(1, crate::audit::AUDIT_PURGE_MAX_BATCH);
+        let threshold = i64::try_from(older_than_ms).unwrap_or(i64::MAX);
+        let deleted = self.connection.execute(
+            "DELETE FROM node_audit WHERE id IN (
+                 SELECT id FROM node_audit WHERE at_ms < ?1 ORDER BY at_ms ASC LIMIT ?2
+             )",
+            params![threshold, i64::try_from(batch).unwrap_or(i64::MAX as i64)],
+        )?;
+        Ok(u64::try_from(deleted).unwrap_or(0))
+    }
+
+    /// 落库审计总条数（关闭审计时仍返回库内既有条数？——不，关闭时返回 0，避免泄漏）。
+    pub fn audit_persisted_count(&self) -> NodeResult<u64> {
+        if !self.audit.enabled() {
+            return Ok(0);
+        }
+        let count: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM node_audit", [], |row| row.get(0))?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    /// 读取最近 `limit` 条审计并标注来源：内存非空用内存，否则回退读库（重启后场景）。
+    pub fn audit_tail_with_source(
+        &self,
+        limit: usize,
+    ) -> NodeResult<(Vec<AuditEvent>, crate::audit::AuditSource)> {
+        if !self.audit.is_empty() {
+            return Ok((self.audit.tail(limit), crate::audit::AuditSource::Memory));
+        }
+        if !self.audit.enabled() {
+            return Ok((Vec::new(), crate::audit::AuditSource::Persisted));
+        }
+        let max = usize::try_from(crate::audit::AUDIT_QUERY_MAX_LIMIT).unwrap_or(200);
+        let take = u32::try_from(limit.min(max)).unwrap_or(50);
+        let take = take.max(1);
+        let mut events = self.audit_query(take, 0, None, None)?;
+        // 库里是升序；内存语义是“最旧的在前”，保持一致。
+        let len = events.len();
+        if len > limit {
+            events.drain(..len - limit);
+        }
+        Ok((events, crate::audit::AuditSource::Persisted))
     }
 
     /// 节点标识。
@@ -1114,6 +1250,28 @@ fn migrate(connection: &Connection) -> NodeResult<()> {
         }
     }
     verify_migration_checksum(connection, 8, MIGRATION_0008)?;
+    let current: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if current < 9 {
+        let sql = MIGRATION_0009.replace(MIGRATION_CHECKSUM_SLOT, &checksum(MIGRATION_0009));
+        connection
+            .execute_batch(&sql)
+            .map_err(|_| NodeError::MigrationFailed("node audit migration failed"))?;
+        let applied: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if applied < 9 {
+            return Err(NodeError::MigrationFailed(
+                "node audit migration did not record its version",
+            ));
+        }
+    }
+    verify_migration_checksum(connection, 9, MIGRATION_0009)?;
     Ok(())
 }
 

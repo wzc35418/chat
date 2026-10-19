@@ -9,7 +9,7 @@
     },
     {
       "status": "PASS",
-      "message": "本地Markdown链接及显式函数锚点已检查：1664"
+      "message": "本地Markdown链接及显式函数锚点已检查：1667"
     },
     {
       "status": "PASS",
@@ -41,7 +41,7 @@
     "未验证 MLS/密码学/跨端/网络/部署行为",
     "SQL仅在内存普通SQLite中验证，不证明加密存储可用"
   ],
-  "fileCount": 569,
+  "fileCount": 575,
   "functionCount": 197,
-  "markdownLinks": 1664
+  "markdownLinks": 1667
 }
