@@ -1409,6 +1409,26 @@ pub fn discard_pending_control(
     let saved = persist_snapshot(store, &record, record.mls_epoch)?;
     Ok(project(&record, discarded.epoch, None, saved))
 }
+
+/// 对端控制提交里的**非角色策略声明**（禁言 / 改名）。
+///
+/// 与 `policy_intent`（角色/转让语义）**互斥**：一条提交只声明一种策略变化；两者同时出现 →
+/// `INVALID_INPUT`（不猜哪一个是权威）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PolicySyncIntent {
+    /// 设置/取消某成员的禁言（目标必须是确认成员；群主不能禁言自己）。
+    SetMuted {
+        /// 目标成员凭据。
+        credential: String,
+        /// 目标禁言状态。
+        muted: bool,
+    },
+    /// 改群名（沿用 `validate_name`：1..=64 字节、无控制字符、无首尾空白）。
+    RenameGroup {
+        /// 新群名。
+        name: String,
+    },
+}
 /// 对端条目的输入（外层已验证的公开绑定字段；不含任何密钥）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerEntryInput {
@@ -1433,6 +1453,8 @@ pub struct PeerEntryInput {
     pub policy_intent: Option<crate::group_node::ControlIntent>,
     /// 可选：`SetRole` 声明的目标角色（`ControlIntent::SetRole` 本身不带角色）。
     pub policy_role: Option<MemberRole>,
+    /// 可选：**非角色策略声明**（禁言 / 改名）。与 `policy_intent` 互斥。
+    pub policy_sync: Option<PolicySyncIntent>,
 }
 
 impl PeerEntryInput {
@@ -1453,7 +1475,14 @@ impl PeerEntryInput {
             removed_members: Vec::new(),
             policy_intent: None,
             policy_role: None,
+            policy_sync: None,
         }
+    }
+
+    /// 声明一条非角色策略变化（禁言 / 改名）。
+    pub fn with_policy_sync(mut self, policy_sync: PolicySyncIntent) -> Self {
+        self.policy_sync = Some(policy_sync);
+        self
     }
 }
 
@@ -1503,6 +1532,63 @@ pub enum PeerEntryOutcome {
 }
 
 
+/// 把对端声明的**非角色策略**（禁言 / 改名）先算成候选策略（DOMAIN-002 授权 + DOMAIN-004 派生）。
+///
+/// 返回值：(候选策略, 改名目标名)。改名不在 `GroupSnapshot` 里（公开层只有摘要），因此合并成功后
+/// 由调用方把名字写回记录；禁言由 `apply_domain_policy` 从候选成员里写回。
+///
+/// 失败语义：声明与提交形态不符（含成员增删）→ `STATE_CORRUPTED`；权限不足 → `PERMISSION_DENIED`；
+/// 目标不是确认成员 → `INVALID_TARGET`；群主禁言自己 → `PERMISSION_DENIED`；
+/// 名字不合法 → `INVALID_INPUT`（沿用既有 `validate_name`）。
+fn prepare_peer_policy_sync(
+    record: &GroupRecord,
+    sync: &PolicySyncIntent,
+    sender_identity: &str,
+    declared_added: usize,
+    declared_removed: usize,
+) -> GroupResult<(ProposedPolicy, Option<String>)> {
+    if declared_added != 0 || declared_removed != 0 {
+        return Err(GroupError::corrupted(
+            "declared policy intent does not match the commit member changes",
+        ));
+    }
+    validate_credential(sender_identity)?;
+    let snapshot = domain_snapshot(record)?;
+    let actor_index = member_index(record, sender_identity)?;
+    let actor = actor_of(record, actor_index);
+    let (operation, rename_to) = match sync {
+        PolicySyncIntent::SetMuted { credential, muted } => {
+            validate_credential(credential)?;
+            let target_index = member_index(record, credential)?;
+            // 群主不能禁言自己：自我禁言会让群失去唯一能解禁的人。
+            if target_index == actor_index
+                && record.members[actor_index].role == MemberRole::Owner.as_u64()
+            {
+                return Err(GroupError::new(
+                    "PERMISSION_DENIED",
+                    "the group owner cannot mute itself",
+                ));
+            }
+            let operation = GroupOperation::SetMuted {
+                account: account_id_for(&record.members[target_index].credential),
+                muted: *muted,
+            };
+            (operation, None)
+        }
+        PolicySyncIntent::RenameGroup { name } => {
+            validate_name(name)?;
+            let operation = GroupOperation::Rename {
+                name_digest: Digest::sha256(name.as_bytes()),
+            };
+            (operation, Some(name.clone()))
+        }
+    };
+    let authorized =
+        authorize_group_operation(&snapshot, actor, operation).map_err(GroupError::from)?;
+    let proposed: ProposedPolicy =
+        apply_policy_operation(&snapshot, &authorized).map_err(GroupError::from)?;
+    Ok((proposed, rename_to))
+}
 /// 把对端声明的策略语义落到本地快照（DOMAIN-002 授权 + DOMAIN-004 派生版本/控制头）。
 ///
 /// - 只允许**纯角色变更**的声明：真实提交若同时增删成员 / 移除了本机 → `STATE_CORRUPTED`
@@ -1648,7 +1734,24 @@ pub fn group_process_peer_entry(
     for credential in input.added_members.iter().chain(input.removed_members.iter()) {
         validate_credential(credential)?;
     }
+    // 角色声明与非角色声明（禁言/改名）互斥：同时出现 → 不猜权威。
+    if input.policy_intent.is_some() && input.policy_sync.is_some() {
+        return Err(GroupError::new(
+            "INVALID_INPUT",
+            "a peer entry may declare either a role intent or a mute/rename intent, not both",
+        ));
+    }
     // 策略声明先算好（授权 + DOMAIN-004）：失败时**连 MLS 合并不发生**，快照完全不动。
+    let prepared_sync = match &input.policy_sync {
+        Some(sync) => Some(prepare_peer_policy_sync(
+            &record,
+            sync,
+            &input.sender_identity,
+            input.added_members.len(),
+            input.removed_members.len(),
+        )?),
+        None => None,
+    };
     let prepared_policy = match &input.policy_intent {
         Some(intent) => Some(prepare_peer_policy_intent(
             &record,
@@ -1744,6 +1847,18 @@ pub fn group_process_peer_entry(
                             member.role = MemberRole::Admin.as_u64();
                         }
                     }
+                }
+            }
+            // 非角色策略声明（禁言 / 改名）：同样要求“纯策略提交”（无成员增删）。
+            if let Some((prepared, rename_to)) = prepared_sync.as_ref() {
+                if added != 0 || removed != 0 || self_removed {
+                    return Err(GroupError::corrupted(
+                        "declared policy intent does not match the commit member changes",
+                    ));
+                }
+                apply_domain_policy(&mut record, &prepared.policy)?;
+                if let Some(name) = rename_to {
+                    record.name = name.clone();
                 }
             }
             record.mls_epoch = new_epoch;

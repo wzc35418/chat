@@ -206,6 +206,9 @@ struct IdentityState {
     contacts: Vec<ContactRecord>,
     /// 正式加密存储句柄；只有 `open_persisted` 构造的对象才有。
     core: Option<ConversationCore>,
+    /// 持久化模式的库路径与主密钥（恢复文件导出/导入需要自行重开库）。
+    database: Option<String>,
+    master_key_hex: Option<String>,
     clock: Clock,
     closed: bool,
 }
@@ -247,6 +250,109 @@ impl IdentityState {
     }
 }
 
+
+/// 恢复文件导入结果（纯数据，不含种子）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct RecoveryImportViewFfi {
+    /// 账户 ID。
+    pub account_id: String,
+    /// 设备 ID。
+    pub device_id: String,
+    /// 账户公钥（小写 hex）。
+    pub account_public_key: String,
+    /// 设备公钥（小写 hex）。
+    pub device_public_key: String,
+    /// 显示名。
+    pub display_name: String,
+    /// 创建时间（Unix 毫秒）。
+    pub created_at_ms: i64,
+    /// 设备列表摘要（小写 hex）。
+    pub devices_digest: String,
+}
+
+/// 恢复层错误 → FFI 错误（稳定码原样透出：`RECOVERY_BAD_PASSPHRASE` 等）。
+fn recovery_failure(error: chat_identity::recovery::RecoveryError) -> FfiError {
+    let detail = error.detail();
+    state_error(error.code(), &detail)
+}
+
+/// 只为恢复文件打开正式库（调用方必须已释放别的写句柄）。
+fn open_formal_store(
+    database_path: &str,
+    master_key_hex: &str,
+) -> Result<chat_storage::formal::Store, FfiError> {
+    let key = decode_master_key_hex(master_key_hex)?;
+    chat_storage::formal::open_store(
+        chat_storage::formal::StoreOptions::new(database_path, chat_storage::formal::KeyProvenance::Raw32),
+        chat_storage::formal::ProtectedStorageKey::from_bytes(key),
+    )
+    .map_err(|error| {
+        let detail = error.to_string();
+        state_error(error.code(), &detail)
+    })
+}
+
+fn decode_master_key_hex(text: &str) -> Result<[u8; 32], FfiError> {
+    if text.len() != 64 {
+        return Err(state_error(
+            "INVALID_INPUT",
+            "master key must be exactly 64 hexadecimal characters",
+        ));
+    }
+    let bytes = text.as_bytes();
+    let mut key = [0_u8; 32];
+    for (index, slot) in key.iter_mut().enumerate() {
+        let high = hex_nibble(bytes[index * 2])?;
+        let low = hex_nibble(bytes[index * 2 + 1])?;
+        *slot = (high << 4) | low;
+    }
+    Ok(key)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, FfiError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(state_error("INVALID_INPUT", "master key must be hexadecimal")),
+    }
+}
+
+/// 重新打开正式库并恢复身份句柄（导出临时释放写锁后调用）。
+fn restore_persisted(
+    state: &mut IdentityState,
+    database_path: &str,
+    master_key_hex: &str,
+) -> Result<(), FfiError> {
+    let core = ConversationCore::open(database_path, master_key_hex)
+        .map_err(|error| core_failure!(error))?;
+    let persisted = core
+        .open_persisted_identity()
+        .map_err(|error| core_failure!(error))?
+        .ok_or_else(|| state_error("STATE_CORRUPTED", "identity account is missing"))?;
+    let listed = core.list_contacts().map_err(|error| core_failure!(error))?;
+    let mut contacts = Vec::with_capacity(listed.len());
+    for item in listed {
+        contacts.push(restore_contact(item)?);
+    }
+    let projection = core
+        .load_identity_account()
+        .map_err(|error| core_failure!(error))?
+        .ok_or_else(|| state_error("STATE_CORRUPTED", "identity projection is missing"))?;
+    let view = AccountView {
+        account_id: projection.account_id,
+        device_id: projection.device_id,
+        display_name: projection.display_name,
+        fingerprint: projection.fingerprint,
+    };
+    state.account_id = persisted.account.account_id();
+    state.account = Some(persisted.account);
+    state.device = Some(persisted.device);
+    state.contacts = contacts;
+    state.view = view;
+    state.core = Some(core);
+    Ok(())
+}
 /// 口令加好友与本机身份的 UniFFI 对象。
 #[derive(uniffi::Object)]
 pub struct IdentityFfi {
@@ -279,6 +385,8 @@ impl IdentityFfi {
         device_id: DeviceId,
         contacts: Vec<ContactRecord>,
         core: Option<ConversationCore>,
+        database: Option<String>,
+        master_key_hex: Option<String>,
         clock: Clock,
     ) -> Self {
         let account_id = account.account_id();
@@ -292,6 +400,8 @@ impl IdentityFfi {
                 view,
                 contacts,
                 core,
+                database,
+                master_key_hex,
                 clock,
                 closed: false,
             }),
@@ -315,6 +425,8 @@ impl IdentityFfi {
             device,
             device_id,
             Vec::new(),
+            None,
+            None,
             None,
             clock,
         )))
@@ -342,6 +454,8 @@ impl IdentityFfi {
             device,
             device_id,
             Vec::new(),
+            None,
+            None,
             None,
             clock,
         )))
@@ -407,6 +521,8 @@ impl IdentityFfi {
             persisted.device_id,
             contacts,
             Some(core),
+            Some(database_path),
+            Some(master_key_hex),
             clock,
         )))
     }
@@ -623,6 +739,139 @@ impl IdentityFfi {
         node: String,
     ) -> Result<Arc<Self>, FfiError> {
         Self::open_persisted_with_clock(database_path, master_key_hex, node, system_now_ms)
+    }
+
+    /// 只**绑定**恢复目标库（不建身份），用于新机器导入恢复文件。
+    ///
+    /// 语义：打开（必要时创建）正式库、确认库内没有身份、随即关闭并保持"关闭态"。
+    /// 之后调用 [`export_recovery_bundle`] 会以 `CORE_CLOSED` 拒绝，
+    /// 而 [`import_recovery_bundle`] 可以在这个空库上执行；导入成功后用
+    /// `open_persisted` 打开同一库即可拿到恢复的身份。
+    ///
+    /// 目标库已有身份 → `RECOVERY_TARGET_NOT_EMPTY`（不覆盖；请改用 `open_persisted` 直接打开）。
+    #[uniffi::constructor]
+    pub fn open_recovery_target(
+        database_path: String,
+        master_key_hex: String,
+        node: String,
+    ) -> Result<Arc<Self>, FfiError> {
+        let node = parse_node(&node)?;
+        // 校验主密钥形态（失败即 INVALID_INPUT），并确认库内没有身份。
+        let _ = decode_master_key_hex(&master_key_hex)?;
+        {
+            let store = open_formal_store(&database_path, &master_key_hex)?;
+            if store
+                .load_identity_account()
+                .map_err(|error| {
+                    let detail = error.to_string();
+                    state_error(error.code(), &detail)
+                })?
+                .is_some()
+            {
+                return Err(state_error(
+                    "RECOVERY_TARGET_NOT_EMPTY",
+                    "the target store already holds an identity",
+                ));
+            }
+        }
+        // 关闭态占位身份：只为了让对象可构造；@account()` 在导入+重开之前不可信。
+        let now_ms = system_now_ms();
+        let account = LocalAccount::create("恢复目标", now_ms).map_err(FfiError::from)?;
+        let device = DeviceKeys::generate();
+        let device_id = device.device_id(account.account_id());
+        let view = account_view_of(&account, device_id);
+        let mut state = IdentityState {
+            account: None,
+            device: None,
+            account_id: account.account_id(),
+            node,
+            view,
+            contacts: Vec::new(),
+            core: None,
+            database: Some(database_path),
+            master_key_hex: Some(master_key_hex),
+            clock: system_now_ms,
+            closed: true,
+        };
+        state.closed = true;
+        Ok(Arc::new(Self {
+            state: Mutex::new(state),
+        }))
+    }
+
+    /// IDENTITY-013：导出身份恢复文件（加密，**不含存储主密钥**）。
+    ///
+    /// 需要**持久化模式**（`open_persisted`）且库里已有身份，否则 `INVALID_INPUT`。
+    /// 导出期间会短暂释放正式库的独占写锁（导出后自动重开并恢复身份句柄）。
+    pub fn export_recovery_bundle(&self, passphrase: String) -> Result<Vec<u8>, FfiError> {
+        let mut state = self.lock()?;
+        state.require_open()?;
+        let Some(database) = state.database.clone() else {
+            return Err(state_error(
+                "INVALID_INPUT",
+                "identity is not persisted: open it with open_persisted first",
+            ));
+        };
+        let Some(master_key_hex) = state.master_key_hex.clone() else {
+            return Err(state_error(
+                "INVALID_INPUT",
+                "identity is not persisted: open it with open_persisted first",
+            ));
+        };
+        // 释放独占写锁：导出只需要读，导出后立刻把身份句柄装回去。
+        if let Some(core) = state.core.take() {
+            core.close();
+        }
+        let bundle = {
+            let store = open_formal_store(&database, &master_key_hex)?;
+            chat_identity::recovery::export_recovery_bundle(&store, &passphrase)
+                .map_err(recovery_failure)?
+        };
+        restore_persisted(&mut state, &database, &master_key_hex)?;
+        Ok(bundle)
+    }
+
+    /// IDENTITY-014：把恢复文件导入本对象的库（**只允许空库**）。
+    ///
+    /// - 对象必须已 `shutdown()`（先释放独占写锁）；否则显式 `INVALID_STATE_TRANSITION`；
+    /// - 目标库已有身份 → `RECOVERY_TARGET_NOT_EMPTY`（绝不覆盖）；
+    /// - 导入成功后对象仍是关闭状态：调用方重新 `open_persisted` 即可拿到恢复的身份。
+    pub fn import_recovery_bundle(
+        &self,
+        passphrase: String,
+        bundle: Vec<u8>,
+    ) -> Result<RecoveryImportViewFfi, FfiError> {
+        let state = self.lock()?;
+        let Some(database) = state.database.clone() else {
+            return Err(state_error(
+                "INVALID_INPUT",
+                "identity is not persisted: open it with open_persisted first",
+            ));
+        };
+        let Some(master_key_hex) = state.master_key_hex.clone() else {
+            return Err(state_error(
+                "INVALID_INPUT",
+                "identity is not persisted: open it with open_persisted first",
+            ));
+        };
+        if !state.closed {
+            return Err(state_error(
+                "INVALID_STATE_TRANSITION",
+                "close the identity object before importing into its database",
+            ));
+        }
+        let mut store = open_formal_store(&database, &master_key_hex)?;
+        let view = chat_identity::recovery::import_recovery_bundle(&mut store, &bundle, &passphrase)
+            .map_err(recovery_failure)?;
+        Ok(RecoveryImportViewFfi {
+            account_id: view.account_id,
+            device_id: view.device_id,
+            account_public_key: view.account_public_key,
+            device_public_key: view.device_public_key,
+            display_name: view.display_name,
+            created_at_ms: view.created_at_ms,
+            devices_digest: view.devices_digest,
+        })
     }
 
     /// 本机账户的脱敏视图。账户在构造时就已建立，因此不会失败。

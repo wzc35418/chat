@@ -832,6 +832,83 @@ cargo test --offline -p chat-core                        # 128 passed（本记�
 - **证据**：`cargo test -p chat-core` 中 `group_node` 新增 4 单测 + 2 真节点集成——真节点上转让的日志元数据为 `transfer_ownership` 且目标摘要≠提交摘要，回执接受后 epoch 2、群主易主；同一 pending 用旧入口被拒且节点日志为空。
 - **协议待补**：PROTOCOL-004 无“通用 self_update”值（建议 `PendingControl` 记领域操作或协议加字段）；`set_muted`/`rename_group` 无 MLS 提交不经过映射；`leave_group`/`dissolve_group` 本切片仍不产生 MLS 提交，故 `LeaveSelf`/`Dissolve` 映射已实现并单测但端到端不可达（文档不冒充已运行通路）。
 
+## 禁言与群名随控制提交同步（GROUPS-015，2026-10-19，Windows x64）
+
+GROUPS-014 已能同步转让/改角色，但**禁言（muted）与群名**仍只在本机生效。本轮把这两类纯策略变更
+也接到同一条“控制提交 + 策略声明”通道上。
+
+代码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)（`PolicySyncIntent` + `PeerEntryInput.policy_sync`）；
+测试：[crates/core/tests/groups_policy_sync.rs](../../crates/core/tests/groups_policy_sync.rs)（4 个，真双设备两库）。
+
+### 公开面（扩展）
+
+```text
+pub enum PolicySyncIntent {
+    SetMuted { credential: String, muted: bool },
+    RenameGroup { name: String },
+}
+
+PeerEntryInput {
+    ... 既有字段 ...
+    policy_intent: Option<ControlIntent>,   // 角色/转让（GROUPS-014，语义不变）
+    policy_role: Option<MemberRole>,
+    policy_sync: Option<PolicySyncIntent>,  // 新增：禁言 / 改名
+}
+```
+
+`policy_intent` 与 `policy_sync` **互斥**：同时出现 → `INVALID_INPUT`（不猜哪一个是权威）。
+
+### 关键语义
+
+1. **先算策略、再做 MLS 合并**：带 `policy_sync` 时，在调用 CRYPTO-006 之前完成 DOMAIN-002 授权 +
+   DOMAIN-004 派生；授权/校验失败**连合并不发生**，快照逐字段不动。
+2. **合并后应用**：核对真实成员变化必须为空（纯策略提交）→ `apply_domain_policy` 写回 `muted`
+   （候选成员里带禁言位）→ 改名时再写回 `record.name`；随后 `record.validate()` 收口。
+3. **校验**：目标必须是确认成员（`member_index` → `INVALID_TARGET`）；群主不能禁言自己 →
+   `PERMISSION_DENIED`（自我禁言会让群失去唯一能解禁的人）；名字沿用既有 `validate_name`
+   （1..=64 字节、无控制字符、无首尾空白 → `INVALID_INPUT`）。任务书写“≤80 字符”，实现保留这条
+   **更严格**的既有规则（与 `rename_group`/建群一致，避免对端设出本机 API 拒绝的名字）。
+4. **权限**：只有群主/管理员能禁言他人与改名（DOMAIN-002）；普通成员越权 → `PERMISSION_DENIED`。
+5. **不声明 = 保持现状**（向后兼容）：只合并 MLS 状态，`muted`/群名/策略版本都不动。
+6. **发送侧现实**：`set_muted` / `rename_group` 本身是**纯策略层**（不产生 MLS 提交，保持既有语义与
+   既有用例），因此“随提交传播”由协调者另外准备一个 `SelfUpdate` 提交承载声明（测试即如此：
+   先本地策略生效 → 准备并接受自更新提交 → 对端按 `policy_sync` 应用）。
+
+### 错误码
+
+`STATE_CORRUPTED`（声明与成员变化不一致）、`INVALID_INPUT`（名字不合法、两类声明同时出现）、
+`INVALID_TARGET`（目标不是确认成员）、`PERMISSION_DENIED`（越权 / 群主禁言自己）。
+
+### 复现命令（全程离线）
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test groups_policy_sync   # 4 passed
+cargo test --offline -p chat-core                              # 200 passed（既有 196 继续通过）
+```
+
+### 证据
+
+- `groups_policy_sync::mute_syncs_to_the_peer_through_the_control_commit`：A 禁言 bob → 真实
+  `SelfUpdate` 提交 → B 处理带 `SetMuted{bob,true}` 声明的提交后 **bob = muted**、epoch 2；
+  落库快照与返回值一致。
+- `groups_policy_sync::rename_syncs_to_the_peer_through_the_control_commit`：A 改名 → B 处理后
+  **群名更新**（返回值与 `group_snapshot` 都变）。
+- `groups_policy_sync::member_cannot_rename_or_mute_others_and_the_snapshot_is_unchanged`：bob（普通成员）
+  的提交声明改名 / 禁言 alice → 两次都 `PERMISSION_DENIED` 且快照**逐字段相等**；群主禁言自己 →
+  `PERMISSION_DENIED`；含控制字符的名字与 65 字节名字 → `INVALID_INPUT` 且快照不变。
+- `groups_policy_sync::without_a_policy_declaration_the_peer_behaviour_is_unchanged`：同一提交不带声明 →
+  epoch 前进但群名 / 禁言**保持不变**（向后兼容）。
+
+### 已知限制
+
+1. **发送侧仍需协调者准备提交**：`set_muted`/`rename_group` 不产生 MLS 提交（保持既有契约），
+   本轮没有把它们改成“自动准备提交”（那会改变它们“纯策略、无 pending”的语义与既有用例）。
+2. **一次提交只同步一个非角色策略**：禁言与改名不能同一条提交，也不能与角色声明混用。
+3. **群名不进节点公开元数据**：对端从受信任的控制声明里拿名字（DOMAIN-004 的候选只有摘要）。
+4. **名字长度沿用既有 64 字节规则**（见上）；若要放宽到 80 字符，需同时改建群/改名 API 与本文档。
+5. **声明可信度取决于外层日志**：本层只按本地快照做 DOMAIN-002/004 再校验，不做独立事实发现。
+
 ## 自移除提案编排（GROUPS-013，2026-10-18，Windows x64）
 
 背景：MLS 1.0 禁止一条 Commit 移除提交者自己，唯一致命合法路径是"本机对自己发起 Remove 提案 → 群里

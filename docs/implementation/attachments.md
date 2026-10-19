@@ -435,6 +435,43 @@ cargo test --offline -p chat-core                                # 76 passed（�
 5. **一个 transport 绑定一个群 + 一条 source 条目**：多附件（不同 source seq）需要按消息构造 transport 或多绑定表；本轮按“一消息一附件一组”的切片构造。
 6. **节点授权需先有本设备的已接受日志条目**：附件上传前必须已有一条本设备条目（测试用 append 真实写入），不存在“先传附件再发消息”的路径。
 
+## EXPD 实现记录：exporter 包装密钥 + 协议字段 57（2026-10-19，Windows x64）
+
+源码 [crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)、
+[crates/core/src/attachment_message.rs](../../crates/core/src/attachment_message.rs)；
+测试 [crates/core/tests/attachment_descriptor_protocol.rs](../../crates/core/tests/attachment_descriptor_protocol.rs)。
+
+1. **包装密钥改为真实 exporter**：`attachment_exporter_wrapping_key(device, store, attachment_id,
+   conversation_id, mls_epoch)` → `MlsDevice::export_key(store, "chat attachment file key",
+   attachment_wrapping_context(attachment_id, conversation_id, mls_epoch), 32)`。crypto 的前置失败按**稳定码原样透出**
+   （`EXPORTER_PENDING_COMMIT` / `EXPORTER_NOT_PERSISTED` / `STALE_EPOCH` / `USE_AFTER_EVICTION` / `CRYPTO_FAILURE`），
+   新增 `AttachmentError::Exporter { code, detail }` 承载，绝不降级到占位派生。
+   旧的 P0 派生只保留为 `attachment_legacy_wrapping_key`（仅用于打开 legacy v1 描述符）。
+2. **描述符进协议字段 57**：`encode_attachment_metadata(body)` 产出 ≤512 字节的紧凑字节
+   （version ‖ file_id(16) ‖ plain_size(8) ‖ ciphertext_bytes(8) ‖ chunk_bytes(4) ‖ chunk_count(4) ‖
+   content_digest(32) ‖ ciphertext_digest(32) ‖ descriptor_len(2) ‖ descriptor ‖ binding(32)），
+   attachment_id 由 file_id 确定性派生（`att-<hex>`）；`parse_attachment_metadata` 严格反解。
+   消息正文只留 `[附件]`，**不含任何密钥材料**。
+3. **接收侧优先级**：`PersistedAttachmentStore::adopt_attachment_event(metadata, legacy_body,
+   exporter_key, legacy_key)` —— 有 57 字段就按描述符派生来源选钥匙（v2 → exporter、v1 → legacy）；
+   没有 57 字段则回退旧正文路径；两路都没有描述符 → `ATTACHMENT_KEY_UNAVAILABLE`。
+4. **legacy v1 仍可解**：`open_secret_descriptor` 两个版本都读；采用时用 legacy 密钥。
+
+验证证据（`cargo test --offline -p chat-core`，**196 passed**，含新增 3 例）：
+
+- `descriptor_travels_in_field_57_and_the_other_device_decrypts_independently`：描述符在字段 57
+  （`attachment_metadata_from_event` 非空、旧正文为空）、正文只有 `[附件]`；**两个独立库**导出的 exporter
+   key 相同；B 库采用后独立下载解密，明文逐字节一致。
+- `legacy_body_with_v1_descriptor_is_still_accepted`：v1（legacy P0）描述符经旧正文路径仍可解；绑定不符先被拒。
+- `exporter_preconditions_fail_explicitly_without_writes`：从未持久化群状态时 exporter 显式失败（稳定码）且零写入。
+
+已知限制：
+
+1. 两库导出的密钥相同这一点由“同一份已提交群状态写入两个库”验证（同一设备状态、两个独立数据库）；
+   **两个真实不同设备**的等价性由 crypto 的 exporter 语义保证（同 epoch 导出相同字节），core 侧未再单独构造第二个 MLS 设备。
+2. 字段 57 的 `display_name` 不随公开元数据走：接收侧用固定占位 `attachment`，原始文件名不进公开层。
+3. 描述符仍在消息事件里（字段 57），只是不再占正文；正文摘要 `[附件]` 是既有占位约定。
+
 ## SECD 实现记录：附件密钥描述符随消息投递（2026-10-19，Windows x64）
 
 源码 [crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)（编解码 + 采用）与

@@ -766,5 +766,33 @@ cargo test --offline -p chat-identity -p chat-storage    # 56 + 94 passed（既�
    不提供口令强度策略，只做长度/控制字符校验。
 4. **导入是"新建身份"**：不迁移旧数据、不合并、不删除目标库里其它数据（目标库必须没有身份）。
 5. **参数白名单是固定的三组**：升级 argon2 参数需要发版（文件头带版本，旧文件仍可导入）。
+### FFI 接线（IdentityFfi，2026-10-18，Windows x64）
+
+~~~text
+IdentityFfi::open_recovery_target(database_path, master_key_hex, node) -> Arc<IdentityFfi>
+IdentityFfi.export_recovery_bundle(passphrase) -> Vec<u8>
+IdentityFfi.import_recovery_bundle(passphrase, bytes) -> RecoveryImportViewFfi
+RecoveryImportViewFfi { account_id, device_id, account_public_key, device_public_key,
+                        display_name, created_at_ms, devices_digest }
+~~~
+
+- **导出**：需要 `open_persisted` 身份且库里已有身份，否则 `INVALID_INPUT`（非持久化对象）；
+  导出期间短暂释放正式库的独占写锁，导出后自动重开并恢复身份句柄（`account()` 仍可用）；
+  关闭后 → `CORE_CLOSED`。
+- **导入**：只允许在**空库**上执行，且对象必须已 `shutdown()`（先释放写锁），否则
+  `INVALID_STATE_TRANSITION`；目标库已有身份 → `RECOVERY_TARGET_NOT_EMPTY`（绝不覆盖）。
+  导入成功后对象仍是关闭态，调用方用 `open_persisted` 打开同一库即拿到恢复的身份。
+- **空库从哪来**：`open_recovery_target` 打开（必要时创建）库、确认没有身份、随即关闭并保持关闭态；
+  目标库已有身份时它直接返回 `RECOVERY_TARGET_NOT_EMPTY`。
+- **错误码原样透出**：`RECOVERY_BAD_PASSPHRASE` / `RECOVERY_CORRUPTED` / `RECOVERY_UNSUPPORTED` /
+  `RECOVERY_TARGET_NOT_EMPTY` / `INVALID_INPUT` / `CORE_CLOSED` / `INVALID_STATE_TRANSITION` /
+  storage 冻结码。
+- 测试：[crates/ffi/tests/identity_recovery_ffi.rs](../../crates/ffi/tests/identity_recovery_ffi.rs)（3 个，真临时库）。
+  复现：`cargo test --offline -p chat-ffi` → 60 passed（既有 57 继续通过）。
+
+FFI 侧已知限制：① `open_recovery_target` 的 `account()` 在导入前只是占位值（不可信，已注释）；
+② 导入后必须重开对象才能用身份（不会自动重建句柄）；③ 导出要求先持久化打开——纯 `create()` 内存身份
+无法导出（它没有库，也就没有可恢复的落盘身份）。
+
 
 

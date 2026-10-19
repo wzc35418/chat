@@ -151,6 +151,17 @@ tasks.register<JavaExec>("dpapiSmoke") {
     systemProperty("stdout.encoding", "UTF-8")
 }
 
+tasks.register<JavaExec>("pluginSmoke") {
+    group = "verification"
+    description = "PLUGINS 竖直冒烟：清单校验/安装/启动/派发计划/私有存储/停止/卸载（不执行插件代码）。"
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
+    systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.PluginSmokeKt")
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+}
+
 tasks.register<JavaExec>("platformSmoke") {
     group = "verification"
     description = "PLATFORM-007~010 竖切：通知诚实不可用、参数校验、生命周期与单次退出。"

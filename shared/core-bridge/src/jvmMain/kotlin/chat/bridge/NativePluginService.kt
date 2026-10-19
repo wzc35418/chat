@@ -57,7 +57,11 @@ class NativePluginService(private val native: PluginsFfi) : PluginService {
     }
 
     override suspend fun dispatch(pluginId: String, extensionPoint: String, input: String): DispatchPlanView {
-        val operationId = "op-" + pluginId + "-" + System.nanoTime().toString()
+        // PROTOCOL-001 operation id 文本：op:1:<64 hex>
+        val random = java.security.SecureRandom()
+        val bytes = ByteArray(32).also { random.nextBytes(it) }
+        val hex = bytes.joinToString("") { byte -> "%02x".format(byte) }
+        val operationId = "op:1:" + hex
         val plan: DispatchPlanViewFfi = call {
             val now = nowMillis()
             it.dispatch(
@@ -69,6 +73,7 @@ class NativePluginService(private val native: PluginsFfi) : PluginService {
                 now + 5_000UL,
             )
         }
+        operationOwners[plan.operationId] = plan.pluginId
         return DispatchPlanView(
             pluginId = plan.pluginId,
             extensionPoint = plan.extensionPoint,
@@ -79,9 +84,12 @@ class NativePluginService(private val native: PluginsFfi) : PluginService {
         )
     }
 
+    private val operationOwners = HashMap<String, String>()
+
     override suspend fun finishDispatch(operationId: String, output: String): Unit = call {
-        // finish 需要 pluginId：从 operationId 解析（桥自造格式 op-<plugin>-<nano>）。
-        val pluginId = operationId.removePrefix("op-").substringBeforeLast('-')
+        // finish 需要 pluginId：operation id 本身不含插件信息，桥内记录对应关系。
+        val pluginId = operationOwners[operationId]
+            ?: throw LocalStoreException("PLUGIN_OPERATION_UNKNOWN", "unknown dispatch operation")
         it.finishDispatch(pluginId, operationId, output.toByteArray(Charsets.UTF_8), nowMillis())
     }
 

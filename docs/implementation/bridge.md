@@ -861,5 +861,32 @@ list_plugins() -> Vec<PluginInfoFfi>                     is_open() -> bool      
   `PLUGIN_OPERATION_CONFLICT` / `PLUGIN_OPERATION_UNKNOWN` / `UNKNOWN_EXTENSION_POINT`）；
 - 存储读写需要 `PrivateStorage` 能力且只看自己的命名空间；
 - 测试：[crates/ffi/tests/plugins_ffi.rs](../../crates/ffi/tests/plugins_ffi.rs)（7 个，纯内存）。
+## 身份恢复文件 FFI（IdentityFfi，2026-10-18）
+
+~~~text
+IdentityFfi::open_recovery_target(database_path, master_key_hex, node) -> Arc<IdentityFfi>
+IdentityFfi.export_recovery_bundle(passphrase) -> Vec<u8>
+IdentityFfi.import_recovery_bundle(passphrase, bytes) -> RecoveryImportViewFfi
+RecoveryImportViewFfi { account_id, device_id, account_public_key, device_public_key,
+                        display_name, created_at_ms, devices_digest }
+~~~
+
+- **导出**：需 `open_persisted` 且库里有身份，否则 `INVALID_INPUT`；导出期间短暂释放库独占写锁
+  （之后自动重开并恢复身份句柄）；对象已关闭 → `CORE_CLOSED`。
+- **导入**：只在**空库**上允许，且对象必须已 `shutdown()`，否则 `INVALID_STATE_TRANSITION`；
+  目标库已有身份 → `RECOVERY_TARGET_NOT_EMPTY`（绝不覆盖）；导入后仍需 `open_persisted` 才能用身份。
+- **空库来源**：`open_recovery_target`（打开/创建库 → 确认无身份 → 立即关闭并保持关闭态）。
+- 错误码原样透出：`RECOVERY_BAD_PASSPHRASE` / `RECOVERY_CORRUPTED` / `RECOVERY_UNSUPPORTED` /
+  `RECOVERY_TARGET_NOT_EMPTY` / `INVALID_INPUT` / `CORE_CLOSED` / `INVALID_STATE_TRANSITION`。
+- 测试：[crates/ffi/tests/identity_recovery_ffi.rs](../../crates/ffi/tests/identity_recovery_ffi.rs)（3 个，真临时库）。
+
+复现命令：
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-ffi --test identity_recovery_ffi   # 3 passed
+cargo test --offline -p chat-ffi                                 # 60 passed（既有 57 继续通过）
+~~~
+
 
 ~~~
