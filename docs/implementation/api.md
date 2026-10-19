@@ -699,3 +699,40 @@ GET  /v1/mailbox、GET /v1/groups/{id}/log      // 强制模式下也要带未�
 1. 中间件只记录 HTTP 级结果；业务级细节（哪些对象、正文摘要）不记录（隐私约束）。
 2. 请求标识由调用方可选提供，节点不做跨节点唯一性保证（只保证本节点内可检索）。
 
+## NODE-018 · 审计只读端点 GET /v1/audit（2026-10-19，Windows x64）
+
+审计日志有了，但只有进程内 API（`NodeService::audit_tail`）。本轮开放一个**只读 HTTP 端点**，
+只暴露调用方自己的事件与节点级事件。
+
+### 端点
+
+    GET /v1/audit?limit=N&since_ms=T&kind=K
+    响应 { events: [AuditEventDto], truncated: bool, filtered: u32, audit_enabled: bool }
+    AuditEventDto { kind, at_ms, device_id (null = 节点级), group_id, outcome, code, request_id }
+
+- **设备鉴权必需**（同一套签名挑战；查询串参与签名）；
+- `limit`：默认 50、`1..=200`（越界 400，不静默夹取）；`truncated` 表示还有更早的事件被截掉；
+- `since_ms`：只返回 `at_ms >= since_ms` 的事件；
+- `kind`：白名单 `http / append / control / capability_issue / capability_revoke / auth / rate_limit`，
+  未知种类 400；未知查询参数同样 400；
+- **可见性**：只返回「本设备事件」与「节点级事件（`device_id = null`）」；其它设备的事件被过滤，
+  并计入 `filtered`（不泄漏存在性之外的任何字段）；
+- **审计关闭时**：`200 + events=[] + audit_enabled=false`（不报错、不伪造数据）。
+
+### 证据（`cargo test --offline -p chat-node-api`，36 passed）
+
+- `group_mailbox_http::audit_endpoint_returns_own_and_node_level_events_and_filters_others`：本设备事件与节点级事件可见，
+  另一台设备的事件被过滤且 `filtered >= 1`；
+- `audit_endpoint_validates_kind_and_limit`：已知 kind 200 / 未知 kind 400；`limit=200` 通过、`201`/`0` 400；未知查询参数 400；
+- `audit_endpoint_truncates_and_respects_since_ms`：`limit=2` 时 `truncated=true` 且只回 2 条；`since_ms` 过滤生效；
+- `audit_endpoint_requires_authentication`：**缺失**鉴权头 → 400 `INVALID_REQUEST`（与全仓既有约定一致）；
+  带鉴权头但签名绑定到别的方法 → 401；
+- `audit_endpoint_reports_a_disabled_audit_without_faking_events`：关闭审计后 `audit_enabled=false`、`events` 为空、`truncated=false`。
+
+### 已知限制
+
+1. 没有分页游标：只有 `limit` + `truncated`，要取更早的事件需要用 `since_ms` 反向逼近。
+2. 过滤只按设备归属：群里其它成员的事件、以及「本设备不该看到的群事件」不做二次裁剪（本层不持有群成员关系）。
+3. **缺失鉴权头返回 400 而不是 401**：这是全仓既有约定（`missing_auth_header` → `INVALID_REQUEST`），
+   改成 401 会同时影响所有端点与既有用例，因此本端点沿用；401 保留给「有鉴权头但不合法/过期/签名不符」。
+

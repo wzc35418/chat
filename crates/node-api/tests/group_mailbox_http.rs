@@ -1999,3 +1999,140 @@ async fn revocation_is_limited_to_the_issuing_device_over_http() {
     assert_eq!(again.status, 200);
     assert_eq!(again.json()["revoked"], false);
 }
+
+// ---------------------------------------------------------------- NODE-018 审计只读端点
+
+use chat_node_services::audit::{AuditEvent, AuditOutcome};
+
+/// 往节点审计里注入一条事件（测试专用 helper；生产路径由中间件/handler 写入）。
+fn inject_audit(node: &Node, event: AuditEvent) {
+    node.state
+        .with_service(|service| {
+            service.record_audit(event);
+            Ok(())
+        })
+        .expect("audit injection");
+}
+
+#[tokio::test]
+async fn audit_endpoint_returns_own_and_node_level_events_and_filters_others() {
+    let (node, _group) = setup(NodeAuthPolicy::default()).await;
+    // 本设备事件、节点级事件、其它设备事件各一条。
+    inject_audit(
+        &node,
+        AuditEvent::new("capability_issue", 1_000, AuditOutcome::Ok).with_device(device_text(21)),
+    );
+    inject_audit(&node, AuditEvent::new("http", 1_001, AuditOutcome::Ok));
+    inject_audit(
+        &node,
+        AuditEvent::new("capability_revoke", 1_002, AuditOutcome::Denied)
+            .with_device(device_text(22))
+            .with_code("PERMISSION_DENIED"),
+    );
+
+    let response = get_request(&node, 21, "/v1/audit", "limit=50").await;
+    assert_eq!(response.status, 200, "{}", String::from_utf8_lossy(&response.body));
+    let body = response.json();
+    assert_eq!(body["audit_enabled"], true);
+    let events = body["events"].as_array().expect("events array");
+    // 本设备 + 节点级都会出现；其它设备那条被过滤。
+    assert!(
+        events.iter().any(|event| {
+            event["kind"] == "capability_issue"
+                && event["device_id"] == device_text(21)
+                && event["outcome"] == "ok"
+        }),
+        "the own-device event must be visible: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["kind"] == "http" && event["device_id"].is_null()),
+        "node-level events are visible to every device"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event["kind"] == "capability_revoke" && event["device_id"] == device_text(22)
+        }),
+        "another device event must not leak"
+    );
+    assert!(
+        body["filtered"].as_u64().expect("filtered") >= 1,
+        "filtered events are counted: {body}"
+    );
+}
+
+#[tokio::test]
+async fn audit_endpoint_validates_kind_and_limit() {
+    let (node, _group) = setup(NodeAuthPolicy::default()).await;
+    // kind 白名单：已知种类 200，未知种类 400。
+    let known = get_request(&node, 21, "/v1/audit", "kind=capability_revoke").await;
+    assert_eq!(known.status, 200, "{}", String::from_utf8_lossy(&known.body));
+    let unknown = get_request(&node, 21, "/v1/audit", "kind=everything").await;
+    assert_eq!(unknown.status, 400);
+    assert_eq!(unknown.error_code(), "INVALID_REQUEST");
+    // limit 上限：200 允许，201/0 拒绝。
+    assert_eq!(get_request(&node, 21, "/v1/audit", "limit=200").await.status, 200);
+    let too_large = get_request(&node, 21, "/v1/audit", "limit=201").await;
+    assert_eq!(too_large.status, 400);
+    assert_eq!(too_large.error_code(), "INVALID_REQUEST");
+    assert_eq!(get_request(&node, 21, "/v1/audit", "limit=0").await.status, 400);
+    // 未知查询参数同样 400（签名原文与查询串一致，不做“尽力兼容”）。
+    assert_eq!(get_request(&node, 21, "/v1/audit", "cursor=1").await.status, 400);
+}
+
+#[tokio::test]
+async fn audit_endpoint_truncates_and_respects_since_ms() {
+    let (node, _group) = setup(NodeAuthPolicy::default()).await;
+    let device = device_text(21);
+    for index in 0..5u64 {
+        inject_audit(
+            &node,
+            AuditEvent::new("append", 10_000 + index, AuditOutcome::Ok).with_device(device.clone()),
+        );
+    }
+    let limited = get_request(&node, 21, "/v1/audit", "kind=append&limit=2").await;
+    assert_eq!(limited.status, 200);
+    let body = limited.json();
+    assert_eq!(body["events"].as_array().expect("events").len(), 2);
+    assert_eq!(body["truncated"], true, "more events existed: {body}");
+    // since_ms 只保留不早于该毫秒的事件。
+    let since = get_request(&node, 21, "/v1/audit", "kind=append&since_ms=10003").await;
+    let body = since.json();
+    let events = body["events"].as_array().expect("events");
+    assert_eq!(events.len(), 2, "only the last two events qualify: {events:?}");
+    assert!(events
+        .iter()
+        .all(|event| event["at_ms"].as_u64().expect("at_ms") >= 10_003));
+}
+
+#[tokio::test]
+async fn audit_endpoint_requires_authentication() {
+    let (node, _group) = setup(NodeAuthPolicy::default()).await;
+    // 与全仓约定一致：**缺失**鉴权头 → 400 INVALID_REQUEST（其它端点同款）；
+    // 带着鉴权头但签名绑定不符（签名覆盖 POST 却以 GET 提交）→ 401。
+    let missing = http(&node.address, "GET", "/v1/audit?limit=10", &[], b"").await;
+    assert_eq!(missing.status, 400, "missing auth headers are invalid requests");
+    assert_eq!(missing.error_code(), "INVALID_REQUEST");
+    let wrong_binding = request_headers(&node, 21, "POST", "/v1/audit", "limit=10", b"").await;
+    let denied = http(&node.address, "GET", "/v1/audit?limit=10", &wrong_binding, b"").await;
+    assert_eq!(denied.status, 401, "a signature bound to another method is rejected");
+}
+
+#[tokio::test]
+async fn audit_endpoint_reports_a_disabled_audit_without_faking_events() {
+    let (node, _group) = setup(NodeAuthPolicy::default()).await;
+    inject_audit(
+        &node,
+        AuditEvent::new("http", 5_000, AuditOutcome::Ok).with_device(device_text(21)),
+    );
+    node.state
+        .with_service(|service| service.set_audit_enabled(false))
+        .expect("audit can be disabled under the default policy");
+    let response = get_request(&node, 21, "/v1/audit", "limit=10").await;
+    assert_eq!(response.status, 200, "{}", String::from_utf8_lossy(&response.body));
+    let body = response.json();
+    assert_eq!(body["audit_enabled"], false);
+    assert_eq!(body["events"].as_array().expect("events").len(), 0);
+    assert_eq!(body["truncated"], false);
+}

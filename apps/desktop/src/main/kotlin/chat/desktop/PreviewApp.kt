@@ -641,6 +641,13 @@ fun main() = application {
     // 附件服务在后面创建（需要缓存目录），这里先留引用给早先定义的回调使用。
     val attachmentServiceHolder = remember { mutableStateOf<chat.api.AttachmentService?>(null) }
 
+    /** PRESENTATION 门面：单点编排（缺服务时显式失败，不 mock 成功）。 */
+    fun facadeOf(local: chat.api.LocalStore): chat.presentation.AppFacade = chat.presentation.AppFacade(
+        store = local,
+        attachments = attachmentServiceHolder.value,
+        plugins = pluginService,
+    )
+
     val storeHandlers = StoreHandlers(
         cancelLatestDraft = {
             scope.launch {
@@ -731,25 +738,28 @@ fun main() = application {
                 val conversationId = storeState.selectedConversationId ?: return@launch
                 val attachmentService = attachmentServiceHolder.value ?: return@launch
                 storeState = storeState.beginBusy()
-                runCatching {
-                    val page = local.listMessages(conversationId, null, 20)
-                    var updated = storeState
-                    for (message in page.items) {
-                        updated = updated.withMessagePreview(message.messageId, message.body)
-                        val ids = runCatching { local.messageAttachmentIds(message.messageId) }.getOrDefault(emptyList())
-                        val cards = if (ids.isEmpty()) emptyList() else {
-                            runCatching { attachmentService.records(ids).map { it.toCard() } }.getOrDefault(emptyList())
-                        }
-                        updated = updated.withMessageCards(message.messageId, cards)
+                // 走 PRESENTATION 门面：消息 + 附件卡片一次编排，缺失/失败显式计数。
+                when (val opened = facadeOf(local).openConversation(conversationId, null, 20)) {
+                    is chat.presentation.UseCaseResult.Failed -> {
+                        storeState = storeState.withError(opened.code, opened.message)
                     }
-                    updated
-                }.onSuccess { storeState = it }
-                    .onFailure { error ->
-                        storeState = storeState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
-                            error.message,
+                    is chat.presentation.UseCaseResult.Ok -> {
+                        var updated = storeState
+                        for (message in opened.value.messages) {
+                            updated = updated.withMessagePreview(message.messageId, message.body)
+                            updated = updated.withMessageCards(
+                                message.messageId,
+                                opened.value.cardsByMessage[message.messageId] ?: emptyList(),
+                            )
+                        }
+                        storeState = updated.copy(
+                            busy = false,
+                            notice = "已加载 " + opened.value.messages.size + " 条消息；无附件 " +
+                                opened.value.messagesWithoutAttachments + " 条，取卡片失败 " +
+                                opened.value.messagesWithFailedAttachments + " 条",
                         )
                     }
+                }
             }
         },
         downloadCard = { attachmentId ->

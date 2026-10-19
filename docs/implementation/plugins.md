@@ -795,6 +795,54 @@ PluginInfoFfi     { plugin_id, running, extension_points, version, manifest: Man
 2. **库与宿主不是同一个物理事务**：库先写、宿主后提交，宿主失败时用补偿写回（本进程内可见的原子性，
    进程崩溃在两步之间仍可能留下"库有行、宿主未加载"——重开时会重新加载，属可恢复状态）；
 3. 升级不迁移插件私有 KV（storage 按 plugin id 保留）。
+## 插件私有 KV 升级迁移与残留清理（2026-10-18）
+
+### storage（[crates/storage/src/formal/plugins.rs](../../crates/storage/src/formal/plugins.rs)）
+
+~~~text
+plugin_kv_rename_or_keep(plugin_id, from, to, policy) -> KvMigrationReport
+KvMigrationPolicy::Keep            // 默认：旧键原样保留
+KvMigrationPolicy::Namespace       // 把旧键复制到 v<from>/ 前缀下（原键保留）
+KvMigrationReport { copied, kept, prefix, plugin_id, from, to }
+plugin_kv_keys(plugin_id) -> Vec<String>
+purge_uninstalled_plugins(older_than_ms, limit) -> u64
+const MAX_PLUGIN_PURGE = 256;  STATE_UNINSTALLED = "uninstalled"
+~~~
+
+- **绝不静默删除**：`Keep` 不动 KV；`Namespace` **只增不删**，原键仍在；
+- `Namespace` 幂等：已经在新前缀里的键**跳过**（否则每次重跑都会叠一层 `v1.0.0/v1.0.0/...`）；
+- 同前缀下已存在且**值不同** → `INVALID_INPUT`（不覆盖别人的数据）；条目/字节配额会超 → 显式报错（不半迁移）；
+- `purge_uninstalled_plugins` 只删 `state = uninstalled` 且 `updated_at_ms < 阈值`（**严格小于**）的行，
+  KV 由 0010 的外键 `ON DELETE CASCADE` 一并清空；单次最多 [`MAX_PLUGIN_PURGE`] 行。
+
+### FFI（PluginsFfi）
+
+~~~text
+PluginsFfi.purge_uninstalled_plugins(older_than_ms: u64) -> u32     // 只删 uninstalled 行 + KV，≤256
+PluginsFfi.install_package(...)                                     // 升级路径按 Keep 处理 KV
+~~~
+
+- 升级 `install_package` 成功后显式调用 `plugin_kv_rename_or_keep(..., Keep)`：旧键原样保留；
+  插件行的 `state/updated_at_ms` 由 upsert 刷新；Keep 失败会把插件行恢复成旧版本（不变半状态）；
+- 纯内存对象 → `INVALID_STATE_TRANSITION`。
+
+### 证据
+
+[crates/ffi/tests/plugins_kv_upgrade.rs](../../crates/ffi/tests/plugins_kv_upgrade.rs)（5 个，真库）：
+Keep 升级后旧键仍可读且重开仍可读；Namespace 迁移后 `v1.0.0/a` 可读、原键 `a` 仍在、重跑 `copied=0`；
+`uninstalled` 行清理前后对比（行与 KV 都没了）；阈值**严格小于**边界（等值不删、+1 删）、
+上限 0 / 257 显式拒绝、非 uninstalled 行永不清理；258 行批量清理第一次 256、第二次 2。
+
+复现：`cargo test --offline -p chat-ffi --test plugins_kv_upgrade` → 5 passed；
+`cargo test --offline -p chat-storage -p chat-ffi` → **166 passed**（既有 95 / 66 继续通过）。
+
+### 已知限制
+
+1. **Namespace 迁移是逐键写入**（每个键一个 storage 事务）：中途失败时已写入的副本**不会删除**
+   （安全方向是"只增不删"），重跑会跳过已复制的键；但没有跨键的单一物理事务。
+2. 部分迁移若恰好突破配额，会在预检阶段就拒绝（预检按最坏情况合计），仍不做半迁移。
+3. **清理只认 `uninstalled`**：`installed/stopped/running` 行即使很久没更新也不会被删。
+
 
 
 

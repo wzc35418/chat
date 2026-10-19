@@ -358,6 +358,214 @@ impl Store {
     }
 }
 
+
+/// KV 迁移策略（插件版本升级时如何对待旧命名空间的键值）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvMigrationPolicy {
+    /// **默认**：旧键原样保留（升级后仍可直接读）。
+    Keep,
+    /// 把旧键**复制**到 `v<from>/` 前缀下（新命名空间），**原键保留**（绝不静默删除）。
+    Namespace,
+}
+
+/// KV 迁移结果（纯数据）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvMigrationReport {
+    /// 复制到新前缀的键数（`Keep` 恒为 0）。
+    pub copied: u64,
+    /// 原样保留的键数。
+    pub kept: u64,
+    /// 新前缀（`Keep` 为 `None`）。
+    pub prefix: Option<String>,
+    /// 插件 ID（诊断用）。
+    pub plugin_id: String,
+    /// 旧版本文本（诊断用）。
+    pub from: String,
+    /// 新版本文本（诊断用）。
+    pub to: String,
+}
+
+/// 单个插件最多一次清理多少行（与 `MAX_PLUGIN_ROWS` 一致）。
+pub const MAX_PLUGIN_PURGE: usize = 256;
+/// `uninstalled` 行状态文本（卸载时上层写入，清理只认这个值）。
+pub const STATE_UNINSTALLED: &str = "uninstalled";
+
+impl Store {
+    /// 升级时的 KV 处理：`Keep`（默认，原样保留）或 `Namespace`（复制到 `v<from>/` 前缀）。
+    ///
+    /// - **绝不删除**旧键；`Namespace` 只增不删，且对"已经复制过"的键幂等跳过；
+    /// - 同前缀下已存在且值不同 → 显式 `INVALID_INPUT`（不覆盖别人的数据）；
+    /// - 复制会突破条目/字节配额 → 显式报错（不做半迁移）。
+    pub fn plugin_kv_rename_or_keep(
+        &mut self,
+        plugin_id: &str,
+        from: &str,
+        to: &str,
+        policy: KvMigrationPolicy,
+    ) -> Result<KvMigrationReport> {
+        self.ensure_ready()?;
+        validate_plugin_id(plugin_id)?;
+        validate_key(from)?;
+        validate_key(to)?;
+        let existing = self.plugin_kv_keys(plugin_id)?;
+        let kept = existing.len() as u64;
+        let Some(prefix) = namespace_prefix(policy, from)? else {
+            return Ok(KvMigrationReport {
+                copied: 0,
+                kept,
+                prefix: None,
+                plugin_id: plugin_id.to_owned(),
+                from: from.to_owned(),
+                to: to.to_owned(),
+            });
+        };
+        let mut plan: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut plain_bytes: u64 = 0;
+        for key in &existing {
+            // 已经在新命名空间里的键不再迁移（否则每次重跑都会叠加一层前缀）。
+            if key.starts_with(&prefix) {
+                continue;
+            }
+            let Some(value) = self.plugin_kv_get(plugin_id, key)? else {
+                continue;
+            };
+            plain_bytes = plain_bytes.saturating_add(value.len() as u64);
+            let target = format!("{prefix}{key}");
+            if target.len() > MAX_PLUGIN_KEY_BYTES {
+                return Err(StorageError::InvalidInput(
+                    "migrated key exceeds the key length limit".to_owned(),
+                ));
+            }
+            if let Some(current) = self.plugin_kv_get(plugin_id, &target)? {
+                if current == value {
+                    continue; // 已复制过（幂等重跑）
+                }
+                return Err(StorageError::InvalidInput(
+                    "the migration prefix already holds a different value".to_owned(),
+                ));
+            }
+            plan.push((target, value));
+        }
+        let copies = plan.len() as u64;
+        if copies > 0 {
+            if existing.len().saturating_add(plan.len()) > MAX_PLUGIN_KV_ENTRIES {
+                return Err(StorageError::InvalidInput(
+                    "migrating the plugin namespace would exceed the entry limit".to_owned(),
+                ));
+            }
+            let copy_bytes: u64 = plan.iter().map(|(_, value)| value.len() as u64).sum();
+            if plain_bytes.saturating_add(copy_bytes) > MAX_PLUGIN_KV_TOTAL_BYTES as u64 {
+                return Err(StorageError::InvalidInput(
+                    "migrating the plugin namespace would exceed the byte limit".to_owned(),
+                ));
+            }
+            for (key, value) in &plan {
+                self.plugin_kv_set(plugin_id, key, value)?;
+            }
+        }
+        Ok(KvMigrationReport {
+            copied: copies,
+            kept,
+            prefix: Some(prefix),
+            plugin_id: plugin_id.to_owned(),
+            from: from.to_owned(),
+            to: to.to_owned(),
+        })
+    }
+
+    /// 该插件命名空间里的全部键（升序）。
+    pub fn plugin_kv_keys(&self, plugin_id: &str) -> Result<Vec<String>> {
+        self.ensure_ready()?;
+        validate_plugin_id(plugin_id)?;
+        let connection = self.connection();
+        let mut statement = connection
+            .prepare("SELECT key FROM plugin_kv WHERE plugin_id = ?1 ORDER BY key ASC")
+            .map_err(StorageError::from)?;
+        let rows = statement
+            .query_map([plugin_id], |row| row.get::<usize, String>(0))
+            .map_err(StorageError::from)?;
+        let mut keys = Vec::new();
+        for row in rows {
+            keys.push(row.map_err(StorageError::from)?);
+        }
+        Ok(keys)
+    }
+
+    /// 清理 `uninstalled` 且最后更新早于阈值（**严格小于**）的插件行（同事务级联清 KV）。
+    ///
+    /// 只删 `state = 'uninstalled'` 的行；单次最多 [`MAX_PLUGIN_PURGE`] 行（updated_at 升序）。
+    pub fn purge_uninstalled_plugins(&mut self, older_than_ms: i64, limit: usize) -> Result<u64> {
+        self.ensure_ready()?;
+        if older_than_ms < 0 {
+            return Err(StorageError::InvalidInput(
+                "purge threshold must be a non-negative timestamp".to_owned(),
+            ));
+        }
+        if limit == 0 || limit > MAX_PLUGIN_PURGE {
+            return Err(StorageError::InvalidInput(
+                "purge limit must be within 1..=256".to_owned(),
+            ));
+        }
+        let mut transaction = self.begin_transaction(WriteScope::inbound("plugins"))?;
+        let outcome = (|| -> Result<u64> {
+            let mut ids = Vec::new();
+            {
+                let mut statement = transaction
+                    .transaction
+                    .prepare(
+                        "SELECT id FROM plugins
+                          WHERE state = ?1 AND updated_at_ms < ?2
+                          ORDER BY updated_at_ms ASC, id ASC LIMIT ?3",
+                    )
+                    .map_err(StorageError::from)?;
+                let rows = statement
+                    .query_map(
+                        params![STATE_UNINSTALLED, older_than_ms, limit as i64],
+                        |row| row.get::<usize, String>(0),
+                    )
+                    .map_err(StorageError::from)?;
+                for row in rows {
+                    ids.push(row.map_err(StorageError::from)?);
+                }
+            }
+            let mut removed = 0_u64;
+            for id in ids {
+                removed += transaction
+                    .transaction
+                    .execute("DELETE FROM plugins WHERE id = ?1", [id])
+                    .map_err(StorageError::from)? as u64;
+            }
+            Ok(removed)
+        })();
+        match outcome {
+            Ok(removed) => {
+                commit_transaction(transaction)?;
+                Ok(removed)
+            }
+            Err(error) => {
+                transaction.poison();
+                let _ = rollback_transaction(transaction);
+                Err(error)
+            }
+        }
+    }
+}
+
+/// 迁移目标前缀（`Namespace` → `v<from>/`；`Keep` → `None`）。
+fn namespace_prefix(policy: KvMigrationPolicy, from: &str) -> Result<Option<String>> {
+    match policy {
+        KvMigrationPolicy::Keep => Ok(None),
+        KvMigrationPolicy::Namespace => {
+            let prefix = format!("v{from}/");
+            if prefix.len() > MAX_PLUGIN_KEY_BYTES {
+                return Err(StorageError::InvalidInput(
+                    "the migration prefix is too long".to_owned(),
+                ));
+            }
+            Ok(Some(prefix))
+        }
+    }
+}
 /// 插件 KV 的 AAD（绑定 plugin_id 与 key，跨插件/跨键不可互换）。
 fn plugin_kv_aad(plugin_id: &str, key: &str) -> Vec<u8> {
     let mut aad = Vec::with_capacity(plugin_id.len() + key.len() + 32);

@@ -597,3 +597,84 @@ impl CapabilityResponseDto {
         }
     }
 }
+
+// ---------------------------------------------------------------- NODE-018 审计只读端点
+
+/// 允许查询的审计种类白名单。
+pub const AUDIT_KIND_WHITELIST: [&str; 7] = [
+    "http",
+    "append",
+    "control",
+    "capability_issue",
+    "capability_revoke",
+    "auth",
+    "rate_limit",
+];
+
+/// 审计查询默认条数。
+pub const DEFAULT_AUDIT_LIMIT: u32 = 50;
+/// 审计查询条数上限。
+pub const MAX_AUDIT_LIMIT: u32 = 200;
+
+/// 一条审计事件（只含元数据；不含正文/令牌/密钥）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AuditEventDto {
+    /// 事件种类。
+    pub kind: String,
+    /// 事件时间（Unix 毫秒）。
+    pub at_ms: u64,
+    /// 相关设备（节点级事件为 null）。
+    pub device_id: Option<String>,
+    /// 相关群。
+    pub group_id: Option<String>,
+    /// 结果：ok / denied / failed。
+    pub outcome: String,
+    /// 稳定错误码（成功为 null）。
+    pub code: Option<String>,
+    /// 请求标识。
+    pub request_id: Option<String>,
+}
+
+/// GET /v1/audit 的响应。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AuditResponseDto {
+    /// 事件列表（最旧的在前）。
+    pub events: Vec<AuditEventDto>,
+    /// 是否因为 `limit` 截断（还有更早的事件没返回）。
+    pub truncated: bool,
+    /// 因**不是本设备且不是节点级**而被过滤掉的事件数。
+    pub filtered: u32,
+    /// 节点审计当前是否开启（关闭时 `events` 恒为空，不伪造）。
+    pub audit_enabled: bool,
+}
+
+impl AuditResponseDto {
+    /// 由服务层事件构造响应（调用方已完成权限过滤与截断）。
+    pub fn new(
+        events: Vec<chat_node_services::audit::AuditEvent>,
+        truncated: bool,
+        filtered: u32,
+        audit_enabled: bool,
+    ) -> Self {
+        Self {
+            events: events.into_iter().map(audit_event_dto).collect(),
+            truncated,
+            filtered,
+            audit_enabled,
+        }
+    }
+}
+
+/// 把服务层审计事件投影成 DTO（只搬元数据）。
+pub fn audit_event_dto(event: chat_node_services::audit::AuditEvent) -> AuditEventDto {
+    AuditEventDto {
+        kind: event.kind,
+        at_ms: event.at_ms,
+        device_id: event.device_id,
+        group_id: event.group_id,
+        outcome: event.outcome.as_str().to_owned(),
+        code: event.code.map(str::to_owned),
+        request_id: event.request_id,
+    }
+}
+

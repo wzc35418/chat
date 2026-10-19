@@ -477,6 +477,7 @@ impl PluginsFfi {
         // 版本基线取自**库**里的已装行（重开后仍然一致）。
         let rows = store.load_plugins().map_err(storage_failure)?;
         let previous = rows.into_iter().find(|row| row.id == plugin_id);
+        let mut previous_version_text: Option<String> = None;
         let upgraded_from = match &previous {
             None => None,
             Some(row) => {
@@ -490,14 +491,32 @@ impl PluginsFfi {
                         to: manifest.version,
                     }));
                 }
-                Some(version_text(installed.version))
+                let text = version_text(installed.version);
+                previous_version_text = Some(text.clone());
+                Some(text)
             }
         };
         transaction.stage().map_err(failure)?;
-        // ① 落库：单条 upsert 就是一个 storage 事务。
+        // ① 落库：单条 upsert 就是一个 storage 事务（同时刷新 state/updated_at_ms）。
         store
             .upsert_plugin(&plugin_id, &manifest_json, STATE_INSTALLED)
             .map_err(storage_failure)?;
+        // ①b 升级路径的私有 KV：**Keep**（默认）原样保留；失败就整体回滚到旧的插件行。
+        if let Some(from_version) = previous_version_text.as_deref() {
+            if let Err(error) = store.plugin_kv_rename_or_keep(
+                &plugin_id,
+                from_version,
+                &new_version_text,
+                chat_storage::formal::KvMigrationPolicy::Keep,
+            ) {
+                if let Some(row) = &previous {
+                    let _ = store.upsert_plugin(&row.id, &row.manifest_json, &row.state);
+                } else {
+                    let _ = store.delete_plugin(&plugin_id);
+                }
+                return Err(storage_failure(error));
+            }
+        }
         // ② 内存宿主提交；失败则把库恢复成提交前的样子。
         match transaction.commit(host) {
             Ok(_) => Ok(InstallOutcomeFfi {
@@ -680,6 +699,34 @@ impl PluginsFfi {
             .host
             .data_put(&runtime, &key, &value)
             .map_err(failure)
+    }
+
+    /// PLUGINS：清理**已卸载**的插件残留（行 + 私有 KV）。
+    ///
+    /// - 只删 `state = uninstalled` 且 `updated_at_ms < older_than_ms`（严格小于）的行；
+    /// - 每行删除时 `plugin_kv` 由外键级联清空（0010 的 ON DELETE CASCADE）；
+    /// - 单次最多 256 行，返回实际删除数；纯内存对象 → `INVALID_STATE_TRANSITION`。
+    pub fn purge_uninstalled_plugins(&self, older_than_ms: u64) -> Result<u32, FfiError> {
+        let mut inner = self.lock()?;
+        if inner.closed {
+            return Err(core_closed());
+        }
+        let Inner { store, .. } = &mut *inner;
+        let Some(store) = store.as_mut() else {
+            return Err(FfiError::Store {
+                code: "INVALID_STATE_TRANSITION".to_owned(),
+                reason: "purge_uninstalled_plugins requires the persistent plugin host"
+                    .to_owned(),
+            });
+        };
+        let threshold = i64::try_from(older_than_ms).map_err(|_| FfiError::Store {
+            code: "INVALID_INPUT".to_owned(),
+            reason: "the purge threshold is out of range".to_owned(),
+        })?;
+        let removed = store
+            .purge_uninstalled_plugins(threshold, chat_storage::formal::MAX_PLUGIN_PURGE)
+            .map_err(storage_failure)?;
+        Ok(u32::try_from(removed).unwrap_or(u32::MAX))
     }
 
     /// 已安装插件列表（纯数据）。

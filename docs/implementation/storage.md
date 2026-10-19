@@ -1072,6 +1072,29 @@ plugin_kv_delete_all(plugin_id) -> u64
 cargo test --offline -p chat-storage   # 94 passed
 cargo test --offline -p chat-ffi       # 57 passed
 ~~~
+## 插件 KV 迁移与残留清理（2026-10-18）
+
+~~~text
+pub fn plugin_kv_rename_or_keep(&mut self, plugin_id, from, to, policy: KvMigrationPolicy)
+    -> Result<KvMigrationReport>
+pub fn plugin_kv_keys(&self, plugin_id) -> Result<Vec<String>>
+pub fn purge_uninstalled_plugins(&mut self, older_than_ms: i64, limit: usize) -> Result<u64>
+
+KvMigrationPolicy::{Keep, Namespace}
+KvMigrationReport { copied, kept, prefix, plugin_id, from, to }
+pub const MAX_PLUGIN_PURGE: usize = 256;
+pub const STATE_UNINSTALLED: &str = "uninstalled";
+~~~
+
+- `Keep`：只回报 `kept`，不改任何键值（升级默认策略）；
+- `Namespace`：把每个旧键**复制**成 `v<from>/<old_key>`（**原键保留**）；已经带该前缀的键跳过（幂等，
+  否则每次重跑都会叠一层前缀）；同目标键值不同 → `INVALID_INPUT`；预计超条目/字节配额 → `INVALID_INPUT`；
+- `purge_uninstalled_plugins`：`state = uninstalled AND updated_at_ms < older_than_ms`（**严格小于**）
+  按 `updated_at_ms ASC, id ASC` 取前 `limit`（1..=256）行删除，KV 随外键级联清空，返回实际删除行数；
+  `limit == 0` 或超过 256 → 显式 `INVALID_INPUT`。
+
+复现：`cargo test --offline -p chat-storage -p chat-ffi` → 166 passed（既有 95 / 66 继续通过）。
+
 
 
 

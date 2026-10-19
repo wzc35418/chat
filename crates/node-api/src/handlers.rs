@@ -30,6 +30,7 @@ use crate::dto::{
     GroupLogResponseDto, GroupRegistrationResponseDto, MailboxPageResponseDto,
     MailboxReceiptResponseDto, RegisterDeviceRequestDto, RegisterGroupRequestDto,
     CapabilityResponseDto, HealthResponseDto, IssueCapabilityRequestDto,
+    AuditResponseDto, AUDIT_KIND_WHITELIST, DEFAULT_AUDIT_LIMIT, MAX_AUDIT_LIMIT,
     RevokeCapabilityRequestDto, RevokeCapabilityResponseDto, SignedAuthHeaders,
     StoreMailboxItemRequestDto, UploadSessionResponseDto, parse_chunk_index,
 };
@@ -61,6 +62,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/mailbox", get(read_mailbox_page))
         .route("/v1/mailbox/ack", post(ack_mailbox_items))
         .route("/v1/capabilities", post(issue_capability))
+        // NODE-018：审计只读端点（设备鉴权；只暴露本设备与节点级事件）。
+        .route("/v1/audit", get(audit_tail))
         // CAP-REV：撤销能力令牌（设备鉴权；撤销立即生效）。
         .route("/v1/capabilities/{token_id}/revoke", post(revoke_capability))
         .route("/v1/blobs", post(begin_blob_upload))
@@ -122,6 +125,78 @@ pub async fn request_audit_layer(
     let now_ms = state.now().saturating_mul(1_000);
     state.record_http_audit(&request_id, outcome, None, now_ms);
     response
+}
+
+/// GET /v1/audit?limit=N&since_ms=T&kind=K：读取本设备可见的审计事件（NODE-018）。
+///
+/// 语义：
+/// - 设备鉴权必需（与其它端点同一套签名挑战；未鉴权 → 401）；
+/// - `limit` 默认 50、上限 200（越界 400，不静默夹取）；`since_ms` 只返回不早于该毫秒的事件；
+/// - `kind` 必须命中白名单，未知种类 → 400；
+/// - **只暴露本设备事件或节点级事件（`device_id = null`）**，其余过滤并计入 `filtered`；
+/// - 审计关闭时返回空列表 + `audit_enabled = false`（不报错、不伪造）。
+pub async fn audit_tail(
+    State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let mut query = parse_query(uri.query().unwrap_or(""))?;
+    let limit = take_number::<u32>(&mut query, "limit")?.unwrap_or(DEFAULT_AUDIT_LIMIT);
+    if limit == 0 || limit > MAX_AUDIT_LIMIT {
+        return Err(ApiError::invalid_request("limit must be within 1..=200"));
+    }
+    let since_ms = take_number::<u64>(&mut query, "since_ms")?.unwrap_or(0);
+    let kind = match query.remove("kind") {
+        Some(kind) => {
+            if !AUDIT_KIND_WHITELIST.contains(&kind.as_str()) {
+                return Err(ApiError::invalid_request("kind is not a known audit kind"));
+            }
+            Some(kind)
+        }
+        None => None,
+    };
+    ensure_no_unknown_query(&query)?;
+    let now = state.now();
+    let actor = authenticate(&state, &headers, &uri, "GET", b"", now)?;
+    let response = state.with_service(|service| {
+        let enabled = service.audit_enabled();
+        if !enabled {
+            return Ok(AuditResponseDto::new(Vec::new(), false, 0, false));
+        }
+        // 扫全部（受环形容量限制）后按可见性/种类/时间过滤，最后按 limit 截断。
+        let scanned = service.audit_tail(chat_node_services::audit::AUDIT_CAPACITY);
+        let mut visible = Vec::new();
+        let mut filtered = 0u32;
+        for event in scanned {
+            if event.at_ms < since_ms {
+                continue;
+            }
+            if let Some(kind) = kind.as_deref() {
+                if event.kind != kind {
+                    continue;
+                }
+            }
+            // 可见性：节点级（device_id = None）或本设备；其余一律过滤并计数。
+            match event.device_id.as_deref() {
+                None => {}
+                Some(device) if device == actor.device_id => {}
+                Some(_) => {
+                    filtered = filtered.saturating_add(1);
+                    continue;
+                }
+            }
+            visible.push(event);
+        }
+        let total = visible.len();
+        let take = usize::try_from(limit).unwrap_or(usize::MAX);
+        let truncated = total > take;
+        if truncated {
+            // 保留最近的 limit 条（最旧的在前）。
+            visible.drain(..total - take);
+        }
+        Ok(AuditResponseDto::new(visible, truncated, filtered, true))
+    })?;
+    Ok(Json(response).into_response())
 }
 
 fn ensure_body_bounded(state: &AppState, length: usize) -> Result<(), ApiError> {
