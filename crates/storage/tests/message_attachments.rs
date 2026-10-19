@@ -103,8 +103,8 @@ fn message_attachment_refs_are_idempotent_and_cascade() {
     let mut store = fixture.open();
     assert_eq!(
         store.schema_version(),
-        10,
-        "0009 adds message attachments + 0010 plugins"
+        11,
+        "0009 adds message attachments + 0010 plugins + 0011 credential directory"
     );
     store
         .save_attachment(attachment("att-ref", "imported", 1_000))

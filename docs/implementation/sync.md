@@ -6,6 +6,36 @@
 
 返回类型与字段约束见 [类型字典](TYPES.md)，事务编号见 [事务和并发约定](TRANSACTIONS.md)，纵向流程见 [关键调用链](FLOWS.md)。所有 Result<T> 表示显式可恢复错误，不允许安全验证失败后继续推进。
 
+## 作者账户：凭据目录映射（SYNC-002 补全，2026-10-19，Windows x64）
+
+同步 apply 与应用消息落库以前用**确定性占位**把作者凭据变成账户 ID，别的设备无法把它对上真实账户。
+本轮改走 `crates/storage` 的 0011 凭据目录（见 storage.md）：
+
+- `sync_worker::resolve_author_account(store, credential) -> (账户文本, 是否已知)`：目录命中 → 目录里的
+  `account_id`（`known = true`）；未命中 → 确定性占位（`known = false`），调用方必须计数；
+- `apply_verified_page`（现在公开，作为拉取管线的 apply 步骤可被诊断/测试直接调用）在落库每条应用消息前
+  解析作者：已知 → 真实账户，未知 → 占位并 `ApplyReport::unknown_authors += 1`；
+- `ApplyReport` 新增字段 `unknown_authors: u64`（**绝不静默伪造**：未知作者既不丢消息也不假装已知）。
+
+目录的写入点在 core 的群路径：`create_group(_with_welcome)` 与 `group_join_from_welcome` 成功后把本机与
+已知成员的凭据（含 `device_id`）写一次（`sync_credential_directory`，幂等 upsert）。
+
+### 证据
+
+- `credential_directory::creating_a_group_writes_the_credential_directory`：建群后目录含 alice/bob 两条、
+  ID 都是 32 字节且 account ≠ device；`resolve_author_account("alice")` 返回目录里的账户（known = true），
+  未知凭据返回占位（known = false）；`ApplyReport::default().unknown_authors == 0`。
+- `credential_directory::joining_writes_the_directory_and_unknown_credentials_count_as_placeholders`：
+  加入侧同样写入两条；删掉 alice 的映射后同一凭据只能拿到占位（对应 apply 时的 `unknown_authors` 计数）。
+
+### 已知限制
+
+1. **未知作者的端到端计数未用真节点覆盖**：构造带签名的 `LogEntry` 需要节点回执与候选签名，本轮用
+   `resolve_author_account` 的 known/unknown 分支 + `ApplyReport` 字段做代理验证；接节点夹具后可补一条
+   端到端用例。
+2. **目录只在建群/入群写入**：成员后续增删不刷新目录（凭据不变，故目前够用）；身份层接入后应补。
+3. **account 值仍是本机派生**（见 storage.md 限制 1）。
+
 ## 重试/信箱/发送调度实现记录（2026-10-18，Windows x64）
 
 本轮实现 sync 的**纯逻辑部分**（不连网、不连库、不 sleep），网络与持久化通过 trait/端口注入：

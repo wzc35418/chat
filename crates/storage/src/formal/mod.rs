@@ -13,6 +13,7 @@
 
 mod attachments;
 mod cursor;
+mod directory;
 mod entry;
 mod error;
 mod identity;
@@ -32,6 +33,10 @@ pub use attachments::{
     MAX_ATTACHMENT_PLAIN_BYTES, MAX_ATTACHMENT_PROGRESS_ID_BYTES, MAX_MESSAGE_ATTACHMENT_LIST,
 };
 pub use cursor::PageCursor;
+pub use directory::{
+    CREDENTIAL_DIRECTORY_ID_BYTES, CredentialDirectoryRecord, MAX_CREDENTIAL_BYTES,
+    MAX_CREDENTIAL_DIRECTORY_ROWS,
+};
 pub use entry::{
     AppliedEntry, MAX_SESSION_PREVIEW_CHARS, MAX_SESSION_TITLE_BYTES, SessionSummary,
     VerifiedEntryInput, apply_verified_entry, materialize_session, verified_entry_submission_id,

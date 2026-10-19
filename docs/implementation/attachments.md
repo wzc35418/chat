@@ -674,4 +674,68 @@ cargo test --offline -p chat-core                                   # 212 passed
    永不参与路径拼接；落库前的 `validate_display_name` 仍会拒绝分隔符）。
 4. **老客户端收不到名字**：v2 字段对 v1 解析器是新版本，会按"不支持版本"拒绝——需要老客户端升级
    才能读新消息的字段 57（v1 解析器只认 version=1）。
+## 字段 57 双版本兼容窗口（ATTACHMENTS metadata v1↔v2，2026-10-18，Windows x64）
+
+上一轮把展示名放进了字段 57，但放在 binding **之前**——老 v1 解析器会把名字段当 binding，
+等于"老客户端读新消息即损坏"。本轮把展示名改成**尾部追加段**并开兼容窗口。
+
+代码：[crates/core/src/attachments.rs](../../crates/core/src/attachments.rs)（定点）；
+测试：[crates/core/tests/attachment_metadata_compat.rs](../../crates/core/tests/attachment_metadata_compat.rs)（4 个，字节级）。
+
+### 最终布局
+
+~~~text
+所有版本共享的前缀（v1 逐字节不变）：
+  version(1) ‖ file_id(16) ‖ plain_size(8) ‖ ciphertext_bytes(8) ‖ chunk_bytes(4)
+  ‖ chunk_count(4) ‖ content_digest(32) ‖ ciphertext_digest(32)
+  ‖ descriptor_len(2) ‖ descriptor ‖ binding(32)
+v2 在**末尾追加**：name_len(1) ‖ display_name(UTF-8 ≤128 字节)
+~~~
+
+版本登记表：`ATTACHMENT_METADATA_VERSIONS = [1, 2]`，`attachment_metadata_version_supported(v)`
+是唯一判定入口；**未登记版本（0、3、9、255…）一律显式拒绝**（`ATTACHMENT_CORRUPTED`），绝不猜布局。
+
+### 兼容窗口语义
+
+| 输入 | 结果 |
+|---|---|
+| v1 主体（无尾部） | 正常解析，展示名回退 `attachment` |
+| v1 主体 + 任意尾部多余字节（发送方是 v2） | **忽略尾部**、回退占位名、不报错 |
+| v2 主体 + 合法 `name_len‖name` | 用尾部段里的名字（清洗后） |
+| v2 但完全没有尾部段 | `ATTACHMENT_CORRUPTED`（v2 必须带名字段） |
+| v2 但前缀长度与实际尾部不符（多/少一字节） | `ATTACHMENT_CORRUPTED` |
+| v2 名字 > 128 字节或不是 UTF-8 | `ATTACHMENT_CORRUPTED` |
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test attachment_metadata_compat   # 4 passed
+cargo test --offline -p chat-core --test attachment_display_name      # 4 passed（布局改动后仍绿）
+cargo test --offline -p chat-core                                     # 216 passed（既有 212 继续通过）
+~~~
+
+### 证据
+
+- `attachment_metadata_compat::a_v1_view_accepts_v2_bytes_and_falls_back_to_the_placeholder`：
+  v2 字节用 v2 视角解析得到真实名字；把版本字节改回 1（模拟老解析器）后仍能解析，展示名回退占位，
+  且 `file_id/binding/chunk_count` 与 v2 视角完全一致。
+- `attachment_metadata_compat::plain_v1_metadata_is_unchanged`：纯 v1 正常解析；v1 后跟 9 个多余字节
+  也被忽略（binding 不变）。
+- `attachment_metadata_compat::unknown_versions_are_rejected_and_are_not_registered`：
+  登记表就是 `[1, 2]`；版本 0/3/9/255 全部 `ATTACHMENT_CORRUPTED`。
+- `attachment_metadata_compat::v2_trailer_bounds_and_shape_are_still_enforced`：
+  名字 129 字节、尾部多一字节、尾部被截断、v2 无尾部段、非 UTF-8 名字全部拒绝；
+  128 字节边界可以解析。
+
+### 已知限制
+
+1. **老解析器仍会把 v2 的版本字节当未知版本拒绝**：兼容窗口在**新版解析器**里实现（v1 语义读 v2 字节）。
+   真正让"未升级的旧客户端"读新消息，需要旧客户端本身按 v1 语义忽略尾部——即必须发一个只放宽
+   版本检查、不解释尾部的过渡版本。
+2. **尾部段无长度校验上限之外的语义**：名字仍在 512 字节总预算内；描述符接近 256 上限时，
+   长名字会让总长超限而显式 `CONTENT_TOO_LARGE`。
+3. **v2 必须带名字段**（哪怕空名也要写 `name_len=0` 的回退字节）：这是"版本=结构存在"的约定，
+   避免同一版本有两种形状。
+
 

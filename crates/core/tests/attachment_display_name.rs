@@ -201,22 +201,22 @@ fn legacy_metadata_without_a_name_falls_back_to_the_placeholder() {
     assert_eq!(parsed.chunk_count, 1);
 }
 
-/// 把 v2 元数据改写成 v1（删掉 `name_len ‖ name` 段，版本号置 1）。
+/// 把 v2 元数据改写成 v1：名字是**尾部追加段**，砍掉尾部并把版本号置 1。
 fn strip_display_name(metadata: &[u8]) -> Vec<u8> {
-    const HEADER: usize = 1 + 16 + 8 + 8 + 4 + 4 + 32 + 32 + 2;
-    let mut cursor = HEADER;
-    let descriptor_len = usize::from(u16::from_be_bytes([
-        metadata[HEADER - 2],
-        metadata[HEADER - 1],
-    ]));
-    cursor += descriptor_len;
-    let name_len = usize::from(metadata[cursor]);
-    let mut legacy = Vec::with_capacity(metadata.len() - name_len - 1);
-    legacy.extend_from_slice(&metadata[..1]);
+    let trailer = 1 + usize::from(metadata[metadata.len() - 1 - trailer_name_len(metadata)]);
+    let mut legacy = metadata[..metadata.len() - trailer].to_vec();
     legacy[0] = ATTACHMENT_METADATA_VERSION;
-    legacy.extend_from_slice(&metadata[1..cursor]);
-    legacy.extend_from_slice(&metadata[cursor + 1 + name_len..]);
     legacy
+}
+
+/// 尾部段里的名字长度（v2 元数据最后一个字节是名字的最后一个字节）。
+fn trailer_name_len(metadata: &[u8]) -> usize {
+    // 名字段长度前缀在"名字之前"：从尾部反推——名字长度 = metadata.len() - 1 - 前缀位置，
+    // 而前缀位置只能靠解析确定，因此这里直接扫描：v2 编码保证 ≥1 字节前缀。
+    let mut cursor = 1 + 16 + 8 + 8 + 4 + 4 + 32 + 32;
+    let descriptor_len = usize::from(u16::from_be_bytes([metadata[cursor], metadata[cursor + 1]]));
+    cursor += 2 + descriptor_len + 32;
+    usize::from(metadata[cursor])
 }
 
 #[test]

@@ -537,6 +537,8 @@ pub struct ApplyReport {
     pub unsupported: u64,
     /// 本机落后于条目 epoch（MISSING_LOG_ENTRIES）：需要先追赶，本页**不推进游标**。
     pub needs_catchup: bool,
+    /// 作者凭据**不在凭据目录**里、只能用确定性占位的条目数（显式计数，绝不静默伪造）。
+    pub unknown_authors: u64,
 }
 
 impl ApplyReport {
@@ -562,7 +564,8 @@ pub fn applied_message_id(group_id: &str, seq: u64) -> String {
     MessageId::from_bytes(digest).encode()
 }
 
-/// 远端作者的**占位**账户 ID（设备凭据的确定性派生；真实账户映射待 IDENTITY 凭据目录接入）。
+/// 远端作者的**占位**账户 ID：**只**在凭据目录里查不到该凭据时使用（并显式计入
+/// `ApplyReport::unknown_authors`）。真实映射见 `crates/storage` 的 0011 凭据目录。
 fn placeholder_author_account(credential: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"chat/sync/applied-author/v1");
@@ -570,6 +573,21 @@ fn placeholder_author_account(credential: &str) -> String {
     hasher.update(credential.as_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
     AccountId::from_bytes(digest).encode()
+}
+
+
+/// 用**凭据目录**把作者凭据解析成真实账户：`(账户文本, 是否已知)`。
+///
+/// 目录命中 → 返回目录里的 `account_id` 文本（`true`）；未命中 → 返回确定性占位（`false`），
+/// 调用方必须把 `false` 计入 `ApplyReport::unknown_authors`（**绝不静默伪造**）。
+pub fn resolve_author_account(
+    store: &Store,
+    credential: &str,
+) -> (String, bool) {
+    match store.load_credential_directory(credential) {
+        Ok(Some(record)) => (AccountId::from_bytes(record.account_id).encode(), true),
+        Ok(None) | Err(_) => (placeholder_author_account(credential), false),
+    }
 }
 
 /// 把一条已通过外层验证的条目应用进 MLS 并落库。
@@ -582,7 +600,7 @@ fn placeholder_author_account(credential: &str) -> String {
 /// - `MISSING_LOG_ENTRIES`：本机落后 → 置 `needs_catchup`，**不推进游标**，交给追赶流程；
 /// - `UNSUPPORTED_ENTRY` / 载荷不是 MLS 消息 / 本机不在该群 / 正文非 UTF-8：跳过并计数；
 /// - 其它错误（例如 STATE_CORRUPTED）**向上抛出**：游标不前进。
-fn apply_verified_page(
+pub fn apply_verified_page(
     store: &mut Store,
     group_id: &str,
     entries: &[LogEntry],
@@ -622,11 +640,17 @@ fn apply_verified_page(
                     report.unsupported = report.unsupported.saturating_add(1);
                     continue;
                 };
+                // 凭据目录：把作者凭据映射成真实 AccountId；查不到才退回占位并显式计数。
+                let (author_account, known) =
+                    resolve_author_account(store, &candidate.author_device_id);
+                if !known {
+                    report.unknown_authors = report.unknown_authors.saturating_add(1);
+                }
                 let input = chat_storage::formal::VerifiedEntryInput {
                     conversation_id: group_id.to_owned(),
                     title: String::new(),
                     message_id: applied_message_id(group_id, entry.receipt.seq),
-                    author_account: placeholder_author_account(&candidate.author_device_id),
+                    author_account,
                     author_device: candidate.author_device_id.clone(),
                     body,
                     mine: false,

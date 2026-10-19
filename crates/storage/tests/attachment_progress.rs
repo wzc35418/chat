@@ -115,8 +115,8 @@ fn attachment_progress_roundtrip_is_idempotent_and_directional() {
     let mut store = fixture.open();
     assert_eq!(
         store.schema_version(),
-        10,
-        "0008 progress + 0009 message attachments + 0010 plugins"
+        11,
+        "0008 progress + 0009 message attachments + 0010 plugins + 0011 credential directory"
     );
     store
         .save_attachment(attachment("att-progress", 3))

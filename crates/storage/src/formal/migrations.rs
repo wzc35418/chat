@@ -73,6 +73,11 @@ pub(crate) const MIGRATIONS: &[MigrationDef] = &[
         name: "0010_plugins",
         sql: include_str!("../../migrations/0010_plugins.sql"),
     },
+    MigrationDef {
+        version: 11,
+        name: "0011_credential_directory",
+        sql: include_str!("../../migrations/0011_credential_directory.sql"),
+    },
 ];
 
 /// 迁移结果。

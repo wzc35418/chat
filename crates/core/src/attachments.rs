@@ -4752,6 +4752,16 @@ pub const ATTACHMENT_METADATA_VERSION: u8 = 1;
 pub const ATTACHMENT_METADATA_VERSION_DISPLAY_NAME: u8 = 2;
 /// 字段 57 里展示名的字节上限（UTF-8）。
 pub const MAX_ATTACHMENT_METADATA_DISPLAY_NAME_BYTES: usize = 128;
+/// 已登记的字段 57 版本（登记表：新增版本必须同时更新编码器与解析器）。
+pub const ATTACHMENT_METADATA_VERSIONS: [u8; 2] = [
+    ATTACHMENT_METADATA_VERSION,
+    ATTACHMENT_METADATA_VERSION_DISPLAY_NAME,
+];
+
+/// 版本是否已登记（未登记 = 未知版本，解析时显式拒绝）。
+pub fn attachment_metadata_version_supported(version: u8) -> bool {
+    ATTACHMENT_METADATA_VERSIONS.contains(&version)
+}
 /// 附件元数据上限（与协议字段上限一致）。
 pub const MAX_ATTACHMENT_METADATA_BYTES: usize = 512;
 
@@ -4862,9 +4872,10 @@ pub fn encode_attachment_metadata(body: &AttachmentMessageBody) -> AttachmentRes
     out.extend_from_slice(&ciphertext_digest);
     out.extend_from_slice(&(descriptor.len() as u16).to_be_bytes());
     out.extend_from_slice(&descriptor);
+    out.extend_from_slice(&binding);
+    // 展示名是**尾部追加段**（v1 前缀逐字节不变）：老解析器读完 binding 就收工、忽略多余字节。
     out.push(u8::try_from(name_bytes.len()).map_err(|_| AttachmentError::ContentTooLarge)?);
     out.extend_from_slice(name_bytes);
-    out.extend_from_slice(&binding);
     if out.len() > MAX_ATTACHMENT_METADATA_BYTES {
         return Err(AttachmentError::ContentTooLarge);
     }
@@ -4880,9 +4891,9 @@ pub fn parse_attachment_metadata(metadata: &[u8]) -> AttachmentResult<Attachment
         ));
     }
     let version = metadata[0];
-    if version != ATTACHMENT_METADATA_VERSION
-        && version != ATTACHMENT_METADATA_VERSION_DISPLAY_NAME
-    {
+    // 已登记版本才继续（未登记的版本 = 未知版本，显式拒绝并登记在
+    // ATTACHMENT_METADATA_VERSIONS 里；这里绝不"猜"新版本布局）。
+    if !attachment_metadata_version_supported(version) {
         return Err(AttachmentError::AttachmentCorrupted(
             "attachment metadata has an unsupported version",
         ));
@@ -4926,32 +4937,32 @@ pub fn parse_attachment_metadata(metadata: &[u8]) -> AttachmentResult<Attachment
     }
     let descriptor = &metadata[cursor..cursor + descriptor_len];
     cursor += descriptor_len;
-    // v2：描述符之后是展示名（长度前缀 u8）；v1：没有名字，回退占位名。
+    // v1 布局的前缀在**所有版本**里都逐字节相同：描述符之后紧跟 binding(32)。
+    let binding = &metadata[cursor..cursor + 32];
+    let body_end = cursor + 32;
+    // 兼容窗口的尾部段（只有 v2 才解释它）：
+    // - v1 解析器看到多余字节 → 忽略（发送方是 v2，老客户端照旧工作）；
+    // - v2 解析器要求尾部恰好是 name_len(1) ‖ name，长度不符 → 真损坏，显式拒绝。
     let mut display_name = ATTACHMENT_METADATA_DISPLAY_NAME.to_owned();
+    let trailing = metadata.len().saturating_sub(body_end);
     if version == ATTACHMENT_METADATA_VERSION_DISPLAY_NAME {
-        if metadata.len() < cursor + 1 + 32 {
+        if trailing == 0 {
             return Err(AttachmentError::AttachmentCorrupted(
                 "attachment metadata display name length is missing",
             ));
         }
-        let name_len = usize::from(metadata[cursor]);
-        cursor += 1;
-        if name_len > MAX_ATTACHMENT_METADATA_DISPLAY_NAME_BYTES
-            || metadata.len() < cursor + name_len + 32
-            || metadata.len() != cursor + name_len + 32
-        {
+        let name_len = usize::from(metadata[body_end]);
+        if trailing != name_len + 1 || name_len > MAX_ATTACHMENT_METADATA_DISPLAY_NAME_BYTES {
             return Err(AttachmentError::AttachmentCorrupted(
                 "attachment metadata display name length is invalid",
             ));
         }
-        let name_bytes = &metadata[cursor..cursor + name_len];
-        cursor += name_len;
+        let name_bytes = &metadata[body_end + 1..body_end + 1 + name_len];
         let name = std::str::from_utf8(name_bytes).map_err(|_| {
             AttachmentError::AttachmentCorrupted("attachment metadata display name is not UTF-8")
         })?;
         display_name = sanitize_metadata_display_name(name);
     }
-    let binding = &metadata[cursor..cursor + 32];
     let attachment_id = format!(
         "{}{}",
         ATTACHMENT_ID_PREFIX,
@@ -4976,7 +4987,7 @@ pub fn parse_attachment_metadata(metadata: &[u8]) -> AttachmentResult<Attachment
             "attachment metadata manifest fields must be non-zero",
         ));
     }
-    // v2 用字段里的展示名（已清洗）；v1 保持占位名。
+    // v2 用尾部段里的展示名（已清洗）；v1 保持占位名（尾部多余字节被忽略）。
     body.display_name = display_name;
     Ok(body)
 }

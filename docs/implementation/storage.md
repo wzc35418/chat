@@ -18,6 +18,57 @@ Rust storage 唯一拥有客户端核心数据库；节点库单独实现于 nod
 
 返回类型与字段约束见 [类型字典](TYPES.md)，事务编号见 [事务和并发约定](TRANSACTIONS.md)，纵向流程见 [关键调用链](FLOWS.md)。所有 Result<T> 表示显式可恢复错误，不允许安全验证失败后继续推进。
 
+## 凭据目录（STORAGE-016，2026-10-19，Windows x64）
+
+新增迁移 `0011_credential_directory`（schema 版本 11）：把群内**凭据文本**映射成真实账户/设备 ID，
+供 core 的同步 apply 与应用消息落库使用（此前是确定性占位，不可查询、无法被身份层覆盖）。
+
+```sql
+CREATE TABLE credential_directory (
+    credential TEXT PRIMARY KEY NOT NULL,
+    account_id BLOB NOT NULL CHECK (length(account_id) = 32),
+    device_id BLOB NOT NULL CHECK (length(device_id) = 32),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0)
+);
+CREATE INDEX credential_directory_account ON credential_directory(account_id);
+```
+
+代码：[crates/storage/src/formal/directory.rs](../../crates/storage/src/formal/directory.rs)；
+测试：[crates/core/tests/credential_directory.rs](../../crates/core/tests/credential_directory.rs)。
+
+### API（`Store`）
+
+```text
+upsert_credential_directory(&[CredentialDirectoryRecord]) -> Result<usize>   // 幂等批量写，整笔事务
+load_credential_directory(credential) -> Result<Option<CredentialDirectoryRecord>>
+load_all_credential_directory() -> Result<Vec<CredentialDirectoryRecord>>   // 凭据升序，≤1024
+delete_credential_directory(credential) -> Result<bool>                     // 撤销/测试
+```
+
+- 凭据 1..=128 字节且无控制字符（否则 `INVALID_INPUT`）；
+- 条目总数上限 `MAX_CREDENTIAL_DIRECTORY_ROWS = 1024`：**整笔**失败并回滚（同批里合法的条目也不写），
+  更新已存在映射不占新行；
+- 同凭据重复 upsert 幂等（映射按最后一次覆盖、只刷新 `updated_at_ms`）；
+- `account_id` / `device_id` 是 32 字节协议 ID（BLOB，非秘密）；读回时长度不符按数据损坏处理（不截断）。
+
+### 证据
+
+- `credential_directory::upsert_load_and_overwrite_round_trips`：幂等 upsert、覆盖生效、未知凭据 `None`、
+  全量按凭据升序、删除后读回 `None` 且重复删除返回 `false`。
+- `credential_directory::directory_limit_is_enforced_without_partial_writes`：写满 1024 条后第 1025 条整笔
+  失败（`INVALID_INPUT`），目录仍为 1024 条且溢出条目不存在；已存在条目的更新不受上限影响。
+- `credential_directory::directory_survives_reopen_and_the_old_tables_still_work`：重开后目录保留，
+  且既有写入路径（`apply_verified_entry` 写消息）在迁移后仍然可用。
+- 迁移版本相关断言（`formal_store` / `attachments_records` / `attachment_progress` / `message_attachments`）
+  已同步到 11 条迁移。
+
+### 已知限制
+
+1. **映射值目前来自 core 的确定性派生**（`account_id_for` / `device_id_for`），还没有与真实身份账户
+   做交叉校验；身份层接入后应把同一条记录 upsert 成真实 `AccountId`（表结构已就绪）。
+2. **没有目录分页**：`load_all` 一次最多 1024 条（与上限一致）；规模再大需要分页 API。
+3. 目录是**本机**材料：不同设备各自维护自己的目录，不做跨端同步（凭据本身在群内公开）。
+
 ## P0-04 正式存储路径实现记录（2026-10-18，Windows x64）
 
 正式路径位于 [crates/storage/src/formal/](../../crates/storage/src/formal/)（mod.rs 公开 API、seal.rs 主密钥与 AEAD、migrations.rs 版本化迁移、error.rs 稳定错误码），附加 schema 见 [migrations/0002_formal_store.sql](../../crates/storage/migrations/0002_formal_store.sql)。与 `store.rs` 的 P0-03 未加密实验完全分开：不共享连接、表或错误类型；既有实验代码与测试未改动，仍全部通过。

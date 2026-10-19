@@ -802,6 +802,30 @@ fn load_record(store: &Store, group_id: &str) -> GroupResult<(GroupRecord, u64)>
     Ok((record, stored.state_version))
 }
 
+/// 把群成员的凭据写进**凭据目录**（IDENTITY 凭据 → 账户/设备 ID 的真实映射）。
+///
+/// 建群与入群时调用：本机与已知对端都写（含 device_id），同步 apply 与应用消息落库据此把凭据
+/// 映射成真实 AccountId；未知凭据保留占位但显式计数（见 sync_worker 的 `unknown_authors`）。
+///
+/// 映射值来自本层的确定性账户/设备派生（`account_id_for` / `device_id_for`），是当前 P0 的
+/// 权威映射；将来身份层接入真实 AccountId 时只需覆盖同一条记录（upsert 幂等）。
+fn sync_credential_directory(store: &mut Store, record: &GroupRecord) -> GroupResult<()> {
+    let entries: Vec<chat_storage::formal::CredentialDirectoryRecord> = record
+        .members
+        .iter()
+        .map(|member| chat_storage::formal::CredentialDirectoryRecord {
+            credential: member.credential.clone(),
+            account_id: account_id_for(&member.credential).as_bytes().to_owned(),
+            device_id: device_id_for(&member.credential).as_bytes().to_owned(),
+            updated_at_ms: 0,
+        })
+        .collect();
+    store
+        .upsert_credential_directory(&entries)
+        .map_err(GroupError::from)?;
+    Ok(())
+}
+
 /// 写入快照记录（同一命名空间内单调 epoch；返回 storage 的 state_version）。
 fn persist_snapshot(store: &mut Store, record: &GroupRecord, epoch: u64) -> GroupResult<u64> {
     record.validate()?;
@@ -990,6 +1014,8 @@ pub fn create_group_with_welcome(
     // 建群时先自检策略快照不变量（全零头 + 唯一群主）。
     let _ = domain_snapshot(&record)?;
     let saved = persist_snapshot(store, &record, epoch)?;
+    // 建群后把本机与已知对端的凭据写进目录（凭据 → 真实账户/设备映射）。
+    sync_credential_directory(store, &record)?;
 
     Ok((project(&record, epoch, pending.as_ref(), saved), welcome))
 }
@@ -2134,6 +2160,8 @@ pub fn group_join_from_welcome(
     record.validate()?;
     let _ = domain_snapshot(&record)?;
     let saved = persist_snapshot(store, &record, record.mls_epoch)?;
+    // 入群后把本机与已知成员写进凭据目录（真实账户/设备映射的来源）。
+    sync_credential_directory(store, &record)?;
     Ok(project(&record, joined.epoch, None, saved))
 }
 /// GROUPS-010：转让群主（仅现群主；目标是确认成员且不是自己）。

@@ -27,6 +27,9 @@ import chat.presentation.display.ConversationSummaryView
 import chat.presentation.display.StoredDraftState
 import chat.presentation.display.StoredDraftStatusKind
 import chat.presentation.display.toDraftUiState
+import chat.presentation.preview.updateRecoveryPassphrase
+import chat.presentation.preview.withMessageCards
+import chat.presentation.preview.withRecoveryExported
 import chat.presentation.display.toConversationDisplayPage
 import chat.presentation.display.toDraftEvidence
 import chat.presentation.display.toMessageDisplayPage
@@ -154,6 +157,8 @@ fun main() = runBlocking {
     checkDraftSendPresentation()
     checkPagingPresentation()
     checkMarkdown()
+    checkRecoveryPresentation()
+    checkMessageCardsPresentation()
     println("PASS DS-02/DS-04/DS-05/DS-07/DS-08/DS-09/DS-10/DS-11/DS-12 presentation checks")
 }
 
@@ -1282,3 +1287,26 @@ private fun msg(id: String, conversationId: String): MessageDisplayView =
         body = "body-$id",
         mine = false,
     )
+
+/** IDENTITY-013 恢复导出提示：必须说明"不含主密钥、旧库数据仍不可读"，不把失败吞成成功。 */
+private fun checkRecoveryPresentation() {
+    val state = chat.presentation.preview.PreviewIdentityState(recoveryPassphrase = "correct horse")
+        .updateRecoveryPassphrase("new passphrase")
+        .withRecoveryExported(2048, "D:/tmp/identity.chatrecovery")
+    check(state.recoveryPassphrase == "new passphrase")
+    check(!state.busy) { "导出完成后不应仍标记 busy" }
+    val notice = state.recoveryNotice ?: error("缺少导出提示")
+    check(notice.contains("不含主密钥")) { "提示必须说明不含主密钥" }
+    check(notice.contains("仍不可读")) { "提示必须说明旧库数据仍不可读" }
+    check(notice.contains("2048")) { "提示应包含导出字节数" }
+    check(state.lastErrorCode == null)
+    println("PASS IDENTITY-013 recovery presentation: notice states master key excluded and old data unreadable")
+}
+
+/** 消息附件卡片：查过但没有附件必须显式记为空列表（不把"读不到"当"没附件"）。 */
+private fun checkMessageCardsPresentation() {
+    val state = chat.presentation.preview.PreviewStoreState().withMessageCards("msg-1", emptyList())
+    check(state.messageCards["msg-1"]?.isEmpty() == true) { "查过但没有附件必须记为空列表" }
+    check(!state.busy)
+    println("PASS attachment cards presentation: empty result recorded explicitly, busy cleared")
+}
