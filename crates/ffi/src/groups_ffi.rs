@@ -521,6 +521,86 @@ fn summary_ffi(view: &chat_core::groups::GroupSummaryView) -> GroupSummaryFfi {
     }
 }
 
+/// 邀请元数据（纯数据；加入前由 core 逐项校验）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct InviteMetaFfi {
+    /// 协议群 ID（`grp:1:<hex>`）。
+    pub group_id: String,
+    /// MLS 群 ID（小写 hex）。
+    pub mls_group_id: String,
+    /// 群名。
+    pub name: String,
+    /// 邀请者凭据。
+    pub inviter_credential: String,
+    /// 群主凭据。
+    pub owner_credential: String,
+    /// 被邀请者凭据。
+    pub invitee_credential: String,
+    /// 预期成员凭据集合。
+    pub members: Vec<String>,
+    /// 预期 epoch。
+    pub epoch: u64,
+}
+
+/// 邀请提交的真实回执（节点签发，已验签）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct InviteReceiptFfi {
+    /// 节点分配的提交标识（重复提交返回同一个）。
+    pub submission_id: String,
+    /// 节点日志序号（从 1 开始）。
+    pub seq: u64,
+    /// 该条目之后的日志链摘要（小写 hex）。
+    pub log_hash: String,
+    /// 节点身份。
+    pub node_id: String,
+}
+
+/// 一条可投递/可接受的入群邀请（纯数据，不含任何私钥）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupInviteBlobFfi {
+    /// 邀请元数据。
+    pub meta: InviteMetaFfi,
+    /// MLS Welcome 字节（加入凭据；不含私钥材料）。
+    pub welcome_bytes: Vec<u8>,
+}
+
+/// 节点端点必须显式配置（空串 → `INVALID_TARGET`，不静默回退）。
+fn require_endpoint(endpoint_url: &str) -> Result<(), FfiError> {
+    if endpoint_url.trim().is_empty() {
+        return Err(FfiError::Store {
+            code: "INVALID_TARGET".to_owned(),
+            reason: "a node endpoint must be configured for invite delivery".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn invite_meta_back(meta: &InviteMetaFfi) -> chat_core::groups::GroupInviteMeta {
+    chat_core::groups::GroupInviteMeta {
+        group_id: meta.group_id.clone(),
+        mls_group_id: meta.mls_group_id.clone(),
+        name: meta.name.clone(),
+        inviter_credential: meta.inviter_credential.clone(),
+        owner_credential: meta.owner_credential.clone(),
+        invitee_credential: meta.invitee_credential.clone(),
+        members: meta.members.clone(),
+        epoch: meta.epoch,
+    }
+}
+
+fn invite_meta_ffi(meta: &chat_core::groups::GroupInviteMeta) -> InviteMetaFfi {
+    InviteMetaFfi {
+        group_id: meta.group_id.clone(),
+        mls_group_id: meta.mls_group_id.clone(),
+        name: meta.name.clone(),
+        inviter_credential: meta.inviter_credential.clone(),
+        owner_credential: meta.owner_credential.clone(),
+        invitee_credential: meta.invitee_credential.clone(),
+        members: meta.members.clone(),
+        epoch: meta.epoch,
+    }
+}
+
 /// 群治理 FFI 门面。
 #[derive(uniffi::Object)]
 pub struct GroupFfi {
@@ -739,6 +819,72 @@ impl GroupFfi {
             .group_accept_with_receipt(&group_id, &view)
             .map_err(|error| failure!(error))?;
         Ok(group_view(accepted))
+    }
+
+    /// GROUPS-019：把一条入群邀请作为**应用条目**提交到节点，返回真实回执（绝不伪造）。
+    ///
+    /// - 需要库内**持久身份**（未入库 → `INVALID_STATE_TRANSITION`）；
+    /// - `endpoint_url` 为空 / 不可解析 / 公钥格式错 → `INVALID_TARGET`；节点不可达 → `NODE_UNAVAILABLE`；
+    /// - 重复提交同一 (群, blob) 返回**同一个** `submission_id`（节点侧幂等 + 对账）；
+    /// - 回执的群/提交/作者/节点身份与节点签名都由 core 校验后才返回。
+    pub fn group_submit_invite(
+        &self,
+        group_id: String,
+        meta: InviteMetaFfi,
+        welcome_bytes: Vec<u8>,
+        endpoint_url: String,
+        node_id: String,
+        node_public_key_hex: Option<String>,
+    ) -> Result<InviteReceiptFfi, FfiError> {
+        let blob = chat_core::groups::GroupInviteBlob::new(invite_meta_back(&meta), welcome_bytes)
+            .map_err(|error| FfiError::Store {
+                code: error.code().to_owned(),
+                reason: error.to_string(),
+            })?;
+        require_endpoint(&endpoint_url)?;
+        let mut core = self.lock()?;
+        let receipt = core
+            .group_submit_invite(
+                &group_id,
+                &blob,
+                &endpoint_url,
+                &node_id,
+                node_public_key_hex.as_deref(),
+            )
+            .map_err(|error| failure!(error))?;
+        Ok(InviteReceiptFfi {
+            submission_id: receipt.submission_id,
+            seq: receipt.seq,
+            log_hash: receipt.log_hash,
+            node_id: receipt.node_id,
+        })
+    }
+
+    /// GROUPS-019：从群日志取回最近一条可解析的邀请（没有则 `None`）。
+    ///
+    /// 错误语义与 `group_submit_invite` 一致：未配置节点/不可达/回执范围异常都显式失败，
+    /// **不会**把错误当成"没有邀请"（只有确实没有邀请才是 `None`）。
+    pub fn group_fetch_invite(
+        &self,
+        group_id: String,
+        endpoint_url: String,
+        node_id: String,
+        node_public_key_hex: Option<String>,
+    ) -> Result<Option<GroupInviteBlobFfi>, FfiError> {
+        require_endpoint(&endpoint_url)?;
+        let mut core = self.lock()?;
+        let found = core
+            .group_fetch_invite(
+                &group_id,
+                &endpoint_url,
+                &node_id,
+                node_public_key_hex.as_deref(),
+            )
+            .map_err(|error| failure!(error))?;
+        Ok(found.map(|blob| GroupInviteBlobFfi {
+            meta: invite_meta_ffi(&blob.meta),
+            welcome_bytes: blob.welcome,
+        }))
     }
 
     /// GROUPS-013：本机发起自移除提案（离开群的第一步）。

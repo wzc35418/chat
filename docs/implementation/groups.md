@@ -1510,5 +1510,100 @@ crypto 侧新增（与 `advance_epoch_with_self_update` 并存、未改其行为
 [crates/core/tests/groups_list.rs](../../crates/core/tests/groups_list.rs) 继续断言损坏条目计入 `skipped`（既有用例）。
 
 复现：`cargo test --offline -p chat-core -p chat-ffi` → 全绿。
+## 建群/入群自动播种账户撤销集合（CTRLREV-SEED，2026-10-18）
 
+- `create_group_with_welcome` / `create_group` / `group_join_from_welcome` 成功后**自动播种**：
+  把账户级撤销集合（`identity_device_revocations`，由身份层维护）并进新群快照；
+- 返回值新增 `GroupView.seeded_revoked_devices: u32`（播种进来的条数；其它路径恒为 0），
+  同时 `GroupView.revoked_devices` 已是**播种后**的并集；
+- **失败只记录、不阻断**：播种在快照落库之后进行，出错不会回滚建群/入群；此时计数为 0，
+  快照保持未播种，可稍后用 `seed_revoked_devices_from_registry`（或 FFI 的
+  `IdentityFfi.seed_revoked_devices_for_all_groups`）重试；
+- 播种同样守快照上限：多个成员的撤销集合并起来超过 `MAX_REVOKED_DEVICES`(64) 时**显式失败且不写盘**
+  （不会写出对端条目路径本来禁止的越界快照）。
+
+证据：[crates/core/tests/revoked_devices.rs](../../crates/core/tests/revoked_devices.rs) 新增两个用例：
+① 建群前账户已有撤销设备 → `create_group_with_welcome` / `create_group` 视图 `seeded_revoked_devices=1`
+且快照与 `group_list` 计数立刻可见；`group_join_from_welcome` 入群同样播种（bob 的账户集合）；
+② 两个成员各 40 条（合计 80 > 64）→ 建群**仍然成功**、`seeded_revoked_devices=0`、快照为空，
+单独调用播种显式 `INVALID_INPUT` 且仍不写盘。
+
+复现：`cargo test --offline -p chat-core --test revoked_devices` → 6 passed。
+## 邀请投递接 FFI（GROUPS-019，2026-10-18）
+
+~~~text
+GroupFfi.group_submit_invite(group_id, meta: InviteMetaFfi, welcome_bytes,
+                             endpoint_url, node_id, node_public_key_hex?) -> InviteReceiptFfi
+GroupFfi.group_fetch_invite(group_id, endpoint_url, node_id, node_public_key_hex?)
+                             -> Option<GroupInviteBlobFfi>
+
+InviteMetaFfi { group_id, mls_group_id, name, inviter_credential, owner_credential,
+                invitee_credential, members, epoch }
+InviteReceiptFfi { submission_id, seq, log_hash, node_id }
+GroupInviteBlobFfi { meta: InviteMetaFfi, welcome_bytes }
+~~~
+
+- **提交**：blob 先本地校验（`GroupInviteBlob::new`：Welcome 非空且 ≤64 KiB、元数据自洽），
+  再由节点侧执行 head CAS + 应用条目提交；回执的群/提交/作者/节点身份与节点签名全部由 core 校验后才返回；
+- **提交标识确定性**：`submission_id` 由 (群, blob 摘要) 派生 → **重复提交返回同一个** `submission_id`
+  （节点 `SUBMISSION_ID_CONFLICT` 走对账取回原回执，seq/log_hash 也一致）；
+- **取回**：只读最近 `MAX_RECONCILE_PAGES` 页；没有邀请 → `None`；页/网络错误**显式失败**
+  （不会把错误当成"没有邀请"）；
+- 错误码：未配置端点 → `INVALID_TARGET`；端点不可解析/公钥格式错 → `INVALID_TARGET`；
+  节点不可达 → `NODE_UNAVAILABLE`；群不存在（节点侧拒绝）→ 节点稳定码原样透出；关闭后 → `CORE_CLOSED`；
+  未入库身份 → `INVALID_STATE_TRANSITION`；
+- **纯数据**：只有提交标识/序号/日志摘要/节点身份/元数据与 Welcome 字节，不含任何私钥。
+
+### 证据
+
+[crates/ffi/tests/groups_invite_ffi.rs](../../crates/ffi/tests/groups_invite_ffi.rs)（4 个，真 axum 节点 + 真库）：
+submit → 真回执（`seq>=1`、`log_hash` 64 hex、`node_id` 一致、`submission_id` 以 `sub:1:` 开头）→
+fetch 回来的 meta 与 Welcome 字节逐字节一致；重复 submit 同 `submission_id` 且同 seq/log_hash；
+不可达端点 submit/fetch 都 `NODE_UNAVAILABLE`、空端点 `INVALID_TARGET`；
+未知群 fetch 显式失败（不是 None 也不是 NODE_UNAVAILABLE）；关闭后两个方法都 `CORE_CLOSED`。
+
+复现：`cargo test --offline -p chat-ffi --test groups_invite_ffi` → 4 passed；
+`cargo test --offline -p chat-ffi` → **89 passed**。
+
+## GROUPS-019 · 邀请投递四类用例（2026-10-20）
+
+真 axum 节点 + 真双设备双库（两库各自登记身份、设备在节点注册、被邀请者先作为群成员登记）。
+
+### 用例（`crates/core/tests/groups_invite_delivery.rs`，4 例）
+
+1. `invite_is_delivered_through_the_node_and_accepted_by_the_peer`：A 建群 → `submit_group_invite` 拿到**真回执**（node_id / submission_id 非空、节点日志 1 条）→ B `fetch_group_invite` 取回（元数据逐字节一致）→ `accept_group_invite` 成功，断言 epoch 一致、成员 `[alice, bob]`、角色 `member`、快照落库一致；
+2. `submitting_the_same_invite_twice_is_idempotent`：同 blob 再提交 → 同 `submission_id`/`seq`/`log_hash`，**日志条目数仍为 1**（节点按提交 ID 去重）；
+3. `an_unreachable_node_is_explicit_and_leaves_the_snapshot_unchanged`：指向 `http://127.0.0.1:1` → `NODE_UNAVAILABLE`，群快照逐字段不变；
+4. `invalid_or_oversized_welcomes_are_rejected_before_any_submission`：Welcome >64 KiB → `CONTENT_TOO_LARGE`；空 Welcome、被邀请者不在成员里、自邀 → `INVALID_INPUT`；**节点日志仍为 0 条**、快照不变。
+
+### 真实缺陷记录（取回侧定长解码）
+
+第一版 `group_node::fetch_group_invite` 用了**定长**解码：
+
+```rust
+let Ok(bytes) = hex_decode::<64>("invite payload", &candidate.encrypted_payload) else { continue };
+```
+
+`hex_decode<const N: usize>` 要求**恰好 N 字节**，而邀请 blob 是 `version(1) + welcome_len(4) + Welcome(≈1~2 KiB) + meta_len(4) + meta_json`，永远不是 64 字节 → 每条邀请都被当作“不是邀请”跳过 → **`fetch_group_invite` 恒返回 `None`**（提交侧完全正常，所以幂等/不可达两组先绿，成功闭环才暴露）。
+
+修复（单行，动态长度 + 候选上限）：
+
+```rust
+let Ok(bytes) = chat_node_services::canonical::decode_hex_bytes(
+    "invite payload",
+    &candidate.encrypted_payload,
+    MAX_CONTROL_CANDIDATE_BYTES,
+) else { continue };
+```
+
+教训：**变长载荷一律用带 `max_bytes` 的动态解码**，定长泛型只用于密钥/摘要这类长度固定的字段。现在四组用例覆盖了这条路径（成功闭环会直接暴露取回侧解码错误）。
+
+### 验收
+
+- `cargo test --offline -p chat-core` → **EXIT=0，251 passed，0 警告**（既有 240 继续通过 + 本轮 4 例 + 并行任务增量）。
+
+### 已知限制
+
+1. 测试里节点日志只翻最多 `MAX_RECONCILE_PAGES` 页；邀请很多时需要调用方自己指定游标（当前 API 只取“最近一条”）。
+2. 被邀请者必须在节点上先作为群成员登记（节点读日志有成员鉴权），这属于节点侧既有语义。
 

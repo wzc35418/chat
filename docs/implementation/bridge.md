@@ -984,6 +984,32 @@ IdentityFfi.register_device(device_id, device_public_key_hex, label) -> DeviceVi
 来自快照 `revoked_devices` 长度）。`GroupFfi.group_list` 的语义不变：只读快照、不导入 MLS 设备、
 损坏条目计入 `skipped`。测试见 [crates/ffi/tests/groups_list_ffi.rs](../../crates/ffi/tests/groups_list_ffi.rs)
 （默认 0）与 [crates/core/tests/revoked_devices.rs](../../crates/core/tests/revoked_devices.rs)（处理后 1）。
+## 建群/入群播种与全库播种（2026-10-18）
+
+- `GroupViewFfi.seeded_revoked_devices: u32`：建群/入群自动播种的条数（其它路径 0）；
+  `GroupSummaryFfi.revoked_devices_count` 提供列表侧计数；
+- `IdentityFfi.seed_revoked_devices_for_all_groups() -> u32`：对库里所有群播种一次账户撤销集合，
+  幂等（重复调用 0），单群失败不阻断；恢复导入成功后自动播种；
+- 测试：[crates/ffi/tests/identity_seed_groups.rs](../../crates/ffi/tests/identity_seed_groups.rs)（3 个，真库 + 真 OpenMLS）。
+## 邀请投递（GroupFfi 邀请两方法，2026-10-18）
+
+~~~text
+group_submit_invite(group_id, meta, welcome_bytes, endpoint_url, node_id, node_public_key_hex?)
+    -> InviteReceiptFfi { submission_id, seq, log_hash, node_id }
+group_fetch_invite(group_id, endpoint_url, node_id, node_public_key_hex?)
+    -> Option<GroupInviteBlobFfi { meta, welcome_bytes }>
+InviteMetaFfi { group_id, mls_group_id, name, inviter_credential, owner_credential,
+                invitee_credential, members, epoch }
+~~~
+
+- 复用 `chat_core::group_node::{submit_group_invite, fetch_group_invite}`（core 侧新增
+  `ConversationCore::group_submit_invite / group_fetch_invite` 两个薄封装，设备签名钥来自持久身份）；
+- 稳定码：`INVALID_TARGET`（未配置/坏端点/坏公钥）、`NODE_UNAVAILABLE`（不可达）、
+  `INVALID_STATE_TRANSITION`（未入库身份）、`CORE_CLOSED`（已关闭）、节点侧稳定码原样透出；
+- 幂等：同 (群, blob) 重复提交返回同一 `submission_id`；
+- 纯数据、不含密钥；测试 [crates/ffi/tests/groups_invite_ffi.rs](../../crates/ffi/tests/groups_invite_ffi.rs)（4 个，真节点）。
+
+
 
 
 

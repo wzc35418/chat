@@ -880,6 +880,23 @@ IdentityFfi.register_device(device_id, device_public_key_hex, label) -> DeviceVi
 
 复现：`cargo test --offline -p chat-ffi --test identity_device_register` → 6 passed；
 `cargo test --offline -p chat-ffi` → **82 passed**（既有 76 继续通过）。
+### 恢复导入后的群播种（IdentityFfi，2026-10-18）
+
+~~~text
+IdentityFfi.seed_revoked_devices_for_all_groups() -> u32   // 返回新增条数合计
+~~~
+
+- 对库里**每个群**调用一次 `seed_revoked_devices_from_registry`（账户视角撤销集合 → 群快照并集）；
+- 幂等：并集没有新增时返回 0，且不写盘；
+- 单个群失败（快照损坏等）**不阻断**其它群，只是不计入合计；
+- 身份恢复导入（`import_recovery_bundle`）成功后**自动**对库里已有的群各播种一次（失败只记录、不阻断导入）；
+- 需持久化身份：纯内存 → `INVALID_STATE_TRANSITION`；关闭 → `CORE_CLOSED`。
+
+证据：[crates/ffi/tests/identity_seed_groups.rs](../../crates/ffi/tests/identity_seed_groups.rs)（3 个，真库 + 真 OpenMLS）：
+建群时账户已有撤销设备 → 视图 `seeded_revoked_devices=1` 且列表计数 1；建群后写入撤销 →
+`seed_revoked_devices_for_all_groups` 两个群各 +1（合计 2）、重复调用 0、落盘计数都为 1；
+恢复导入到"已有群 + 已有撤销"的库 → 导入后列表计数立刻为 1，再用恢复身份播种返回 0。
+
 
 
 

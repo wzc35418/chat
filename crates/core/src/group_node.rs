@@ -737,7 +737,11 @@ pub fn fetch_group_invite(
             if candidate.kind != KIND_APPLICATION {
                 continue;
             }
-            let Ok(bytes) = hex_decode::<64>( "invite payload", &candidate.encrypted_payload) else {
+            let Ok(bytes) = chat_node_services::canonical::decode_hex_bytes(
+                "invite payload",
+                &candidate.encrypted_payload,
+                MAX_CONTROL_CANDIDATE_BYTES,
+            ) else {
                 continue;
             };
             if let Ok(blob) = groups::GroupInviteBlob::decode(&bytes) {

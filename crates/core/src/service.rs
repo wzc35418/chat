@@ -1603,6 +1603,98 @@ impl ConversationCore {
         Ok(ControlReceiptView::from_receipt(receipt))
     }
 
+    /// GROUPS-019：把一条入群邀请作为应用条目提交到节点，返回**真实回执**。
+    ///
+    /// 与 [`group_submit_control`] 同一套设备密钥来源（持久身份派生）；未入库身份 →
+    /// `INVALID_STATE_TRANSITION`；端点/公钥格式错 → `INVALID_TARGET`；传输失败 → `NODE_UNAVAILABLE`。
+    pub fn group_submit_invite(
+        &mut self,
+        group_id: &str,
+        blob: &crate::groups::GroupInviteBlob,
+        endpoint_url: &str,
+        node_id: &str,
+        node_public_key_hex: Option<&str>,
+    ) -> anyhow::Result<crate::group_node::InviteReceiptView> {
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        let client = self.node_client_for(
+            store,
+            endpoint_url,
+            node_id,
+            node_public_key_hex,
+        )?;
+        crate::group_node::submit_group_invite(&client, group_id, blob).map_err(anyhow::Error::new)
+    }
+
+    /// GROUPS-019：从群日志取回最近一条可解析的邀请（没有则 `None`）。
+    ///
+    /// 页/网络错误显式失败，**不会**被当成"没有邀请"。
+    pub fn group_fetch_invite(
+        &mut self,
+        group_id: &str,
+        endpoint_url: &str,
+        node_id: &str,
+        node_public_key_hex: Option<&str>,
+    ) -> anyhow::Result<Option<crate::groups::GroupInviteBlob>> {
+        let guard = self.store_guard()?;
+        let store = guard.as_ref().ok_or_else(closed)?;
+        let client = self.node_client_for(store, endpoint_url, node_id, node_public_key_hex)?;
+        crate::group_node::fetch_group_invite(&client, group_id).map_err(anyhow::Error::new)
+    }
+
+    /// 用持久身份的种子派生设备签名钥构造节点客户端（端点/节点 ID/节点公钥显式）。
+    fn node_client_for(
+        &self,
+        store: &chat_storage::formal::Store,
+        endpoint_url: &str,
+        node_id: &str,
+        node_public_key_hex: Option<&str>,
+    ) -> anyhow::Result<chat_node_client::NodeClient> {
+        let seeds = store
+            .load_identity_seeds()
+            .map_err(anyhow::Error::new)?
+            .ok_or_else(|| {
+                anyhow::Error::new(SyncError::new(
+                    ErrorCode::InvalidStateTransition,
+                    "the local identity is not enrolled in this database",
+                ))
+            })?;
+        let device_seed: [u8; 32] = seeds.device_seed.as_slice().try_into().map_err(|_| {
+            anyhow::Error::new(SyncError::new(
+                ErrorCode::StateCorrupted,
+                "the persisted device seed is not 32 bytes",
+            ))
+        })?;
+        let signing_key = chat_protocol::signing_key_from_seed(&device_seed);
+        let mut endpoint = chat_node_client::NodeEndpoint::new(endpoint_url, node_id).map_err(|_| {
+            anyhow::Error::new(SyncError::new(
+                ErrorCode::InvalidTarget,
+                "node endpoint must be a parseable http(s) URL",
+            ))
+        })?;
+        if let Some(hex_key) = node_public_key_hex {
+            let key: [u8; 32] = chat_node_services::canonical::hex_decode::<32>(
+                "node public key",
+                hex_key.trim(),
+            )
+            .map_err(|_| {
+                anyhow::Error::new(SyncError::new(
+                    ErrorCode::InvalidTarget,
+                    "node public key must be 32 bytes of lowercase hex",
+                ))
+            })?;
+            endpoint = endpoint.with_node_public_key(key);
+        }
+        chat_node_client::NodeClient::new(endpoint, seeds.device_id.clone(), signing_key).map_err(
+            |_| {
+                anyhow::Error::new(SyncError::new(
+                    ErrorCode::InvalidTarget,
+                    "node client could not be created from the persisted device identity",
+                ))
+            },
+        )
+    }
+
     /// NODE-006 接受侧：用**真实回执**接受并合并 pending 控制提交。
     ///
     /// 回执绑定（候选正文逐字节等于本 pending 的 Commit、提交/作者/群/节点身份、节点签名、
