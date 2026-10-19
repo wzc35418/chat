@@ -130,3 +130,19 @@ P0-03 局部实验已通过客户端单连接事务及独立节点接受事务�
 - [ ] **经中继实跑**：仍未验证（需要可用 relay 或第二台设备）。
 - [ ] **跨网段/对称 NAT 直连**：未验证。
 - [ ] **OS 凭据库（Credential Manager/keychain）**：未接，当前是 DPAPI 文件封装。
+
+
+
+## 2026-10-19 收尾回归（第 48 轮，最终基线）
+
+- **Rust**：`cargo test --workspace --offline` → **994 passed / 0 failed**（`cargo check --locked` 通过）
+- **Gradle**：14 个任务全部 `BUILD SUCCESSFUL`（presentationChecks / p0Smoke / p0Snapshot / previewSnapshot / localStoreSmoke / identitySmoke / identityPersistSmoke / attachmentSmoke / keySlotSmoke / groupSmoke / dpapiSmoke / platformSmoke / pluginSmoke / pluginJvmSmoke）
+- **Android**：`assembleDebug` 成功
+- **文档自检**：`tools/verify-project.cjs` PASS
+- **磁盘**：`tools/check-disk.ps1` → D: 171.63 GB 空闲
+
+仍**未覆盖**（P0 口径不变）：经中继实际收发、跨网段/对称 NAT、跨机器附件下载（本机双库已验）、OS 凭据库（当前 DPAPI 文件封装）、插件沙箱执行（当前同 JVM 无沙箱、需用户确认）。
+
+```
+RUST_EXIT=0  LOCKED_EXIT=0  VERIFY_EXIT=0  GRADLE_EXIT=0  ANDROID_EXIT=0
+```

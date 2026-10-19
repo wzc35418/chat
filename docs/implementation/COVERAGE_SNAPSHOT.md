@@ -110,3 +110,22 @@
 - **TRANSPORT**：新增 `reconnect.rs` 策略层（RetryPolicy + 确定性抖动 + 状态机），**真实重连仍未接入 Session**；经中继/跨网段仍未验证。
 - **测试**：Rust 994；Gradle 13 个任务（含 p0Smoke/p0Snapshot/previewSnapshot/pluginSmoke/pluginJvmSmoke）。
 - **事故记录**：两次"脚本/整文件写"导致源码截断（`node-services/src/group.rs`、`transport/src/session.rs`），均已 git 恢复；此后所有任务都加了硬性规则（只新增文件 + 单行插入 + 定点 edit）。
+
+
+## 最终基线（2026-10-19，第 48 轮收尾）
+
+| 指标 | 数值 |
+|---|---|
+| Rust 测试 | **994 passed / 0 failed** |
+| Gradle 任务 | **14 个**（含 p0Smoke/p0Snapshot/previewSnapshot/pluginSmoke/pluginJvmSmoke） |
+| Android | assembleDebug 成功 |
+| 迁移 | storage 0001–0012、node-services 0001–0008 |
+| 核对 | `tools/verify-project.cjs` PASS、`tools/check-disk.ps1` OK |
+
+### 距"功能完整（A 口径）"还差什么
+
+1. **插件沙箱与安装事务**：当前同 JVM 无沙箱（trusted 仅确认），缺 JAR 安装事务/版本升级/权限清单执行
+2. **传输真实重连 + 经中继 + 跨网段**：只有策略层（RetryPolicy/抖动/状态机），Session 未接入；中继与 NAT 未验证
+3. **PRESENTATION 用例层收敛**：界面仍以面板/样例为主，未收敛为单一用例入口
+4. **OS 凭据库 + 后台收消息通知接线**
+5. 多节点撤销同步、凭据目录与真实身份账户交叉校验
