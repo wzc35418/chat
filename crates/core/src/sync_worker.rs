@@ -22,9 +22,16 @@ use std::future::Future;
 use std::pin::Pin;
 
 use chat_node_client::{NodeClient, NodeClientError, NodeClientErrorKind};
-use chat_node_services::canonical::{hex_decode, hex_encode, sha256_concat};
+use chat_node_services::canonical::{decode_hex_bytes, hex_decode, hex_encode, sha256_concat};
 use chat_node_services::group::{LogEntry, SignedLogHead};
-use chat_protocol::{Digest, ErrorCode, GroupId, MAX_CIPHERTEXT_BYTES, VerifiedHead};
+use chat_protocol::{
+    AccountId, Digest, ErrorCode, GroupId, MAX_CIPHERTEXT_BYTES, MessageId, VerifiedHead,
+};
+use sha2::{Digest as _, Sha256};
+
+use crate::groups::{
+    PeerEntryInput, PeerEntryOutcome, group_process_peer_entry, load_group_device,
+};
 use chat_storage::formal::{MlsGroupStateInput, MlsRecordInput, Store};
 use chat_sync::catchup::{AwaitReason, CatchupPolicy, CatchupStep, NodeLogHead, catchup_plan};
 use chat_sync::clock::{Clock, SystemClock};
@@ -242,6 +249,16 @@ pub fn run_pull_once(
     run_pull_once_at(store, client, group_id, SystemClock.now_unix_ms())
 }
 
+/// 与 [`run_pull_once_at`] 相同，但额外返回本页的 MLS 应用报告（跳过/失败分类可见）。
+pub fn run_pull_once_reporting_at(
+    store: &mut Store,
+    client: &NodeClient,
+    group_id: &str,
+    now_ms: i64,
+) -> SyncResult<(PullOutcome, ApplyReport)> {
+    run_pull_once_inner(store, client, group_id, now_ms, true)
+}
+
 /// 与 [`run_pull_once`] 相同，但显式给定时钟（测试/诊断入口，避免读系统时间）。
 pub fn run_pull_once_at(
     store: &mut Store,
@@ -249,6 +266,16 @@ pub fn run_pull_once_at(
     group_id: &str,
     now_ms: i64,
 ) -> SyncResult<PullOutcome> {
+    run_pull_once_inner(store, client, group_id, now_ms, false).map(|(outcome, _)| outcome)
+}
+
+fn run_pull_once_inner(
+    store: &mut Store,
+    client: &NodeClient,
+    group_id: &str,
+    now_ms: i64,
+    want_report: bool,
+) -> SyncResult<(PullOutcome, ApplyReport)> {
     let policy = PullPolicy::DEFAULT;
     let mut state = load_state(store, group_id)?
         .ok_or_else(|| SyncError::new(ErrorCode::InvalidCursor, "pull cursor is not initialized"))?;
@@ -261,26 +288,32 @@ pub fn run_pull_once_at(
         } => {
             state.next_attempt_at_ms = next_attempt_at_ms;
             persist(store, &state, &[])?;
-            return Ok(PullOutcome {
-                applied: 0,
-                cursor_after: state.cursor_seq,
-                resync_required: false,
-                resync_reason: None,
-                node_head: state.node_head,
-                backoff_ms: Some(delay_ms),
-                stopped: None,
-            });
+            return Ok((
+                PullOutcome {
+                    applied: 0,
+                    cursor_after: state.cursor_seq,
+                    resync_required: false,
+                    resync_reason: None,
+                    node_head: state.node_head,
+                    backoff_ms: Some(delay_ms),
+                    stopped: None,
+                },
+                ApplyReport::default(),
+            ));
         }
         PullAction::Stop { reason } => {
-            return Ok(PullOutcome {
-                applied: 0,
-                cursor_after: state.cursor_seq,
-                resync_required: false,
-                resync_reason: None,
-                node_head: state.node_head,
-                backoff_ms: None,
-                stopped: Some(reason),
-            });
+            return Ok((
+                PullOutcome {
+                    applied: 0,
+                    cursor_after: state.cursor_seq,
+                    resync_required: false,
+                    resync_reason: None,
+                    node_head: state.node_head,
+                    backoff_ms: None,
+                    stopped: Some(reason),
+                },
+                ApplyReport::default(),
+            ));
         }
         _ => {}
     }
@@ -300,6 +333,26 @@ pub fn run_pull_once_at(
             let pinned = pinned_node_key(client)?;
             match fetch_and_verify(client, group_id, &state, pinned, from, to) {
                 Ok(entries) => {
+                    // 先 apply 进 MLS：落后（MISSING_LOG_ENTRIES）时**不推进游标**，交给追赶流程。
+                    let report = apply_verified_page(store, group_id, &entries, now_ms)?;
+                    if report.needs_catchup {
+                        state.consecutive_failures = 0;
+                        state.last_pull_at_ms = Some(now_ms);
+                        persist(store, &state, &[])?;
+                        return Ok((
+                            PullOutcome {
+                                applied: report.applied,
+                                cursor_after: state.cursor_seq,
+                                resync_required: true,
+                                // 本机 MLS 落后于条目：走追赶流程（RebuildEpoch 由上层执行）。
+                            resync_reason: Some(ResyncReason::GapTooLarge),
+                                node_head: node.log_sequence,
+                                backoff_ms: None,
+                                stopped: None,
+                            },
+                            report,
+                        ));
+                    }
                     let applied = u64::try_from(entries.len()).unwrap_or(0);
                     let last = entries
                         .last()
@@ -317,15 +370,19 @@ pub fn run_pull_once_at(
                     state.next_attempt_at_ms = now_ms.saturating_add(policy.page_interval_ms);
                     // 条目与游标是同一次快照写入：不存在“游标前进但条目没落盘”。
                     persist(store, &state, &entries)?;
-                    Ok(PullOutcome {
-                        applied,
-                        cursor_after: state.cursor_seq,
-                        resync_required: false,
-                        resync_reason: None,
-                        node_head: node.log_sequence,
-                        backoff_ms: None,
-                        stopped: None,
-                    })
+                    let _ = want_report;
+                    Ok((
+                        PullOutcome {
+                            applied,
+                            cursor_after: state.cursor_seq,
+                            resync_required: false,
+                            resync_reason: None,
+                            node_head: node.log_sequence,
+                            backoff_ms: None,
+                            stopped: None,
+                        },
+                        report,
+                    ))
                 }
                 Err(error) => {
                     record_failure(store, &mut state, policy, now_ms)?;
@@ -333,15 +390,18 @@ pub fn run_pull_once_at(
                 }
             }
         }
-        PullAction::Resync { reason } => Ok(PullOutcome {
-            applied: 0,
-            cursor_after: state.cursor_seq,
-            resync_required: true,
-            resync_reason: Some(reason),
-            node_head: node.log_sequence,
-            backoff_ms: None,
-            stopped: None,
-        }),
+        PullAction::Resync { reason } => Ok((
+            PullOutcome {
+                applied: 0,
+                cursor_after: state.cursor_seq,
+                resync_required: true,
+                resync_reason: Some(reason),
+                node_head: node.log_sequence,
+                backoff_ms: None,
+                stopped: None,
+            },
+            ApplyReport::default(),
+        )),
         PullAction::Backoff {
             delay_ms,
             next_attempt_at_ms,
@@ -350,25 +410,31 @@ pub fn run_pull_once_at(
             // 未到时机/已到 head/页间隔：不调用数据源，只把下次时间写回（幂等）。
             state.next_attempt_at_ms = next_attempt_at_ms;
             persist(store, &state, &[])?;
-            Ok(PullOutcome {
+            Ok((
+                PullOutcome {
+                    applied: 0,
+                    cursor_after: state.cursor_seq,
+                    resync_required: false,
+                    resync_reason: None,
+                    node_head: node.log_sequence,
+                    backoff_ms: Some(delay_ms),
+                    stopped: None,
+                },
+                ApplyReport::default(),
+            ))
+        }
+        PullAction::Stop { reason } => Ok((
+            PullOutcome {
                 applied: 0,
                 cursor_after: state.cursor_seq,
                 resync_required: false,
                 resync_reason: None,
                 node_head: node.log_sequence,
-                backoff_ms: Some(delay_ms),
-                stopped: None,
-            })
-        }
-        PullAction::Stop { reason } => Ok(PullOutcome {
-            applied: 0,
-            cursor_after: state.cursor_seq,
-            resync_required: false,
-            resync_reason: None,
-            node_head: node.log_sequence,
-            backoff_ms: None,
-            stopped: Some(reason),
-        }),
+                backoff_ms: None,
+                stopped: Some(reason),
+            },
+            ApplyReport::default(),
+        )),
     }
 }
 
@@ -459,6 +525,158 @@ pub fn run_catchup_once_at(
     })
 }
 
+
+/// 一页条目的 MLS 应用报告（SYNC-002 补全：拉到的条目真正 apply 进 MLS）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ApplyReport {
+    /// 真正应用（消息/Commit/提案）的条目数。
+    pub applied: u64,
+    /// epoch 已过期（STALE_EPOCH）被跳过的条目数。
+    pub stale: u64,
+    /// 无法应用（UNSUPPORTED_ENTRY：载荷不是本群的 MLS 消息、本机不在该群、非 UTF-8 正文等）的条目数。
+    pub unsupported: u64,
+    /// 本机落后于条目 epoch（MISSING_LOG_ENTRIES）：需要先追赶，本页**不推进游标**。
+    pub needs_catchup: bool,
+}
+
+impl ApplyReport {
+    /// 跳过总数（stale + unsupported）。
+    pub const fn skipped(&self) -> u64 {
+        self.stale.saturating_add(self.unsupported)
+    }
+
+    /// 全部条目都被跳过（没有真正应用）。
+    pub const fn all_skipped(&self) -> bool {
+        self.applied == 0 && self.skipped() > 0
+    }
+}
+
+/// 应用消息的确定性 message id（同一条目重放得到同一个 id → 落库幂等）。
+pub fn applied_message_id(group_id: &str, seq: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"chat/sync/applied-message/v1");
+    hasher.update((group_id.len() as u32).to_be_bytes());
+    hasher.update(group_id.as_bytes());
+    hasher.update(seq.to_be_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    MessageId::from_bytes(digest).encode()
+}
+
+/// 远端作者的**占位**账户 ID（设备凭据的确定性派生；真实账户映射待 IDENTITY 凭据目录接入）。
+fn placeholder_author_account(credential: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"chat/sync/applied-author/v1");
+    hasher.update((credential.len() as u32).to_be_bytes());
+    hasher.update(credential.as_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    AccountId::from_bytes(digest).encode()
+}
+
+/// 把一条已通过外层验证的条目应用进 MLS 并落库。
+///
+/// 分类（与 SYNC-002 一致，绝不静默丢数据）：
+///
+/// - 应用成功：应用消息 → 写正式消息行（确定性 message id，重放幂等）；Commit 合并 epoch+1、
+///   提案暂存 —— 三者都由 {@link crate::groups::group_process_peer_entry} 负责持久化；
+/// - `STALE_EPOCH`：跳过并计数（游标照常前进，否则会被一条旧条目永久卡住）；
+/// - `MISSING_LOG_ENTRIES`：本机落后 → 置 `needs_catchup`，**不推进游标**，交给追赶流程；
+/// - `UNSUPPORTED_ENTRY` / 载荷不是 MLS 消息 / 本机不在该群 / 正文非 UTF-8：跳过并计数；
+/// - 其它错误（例如 STATE_CORRUPTED）**向上抛出**：游标不前进。
+fn apply_verified_page(
+    store: &mut Store,
+    group_id: &str,
+    entries: &[LogEntry],
+    now_ms: i64,
+) -> SyncResult<ApplyReport> {
+    let mut report = ApplyReport::default();
+    // 本机不是该群成员（没有群快照）→ 整页按 UNSUPPORTED 跳过，与“只落库不 apply”的旧行为一致。
+    let mut device = match load_group_device(store, group_id) {
+        Ok(device) => device,
+        Err(_) => {
+            report.unsupported = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+            return Ok(report);
+        }
+    };
+    for entry in entries {
+        let candidate = &entry.candidate.candidate;
+        let payload = match decode_hex_bytes(
+            "entry payload",
+            &candidate.encrypted_payload,
+            MAX_CIPHERTEXT_BYTES,
+        ) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                report.unsupported = report.unsupported.saturating_add(1);
+                continue;
+            }
+        };
+        let input = PeerEntryInput::new(
+            group_id,
+            candidate.mls_epoch,
+            candidate.author_device_id.clone(),
+            payload,
+        );
+        match group_process_peer_entry(&mut device, store, &input) {
+            Ok(PeerEntryOutcome::Application { plaintext, .. }) => {
+                let Ok(body) = String::from_utf8(plaintext) else {
+                    report.unsupported = report.unsupported.saturating_add(1);
+                    continue;
+                };
+                let input = chat_storage::formal::VerifiedEntryInput {
+                    conversation_id: group_id.to_owned(),
+                    title: String::new(),
+                    message_id: applied_message_id(group_id, entry.receipt.seq),
+                    author_account: placeholder_author_account(&candidate.author_device_id),
+                    author_device: candidate.author_device_id.clone(),
+                    body,
+                    mine: false,
+                    created_at_ms: now_ms,
+                };
+                store
+                    .apply_verified_entry(input)
+                    .map_err(|error| {
+                        // StorageError::code() 是冻结码；正文/时间戳不合法属数据问题，不静默跳过。
+                        let _ = error.code();
+                        SyncError::new(
+                            ErrorCode::StorageFailure,
+                            "applied message could not be persisted",
+                        )
+                    })?;
+                report.applied = report.applied.saturating_add(1);
+            }
+            Ok(PeerEntryOutcome::Commit { .. } | PeerEntryOutcome::Proposal { .. }) => {
+                report.applied = report.applied.saturating_add(1);
+            }
+            Ok(PeerEntryOutcome::OwnPendingCommit { .. }) => {
+                report.unsupported = report.unsupported.saturating_add(1);
+            }
+            Err(error) => match error.code() {
+                "STALE_EPOCH" => report.stale = report.stale.saturating_add(1),
+                "MISSING_LOG_ENTRIES" => {
+                    report.needs_catchup = true;
+                    break;
+                }
+                "UNSUPPORTED_ENTRY"
+                | "INVALID_CIPHERTEXT"
+                | "INVALID_CANDIDATE"
+                | "INVALID_TARGET"
+                | "INVALID_CONTROL_RESULT"
+                | "INVALID_INPUT"
+                | "PERMISSION_DENIED" => {
+                    report.unsupported = report.unsupported.saturating_add(1);
+                }
+                _ => {
+                    // 其它错误（例如 STATE_CORRUPTED）不静默跳过：游标不前进。
+                    return Err(SyncError::new(
+                        ErrorCode::StateCorrupted,
+                        "a verified entry could not be applied to the MLS group",
+                    ));
+                }
+            },
+        }
+    }
+    Ok(report)
+}
 /// 验证一页节点条目：节点回执、候选绑定、群绑定、序号与前序哈希连续性。
 ///
 /// 与 [`run_pull_once`] 内部的验签是**同一个函数**：公开出来是为了能用“手工构造的坏页”验证拒绝路径

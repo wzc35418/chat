@@ -76,5 +76,19 @@ interface IdentityService {
 
     suspend fun confirmIdentityChange(contactId: String): IdentityContact
 
+    /**
+     * IDENTITY-013：导出加密恢复文件（口令派生 KDF + AEAD，**不含主密钥**）。
+     *
+     * 只恢复身份（账户/设备种子），旧库消息与附件仍不可读；未打开持久身份时显式失败。
+     */
+    suspend fun exportRecoveryBundle(passphrase: String): ByteArray
+
+    /**
+     * IDENTITY-014：在**空库**导入恢复文件。
+     *
+     * 目标库已有身份时显式拒绝（不覆盖）；导入后需重新打开才能使用身份。
+     */
+    suspend fun importRecoveryBundle(passphrase: String, bundle: ByteArray): RecoveryImportView
+
     suspend fun close()
 }

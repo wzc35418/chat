@@ -1131,6 +1131,152 @@ pub fn set_muted(
     Ok(project(&record, record.mls_epoch, None, saved))
 }
 
+
+/// GROUPS-016：禁言（**策略变更 + 真实 MLS 自更新控制提交**，默认同步到对端）。
+///
+/// 与纯本地的 [set_muted] 的区别：本函数要求调用方给出**本机 MLS 设备**，在策略落库之前准备
+/// 一个 `SelfUpdate` 控制提交（写入 pending，epoch **不推进**），`GroupView.pending` 如实报告；
+/// 对端处理后用 `PeerEntryInput.policy_sync = SetMuted{..}` 应用同一条语义。
+///
+/// `local_only = true` 时退化为纯本地策略变更（不产生提交，行为等价于 [set_muted]）。
+///
+/// 失败语义：无设备/设备不属于该群/epoch 不一致/已有 pending → 显式失败（**绝不静默降级成本地变更**）；
+/// 授权与校验失败发生在准备提交之前；策略落库失败会尝试丢弃刚准备的 pending，不留半状态。
+#[allow(clippy::too_many_arguments)]
+pub fn set_muted_with_commit(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    group_id: &str,
+    actor_credential: &str,
+    target_credential: &str,
+    muted: bool,
+    local_only: bool,
+) -> GroupResult<GroupView> {
+    let (mut record, _) = load_record(store, group_id)?;
+    reject_dissolved(&record)?;
+    let snapshot = domain_snapshot(&record)?;
+    ensure_device_matches_group(device, &record, snapshot.mls_epoch)?;
+    let actor_index = member_index(&record, actor_credential)?;
+    let target_index = member_index(&record, target_credential)?;
+    let actor = actor_of(&record, actor_index);
+    let target_account = account_id_for(&record.members[target_index].credential);
+    let operation = GroupOperation::SetMuted {
+        account: target_account,
+        muted,
+    };
+    let authorized =
+        authorize_group_operation(&snapshot, actor, operation).map_err(GroupError::from)?;
+    let proposed: ProposedPolicy =
+        apply_policy_operation(&snapshot, &authorized).map_err(GroupError::from)?;
+    let pending = prepare_self_update(device, store, local_only)?;
+    apply_domain_policy(&mut record, &proposed.policy)?;
+    let saved = match persist_snapshot(store, &record, record.mls_epoch) {
+        Ok(saved) => saved,
+        Err(error) => {
+            rollback_prepared_commit(device, store, group_id, pending.is_some());
+            return Err(error);
+        }
+    };
+    Ok(project(&record, record.mls_epoch, pending.as_ref(), saved))
+}
+
+/// GROUPS-016：改群名（**策略变更 + 真实 MLS 自更新控制提交**，默认同步到对端）。
+///
+/// 语义与 [set_muted_with_commit] 一致：`local_only = true` 时退化为纯本地改名（等价于
+/// [rename_group]）；同名幂等（不写库、不推进策略版本、不准备提交）。
+pub fn rename_group_with_commit(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    group_id: &str,
+    actor_credential: &str,
+    new_name: &str,
+    local_only: bool,
+) -> GroupResult<GroupView> {
+    validate_name(new_name)?;
+    let (mut record, state_version) = load_record(store, group_id)?;
+    reject_dissolved(&record)?;
+    // 同名幂等：不写库、不推进策略版本、不准备提交。
+    if record.name == new_name {
+        return Ok(project(&record, record.mls_epoch, None, state_version));
+    }
+    let snapshot = domain_snapshot(&record)?;
+    ensure_device_matches_group(device, &record, snapshot.mls_epoch)?;
+    let actor_index = member_index(&record, actor_credential)?;
+    let actor = actor_of(&record, actor_index);
+    let operation = GroupOperation::Rename {
+        name_digest: Digest::sha256(new_name.as_bytes()),
+    };
+    let authorized =
+        authorize_group_operation(&snapshot, actor, operation).map_err(GroupError::from)?;
+    let proposed: ProposedPolicy =
+        apply_policy_operation(&snapshot, &authorized).map_err(GroupError::from)?;
+    let pending = prepare_self_update(device, store, local_only)?;
+    apply_domain_policy(&mut record, &proposed.policy)?;
+    record.name = new_name.to_owned();
+    let saved = match persist_snapshot(store, &record, record.mls_epoch) {
+        Ok(saved) => saved,
+        Err(error) => {
+            rollback_prepared_commit(device, store, group_id, pending.is_some());
+            return Err(error);
+        }
+    };
+    Ok(project(&record, record.mls_epoch, pending.as_ref(), saved))
+}
+
+/// 本机设备必须属于该群且与持久化快照同 epoch（否则显式失败，绝不静默降级成本地变更）。
+fn ensure_device_matches_group(
+    device: &MlsDevice,
+    record: &GroupRecord,
+    snapshot_epoch: u64,
+) -> GroupResult<()> {
+    let group_key = device
+        .group_key()
+        .map_err(|_| GroupError::invalid_target("the local device has no MLS group"))?;
+    if group_key != record.mls_group_key {
+        return Err(GroupError::invalid_target(
+            "the local device is not in this group",
+        ));
+    }
+    let epoch = device
+        .epoch()
+        .map_err(|_| GroupError::corrupted("MLS group epoch is unavailable"))?;
+    if epoch != snapshot_epoch {
+        return Err(GroupError::new(
+            "STALE_EPOCH",
+            "the local MLS epoch does not match the persisted group",
+        ));
+    }
+    Ok(())
+}
+
+/// 可选地准备一个 `SelfUpdate` 控制提交（`local_only` 时返回 None，不碰设备）。
+fn prepare_self_update(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    local_only: bool,
+) -> GroupResult<Option<PendingControl>> {
+    if local_only {
+        return Ok(None);
+    }
+    let pending = device
+        .prepare_control(ControlOperation::SelfUpdate, store)
+        .map_err(GroupError::from)?;
+    Ok(Some(pending))
+}
+
+/// 策略落库失败时丢弃刚准备的 pending（不留半状态；丢弃失败本身就是故障，仍返回原错误）。
+fn rollback_prepared_commit(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    group_id: &str,
+    prepared: bool,
+) {
+    if !prepared {
+        return;
+    }
+    let _ = discard_pending_control(store, group_id, "operator_discarded");
+    let _ = device;
+}
 /// GROUPS-005：移除一名确认成员（群主或管理员；不能移除群主、不能移除自己）。
 ///
 /// 顺序（**非法操作在任何写入之前被拒**）：

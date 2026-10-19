@@ -860,4 +860,73 @@ cargo test --offline -p chat-ffi                   # 42 passed（既有 39 继�
 4. **同步阻塞**：start/stop/status 都在 FFI 的 `Mutex` 内串行；stop 会等当前那一轮网络请求结束。
 5. **一次只能有一个 SyncFfi 持有该库的运行时**：启动期间库被运行时独占，其它 FFI 对象要等 stop/shutdown。
 6. **`node_public_key_hex` 必填**：运行时拒绝未固定节点公钥的配置（core 的 `SyncRuntimeConfig::validate` 语义）。
+## 拉取条目应用进 MLS 并落库（SYNC-002 补全，2026-10-18，Windows x64）
+
+背景：`run_pull_once` 之前只做“验签 + 落库 + 前移游标”，拉到的条目并不 apply 进 MLS，
+自动收消息缺最后一环。本轮补上 **apply 阶段**。
+
+代码：[crates/core/src/sync_worker.rs](../../crates/core/src/sync_worker.rs)（本包内定点改动，**未改 groups.rs**）；
+测试：[crates/core/tests/sync_apply.rs](../../crates/core/tests/sync_apply.rs)（4 个，真节点 + 真双设备两库）。
+
+### 新增公开面
+
+~~~text
+run_pull_once_reporting_at(store, client, group_id, now_ms) -> SyncResult<(PullOutcome, ApplyReport)>
+applied_message_id(group_id, seq) -> String            // 确定性消息 ID（幂等键）
+ApplyReport { applied, stale, unsupported, needs_catchup }   // skipped() = stale + unsupported
+~~~
+
+`run_pull_once` / `run_pull_once_at` 行为不变（内部转调同一实现，报告被丢弃）。
+
+### 应用与分类语义
+
+1. **应用**：对本页每条已通过 `verify_pull_page` 的条目，用节点日志里的候选构造
+   `PeerEntryInput`（群、epoch、`author_device_id` 作为已认证作者、密文载荷）并调用
+   `crate::groups::group_process_peer_entry` ——它内部走 CRYPTO-006 的 `process_verified_entry`，
+   Commit 合并后 epoch **恰好 +1** 并把 MLS 状态 `export_to_store` + 快照落库。
+2. **应用消息落库**：解密出的正文写成正式消息行（STORAGE-008 `apply_verified_entry`），
+   message id 由 `(group_id, 日志序号)` 确定性派生（`applied_message_id`），因此**重放幂等**；
+   正文不是合法 UTF-8 → 记 skipped（不写半条）。
+3. **失败分类**（绝不静默丢数据）：
+   - `STALE_EPOCH` → 跳过并计 `stale`，游标照常前进（否则会被一条旧条目永久卡住）；
+   - `MISSING_LOG_ENTRIES` → 置 `needs_catchup`，**不推进游标**，返回
+     `resync_required=true`（原因 `GapTooLarge`，交给追赶流程的 `RebuildEpoch`）；
+   - `UNSUPPORTED_ENTRY` / 载荷不是 MLS 消息 / 本机不在该群 / 正文非 UTF-8 → 跳过并计 `unsupported`；
+   - 其它（如 `STATE_CORRUPTED`）→ **向上抛错**，游标不前进。
+4. **游标只在 apply 之后前进**：条目落库与游标是同一次 storage 快照写入。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test sync_apply   # 4 passed
+cargo test --offline -p chat-core                     # 208 passed（既有 200 继续通过，0 failed）
+~~~
+
+### 证据
+
+- `sync_apply::pull_applies_the_application_message_into_mls_and_the_store`：alice 用真 MLS 加密
+  一条消息提交到真节点 → bob 的同步 worker 拉取 → `report.applied == 1`、游标 1、
+  `message_exists(applied_message_id)` 为真、会话摘要 `preview == 解密后的正文`。
+- `sync_apply::repeated_pulls_do_not_apply_the_same_entry_twice`：同一页再拉一次 → applied 0、
+  游标不变、消息仍只有一条（幂等）。
+- `sync_apply::a_page_for_a_group_the_local_store_is_not_in_is_skipped_but_advances`：本机不在该群
+  （无群快照）→ 两条条目 `unsupported == 2`、applied 0，但游标前进到 2。
+- `sync_apply::applying_a_control_commit_advances_the_epoch`：alice 提交真 SelfUpdate 控制提交 →
+  bob 拉取应用 → 快照 `epoch == before + 1`（控制提交真的合进了 MLS）。
+
+### 已知限制
+
+1. **作者身份是外层设备 ID**：应用消息的作者取日志候选的 `author_device_id`，写消息行时
+   `author_account` 用**确定性占位**（`placeholder_author_account`）——真实账户映射要等 IDENTITY
+   凭据目录接入；因此群消息在会话列表里的“对端账户”暂时不是真实账户 ID。
+2. **策略语义不经拉取同步**：`set_role` / `transfer_ownership` 等角色变更需要外层声明的目标成员，
+   日志里只有 `domain_target_digest`，故 apply 阶段**不猜测策略**（角色按本地保持不变）；
+   角色同步仍走显式 `group_process_peer_entry(policy_intent)` 路径。
+3. **成员增删提交**（invite / remove）同样缺少“声明身份”，apply 阶段会按 `INVALID_CONTROL_RESULT`
+   跳过并计数；需要控制元数据扩展（PROTOCOL-004 目标摘要 → 成员身份）后再打开。
+4. `MISSING_LOG_ENTRIES` 复用 `ResyncReason::GapTooLarge` 表达“本机 MLS 落后”（`ResyncReason`
+   属于 chat-sync 的日志对齐语义，本包不改它的枚举）。
+5. 应用阶段每条消息一次 storage 事务；大批量页（上百条）会变慢，尚未批处理。
+
 

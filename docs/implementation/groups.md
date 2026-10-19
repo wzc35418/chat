@@ -832,6 +832,81 @@ cargo test --offline -p chat-core                        # 128 passed（本记�
 - **证据**：`cargo test -p chat-core` 中 `group_node` 新增 4 单测 + 2 真节点集成——真节点上转让的日志元数据为 `transfer_ownership` 且目标摘要≠提交摘要，回执接受后 epoch 2、群主易主；同一 pending 用旧入口被拒且节点日志为空。
 - **协议待补**：PROTOCOL-004 无“通用 self_update”值（建议 `PendingControl` 记领域操作或协议加字段）；`set_muted`/`rename_group` 无 MLS 提交不经过映射；`leave_group`/`dissolve_group` 本切片仍不产生 MLS 提交，故 `LeaveSelf`/`Dissolve` 映射已实现并单测但端到端不可达（文档不冒充已运行通路）。
 
+## 禁言 / 改名自动准备控制提交（GROUPS-016，2026-10-19，Windows x64）
+
+GROUPS-015 已能让禁言与群名随控制提交传播，但发送侧仍要协调者手工准备一个 `SelfUpdate` 提交。
+本轮收口：新增**设备感知**的变更入口，策略变更的同时准备真实 MLS 控制提交。
+
+代码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)；
+测试：[crates/core/tests/groups_mutations_commit.rs](../../crates/core/tests/groups_mutations_commit.rs)（4 个，真双设备两库）。
+
+### 公开面（新增）
+
+```text
+pub fn set_muted_with_commit(device, store, group_id, actor, target, muted,
+                             local_only: bool) -> GroupResult<GroupView>
+pub fn rename_group_with_commit(device, store, group_id, actor, new_name,
+                                local_only: bool) -> GroupResult<GroupView>
+```
+
+`local_only = false`（正常路径）：在策略落库之前 `prepare_control(SelfUpdate)` → pending 写入
+（**epoch 不推进**）、`GroupView.pending` 如实报告；接受后 epoch 恰好 +1，禁言/群名保持。
+`local_only = true`：退化为纯本地策略变更，不产生提交（等价于既有 `set_muted` / `rename_group`）。
+
+为什么是**新增**而不是改签名：`set_muted` / `rename_group` 的现有签名叫法被
+`crates/core/src/service.rs`、`crates/ffi/src/groups_ffi.rs`、`crates/node-services/src/group.rs`
+以及既有用例调用，都不在本任务写作用域内；改成带 `device` 的新签名会让这些调用点编译失败。
+因此保留旧函数（纯本地、契约不变），新增设备感知入口并给出显式 `local_only` 开关。
+
+### 关键语义
+
+1. **设备前置校验**：`group_key` 必须属于该群（否则 `INVALID_TARGET`）、设备 epoch 必须与持久化
+   快照一致（否则 `STALE_EPOCH`）——**绝不静默降级成本地变更**。
+2. **顺序**：读快照 → 校验 → DOMAIN-002 授权 + DOMAIN-004 派生 → 准备 `SelfUpdate` 提交 → 应用策略
+   → 持久化 → 投影（带 pending）。授权/校验失败发生在准备提交之前，因此失败时设备与快照都不动。
+3. **失败不留半状态**：策略持久化失败时会尝试丢弃刚准备的 pending（`discard_pending_control`），
+   再返回原错误。
+4. **同名幂等**：`rename_group_with_commit` 在名字未变时不写库、不推进策略版本、不准备提交。
+5. **已有 pending** 时再次变更 → `INVALID_STATE_TRANSITION`（crypto `PendingCommitExists` 原样透出），
+   且既有 pending 不被覆盖。
+
+### 错误码（与 GROUPS-015 一致，未新增）
+
+`PERMISSION_DENIED`（越权、自我禁言）、`INVALID_INPUT`（名字不合法）、`INVALID_TARGET`（目标不是
+成员 / 设备不属于该群）、`STALE_EPOCH`（设备与快照 epoch 不一致）、`INVALID_STATE_TRANSITION`
+（已有 pending）、`INVALID_STATE`（群已解散由 `reject_dissolved` 给出）。
+
+### 复现命令（全程离线）
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test groups_mutations_commit   # 4 passed
+cargo test --offline -p chat-core                                   # 204 passed（既有 200 继续通过）
+```
+
+### 证据
+
+- `groups_mutations_commit::rename_prepares_a_pending_commit_and_accept_keeps_the_name`：默认路径
+  `pending.is_some()`、epoch **不变**、名字与 `policy_version` 已更新；`accept_pending_control` 后
+  epoch +1、名字保持、pending 清空。
+- `groups_mutations_commit::mute_prepares_a_pending_commit_and_syncs_to_the_peer_after_acceptance`：
+  禁言同样准备 pending（bob = muted、epoch 1）；接受后把该提交交给对端 + `policy_sync` 声明，
+  **对端 bob 侧看到自己 muted**（端到端闭环，不再需要手工准备提交）。
+- `groups_mutations_commit::local_only_does_not_prepare_a_control_commit`：`local_only = true` 时
+  改名/禁言都只改策略，`GroupView.pending` 为空且 `device.pending_control()` 为空。
+- `groups_mutations_commit::failures_leave_no_half_state`：普通成员越权改名（`PERMISSION_DENIED`）、
+  群主禁言自己（`PERMISSION_DENIED`）、无群设备（`INVALID_TARGET`）、已有 pending 再变更
+  （`INVALID_STATE_TRANSITION`）——四种失败都**没有产生 pending**，快照逐字段不变，第一次的提交完整保留。
+
+### 已知限制
+
+1. **旧入口仍是纯本地**：`set_muted` / `rename_group` 保持原语义（不产生提交），调用方需要同步到对端
+   时必须改用 `*_with_commit`。等 `service.rs` / FFI / node-services 一并切到新入口（不在本任务写作用域）
+   之后，可以再把旧入口标记为 local-only 的别名。
+2. **提交的准备与接受是两步**：本函数只 prepare（epoch 不推进），接受走既有 `accept_pending_control`；
+   与 `transfer_ownership` / `remove_member` 等既有提交型 API 的形态一致。
+3. **一次提交一条策略**：禁言与改名不能共用同一条提交（与 GROUPS-015 的声明互斥规则一致）。
+
 ## 禁言与群名随控制提交同步（GROUPS-015，2026-10-19，Windows x64）
 
 GROUPS-014 已能同步转让/改角色，但**禁言（muted）与群名**仍只在本机生效。本轮把这两类纯策略变更

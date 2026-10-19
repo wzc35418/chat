@@ -89,6 +89,33 @@ class NativeIdentityService : IdentityService {
             guard { identity.confirmIdentityChange(contactId) }.toContact()
         }
 
+
+    override suspend fun exportRecoveryBundle(passphrase: String): ByteArray = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            val identity = native ?: throw IdentityException("CORE_CLOSED", "identity is not open")
+            guard { identity.exportRecoveryBundle(passphrase) }
+        }
+    }
+
+    override suspend fun importRecoveryBundle(
+        passphrase: String,
+        bundle: ByteArray,
+    ): chat.api.RecoveryImportView = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            val identity = native ?: throw IdentityException("CORE_CLOSED", "identity is not open")
+            val view = guard { identity.importRecoveryBundle(passphrase, bundle) }
+            chat.api.RecoveryImportView(
+                accountId = view.accountId,
+                deviceId = view.deviceId,
+                accountPublicKey = view.accountPublicKey,
+                devicePublicKey = view.devicePublicKey,
+                displayName = view.displayName,
+                createdAtMillis = view.createdAtMs,
+                devicesDigest = view.devicesDigest,
+            )
+        }
+    }
+
     override suspend fun close(): Unit = withContext(NonCancellable) {
         mutex.withLock {
             withContext(Dispatchers.IO) {
