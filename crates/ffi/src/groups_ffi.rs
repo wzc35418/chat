@@ -862,6 +862,9 @@ impl GroupFfi {
 
     /// GROUPS-019：从群日志取回最近一条可解析的邀请（没有则 `None`）。
     ///
+    /// `invitee_credential` 是**可选**过滤：给了就只返回被邀请者匹配的最近一条，
+    /// 别人的邀请返回 `None`（不是错误）；`None` = 不过滤（返回最近一条邀请）。
+    ///
     /// 错误语义与 `group_submit_invite` 一致：未配置节点/不可达/回执范围异常都显式失败，
     /// **不会**把错误当成"没有邀请"（只有确实没有邀请才是 `None`）。
     pub fn group_fetch_invite(
@@ -870,6 +873,7 @@ impl GroupFfi {
         endpoint_url: String,
         node_id: String,
         node_public_key_hex: Option<String>,
+        invitee_credential: Option<String>,
     ) -> Result<Option<GroupInviteBlobFfi>, FfiError> {
         require_endpoint(&endpoint_url)?;
         let mut core = self.lock()?;
@@ -879,6 +883,7 @@ impl GroupFfi {
                 &endpoint_url,
                 &node_id,
                 node_public_key_hex.as_deref(),
+                invitee_credential.as_deref(),
             )
             .map_err(|error| failure!(error))?;
         Ok(found.map(|blob| GroupInviteBlobFfi {

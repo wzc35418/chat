@@ -48,6 +48,9 @@ import chat.presentation.preview.updateSendNodePublicKey
 import chat.presentation.preview.updateSendNodeUrl
 import chat.presentation.preview.withSendStep
 import chat.presentation.preview.withMessageCards
+import chat.presentation.preview.updateInvitee
+import chat.presentation.preview.withFetchedInvite
+import chat.presentation.preview.withInviteReceipt
 import chat.presentation.preview.withMessagePreview
 import chat.presentation.preview.withSyncStatus
 import chat.presentation.display.toCard
@@ -568,6 +571,27 @@ fun main() = application {
                 groupState = groupState.beginBusy()
                 withGroup { service -> service.snapshot(groupId) }
                     .onSuccess { groupState = groupState.withSnapshot(it) }
+                    .onFailure { error ->
+                        groupState = groupState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
+        updateInvitee = { value -> groupState = groupState.updateInvitee(value) },
+        fetchInvite = {
+            scope.launch {
+                val snapshot = groupState.snapshot ?: return@launch
+                groupState = groupState.beginBusy()
+                withGroup { service ->
+                    service.fetchInvite(
+                        snapshot.groupId,
+                        storeState.sendNodeUrl.trim(),
+                        storeState.sendNodeId.trim(),
+                        storeState.sendNodePublicKey.trim().ifEmpty { null },
+                    )
+                }.onSuccess { groupState = groupState.withFetchedInvite(it) }
                     .onFailure { error ->
                         groupState = groupState.withError(
                             (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",

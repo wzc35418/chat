@@ -1635,11 +1635,13 @@ impl ConversationCore {
         endpoint_url: &str,
         node_id: &str,
         node_public_key_hex: Option<&str>,
+        invitee_credential: Option<&str>,
     ) -> anyhow::Result<Option<crate::groups::GroupInviteBlob>> {
         let guard = self.store_guard()?;
         let store = guard.as_ref().ok_or_else(closed)?;
         let client = self.node_client_for(store, endpoint_url, node_id, node_public_key_hex)?;
-        crate::group_node::fetch_group_invite(&client, group_id).map_err(anyhow::Error::new)
+        crate::group_node::fetch_group_invite_for(&client, group_id, invitee_credential)
+            .map_err(anyhow::Error::new)
     }
 
     /// 用持久身份的种子派生设备签名钥构造节点客户端（端点/节点 ID/节点公钥显式）。

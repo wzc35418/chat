@@ -1643,4 +1643,23 @@ let Ok(bytes) = chat_node_services::canonical::decode_hex_bytes(
 1. 标记只表达“这是邀请”，具体邀请内容仍需读 payload（节点不解析正文）；
 2. `target_digest` 是 blob 摘要，不是群/成员摘要（仅用于区分与去重辅助）；
 3. 标记不参与取回逻辑，未来若改变 blob 编码不影响可观测性。
+### 邀请取回按被邀请者过滤（GROUPS-019，2026-10-18）
+
+~~~text
+fetch_group_invite(client, group_id)                       // = fetch_group_invite_for(.., None)
+fetch_group_invite_for(client, group_id, invitee?)         // 只返回 meta.invitee_credential 匹配的最近一条
+GroupFfi.group_fetch_invite(group_id, endpoint_url, node_id, node_public_key_hex?, invitee_credential?)
+~~~
+
+- `invitee = None` → 不过滤（返回最近一条邀请，**旧行为不变**）；旧函数保留为别名；
+- 有过滤时：别人的邀请**不返回**（`None`），**不是错误**；未知凭据同样是 `None`；
+- 页/网络错误仍然显式失败（不会被伪装成"没有邀请"）；
+- 扫描顺序不变（`after` 递增、最多 `MAX_RECONCILE_PAGES` 页），匹配的条目里取**最后**一条 = 最近一条。
+
+证据：[crates/ffi/tests/groups_invite_ffi.rs](../../crates/ffi/tests/groups_invite_ffi.rs)
+`invites_are_filtered_by_the_invited_credential`（真节点 + 双凭据）：先提交 bob、再提交 carol →
+按 bob 只拿 bob、按 carol 只拿 carol、不过滤拿最近的 carol（旧行为）、未知凭据 `None` 不报错。
+
+复现：`cargo test --offline -p chat-ffi --test groups_invite_ffi` → 5 passed。
+
 

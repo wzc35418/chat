@@ -9,7 +9,7 @@
     },
     {
       "status": "PASS",
-      "message": "本地Markdown链接及显式函数锚点已检查：1680"
+      "message": "本地Markdown链接及显式函数锚点已检查：1682"
     },
     {
       "status": "PASS",
@@ -43,5 +43,5 @@
   ],
   "fileCount": 585,
   "functionCount": 197,
-  "markdownLinks": 1680
+  "markdownLinks": 1682
 }

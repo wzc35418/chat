@@ -1008,6 +1008,19 @@ InviteMetaFfi { group_id, mls_group_id, name, inviter_credential, owner_credenti
   `INVALID_STATE_TRANSITION`（未入库身份）、`CORE_CLOSED`（已关闭）、节点侧稳定码原样透出；
 - 幂等：同 (群, blob) 重复提交返回同一 `submission_id`；
 - 纯数据、不含密钥；测试 [crates/ffi/tests/groups_invite_ffi.rs](../../crates/ffi/tests/groups_invite_ffi.rs)（4 个，真节点）。
+## 邀请取回新增可选被邀请者过滤（2026-10-18）
+
+~~~text
+GroupFfi.group_fetch_invite(group_id, endpoint_url, node_id, node_public_key_hex?, invitee_credential?)
+    -> Option<GroupInviteBlobFfi>
+~~~
+
+- `invitee_credential = None` → 不过滤（最近一条邀请，旧行为不变）；给了就只返回被邀请者匹配的最近一条；
+- 别人的邀请 / 未知凭据 → `None`（不是错误）；页/网络错误仍显式失败；
+- core 侧对应 `fetch_group_invite_for`（`fetch_group_invite` 是 `None` 别名），
+  `ConversationCore::group_fetch_invite` 追加 `invitee_credential` 参数；
+- 测试：[crates/ffi/tests/groups_invite_ffi.rs](../../crates/ffi/tests/groups_invite_ffi.rs)（5 个，真节点）。
+
 
 
 

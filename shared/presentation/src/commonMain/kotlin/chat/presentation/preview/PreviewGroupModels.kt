@@ -22,6 +22,12 @@ data class PreviewGroupState(
     val summaryList: List<GroupSummary> = emptyList(),
     val selectedGroupId: String? = null,
     val skippedGroups: Int = 0,
+    /** 待投递邀请的被邀请者凭据。 */
+    val inviteeCredential: String = "",
+    /** 最近一次邀请提交回执。 */
+    val inviteReceipt: chat.api.InviteReceipt? = null,
+    /** 最近一次从节点取回的邀请。 */
+    val fetchedInvite: chat.api.GroupInviteBlob? = null,
 )
 
 fun PreviewGroupState.withRooms(rooms: List<GroupSnapshot>): PreviewGroupState =
@@ -105,3 +111,19 @@ fun PreviewGroupState.withSummaries(summaries: List<GroupSummary>, skipped: Int)
 }
 
 fun PreviewGroupState.selectGroup(groupId: String): PreviewGroupState = copy(selectedGroupId = groupId)
+
+fun PreviewGroupState.updateInvitee(value: String): PreviewGroupState = copy(inviteeCredential = value)
+
+fun PreviewGroupState.withInviteReceipt(receipt: chat.api.InviteReceipt): PreviewGroupState = copy(
+    inviteReceipt = receipt,
+    busy = false,
+    notice = "邀请已提交：seq " + receipt.seq,
+    lastErrorCode = null,
+)
+
+fun PreviewGroupState.withFetchedInvite(blob: chat.api.GroupInviteBlob?): PreviewGroupState = copy(
+    fetchedInvite = blob,
+    busy = false,
+    notice = if (blob == null) "节点上没有可取的邀请" else "已取回邀请：" + blob.meta.name,
+    lastErrorCode = null,
+)

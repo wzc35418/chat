@@ -272,11 +272,19 @@ impl Harness {
     }
 
     fn fetch(&self) -> Result<Option<chat_ffi::groups_ffi::GroupInviteBlobFfi>, FfiError> {
+        self.fetch_for(None)
+    }
+
+    fn fetch_for(
+        &self,
+        invitee_credential: Option<&str>,
+    ) -> Result<Option<chat_ffi::groups_ffi::GroupInviteBlobFfi>, FfiError> {
         self.ffi.group_fetch_invite(
             self.group_id.clone(),
             self.node.endpoint_url(),
             NODE_ID.to_owned(),
             Some(self.node.public_key_hex()),
+            invitee_credential.map(str::to_owned),
         )
     }
 }
@@ -330,6 +338,7 @@ fn an_unreachable_or_unconfigured_node_is_explicit() {
             UNREACHABLE_ENDPOINT.to_owned(),
             NODE_ID.to_owned(),
             Some(harness.node.public_key_hex()),
+            None,
         )
         .expect_err("unreachable node on fetch");
     assert_eq!(code(error), "NODE_UNAVAILABLE");
@@ -360,6 +369,7 @@ fn an_unknown_group_is_reported_explicitly() {
             harness.node.endpoint_url(),
             NODE_ID.to_owned(),
             Some(harness.node.public_key_hex()),
+            None,
         )
         .expect_err("fetching an unknown group must fail explicitly");
     // 节点侧拒绝（群不存在）→ 稳定码不是 NODE_UNAVAILABLE 也不是成功。
@@ -368,6 +378,47 @@ fn an_unknown_group_is_reported_explicitly() {
     assert!(!unknown_code.is_empty());
 }
 
+
+#[test]
+fn invites_are_filtered_by_the_invited_credential() {
+    let harness = Harness::new();
+    // 两条邀请：bob（harness.meta）与 carol。
+    let bob_meta = harness.meta.clone();
+    let carol_meta = InviteMetaFfi {
+        invitee_credential: "carol".to_owned(),
+        members: vec![harness.device_id.clone(), "carol".to_owned()],
+        // 同一个群、同一个 epoch，只是被邀请者不同。
+        ..harness.meta.clone()
+    };
+    let bob_receipt = harness.submit().expect("bob invite submitted");
+    let carol_receipt = harness
+        .ffi
+        .group_submit_invite(
+            harness.group_id.clone(),
+            carol_meta.clone(),
+            vec![0xCD; 48],
+            harness.node.endpoint_url(),
+            NODE_ID.to_owned(),
+            Some(harness.node.public_key_hex()),
+        )
+        .expect("carol invite submitted");
+    assert_ne!(carol_receipt.submission_id, bob_receipt.submission_id);
+
+    // 按 bob 过滤：只拿到 bob 的那条（即使 carol 是更晚提交的）。
+    let only_bob = harness.fetch_for(Some("bob")).expect("fetch bob").expect("bob invite");
+    assert_eq!(only_bob.meta, bob_meta);
+    assert_eq!(only_bob.welcome_bytes, WELCOME_BYTES.to_vec());
+    // 按 carol 过滤：只拿到 carol 的那条。
+    let only_carol = harness.fetch_for(Some("carol")).expect("fetch carol").expect("carol invite");
+    assert_eq!(only_carol.meta, carol_meta);
+    assert_eq!(only_carol.welcome_bytes, vec![0xCD; 48]);
+    // 不传过滤：最近的一条（carol 后提交）→ 旧行为不变。
+    let latest = harness.fetch().expect("fetch unfiltered").expect("some invite");
+    assert_eq!(latest.meta.invitee_credential, "carol");
+    // 未知凭据：None，不报错。
+    let none = harness.fetch_for(Some("dave")).expect("unknown invitee is not an error");
+    assert!(none.is_none(), "somebody else's invite is not returned");
+}
 #[test]
 fn a_closed_object_rejects_invite_calls() {
     let harness = Harness::new();

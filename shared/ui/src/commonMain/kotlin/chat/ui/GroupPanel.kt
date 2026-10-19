@@ -47,6 +47,9 @@ data class GroupHandlers(
     val discardPending: () -> Unit = {},
     val loadGroupList: () -> Unit = {},
     val selectGroup: (String) -> Unit = {},
+    val updateInvitee: (String) -> Unit = {},
+    val submitInvite: () -> Unit = {},
+    val fetchInvite: () -> Unit = {},
 ) {
     companion object {
         val None = GroupHandlers()
@@ -175,6 +178,43 @@ fun GroupPanel(
                             }
                         }
                     }
+                }
+
+                HorizontalDivider(color = Color(0xFFE1E6E1))
+                Text("邀请投递（经节点）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "把邀请（元数据 + Welcome）提交到节点，对方凭同一节点取回并接受。回执是节点真实回执。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF5F6B63),
+                )
+                OutlinedTextField(
+                    value = state.inviteeCredential,
+                    onValueChange = handlers.updateInvitee,
+                    label = { Text("被邀请者凭据") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    TextButton(
+                        onClick = handlers.fetchInvite,
+                        enabled = state.ready && !state.busy,
+                        modifier = Modifier.semantics { contentDescription = "从节点取回邀请" },
+                    ) { Text("取回邀请", style = MaterialTheme.typography.labelMedium) }
+                }
+                Text(
+                    "注意：提交邀请需要真实 Welcome 字节，本面板不持有（由建群/邀请流程产出）；这里只提供取回。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFFB3261A),
+                )
+                state.inviteReceipt?.let {
+                    Text("回执：seq " + it.seq + " · " + it.submissionId, style = MaterialTheme.typography.bodySmall)
+                }
+                state.fetchedInvite?.let {
+                    Text(
+                        "取回邀请：" + it.meta.name + " · epoch " + it.meta.epoch + " · 被邀请 " + it.meta.inviteeCredential +
+                            " · Welcome " + it.welcomeBytes.size + " 字节",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                 }
 
                 val snapshot = state.snapshot

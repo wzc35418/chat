@@ -104,7 +104,8 @@ class NativeGroupService(
         nodeId: String,
         nodePublicKeyHex: String?,
     ): chat.api.GroupInviteBlob? {
-        val blob = call { it.groupFetchInvite(groupId, endpointUrl, nodeId, nodePublicKeyHex) } ?: return null
+        // task-118 给 FFI 增加了可选 invitee 过滤；本层暂不暴露过滤，传 null 表示不过滤。
+        val blob = call { it.groupFetchInvite(groupId, endpointUrl, nodeId, nodePublicKeyHex, null) } ?: return null
         return chat.api.GroupInviteBlob(
             meta = chat.api.GroupInviteMeta(
                 groupId = blob.meta.groupId,

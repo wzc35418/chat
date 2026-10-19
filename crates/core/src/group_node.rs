@@ -719,9 +719,24 @@ pub fn submit_group_invite(
 ///
 /// 只读最近 `MAX_RECONCILE_PAGES` 页；解析失败/版本不支持的条目被跳过（它们不是邀请），
 /// 但**不会**把错误当成“没有邀请”——页/网络错误显式返回。
+///
+/// 等价于 `fetch_group_invite_for(client, group_id, None)`（不过滤被邀请者）。
 pub fn fetch_group_invite(
     client: &NodeClient,
     group_id: &str,
+) -> ControlReceiptResult<Option<groups::GroupInviteBlob>> {
+    fetch_group_invite_for(client, group_id, None)
+}
+
+/// GROUPS-019（按被邀请者过滤）：只返回 `meta.invitee_credential` 匹配的**最近一条**邀请。
+///
+/// - `invitee_credential = None` → 不过滤（返回最近一条邀请）；
+/// - 有过滤时：别人的邀请**不返回**（`None`），也不是错误；未知凭据同样是 `None`；
+/// - 页/网络错误仍然显式返回（不会伪装成“没有邀请”）。
+pub fn fetch_group_invite_for(
+    client: &NodeClient,
+    group_id: &str,
+    invitee_credential: Option<&str>,
 ) -> ControlReceiptResult<Option<groups::GroupInviteBlob>> {
     GroupId::parse(group_id).map_err(|_| {
         ControlReceiptError::new(
@@ -753,7 +768,14 @@ pub fn fetch_group_invite(
                 continue;
             };
             if let Ok(blob) = groups::GroupInviteBlob::decode(&bytes) {
-                found = Some(blob);
+                // 有过滤时只接受被邀请者匹配的条目（别人的邀请既不返回也不报错）。
+                let matches = match invitee_credential {
+                    None => true,
+                    Some(invitee) => blob.meta.invitee_credential == invitee,
+                };
+                if matches {
+                    found = Some(blob);
+                }
             }
         }
         if !page.has_more || page.next_after <= after {
