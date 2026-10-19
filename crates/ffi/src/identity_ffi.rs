@@ -353,6 +353,48 @@ fn restore_persisted(
     state.core = Some(core);
     Ok(())
 }
+
+/// 设备集合里的一台设备（纯数据：公钥是公开材料，不含任何私钥）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DeviceViewFfi {
+    /// 设备 ID（PROTOCOL-001 文本）。
+    pub device_id: String,
+    /// 所属账户 ID。
+    pub account_id: String,
+    /// 本地标签。
+    pub label: String,
+    /// 设备签名公钥（小写 hex，32 字节）。
+    pub device_public_key_hex: String,
+    /// 登记时间（Unix 毫秒）。
+    pub added_at_ms: i64,
+    /// 撤销时间（`None` = 未撤销）。
+    pub revoked_at_ms: Option<i64>,
+    /// 撤销原因。
+    pub revoked_reason: Option<String>,
+    /// 是否就是本机设备。
+    pub is_local: bool,
+}
+
+/// 释放写锁期间需要用到的本机身份坐标（避免闭包里再借用 state）。
+struct LocalDeviceContext {
+    account_id: String,
+    device_id: String,
+    display_name: String,
+    public_key: Option<[u8; 32]>,
+    now_ms: u64,
+}
+
+/// 设备集合错误 → FFI 错误（稳定码原样透出：`DEVICE_SELF_REVOKE` 等）。
+fn device_failure(error: chat_identity::devices::DeviceError) -> FfiError {
+    let detail = error.detail();
+    state_error(error.code(), &detail)
+}
+
+fn storage_failure(error: chat_storage::formal::StorageError) -> FfiError {
+    let detail = error.to_string();
+    state_error(error.code(), &detail)
+}
+
 /// 口令加好友与本机身份的 UniFFI 对象。
 #[derive(uniffi::Object)]
 pub struct IdentityFfi {
@@ -526,6 +568,53 @@ impl IdentityFfi {
             clock,
         )))
     }
+
+    /// 释放正式库的独占写锁执行一段设备集合操作，结束后无条件把身份句柄装回去。
+    ///
+    /// 设备集合在 storage 层（identity_devices），而身份对象以独占写者身份持有同一个库；
+    /// 因此这里采用"短暂释放 → 操作 → 恢复"的时序（与恢复文件导出同一套做法）。
+    fn with_store<T>(
+        &self,
+        f: impl FnOnce(&mut chat_storage::formal::Store, &LocalDeviceContext) -> Result<T, FfiError>,
+    ) -> Result<T, FfiError> {
+        let mut state = self.lock()?;
+        state.require_open()?;
+        let Some(database) = state.database.clone() else {
+            return Err(state_error(
+                "INVALID_STATE_TRANSITION",
+                "device management requires the persistent identity (open_persisted)",
+            ));
+        };
+        let Some(master_key_hex) = state.master_key_hex.clone() else {
+            return Err(state_error(
+                "INVALID_STATE_TRANSITION",
+                "device management requires the persistent identity (open_persisted)",
+            ));
+        };
+        let local = LocalDeviceContext {
+            account_id: state.view.account_id.clone(),
+            device_id: state.view.device_id.clone(),
+            display_name: state.view.display_name.clone(),
+            public_key: state.device.as_ref().map(|device| device.public_key()),
+            now_ms: (state.clock)(),
+        };
+        // 释放独占写锁。
+        if let Some(core) = state.core.take() {
+            core.close();
+        }
+        let outcome = (|| -> Result<T, FfiError> {
+            let mut store = open_formal_store(&database, &master_key_hex)?;
+            f(&mut store, &local)
+        })();
+        // 无论成功失败都把身份句柄装回去（否则对象会在释放写锁后不可用）。
+        let restored = restore_persisted(&mut state, &database, &master_key_hex);
+        match (outcome, restored) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
 }
 
 /// `node` 必须是 PROTOCOL-001 规范文本；解析失败按 INVALID_ID 显式拒绝。
@@ -797,6 +886,69 @@ impl IdentityFfi {
         Ok(Arc::new(Self {
             state: Mutex::new(state),
         }))
+    }
+
+    /// IDENTITY-011：设备列表（默认隐藏已撤销设备）。
+    ///
+    /// 首次调用会把**本机设备**补登记进集合（幂等），因此新建身份后列表里一定有本机一台。
+    pub fn list_devices(&self, include_revoked: bool) -> Result<Vec<DeviceViewFfi>, FfiError> {
+        self.with_store(|store, local| {
+            // 懒登记本机设备（幂等；已撤销不会因此复活）。
+            if let Some(public_key) = local.public_key {
+                store
+                    .upsert_identity_device(&chat_storage::formal::DeviceRegistrationInput {
+                        device_id: local.device_id.clone(),
+                        account_id: local.account_id.clone(),
+                        device_public_key: public_key,
+                        label: local.display_name.clone(),
+                    })
+                    .map_err(storage_failure)?;
+            }
+            let devices = chat_identity::devices::registered_devices(
+                store,
+                &local.account_id,
+                include_revoked,
+            )
+            .map_err(device_failure)?;
+            Ok(devices
+                .into_iter()
+                .map(|device| DeviceViewFfi {
+                    is_local: device.device_id == local.device_id,
+                    device_id: device.device_id,
+                    account_id: device.account_id,
+                    label: device.label,
+                    device_public_key_hex: device.device_public_key,
+                    added_at_ms: device.added_at_ms,
+                    revoked_at_ms: device.revoked_at_ms,
+                    revoked_reason: device.revoked_reason,
+                })
+                .collect())
+        })
+    }
+
+    /// IDENTITY-012：撤销一台设备（幂等；**不能撤销本机** → `DEVICE_SELF_REVOKE`）。
+    pub fn revoke_device(&self, device_id: String, reason: String) -> Result<bool, FfiError> {
+        self.with_store(|store, local| {
+            let now_ms = i64::try_from(local.now_ms).map_err(|_| {
+                state_error("INVALID_INPUT", "the local clock is out of range")
+            })?;
+            chat_identity::devices::revoke_registered_device(
+                store,
+                &local.account_id,
+                &device_id,
+                &local.device_id,
+                &reason,
+                now_ms,
+            )
+            .map_err(device_failure)
+        })
+    }
+
+    /// 设备是否已撤销（未登记视为未撤销）。
+    pub fn device_is_revoked(&self, device_id: String) -> Result<bool, FfiError> {
+        self.with_store(|store, _local| {
+            chat_identity::devices::device_is_revoked(store, &device_id).map_err(device_failure)
+        })
     }
 
     /// IDENTITY-013：导出身份恢复文件（加密，**不含存储主密钥**）。

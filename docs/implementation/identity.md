@@ -833,6 +833,33 @@ DeviceError::code() -> DEVICE_SELF_REVOKE / INVALID_INPUT / 身份层冻结码 /
 1. **撤销只影响本地登记集合**：不会自动广播到其它设备/节点（跨设备撤销同步未做）；
 2. **设备公钥不校验与 device_id 的自洽**：由上层（凭据/凭据目录）保证；
 3. **每账户上限 512 台**（`MAX_DEVICE_REGISTRY_ROWS`），越界显式 `INVALID_INPUT`。
+### 设备集合接 FFI（IdentityFfi，2026-10-18）
+
+~~~text
+IdentityFfi.list_devices(include_revoked: bool) -> Vec<DeviceViewFfi>
+IdentityFfi.revoke_device(device_id: String, reason: String) -> bool
+IdentityFfi.device_is_revoked(device_id: String) -> bool
+
+DeviceViewFfi { device_id, account_id, label, device_public_key_hex, added_at_ms,
+                revoked_at_ms, revoked_reason, is_local }
+~~~
+
+- **需要持久化身份**（`open_persisted`）：纯内存对象 → `INVALID_STATE_TRANSITION`；关闭后 → `CORE_CLOSED`；
+- `list_devices` 首次调用会**懒登记本机设备**（幂等），所以新建身份后列表一定有本机一台且
+  `is_local = true`（`is_local` 依据当前设备 ID 判定）；
+- `revoke_device` 撤销本机 → `DEVICE_SELF_REVOKE`；未登记设备 → `INVALID_INPUT`；跨账户 → `INVALID_INPUT`；
+  撤销后默认列表不含该设备，`include_revoked = true` 时可见撤销时间与原因；
+- 实现细节：设备集合在 storage 层（`identity_devices`），而身份对象以独占写者持有同一个库，
+  因此这三个方法采用"**短暂释放写锁 → 操作 → 无条件恢复身份句柄**"的时序（与恢复文件导出同一套）。
+
+测试：[crates/ffi/tests/identity_devices_ffi.rs](../../crates/ffi/tests/identity_devices_ffi.rs)（5 个，真库）：
+建身份 → list 含本机且 `is_local=true`、公钥 64 hex；撤销本机 `DEVICE_SELF_REVOKE` 且状态不变；
+登记第二台 → 两条 → 撤销 → 默认一条、`include_revoked` 可见原因、重复撤销返回 false；
+撤销未登记 → `INVALID_INPUT`；关闭后三个方法都 `CORE_CLOSED`；纯内存对象 → `INVALID_STATE_TRANSITION`。
+
+复现：`cargo test --offline -p chat-ffi --test identity_devices_ffi` → 5 passed；
+`cargo test --offline -p chat-ffi` → **76 passed**（既有 71 继续通过）。
+
 
 
 

@@ -952,6 +952,22 @@ PluginInfoFfi     { plugin_id, running, extension_points, version, manifest: Man
 - 同版本 → `PLUGIN_STATE_CONFLICT`、降级 → `PLUGIN_VERSION_DOWNGRADE`（库与宿主都不变）；
 - 成功后 0010 `plugins` 行 upsert + 内存宿主提交；重开 `list_plugins` 仍能看到版本与清单；
 - 测试：[crates/ffi/tests/plugins_install_persist.rs](../../crates/ffi/tests/plugins_install_persist.rs)（5 个，真库）。
+## 设备集合（IdentityFfi 设备三方法，2026-10-18）
+
+~~~text
+IdentityFfi.list_devices(include_revoked) -> Vec<DeviceViewFfi>
+IdentityFfi.revoke_device(device_id, reason) -> bool
+IdentityFfi.device_is_revoked(device_id) -> bool
+DeviceViewFfi { device_id, account_id, label, device_public_key_hex, added_at_ms,
+                revoked_at_ms, revoked_reason, is_local }
+~~~
+
+- 需 `open_persisted`（纯内存 → `INVALID_STATE_TRANSITION`；关闭 → `CORE_CLOSED`）；
+- `list_devices` 懒登记本机设备（幂等），因此列表里一定有 `is_local = true` 的本机一台；
+- `revoke_device`：本机 → `DEVICE_SELF_REVOKE`；未登记/跨账户 → `INVALID_INPUT`；幂等（重复撤销 false）；
+- 撤销后默认列表隐藏，`include_revoked` 可见撤销时间与原因（行永不删除）；
+- 测试：[crates/ffi/tests/identity_devices_ffi.rs](../../crates/ffi/tests/identity_devices_ffi.rs)（5 个，真库）。
+
 
 
 

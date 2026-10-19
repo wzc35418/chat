@@ -87,3 +87,18 @@ powershell -ExecutionPolicy Bypass -File tools\demo.ps1
 - 节点默认监听 `http://127.0.0.1:8080`；`demo.ps1 -Stop` 停止，`-Preview` 顺带起预览。
 - 人工测试步骤见 [docs/manual-test-guide.md](docs/manual-test-guide.md)（身份 → 恢复文件 → 发送 → 附件 → 群治理 → 同步 → 插件 P4 → 通知）。
 - 全量回归：`cargo test --offline --workspace` + `gradlew :apps:desktop:presentationChecks ... pluginJvmSmoke`（见指南第 12 节）。
+
+## 全量回归：一键脚本（tools/verify-all.ps1）
+
+```powershell
+powershell -File tools\verify-all.ps1                    # 磁盘 + Rust + 项目结构 + Gradle 11 任务 + Android
+powershell -File tools\verify-all.ps1 -SkipAndroid -SkipGradle   # 只跑检查/结构（约 1-2 分钟）
+powershell -File tools\verify-all.ps1 -TargetDir C:\chat-target  # 把 cargo target 放到 C: 盘
+```
+
+- 阶段顺序：`disk`（不通过直接 abort，退出码 2）→ `rust-check`（`cargo check --offline --locked --workspace --all-targets`）→ `verify-project`（`node tools/verify-project.cjs`）→ `gradle`（11 个桌面回归任务，`--offline --max-workers=1`）→ `android`（`:apps:android:assembleDebug`）。
+- 任一阶段失败**不会中断**其余阶段：最终退出码为 1，报告里能看到所有阶段的真实状态。
+- 报告写到 `build/verify-all-<timestamp>.md`，每阶段日志在 `build/verify-logs/<timestamp>/<stage>.log`；控制台打印 PASS/FAIL 表。
+- 输出**纯 ASCII**：Windows PowerShell 5.1 在中文代码页下会破坏 UTF-8 控制台文本，因此脚本刻意不输出非 ASCII 字符。
+- 脚本会先 dot-source `tools/activate.ps1`（cargo/JDK/Android SDK/MSVC 环境），因此不依赖调用方 shell 已激活。
+

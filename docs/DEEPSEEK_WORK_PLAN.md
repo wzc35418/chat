@@ -56,6 +56,8 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 - [x] **R-09（Lead）：Kotlin 本地存储接口与展示投影。** `shared/core-api/.../LocalStore.kt`（StoredDraft/StoredConversation/StoredMessage/StoredPage/VerifiedMessageInput/LocalStore/LocalStoreException）、`shared/presentation/.../display/CoreProjection.kt`（存储事实 → DraftEvidence/ConversationSummaryView/MessageDisplayView，未知状态安全回退、无 unread 保持 null），`DraftEvidence` 增加 `submissionId`（明确“提交 ID 不是节点回执”），`ConversationSummaryView.unreadCount` 改为可空。验证：`presentationChecks` 新增 `checkCoreProjection` 通过（queued/prepared 都不得显示已接受、未知状态回退本地草稿、null unread 不伪造 0、投影分页直接喂 DS-08 合并器后去重与代次校验仍成立）。
 - [x] **R-11：真实身份/口令加好友接界面（第二个竖直切片）。** Rust 侧 `crates/ffi/src/identity_ffi.rs`（`IdentityFfi`：create/account/create_invite/preview_invite/accept_invite/contacts/confirm_identity_change/shutdown，复用既有 `FfiError`，12 个测试）；Kotlin 侧 `shared/core-api/.../Identity.kt`、`shared/core-bridge/.../{IdentityFactory,NativeIdentityService}.kt`、`shared/presentation/.../display/IdentityPresentation.kt`（验签结果/错误码映射/联系人状态/IdentityChanged 强制禁发）、`preview/PreviewIdentityModels.kt`、`shared/ui/.../RealIdentityPanel.kt`（侧栏“真实身份（本机）”入口）。验证：`:apps:desktop:identitySmoke` PASS（两个真实身份互相校验：指纹一致、篡改→INVALID_SIGNATURE、自签→INVALID_TARGET、accept→requested 且禁发、关闭后需密钥调用→CORE_CLOSED）；`presentationChecks` 新增 `checkIdentityPresentation`；`previewSnapshot` 新增两张真实身份面板截图（面板里的账户/指纹/口令/联系人全部是当场真实生成的结果）。
 - [x] **R-12：SYNC 重试/退避与信箱轮询状态机。** `crates/sync/src/{retry,mailbox,send,clock,ids,error}.rs`：指数退避（1s×2 上限 60s、抖动 ±20%、Retry-After 作下界且夹到 5 分钟、预算耗尽终态、只有成功才重置计数）、信箱轮询（游标只前进、同 id 去重且内容不同 `INVALID_CANDIDATE`、乱序暂存 512 条、双预算、ACK 失败保留进度、空页退避）、发送调度（SubmissionId 由 draft/epoch/attempt 确定性派生、unknown 只 QueryExisting 不重发不重加密、租约语义与 storage 一致）。验证：`cargo test -p chat-sync` 33 passed，clippy 0 警告。
+- [x] **R-151：设备集合接 FFI（DEVFFI）。** `IdentityFfi` 增 `list_devices(include_revoked)` → `DeviceViewFfi{device_id, account_id, label, device_public_key_hex, added_at_ms, revoked_at_ms, revoked_reason, is_local}`、`revoke_device(id, reason)`、`device_is_revoked(id)`；语义：需持久化身份（内存对象 `INVALID_STATE_TRANSITION`、关闭后 `CORE_CLOSED`）、撤销本机 `DEVICE_SELF_REVOKE`、未登记/跨账户 `INVALID_INPUT`、`list_devices` **懒登记本机**（幂等）。实现要点：设备集合在 storage，身份对象独占写者 → 私有 `with_store` 做"短暂释放写锁 → 操作 → **无条件**恢复句柄"，且该泛型辅助必须放在**非 uniffi 导出**的 impl 块（第一版编译即踩到）。验证：`cargo test -p chat-ffi` → 76 passed（新增 5）。
+- [x] **R-152：一键全量回归脚本（VERIFYALL）。** 新 `tools/verify-all.ps1`（纯 ASCII）：disk → rust-check（`-TargetDir` 可指到 C:）→ verify-project → Gradle 11 任务 → Android，**任一阶段失败不中断其余、最终退出码 1**，报告写 `build/verify-all-<ts>.md` + 每阶段日志，控制台 PASS/FAIL 表；参数 `-SkipAndroid/-SkipGradle/-TargetDir`。实测：`-SkipAndroid -SkipGradle` → **disk PASS / rust-check PASS 78.7s / verify-project PASS / overall PASS EXIT=0**。过程中修掉三个真缺陷（引号进命令、PowerShell 5.1 把 stderr 变 ErrorRecord 导致失败时日志为空、`set VAR=` 尾部空格污染）。
 - [x] **R-149：审计持久化与保留期（AUDITP）。** 迁移 **0009_node_audit.sql**（0008 已被能力撤销授权占用）+ 索引 `(at_ms)`/`(device_id,at_ms)`；`record_audit_persisted`（内存环 + 落库）、`audit_query(limit≤200, since_ms, kind?, viewer_device?)`（viewer 过滤=本设备或 NULL）、`purge_audit(older_than_ms, ≤512)`（默认保留 7 天）、`audit_persisted_count`、`audit_tail_with_source`（内存空时**回退读库并标注来源**）；关闭审计时不写库也不返回（内存中关闭前的记录仍可读，已在文档写明）。验证：`cargo test -p chat-node-services` → 111 passed（新增 4：重启后仍可查、三种过滤、800→512+288 保留期截断、关闭不写不读）。
 - [x] **R-150：身份设备登记与撤销（DEVS，IDENTITY-011/012 最小形态）。** 迁移 **0013_device_registry.sql**（`identity_devices` + 撤销时间/原因成对 CHECK + account 索引，schema 12→13）；storage 五件套（幂等 upsert **保留首次时间且撤销不可逆**、list、revoke 幂等、is_revoked、load）；identity 侧 `register_device/registered_devices/revoke_registered_device`（**不能撤销本机** → `DEVICE_SELF_REVOKE`，跨账户拒绝）+ 恢复导入后登记本机设备。验证：`cargo test -p chat-identity -p chat-storage` → 157 passed（新增 6）。限制：撤销**不广播**到其它设备/节点。
 - [x] **R-146：插件私有 KV 迁移与残留清理（PLGKV）。** storage 增 `plugin_kv_rename_or_keep(plugin_id, from, to, policy)`（`Keep` 默认不改；`Namespace` 把旧键**复制**到 `v<from>/` 且**原键保留**、重跑幂等（实现中修掉"叠前缀"bug）、超配额预检整体拒绝）+ `plugin_kv_keys` + `purge_uninstalled_plugins(older_than_ms, limit≤256)`（只删 uninstalled 且 updated_at 严格早于阈值、KV 随外键 CASCADE）；FFI 增 `purge_uninstalled_plugins`，`install_package` 升级路径显式 `Keep`（失败回滚插件行）。验证：`cargo test -p chat-storage -p chat-ffi` → 166 passed（新增 5；含 258 行批量清理 256+2 截断）。
@@ -263,6 +265,8 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 | 2026-10-18 | DS-12 | `shared/presentation/.../display/MarkdownModel.kt`；`shared/ui/.../MarkdownText.kt`；`PreviewChatScreen.kt`（消息卡片 + 样例发送框）、`PreviewChatModels.kt`；验证在 `PresentationChecks.kt` | `presentationChecks` 的 DS-12 组通过：标题/列表/引用/围栏与行内代码/粗体/斜体/删除线/链接解析正确；`<script>` 只作为文字保留（模型无 HTML 节点）；`javascript:` 链接降级为不可点击并给原因、`https` 保留；围栏内 Markdown 标记不解析；反斜杠转义与未闭合标记按普通文字处理；超长输入标记 `truncated` 并截断到上限；空内容回退 `（空消息）`；文本消息返回 Markdown、附件返回 null；输入命令覆盖选区包裹、空选区选中占位、链接模板与越界夹取。截图 `preview-desktop-accepted.png` 等 16 张已复核，消息卡片显示标题/列表/引用/行内代码/链接，发送框显示格式工具栏与 8192 字节计数 | 链接打开能力未接入（只显示文字与地址）；P0 实验页面仍按纯文本显示加密往返结果；Markdown 只在展示层解析，正式消息存储仍是纯文本正文 |
 | 2026-10-18 | DS-11 | `shared/presentation/.../display/PagingPresentation.kt`；`shared/presentation/.../preview/PreviewPagingSample.kt`；`PreviewChatScreen.kt`、`PreviewSnapshot.kt`；验证在 `PresentationChecks.kt` | `presentationChecks` 的 DS-11 组通过：加载中不给可点动作、失败提供单次重试并带语义播报、还有更多/没有更多/空列表映射正确；预览样例经 DS-08 合并器真实跑“成功→失败→重试成功→到底”，失败不丢已加载结果、加载中重复点击不产生第二次请求、到底后重置。截图 `preview-desktop-paging-failed.png`、`preview-desktop-paging-no-more.png`、`preview-compact-paging-failed.png` 已检查 | 只映射展示提示，未查询真实列表/消息游标；“加载中”提示由纯状态用例覆盖（样例脚本同步完成，界面不出现真实等待） |
 
+第五十七轮验证（2026-10-19，R-151/R-152）：`cargo test --workspace --offline` → **Rust 合计 1049 个测试通过 / 0 失败**（上轮 1044；ffi 76）；`cargo check --workspace --locked --offline` 通过；Gradle 11 任务（含 pluginSmoke/pluginJvmSmoke）`BUILD SUCCESSFUL`（1m 14s）；`tools/verify-project.cjs` PASS；新脚本 `tools/verify-all.ps1` 实跑 PASS（disk/rust-check/verify-project）。
+
 第五十六轮验证（2026-10-19，R-149/R-150）：`cargo test --workspace --offline` → **Rust 合计 1044 个测试通过 / 0 失败**（上轮 1034；node-services 111、identity 62、storage 96）；`cargo check --workspace --locked --offline` 通过；Gradle 11 任务（含 pluginSmoke/pluginJvmSmoke）`BUILD SUCCESSFUL`（1m 46s）；`tools/verify-project.cjs` PASS。迁移：storage 0013、node-services 0009。
 
 第五十五轮验证（2026-10-19，R-146/R-147/R-148）：`cargo test --workspace --offline` → **Rust 合计 1034 个测试通过 / 0 失败**（上轮 1024；ffi 71、node-api 36、storage 95）；`cargo check --workspace --locked --offline` 通过；Gradle 11 任务（含 pluginSmoke/pluginJvmSmoke）`BUILD SUCCESSFUL`；`tools/verify-project.cjs` PASS；`tools/demo.ps1` 实测起节点成功（`node health: OK`）。
@@ -414,3 +418,29 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 | 2026-10-18 | R-05 分页查询与 outbox 租约：\`crates/storage/src/formal/{query,outbox_lease,cursor}.rs\`，storage 测试增至 39 | 客户端读路径已具备：会话/消息键集分页与 outbox 租约（unknown 不落完成）。UI 侧 DS-08 合并器与 DS-11 提示可以在 core 接线后直接消费；存储游标仍是内部 \`spg1\`，接 core 时需与 PROTOCOL-012 \`cur1\` 做一次映射 |
 | 2026-10-18 | R-03 正式存储与主密钥：\`crates/storage/src/formal\` + \`crates/crypto/src/key_store.rs\`，列级 AEAD、独占锁、单次事务句柄、崩溃恢复、磁盘字节无明文；37 个测试 | UI 侧 DS-10 的 \`DraftEvidence\` 已可承接“本地排队/节点接受/送达”证据，但 formal store 与 core/ffi 之间还没有桥接；锁定状态需要 core 暴露后才能做正式锁定页 |
 | 2026-10-18 | 用户报告资源管理器双击后虽有窗口就绪提示，但 Alt+Tab 无窗口；Win32 检查窗口 visible 且坐标在主屏幕内。`tools/run-desktop.ps1` 加 `--no-daemon` 隔离启动进程；本机验证 single-use daemon、窗口创建、关闭后 `BUILD SUCCESSFUL in 1m 8s`；用户随后从资源管理器双击复验，确认窗口可见 | DS-05 至 DS-08 无正式接口变化；不要移除桌面启动反馈或改回可复用 daemon |
+
+---
+
+## 一键全量回归脚本（2026-10-19，tools/verify-all.ps1）
+
+**改动**：新增 `tools/verify-all.ps1`；`README.md` 与本节追加使用说明。既有记录未改动。
+
+**阶段**：`disk` → `rust-check` → `verify-project` → `gradle`（11 个桌面回归任务）→ `android`。
+
+- `disk` 失败即 abort（退出码 2，磁盘不足时不冒构建风险）；
+- 其余阶段失败不中断，最终退出码 1，报告含每阶段状态/耗时/日志路径；
+- 报告 `build/verify-all-<timestamp>.md`，日志 `build/verify-logs/<timestamp>/`；
+- 参数：`-SkipAndroid` / `-SkipGradle` / `-TargetDir <path>`（把 `CARGO_TARGET_DIR` 指到 C: 盘）；
+- 纯 ASCII 输出（PowerShell 5.1 中文编码问题）；脚本内部 dot-source `tools/activate.ps1`；
+- 原生命令经 `cmd /c ... > log 2>&1` 执行：PowerShell 5.1 会把原生 stderr 变成 ErrorRecord，导致失败时日志为空。
+
+**验证证据**（本机实跑）：
+
+- `powershell -File tools\verify-all.ps1 -SkipAndroid -SkipGradle` → `disk PASS / rust-check PASS 78.7s / verify-project PASS 0.9s / gradle SKIP / android SKIP`，**overall PASS、退出码 0**，生成 `build/verify-all-20261020-004627.md`；
+- 追加 `-TargetDir D:\AgentProject\chat\target` 复跑 → 同样 PASS、退出码 0（验证 `set "CARGO_TARGET_DIR=..."` 引号形式；未加引号时尾部空格会污染路径）；
+- 期间修掉两个真实缺陷：`cmd /c` 重定向拼接把引号写进命令（导致 `The filename…syntax is incorrect`）、以及 `set VAR=value &&` 的值被尾部空格污染（`target \debug`）。
+
+**对 DeepSeek 任务的影响**：后续回归统一用这个脚本产出证据；`build/` 为构建产物目录，报告不入库。
+
+**未覆盖**：Gradle/Android 两个阶段本次以 `-Skip` 运行（单次全量约数分钟，留给主控在发布前跑）；脚本未做并行化（`--max-workers=1` 是刻意保守）。
+
