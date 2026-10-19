@@ -44,6 +44,7 @@ data class IdentityHandlers(
     val refreshContacts: () -> Unit = {},
     val updateRecoveryPassphrase: (String) -> Unit = {},
     val exportRecovery: () -> Unit = {},
+    val importRecovery: () -> Unit = {},
 ) {
     companion object {
         val None = IdentityHandlers()
@@ -159,7 +160,17 @@ fun RealIdentityPanel(
                         enabled = !state.busy && state.recoveryPassphrase.length >= 8,
                         modifier = Modifier.semantics { contentDescription = "导出身份恢复文件" },
                     ) { Text("导出恢复文件", style = MaterialTheme.typography.labelMedium) }
+                    Button(
+                        onClick = handlers.importRecovery,
+                        enabled = !state.busy && state.recoveryPassphrase.length >= 8,
+                        modifier = Modifier.semantics { contentDescription = "从恢复文件导入身份" },
+                    ) { Text("导入恢复文件", style = MaterialTheme.typography.labelMedium) }
                 }
+                Text(
+                    "导入只允许在**没有身份**的库上执行；已有身份会被拒绝（不覆盖）。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF5F6B63),
+                )
                 state.recoveryNotice?.let {
                     Text(it, style = MaterialTheme.typography.bodySmall)
                 }

@@ -6,6 +6,59 @@
 
 返回类型与字段约束见 [类型字典](TYPES.md)，事务编号见 [事务和并发约定](TRANSACTIONS.md)，纵向流程见 [关键调用链](FLOWS.md)。所有 Result<T> 表示显式可恢复错误，不允许安全验证失败后继续推进。
 
+## 撤销授权策略（CAP-AUTHZ，2026-10-19，Windows x64）
+
+上一轮的撤销端点只要求设备鉴权：**任何设备都能撤销任何令牌**。本轮补上授权策略与审计。
+
+### 存储（迁移 0008）
+
+```sql
+CREATE TABLE capability_token_issuers (           -- 签发时记录 token_id -> 签发设备
+    token_id TEXT PRIMARY KEY NOT NULL,
+    issuer_device_id TEXT NOT NULL,
+    issued_at_ms INTEGER NOT NULL CHECK (issued_at_ms >= 0)
+);
+ALTER TABLE capability_token_revocations ADD COLUMN revoked_by_device TEXT NOT NULL DEFAULT '';
+ALTER TABLE capability_token_revocations ADD COLUMN authorization TEXT NOT NULL DEFAULT 'self';
+```
+
+令牌本身仍不落库（`token_id` 由令牌文本确定性派生）；签发记录只用于**授权判定**，
+撤销记录多了“谁撤销的 + 依据什么授权”两列作为审计。
+
+### 策略
+
+```rust
+pub struct RevokePolicy { pub self_only: bool }   // 默认 { self_only: true }
+// 挂在 CapabilityPolicy.revoke；环境变量 CHAT_NODE_CAPABILITY_REVOKE_ANY_DEVICE=1 放宽
+```
+
+### 服务语义（`NodeService::revoke_capability`）
+
+1. `token_id` 形状校验 → 查签发记录；**没有签发记录 → `CAPABILITY_TOKEN_NOT_FOUND`**（未被本节点签发过）；
+2. 调用方设备 != 签发设备且 `self_only` → `PERMISSION_DENIED`（**不写任何记录**）；
+3. 允许时写撤销记录：`authorization = self`（签发设备本人）或 `policy_relaxed`（放宽策略下的跨设备），
+   并把 `revoked_by_device` 与调用方给的原因一起落库；
+4. 幂等：重复撤销返回 `false` 且保留首次的 `revoked_at_ms` / `reason`（`revocation_record()` 可查审计）。
+
+### 证据（`cargo test --offline -p chat-node-services`，96 passed）
+
+- `capability::revoke_is_limited_to_the_issuing_device_by_default`：`capability_issuer` 返回签发设备；
+  他设备撤销 → `PERMISSION_DENIED` 且**令牌未被撤销**；签发设备自己撤销 → `authorization = self`。
+- `capability::relaxed_policy_allows_cross_device_revocation_with_an_audit_trail`：`self_only = false` 时
+  运营设备可撤销他人令牌，记录里 `authorization = policy_relaxed`、`revoked_by_device = operator`、
+  原因保留，且令牌立即失效（`CAPABILITY_REVOKED`）。
+- `capability::revoking_an_unknown_token_id_is_not_found_and_repeats_are_idempotent`：未知 token_id →
+  `CAPABILITY_TOKEN_NOT_FOUND` 且不落记录；重复撤销返回 `false` 并保留首次原因/时间。
+- 既有 4 处撤销调用已切到新签名（签发设备作为调用方），行为不变。
+
+### 已知限制
+
+1. **签发记录会累积**：`purge_expired_revocations` 目前只清撤销记录（其返回计数也只看撤销行），
+   签发记录尚未按保留期清理；令牌最长 1 小时有效，运维侧可后续加按 `issued_at_ms` 的清理。
+2. **只有设备级主体**：没有账户级/运营者角色模型；放宽策略是部署级开关（`self_only = false`），
+   没有按操作者的更细粒度授权。
+3. **审计字段只有设备与原因码**：不记录请求来源 IP/操作者账户（节点不信任这些字段）。
+
 ## 函数导航
 
 - [NODE-001 register_device](node.md#node-001)

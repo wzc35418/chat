@@ -31,6 +31,7 @@ const MIGRATION_0004: &str = include_str!("../migrations/0004_blob_attachments.s
 const MIGRATION_0005: &str = include_str!("../migrations/0005_retention_capabilities.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_domain_operation.sql");
 const MIGRATION_0007: &str = include_str!("../migrations/0007_capability_revocations.sql");
+const MIGRATION_0008: &str = include_str!("../migrations/0008_capability_revoke_authorization.sql");
 const MIGRATION_CHECKSUM_SLOT: &str = ":checksum";
 
 /// 节点鉴权与注册策略。所有字段在启动时校验，不接受 0 或越界配置。
@@ -1040,6 +1041,30 @@ fn migrate(connection: &Connection) -> NodeResult<()> {
         }
     }
     verify_migration_checksum(connection, 7, MIGRATION_0007)?;
+    let current: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if current < 8 {
+        let sql = MIGRATION_0008.replace(MIGRATION_CHECKSUM_SLOT, &checksum(MIGRATION_0008));
+        connection
+            .execute_batch(&sql)
+            .map_err(|_| {
+                NodeError::MigrationFailed("capability revoke authorization migration failed")
+            })?;
+        let applied: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if applied < 8 {
+            return Err(NodeError::MigrationFailed(
+                "capability revoke authorization migration did not record its version",
+            ));
+        }
+    }
+    verify_migration_checksum(connection, 8, MIGRATION_0008)?;
     Ok(())
 }
 

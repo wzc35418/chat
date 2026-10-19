@@ -228,6 +228,12 @@ pub struct CandidateControlMetadata {
     /// invite/remove/set_role/set_muted/rename/transfer_ownership/leave/dissolve。
     pub operation: String,
     pub target_digest: String,
+    /// PROTOCOL-004 字段 59：邀请新增的成员凭据（UTF-8，≤128 字节/条，≤64 条）。
+    #[serde(default, alias = "addedCredentials")]
+    pub added_credentials: Vec<String>,
+    /// PROTOCOL-004 字段 60：被移除的成员凭据。
+    #[serde(default, alias = "removedCredentials")]
+    pub removed_credentials: Vec<String>,
 }
 
 /// 领域操作声明（PROTOCOL-004 字段 55/56 的**传输层**形态）。
@@ -369,6 +375,12 @@ impl GroupCandidate {
                         return Err(NodeError::InvalidCandidate);
                     }
                     resolved = resolved.with_domain_operation(declaration);
+                }
+                if !metadata.added_credentials.is_empty() || !metadata.removed_credentials.is_empty() {
+                    resolved = resolved.with_credentials(
+                        metadata.added_credentials.clone(),
+                        metadata.removed_credentials.clone(),
+                    );
                 }
                 Some(resolved)
             }

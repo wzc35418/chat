@@ -79,8 +79,10 @@ fn metadata_of(operation: &GroupOperation) -> ControlMetadata {
     ControlMetadata {
         operation: control_operation_of(operation),
         target_digest: policy_operation_digest(operation).expect("digest"),
-        // 领域测试不涉及 PROTOCOL-004 的领域操作声明（55/56）。
+        // 领域测试不涉及 PROTOCOL-004 的领域操作声明（55/56）与成员凭据（59/60）。
         domain_operation: None,
+        added_credentials: Vec::new(),
+        removed_credentials: Vec::new(),
     }
 }
 
@@ -402,7 +404,7 @@ fn invite_commit_matches_business_change() {
         ],
         Vec::new(),
     );
-    let result = verify_control_result(&before, metadata, &commit).expect("verify");
+    let result = verify_control_result(&before, metadata.clone(), &commit).expect("verify");
     assert_eq!(result.epoch_before, before.mls_epoch);
     assert_eq!(result.epoch_after, before.mls_epoch + 1);
     assert_eq!(result.added_devices.len(), 2);
@@ -427,7 +429,7 @@ fn commit_cannot_smuggle_extra_member_changes() {
         vec![CredentialLeaf::new(account(1), device(11))],
     );
     assert_eq!(
-        verify_control_result(&before, metadata, &commit)
+        verify_control_result(&before, metadata.clone(), &commit)
             .unwrap_err()
             .code(),
         ErrorCode::InvalidControlResult
@@ -449,7 +451,7 @@ fn commit_cannot_smuggle_extra_member_changes() {
         Vec::new(),
     );
     assert_eq!(
-        verify_control_result(&before, metadata, &commit)
+        verify_control_result(&before, metadata.clone(), &commit)
             .unwrap_err()
             .code(),
         ErrorCode::InvalidControlResult
@@ -465,7 +467,7 @@ fn commit_cannot_smuggle_extra_member_changes() {
     );
     let metadata = metadata_of(&op.operation);
     let commit = staged(&before, op, Vec::new(), Vec::new());
-    assert!(verify_control_result(&before, metadata, &commit).is_ok());
+    assert!(verify_control_result(&before, metadata.clone(), &commit).is_ok());
 }
 
 #[test]
@@ -487,7 +489,7 @@ fn account_removal_requires_every_device() {
         vec![CredentialLeaf::new(account(4), device(44))],
     );
     assert_eq!(
-        verify_control_result(&before, metadata, &partial)
+        verify_control_result(&before, metadata.clone(), &partial)
             .unwrap_err()
             .code(),
         ErrorCode::InvalidControlResult
@@ -502,7 +504,7 @@ fn account_removal_requires_every_device() {
             CredentialLeaf::new(account(4), device(45)),
         ],
     );
-    let result = verify_control_result(&before, metadata, &full).expect("verify");
+    let result = verify_control_result(&before, metadata.clone(), &full).expect("verify");
     assert_eq!(result.removed_devices.len(), 2);
     assert!(result.policy.policy.member(account(4)).is_none());
 }
@@ -521,7 +523,7 @@ fn metadata_must_match_operation() {
         Vec::new(),
     );
     assert_eq!(
-        verify_control_result(&before, metadata, &commit)
+        verify_control_result(&before, metadata.clone(), &commit)
             .unwrap_err()
             .code(),
         ErrorCode::InvalidControlResult
@@ -530,7 +532,7 @@ fn metadata_must_match_operation() {
     let mut metadata = metadata_of(&op.operation);
     metadata.target_digest = Digest::from_bytes([0x99; 32]);
     assert_eq!(
-        verify_control_result(&before, metadata, &commit)
+        verify_control_result(&before, metadata.clone(), &commit)
             .unwrap_err()
             .code(),
         ErrorCode::InvalidControlResult
@@ -550,7 +552,7 @@ fn wrong_group_or_epoch_is_a_log_conflict() {
     );
     commit.group_id = GroupId::from_bytes([0x99; 32]);
     assert_eq!(
-        verify_control_result(&before, metadata, &commit)
+        verify_control_result(&before, metadata.clone(), &commit)
             .unwrap_err()
             .code(),
         ErrorCode::LogConflict
@@ -563,7 +565,7 @@ fn wrong_group_or_epoch_is_a_log_conflict() {
     );
     commit.epoch_before = before.mls_epoch + 1;
     assert_eq!(
-        verify_control_result(&before, metadata, &commit)
+        verify_control_result(&before, metadata.clone(), &commit)
             .unwrap_err()
             .code(),
         ErrorCode::LogConflict
@@ -577,7 +579,7 @@ fn wrong_group_or_epoch_is_a_log_conflict() {
     );
     commit.epoch_after = commit.epoch_before;
     assert_eq!(
-        verify_control_result(&before, metadata, &commit)
+        verify_control_result(&before, metadata.clone(), &commit)
             .unwrap_err()
             .code(),
         ErrorCode::InvalidControlResult
@@ -599,7 +601,7 @@ fn stale_authorization_and_bad_actor_are_rejected() {
         Vec::new(),
     );
     assert_eq!(
-        verify_control_result(&newer, metadata, &commit)
+        verify_control_result(&newer, metadata.clone(), &commit)
             .unwrap_err()
             .code(),
         ErrorCode::StaleControlHead
@@ -627,7 +629,7 @@ fn control_failures_map_to_frozen_codes_without_retry() {
     let op = authorized(&before, actor(1, 11), invite_operation());
     let metadata = metadata_of(&op.operation);
     let commit = staged(&before, op, Vec::new(), Vec::new());
-    let error = verify_control_result(&before, metadata, &commit).unwrap_err();
+    let error = verify_control_result(&before, metadata.clone(), &commit).unwrap_err();
     assert_eq!(error.code(), ErrorCode::InvalidControlResult);
     let public = map_error(InternalError::from(error), None);
     assert_eq!(public.code(), ErrorCode::InvalidControlResult);

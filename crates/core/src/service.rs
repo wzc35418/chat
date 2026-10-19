@@ -1772,6 +1772,8 @@ impl ControlReceiptView {
                 Some(chat_node_services::group::CandidateControlMetadata {
                     operation: operation.clone(),
                     target_digest: target_digest.clone(),
+                    added_credentials: Vec::new(),
+                    removed_credentials: Vec::new(),
                 })
             }
             (None, None) => None,

@@ -27,6 +27,10 @@ pub const RECEIPT_SIGNING_DOMAIN: &[u8] = b"chat/p1/coordinator-receipt-signatur
 pub const MAX_CIPHERTEXT_BYTES: usize = 64 * 1024;
 /// 当前规范 schema 版本。
 pub const SCHEMA_VERSION: u64 = 1;
+/// 单条成员凭据的字节上限。
+pub const MAX_CONTROL_CREDENTIAL_BYTES: usize = 128;
+/// 控制提交携带的成员凭据总数上限（added + removed）。
+pub const MAX_CONTROL_CREDENTIALS: usize = 64;
 
 /// 候选类别。外层签名必须绑定类别，避免应用事件与控制元数据互换。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,7 +252,7 @@ pub struct DomainOperationDeclaration {
 }
 
 /// 单一控制操作的公开元数据。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlMetadata {
     /// 操作种类（公开层；转让在 MLS `SelfUpdate` 场景下通常是 `SetRole`）。
     pub operation: ControlOperation,
@@ -256,6 +260,10 @@ pub struct ControlMetadata {
     pub target_digest: Digest,
     /// 可选的领域操作声明；`None` 表示旧字节/未声明。
     pub domain_operation: Option<DomainOperationDeclaration>,
+    /// 提交携带的新增成员凭据（仅 `invite` 候选；UTF-8，单个 ≤128B、总数 ≤64）。
+    pub added_credentials: Vec<String>,
+    /// 提交携带的移除成员凭据（仅 `remove` 候选；UTF-8，单个 ≤128B、总数 ≤64）。
+    pub removed_credentials: Vec<String>,
 }
 
 impl ControlMetadata {
@@ -265,7 +273,16 @@ impl ControlMetadata {
             operation,
             target_digest,
             domain_operation: None,
+            added_credentials: Vec::new(),
+            removed_credentials: Vec::new(),
         }
+    }
+
+    /// 附带提交内的成员凭据（新增/移除列表）。
+    pub fn with_credentials(mut self, added: Vec<String>, removed: Vec<String>) -> Self {
+        self.added_credentials = added;
+        self.removed_credentials = removed;
+        self
     }
 
     /// 附带领域操作声明。
@@ -273,6 +290,50 @@ impl ControlMetadata {
         self.domain_operation = Some(declaration);
         self
     }
+}
+
+fn validate_credentials(credentials: &[String]) -> Result<()> {
+    for credential in credentials {
+        if credential.is_empty() || credential.len() > MAX_CONTROL_CREDENTIAL_BYTES {
+            return Err(ProtocolError::InvalidCandidate);
+        }
+        if credential.chars().any(char::is_control) {
+            return Err(ProtocolError::InvalidCandidate);
+        }
+    }
+    Ok(())
+}
+
+fn validate_credential_lists(added: &[String], removed: &[String]) -> Result<()> {
+    let total = added
+        .len()
+        .checked_add(removed.len())
+        .ok_or(ProtocolError::InvalidCandidate)?;
+    if total > MAX_CONTROL_CREDENTIALS {
+        return Err(ProtocolError::InvalidCandidate);
+    }
+    validate_credentials(added)?;
+    validate_credentials(removed)?;
+    let mut seen: Vec<&str> = Vec::with_capacity(total);
+    for credential in added.iter().chain(removed.iter()) {
+        if seen.contains(&credential.as_str()) {
+            return Err(ProtocolError::InvalidCandidate);
+        }
+        seen.push(credential);
+    }
+    Ok(())
+}
+
+fn validate_control_credentials(metadata: &ControlMetadata) -> Result<()> {
+    validate_credential_lists(&metadata.added_credentials, &metadata.removed_credentials)?;
+    // 仅 invite 可带新增、remove 可带移除。
+    if !metadata.added_credentials.is_empty() && metadata.operation != ControlOperation::Invite {
+        return Err(ProtocolError::InvalidCandidate);
+    }
+    if !metadata.removed_credentials.is_empty() && metadata.operation != ControlOperation::Remove {
+        return Err(ProtocolError::InvalidCandidate);
+    }
+    Ok(())
 }
 
 /// NODECAP：提案值自证语义（分类在操作值里），因此**不得**再附领域声明——
@@ -349,6 +410,7 @@ impl UnsignedCandidate {
         }
         match (self.kind, &self.control_metadata) {
             (CandidateKind::Control, Some(metadata)) => {
+                validate_control_credentials(metadata)?;
                 validate_domain_declaration(self.kind, metadata)
             }
             (CandidateKind::Application, None) => Ok(()),
@@ -371,9 +433,11 @@ impl UnsignedCandidate {
 fn candidate_body(candidate: &UnsignedCandidate) -> WireValue {
     let control_operation = candidate
         .control_metadata
+        .as_ref()
         .map(|metadata| WireValue::U64(metadata.operation.as_u64()));
     let control_target = candidate
         .control_metadata
+        .as_ref()
         .map(|metadata| WireValue::digest(metadata.target_digest));
     let mut body_fields = vec![
         WireField::new(field::SCHEMA_VERSION, WireValue::U64(SCHEMA_VERSION)),
@@ -420,19 +484,42 @@ fn candidate_body(candidate: &UnsignedCandidate) -> WireValue {
             WireValue::optional(control_target),
         ),
     ];
-    // 旧候选（无领域声明）不写新字段，保证既有固定向量字节不变。
-    if let Some(declaration) = candidate
-        .control_metadata
-        .and_then(|metadata| metadata.domain_operation)
-    {
-        body_fields.push(WireField::new(
-            field::CONTROL_DOMAIN_OPERATION,
-            WireValue::U64(declaration.operation.as_u64()),
-        ));
-        body_fields.push(WireField::new(
-            field::CONTROL_DOMAIN_TARGET_DIGEST,
-            WireValue::digest(declaration.target_digest),
-        ));
+    // 旧候选（无领域声明/无成员凭据）不写新字段，保证既有固定向量字节不变。
+    if let Some(metadata) = candidate.control_metadata.as_ref() {
+        if !metadata.added_credentials.is_empty() {
+            body_fields.push(WireField::new(
+                field::CONTROL_ADDED_CREDENTIALS,
+                WireValue::List(
+                    metadata
+                        .added_credentials
+                        .iter()
+                        .map(|credential| WireValue::Text(credential.clone()))
+                        .collect(),
+                ),
+            ));
+        }
+        if !metadata.removed_credentials.is_empty() {
+            body_fields.push(WireField::new(
+                field::CONTROL_REMOVED_CREDENTIALS,
+                WireValue::List(
+                    metadata
+                        .removed_credentials
+                        .iter()
+                        .map(|credential| WireValue::Text(credential.clone()))
+                        .collect(),
+                ),
+            ));
+        }
+        if let Some(declaration) = metadata.domain_operation {
+            body_fields.push(WireField::new(
+                field::CONTROL_DOMAIN_OPERATION,
+                WireValue::U64(declaration.operation.as_u64()),
+            ));
+            body_fields.push(WireField::new(
+                field::CONTROL_DOMAIN_TARGET_DIGEST,
+                WireValue::digest(declaration.target_digest),
+            ));
+        }
     }
     WireValue::Struct(body_fields)
 }
@@ -472,6 +559,36 @@ pub fn decode_proposal_kind(body: &WireValue) -> Result<Option<ProposalKind>> {
     };
     let operation = ControlOperation::from_u64(*raw).ok_or(ProtocolError::InvalidCandidate)?;
     Ok(operation.proposal_kind())
+}
+
+/// 从候选规范结构解码控制提交携带的成员凭据（新增/移除）。
+///
+/// 旧字节没有 59/60 → 返回空列表；字段类型不对、单个为空/超 128B、总数超 64、
+/// 列表内或跨列表重复都显式失败（`INVALID_CANDIDATE`）。
+pub fn decode_control_credentials(body: &WireValue) -> Result<(Vec<String>, Vec<String>)> {
+    let WireValue::Struct(fields) = body else {
+        return Err(ProtocolError::InvalidCandidate);
+    };
+    let read = |id: u16| -> Result<Vec<String>> {
+        match fields.iter().find(|candidate| candidate.id == id) {
+            None => Ok(Vec::new()),
+            Some(field) => match &field.value {
+                WireValue::List(items) => items
+                    .iter()
+                    .map(|item| match item {
+                        WireValue::Text(text) => Ok(text.clone()),
+                        _ => Err(ProtocolError::InvalidCandidate),
+                    })
+                    .collect(),
+                _ => Err(ProtocolError::InvalidCandidate),
+            },
+        }
+    };
+    let added = read(field::CONTROL_ADDED_CREDENTIALS)?;
+    let removed = read(field::CONTROL_REMOVED_CREDENTIALS)?;
+    // 与编码前校验同一套规则（数量/单条/重复）；操作配对由候选校验负责。
+    validate_credential_lists(&added, &removed)?;
+    Ok((added, removed))
 }
 
 /// 从候选规范结构解码可选领域操作声明。
@@ -583,6 +700,8 @@ mod tests {
                 operation: ControlOperation::Invite,
                 target_digest: Digest::from_bytes([0x55; 32]),
                 domain_operation: None,
+                added_credentials: Vec::new(),
+                removed_credentials: Vec::new(),
             }),
         }
     }
@@ -627,6 +746,8 @@ mod tests {
                     operation: ControlOperation::Remove,
                     target_digest: Digest::from_bytes([0x55; 32]),
                     domain_operation: None,
+                    added_credentials: Vec::new(),
+                    removed_credentials: Vec::new(),
                 })
             }),
             Box::new(|c| {
@@ -634,6 +755,8 @@ mod tests {
                     operation: ControlOperation::Invite,
                     target_digest: Digest::from_bytes([0x99; 32]),
                     domain_operation: None,
+                    added_credentials: Vec::new(),
+                    removed_credentials: Vec::new(),
                 })
             }),
         ];
@@ -1086,6 +1209,128 @@ mod tests {
             bytes.as_bytes(),
             other_bytes.as_bytes(),
             "提案值参与签名原文"
+        );
+    }
+
+    fn credentialed_candidate() -> UnsignedCandidate {
+        let mut candidate = self::candidate();
+        if let Some(metadata) = candidate.control_metadata.as_mut() {
+            metadata.added_credentials = vec!["alice".to_owned(), "bob".to_owned()];
+        }
+        candidate
+    }
+
+    #[test]
+    fn control_credentials_round_trip_and_old_bytes_stay_empty() {
+        // 旧候选没有 59/60 字段 → 解码为空列表，字节不变。
+        let old_body = candidate_body_fields(&candidate());
+        assert_eq!(
+            decode_control_credentials(&old_body).unwrap(),
+            (Vec::new(), Vec::new())
+        );
+        // 新候选：列表经规范编码后解回一致。
+        let body = candidate_body_fields(&credentialed_candidate());
+        assert_eq!(
+            decode_control_credentials(&body).unwrap(),
+            (vec!["alice".to_owned(), "bob".to_owned()], Vec::new())
+        );
+        // remove 候选携带移除列表。
+        let mut removal = self::candidate();
+        if let Some(metadata) = removal.control_metadata.as_mut() {
+            metadata.operation = ControlOperation::Remove;
+            metadata.removed_credentials = vec!["carol".to_owned()];
+        }
+        let body = candidate_body_fields(&removal);
+        assert_eq!(
+            decode_control_credentials(&body).unwrap(),
+            (Vec::new(), vec!["carol".to_owned()])
+        );
+        // 字段号已登记。
+        assert!(crate::canonical::is_known_field(
+            field::CONTROL_ADDED_CREDENTIALS
+        ));
+        assert!(crate::canonical::is_known_field(
+            field::CONTROL_REMOVED_CREDENTIALS
+        ));
+    }
+
+    #[test]
+    fn control_credentials_are_validated_and_signed() {
+        let mut invalid: Vec<UnsignedCandidate> = Vec::new();
+        let credential = |bytes: usize| "x".repeat(bytes);
+        for (added, removed) in [
+            (vec![String::new()], Vec::new()),
+            (
+                vec![credential(MAX_CONTROL_CREDENTIAL_BYTES + 1)],
+                Vec::new(),
+            ),
+            (vec![String::from("bad\u{7}")], Vec::new()),
+            (vec!["alice".to_owned(), "alice".to_owned()], Vec::new()),
+        ] {
+            let mut candidate = self::candidate();
+            if let Some(metadata) = candidate.control_metadata.as_mut() {
+                metadata.added_credentials = added;
+                metadata.removed_credentials = removed;
+            }
+            invalid.push(candidate);
+        }
+        // 总数超 64。
+        let mut too_many = self::candidate();
+        if let Some(metadata) = too_many.control_metadata.as_mut() {
+            metadata.added_credentials = (0..=MAX_CONTROL_CREDENTIALS)
+                .map(|index| format!("member-{index}"))
+                .collect();
+        }
+        invalid.push(too_many);
+        // 操作与列表不匹配：invite 带移除、remove 带新增。
+        let mut wrong_operation = self::candidate();
+        if let Some(metadata) = wrong_operation.control_metadata.as_mut() {
+            metadata.removed_credentials = vec!["alice".to_owned()];
+        }
+        invalid.push(wrong_operation);
+        let mut wrong_operation = self::candidate();
+        if let Some(metadata) = wrong_operation.control_metadata.as_mut() {
+            metadata.operation = ControlOperation::Remove;
+            metadata.added_credentials = vec!["alice".to_owned()];
+        }
+        invalid.push(wrong_operation);
+        for candidate in invalid {
+            assert_eq!(
+                candidate_signing_bytes(&candidate).unwrap_err(),
+                ProtocolError::InvalidCandidate
+            );
+        }
+        // 签名覆盖列表：改一个凭据就让原签名失效。
+        let key = signing_key_from_seed(&[0x42; 32]);
+        let public_key = key.verifying_key().to_bytes();
+        let bytes = candidate_signing_bytes(&credentialed_candidate()).expect("encode");
+        let signature = sign_bytes(&key, bytes.as_bytes());
+        assert!(verify_ed25519(&public_key, bytes.as_bytes(), &signature).is_ok());
+        let mut changed = credentialed_candidate();
+        if let Some(metadata) = changed.control_metadata.as_mut() {
+            metadata.added_credentials = vec!["alice".to_owned(), "carol".to_owned()];
+        }
+        assert!(!still_verifies(&changed, &public_key, &signature));
+        // 解码端：列表元素不是 text / 数量超限都拒绝。
+        assert_eq!(
+            decode_control_credentials(&WireValue::Struct(vec![WireField::new(
+                field::CONTROL_ADDED_CREDENTIALS,
+                WireValue::List(vec![WireValue::U64(1)]),
+            )]))
+            .unwrap_err(),
+            ProtocolError::InvalidCandidate
+        );
+        let too_many_items = WireValue::Struct(vec![WireField::new(
+            field::CONTROL_ADDED_CREDENTIALS,
+            WireValue::List(
+                (0..=MAX_CONTROL_CREDENTIALS)
+                    .map(|index| WireValue::Text(format!("member-{index}")))
+                    .collect(),
+            ),
+        )]);
+        assert_eq!(
+            decode_control_credentials(&too_many_items).unwrap_err(),
+            ProtocolError::InvalidCandidate
         );
     }
 }

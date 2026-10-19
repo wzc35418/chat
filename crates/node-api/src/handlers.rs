@@ -429,13 +429,14 @@ pub async fn revoke_capability(
     };
     let reason = request.into_reason()?;
     let now = state.now();
-    let _actor = authenticate(&state, &headers, &uri, "POST", &body, now)?;
+    let actor = authenticate(&state, &headers, &uri, "POST", &body, now)?;
     let now_ms = u64::try_from(now)
         .ok()
         .and_then(|seconds| seconds.checked_mul(1_000))
         .ok_or_else(|| ApiError::invalid_request("node clock is out of range"))?;
+    // CAP-AUTHZ：撤销按**调用方设备**授权（默认只允许签发设备撤销自己的令牌；跨设备 → 403）。
     let revoked = state.with_service(|service| {
-        service.revoke_capability(&token_id, &reason, now_ms)
+        service.revoke_capability(&token_id, &actor.device_id, &reason, now_ms)
     })?;
     Ok(Json(RevokeCapabilityResponseDto::new(token_id, revoked)).into_response())
 }

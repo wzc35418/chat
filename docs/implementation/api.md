@@ -6,6 +6,31 @@
 
 返回类型与字段约束见 [类型字典](TYPES.md)，事务编号见 [事务和并发约定](TRANSACTIONS.md)，纵向流程见 [关键调用链](FLOWS.md)。所有 Result<T> 表示显式可恢复错误，不允许安全验证失败后继续推进。
 
+## 撤销端点授权（CAP-AUTHZ，2026-10-19，Windows x64）
+
+`POST /v1/capabilities/{token_id}/revoke` 以前只要求设备鉴权（任何设备都能撤销任何令牌）。现在：
+
+- 请求仍需设备签名鉴权（同一套挑战流程），handler 把**调用方设备**传给服务层做授权判定：
+  `service.revoke_capability(token_id, actor.device_id, reason, now_ms)`；
+- 调用方设备 ≠ 签发设备且策略 `capability.revoke.self_only = true`（默认）→ **403** `PERMISSION_DENIED`；
+- 未知 `token_id`（本节点从未签发）→ **404** `CAPABILITY_TOKEN_NOT_FOUND`；
+- 成功 → 200 `{ token_id, revoked }`；重复撤销幂等（`revoked = false`）；
+- 放宽策略（部署侧 `CHAT_NODE_CAPABILITY_REVOKE_ANY_DEVICE=1`）允许跨设备撤销，服务层记
+  `authorization = policy_relaxed` 与调用方设备作为审计依据。
+
+### 证据（`cargo test --offline -p chat-node-api`，30 passed）
+
+- `group_mailbox_http::revocation_is_limited_to_the_issuing_device_over_http`：设备 22 撤销设备 21 签发的令牌
+  → 403 `PERMISSION_DENIED` 且令牌仍然可用（撤销没有生效）；未知 token_id → 404 `CAPABILITY_TOKEN_NOT_FOUND`；
+  签发设备自己撤销 → 200/`revoked=true`，重复 → `revoked=false`。
+- 既有撤销 HTTP 用例（`capability_revocation_takes_effect_immediately_over_http`、
+  `enforced_mode_requires_a_live_token_for_mailbox_reads`）保持通过：它们本来就是签发设备自己撤销。
+
+### 已知限制
+
+- 端点没有“运营者”主体：放宽策略下任何**已鉴权设备**都能撤销他人令牌（审计会记录是谁），
+  真要做角色化撤销需要账户级角色模型（见 node.md 限制 2）。
+
 ## 已实现端点（P1-03）
 
 路由由 [crates/node-api/src/handlers.rs](../../crates/node-api/src/handlers.rs) 的 `build_router` 构造；DTO 与错误结构见 [dto.rs](../../crates/node-api/src/dto.rs)，状态映射见 [error.rs](../../crates/node-api/src/error.rs)。

@@ -37,6 +37,8 @@ pub enum NodeError {
     CapabilityRevoked,
     /// 请求证明与请求目标不匹配（跨设备/跨账户）。
     PermissionDenied,
+    /// 令牌从未由本节点签发（或签发记录已清理）：撤销/审计按不存在处理。
+    CapabilityTokenNotFound,
     /// 未消费挑战数量达到全局容量上限。
     ChallengeCapacityExceeded,
     /// 限流拒绝（API-005）；携带建议的等待时长（毫秒），供客户端退避。
@@ -117,6 +119,7 @@ impl NodeError {
             Self::InvalidCapability => "INVALID_CAPABILITY",
             Self::CapabilityRevoked => "CAPABILITY_REVOKED",
             Self::PermissionDenied => "PERMISSION_DENIED",
+            Self::CapabilityTokenNotFound => "CAPABILITY_TOKEN_NOT_FOUND",
             Self::ChallengeCapacityExceeded => "CHALLENGE_CAPACITY_EXCEEDED",
             Self::RateLimited { .. } => "RATE_LIMITED",
             Self::GroupNotFound => "GROUP_NOT_FOUND",
@@ -165,6 +168,7 @@ impl NodeError {
             Self::InvalidCapability => "registration capability is not valid",
             Self::CapabilityRevoked => "capability token has been revoked",
             Self::PermissionDenied => "request is not authorized for this target",
+            Self::CapabilityTokenNotFound => "capability token is unknown to this node",
             Self::ChallengeCapacityExceeded => "node challenge capacity is exhausted",
             Self::RateLimited { .. } => "rate limited",
             Self::InvalidCandidate => "candidate or control metadata is not valid",

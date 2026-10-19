@@ -107,6 +107,7 @@ impl ApiError {
             | NodeError::HistoryNotAuthorized => StatusCode::FORBIDDEN,
             NodeError::GroupNotFound
             | NodeError::UploadNotFound
+            | NodeError::CapabilityTokenNotFound
             | NodeError::BlobNotFound => StatusCode::NOT_FOUND,
             NodeError::UploadExpired => StatusCode::GONE,
             NodeError::ContentTooLarge => StatusCode::PAYLOAD_TOO_LARGE,

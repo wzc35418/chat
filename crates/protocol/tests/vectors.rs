@@ -22,6 +22,8 @@ fn candidate() -> UnsignedCandidate {
             operation: ControlOperation::Invite,
             target_digest: Digest::from_bytes([0x55; 32]),
             domain_operation: None,
+            added_credentials: Vec::new(),
+            removed_credentials: Vec::new(),
         }),
     }
 }
@@ -485,4 +487,64 @@ fn attachment_metadata_event_matches_frozen_vector() {
     // 新事件比旧事件多一个 57 字段；旧事件编码走既有冻结向量测试。
     let old = encode_application_event(u_package_event()).expect("old event");
     assert!(bytes.as_bytes().len() > old.as_bytes().len());
+}
+/// 带成员凭据的控制候选（其余字段与 candidate() 相同）。
+fn credentialed_candidate(
+    operation: ControlOperation,
+    added: Vec<&str>,
+    removed: Vec<&str>,
+) -> UnsignedCandidate {
+    let mut candidate = candidate();
+    candidate.control_metadata = Some(
+        ControlMetadata::new(operation, Digest::from_bytes([0x55; 32])).with_credentials(
+            added.into_iter().map(str::to_owned).collect(),
+            removed.into_iter().map(str::to_owned).collect(),
+        ),
+    );
+    candidate
+}
+
+const ADDED_CREDENTIALS_VECTOR: &str = "636861742f70312f63616e6469646174652d617574686f722d7369676e61747572652f7631435043010007000e00010100000000000000010002010000000000000001000301000000000000000000040200000020111111111111111111111111111111111111111111111111111111111111111100050200000020222222222222222222222222222222222222222222222222222222222222222200060200000020333333333333333333333333333333333333333333333333333333333333333300070100000000000000020008020000002044444444444444444444444444444444444444444444444444444444444444440009010000000000000007000a010000000000000009000b0200000020305531dcc50ebca31cf1d5b31e9fc76ed51f66b3b6dd5a030c6539ae6532f979000c05010000000000000001000d0502000000205555555555555555555555555555555555555555555555555555555555555555003b06000000020300000005616c6963650300000003626f62";
+const REMOVED_CREDENTIALS_VECTOR: &str = "636861742f70312f63616e6469646174652d617574686f722d7369676e61747572652f7631435043010007000e00010100000000000000010002010000000000000001000301000000000000000000040200000020111111111111111111111111111111111111111111111111111111111111111100050200000020222222222222222222222222222222222222222222222222222222222222222200060200000020333333333333333333333333333333333333333333333333333333333333333300070100000000000000020008020000002044444444444444444444444444444444444444444444444444444444444444440009010000000000000007000a010000000000000009000b0200000020305531dcc50ebca31cf1d5b31e9fc76ed51f66b3b6dd5a030c6539ae6532f979000c05010000000000000002000d0502000000205555555555555555555555555555555555555555555555555555555555555555003c060000000103000000056361726f6c";
+
+#[test]
+fn control_credentials_match_frozen_vectors_and_decode_back() {
+    let cases = [
+        (
+            credentialed_candidate(ControlOperation::Invite, vec!["alice", "bob"], Vec::new()),
+            ADDED_CREDENTIALS_VECTOR,
+        ),
+        (
+            credentialed_candidate(ControlOperation::Remove, Vec::new(), vec!["carol"]),
+            REMOVED_CREDENTIALS_VECTOR,
+        ),
+    ];
+    for (candidate, expected) in cases {
+        let bytes = candidate_signing_bytes(&candidate).expect("credentials encode");
+        assert_eq!(bytes.to_hex(), expected);
+        // 新字段出现在签名原文里，能解回同一列表。
+        let body = decode_bounded(
+            &bytes.as_bytes()[CANDIDATE_SIGNING_DOMAIN.len()..],
+            DecodeLimits::DEFAULT,
+        )
+        .expect("body decodes");
+        let (added, removed) = decode_control_credentials(body.value()).expect("decode");
+        let metadata = candidate
+            .control_metadata
+            .as_ref()
+            .expect("control metadata");
+        assert_eq!(added, metadata.added_credentials);
+        assert_eq!(removed, metadata.removed_credentials);
+    }
+    // 旧固定向量（无 59/60 字段）解码为空列表；既有 candidate_signing_bytes 向量测试继续通过。
+    let old = candidate_signing_bytes(&candidate()).expect("old candidate");
+    let body = decode_bounded(
+        &old.as_bytes()[CANDIDATE_SIGNING_DOMAIN.len()..],
+        DecodeLimits::DEFAULT,
+    )
+    .expect("old body decodes");
+    assert_eq!(
+        decode_control_credentials(body.value()).unwrap(),
+        (Vec::new(), Vec::new())
+    );
 }

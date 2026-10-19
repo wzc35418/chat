@@ -47,6 +47,7 @@ fn required_policy() -> NodeAuthPolicy {
         capability: CapabilityPolicy {
             required: true,
             max_ttl_seconds: 3_600,
+            revoke: Default::default(),
         },
         ..NodeAuthPolicy::default()
     }

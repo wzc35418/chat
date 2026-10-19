@@ -527,7 +527,7 @@ pub fn run_catchup_once_at(
 
 
 /// 一页条目的 MLS 应用报告（SYNC-002 补全：拉到的条目真正 apply 进 MLS）。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ApplyReport {
     /// 真正应用（消息/Commit/提案）的条目数。
     pub applied: u64,
@@ -539,6 +539,12 @@ pub struct ApplyReport {
     pub needs_catchup: bool,
     /// 作者凭据**不在凭据目录**里、只能用确定性占位的条目数（显式计数，绝不静默伪造）。
     pub unknown_authors: u64,
+    /// 本次真正应用的控制提交携带的新增成员凭据（UTF-8；来自候选字段 59）。
+    pub added_credentials: Vec<String>,
+    /// 本次真正应用的控制提交携带的移除成员凭据（UTF-8；来自候选字段 60）。
+    pub removed_credentials: Vec<String>,
+    /// 带凭据但当前只能显式挂起（本机 pending 回显 / 本机落后）的控制提交数。
+    pub pending_controls: u64,
 }
 
 impl ApplyReport {
@@ -628,12 +634,32 @@ pub fn apply_verified_page(
                 continue;
             }
         };
-        let input = PeerEntryInput::new(
+        // 控制提交携带的成员凭据（字段 59/60）：同步侧据此把真实 MLS 增删写回成员集合。
+        // 旧候选没有这两个列表 → 空，保持旧的“无法证明成员身份”行为（显式计为无法应用）。
+        let (added_credentials, removed_credentials) = match &candidate.control_metadata {
+            Some(metadata) => (
+                metadata.added_credentials.clone(),
+                metadata.removed_credentials.clone(),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        let mut input = PeerEntryInput::new(
             group_id,
             candidate.mls_epoch,
             candidate.author_device_id.clone(),
             payload,
         );
+        input.added_members = added_credentials.clone();
+        input.removed_members = removed_credentials.clone();
+        // 声明了成员身份就必须同时声明预期计数：groups 层用 expectation 与声明身份在合并不前
+        // 做一致性检查，避免“合并后才发现不符”的半状态（更新数对增删提交应为 0）。
+        if !added_credentials.is_empty() || !removed_credentials.is_empty() {
+            input.expectation = Some(chat_crypto::control::CommitExpectation {
+                added: u32::try_from(added_credentials.len()).unwrap_or(u32::MAX),
+                removed: u32::try_from(removed_credentials.len()).unwrap_or(u32::MAX),
+                updated: 0,
+            });
+        }
         match group_process_peer_entry(&mut device, store, &input) {
             Ok(PeerEntryOutcome::Application { plaintext, .. }) => {
                 let Ok(body) = String::from_utf8(plaintext) else {
@@ -670,14 +696,32 @@ pub fn apply_verified_page(
             }
             Ok(PeerEntryOutcome::Commit { .. } | PeerEntryOutcome::Proposal { .. }) => {
                 report.applied = report.applied.saturating_add(1);
+                // 只有真正合并的控制提交才把凭据写进报告（Proposal 的列表必为空）。
+                report.added_credentials.extend(added_credentials);
+                report.removed_credentials.extend(removed_credentials);
             }
             Ok(PeerEntryOutcome::OwnPendingCommit { .. }) => {
-                report.unsupported = report.unsupported.saturating_add(1);
+                // 本机自己的提交回显：显式挂起，交给 accept_pending_control，而不是伪装成应用。
+                report.pending_controls = report.pending_controls.saturating_add(1);
+                report.added_credentials.extend(added_credentials);
+                report.removed_credentials.extend(removed_credentials);
             }
             Err(error) => match error.code() {
-                "STALE_EPOCH" => report.stale = report.stale.saturating_add(1),
+                "STALE_EPOCH" => {
+                    report.stale = report.stale.saturating_add(1);
+                    if !added_credentials.is_empty() || !removed_credentials.is_empty() {
+                        report.pending_controls = report.pending_controls.saturating_add(1);
+                        report.added_credentials.extend(added_credentials);
+                        report.removed_credentials.extend(removed_credentials);
+                    }
+                }
                 "MISSING_LOG_ENTRIES" => {
                     report.needs_catchup = true;
+                    if !added_credentials.is_empty() || !removed_credentials.is_empty() {
+                        report.pending_controls = report.pending_controls.saturating_add(1);
+                        report.added_credentials.extend(added_credentials);
+                        report.removed_credentials.extend(removed_credentials);
+                    }
                     break;
                 }
                 "UNSUPPORTED_ENTRY"

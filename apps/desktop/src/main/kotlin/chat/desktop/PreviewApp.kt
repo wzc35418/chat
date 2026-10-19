@@ -265,6 +265,56 @@ fun main() = application {
         },
         refreshContacts = { scope.launch { refreshContacts() } },
         updateRecoveryPassphrase = { value -> identityState = identityState.updateRecoveryPassphrase(value) },
+        importRecovery = {
+            scope.launch {
+                val service = identity ?: return@launch
+                val database = identityDatabase
+                val key = identityKey
+                if (database == null || key == null) {
+                    identityState = identityState.copy(
+                        busy = false,
+                        notice = "导入需要已打开的本机密钥槽",
+                        lastErrorCode = "INVALID_STATE_TRANSITION",
+                    )
+                    return@launch
+                }
+                if (identityState.account != null) {
+                    // 诚实拒绝：目标库已有身份，导入不会覆盖。
+                    identityState = identityState.copy(
+                        busy = false,
+                        notice = "当前库已有身份；导入必须在空库上执行（请换一个库路径）",
+                        lastErrorCode = "RECOVERY_TARGET_NOT_EMPTY",
+                    )
+                    return@launch
+                }
+                val picker = runCatching { DesktopFilePicker(null) }.getOrNull() ?: return@launch
+                val passphrase = identityState.recoveryPassphrase
+                identityState = identityState.copy(busy = true, lastErrorCode = null)
+                runCatching {
+                    val chosen = picker.chooseImportFile("选择身份恢复文件")
+                    val bytes = File(chosen.path).readBytes()
+                    val view = service.importRecoveryBundle(passphrase, bytes)
+                    view
+                }.onSuccess { view ->
+                    val reopened = runCatching { service.openPersisted(database, key, node) }
+                    identityState = identityState.copy(
+                        busy = false,
+                        account = reopened.getOrNull() ?: identityState.account,
+                        notice = "已导入身份 " + view.deviceId + "（受限显示）；旧库消息与附件仍不可读",
+                        lastErrorCode = reopened.exceptionOrNull()?.let { (it as? LocalStoreException)?.code },
+                    )
+                    runCatching { refreshContacts() }
+                }.onFailure { error ->
+                    identityState = identityState.copy(
+                        busy = false,
+                        notice = error.message ?: "导入失败",
+                        lastErrorCode = (error as? IdentityException)?.code
+                            ?: (error as? LocalStoreException)?.code
+                            ?: "UNKNOWN_RESULT",
+                    )
+                }
+            }
+        },
         exportRecovery = {
             scope.launch {
                 val service = identity ?: return@launch

@@ -903,7 +903,7 @@ cargo test --offline -p chat-ffi                   # 42 passed（既有 39 继�
 ~~~text
 run_pull_once_reporting_at(store, client, group_id, now_ms) -> SyncResult<(PullOutcome, ApplyReport)>
 applied_message_id(group_id, seq) -> String            // 确定性消息 ID（幂等键）
-ApplyReport { applied, stale, unsupported, needs_catchup }   // skipped() = stale + unsupported
+ApplyReport { applied, stale, unsupported, needs_catchup, unknown_authors, added_credentials, removed_credentials, pending_controls }   // skipped() = stale + unsupported
 ~~~
 
 `run_pull_once` / `run_pull_once_at` 行为不变（内部转调同一实现，报告被丢弃）。
@@ -911,9 +911,10 @@ ApplyReport { applied, stale, unsupported, needs_catchup }   // skipped() = stal
 ### 应用与分类语义
 
 1. **应用**：对本页每条已通过 `verify_pull_page` 的条目，用节点日志里的候选构造
-   `PeerEntryInput`（群、epoch、`author_device_id` 作为已认证作者、密文载荷）并调用
+   `PeerEntryInput`（群、epoch、`author_device_id` 作为已认证作者、密文载荷，以及候选
+   control metadata 里的 `added_credentials` / `removed_credentials`）并调用
    `crate::groups::group_process_peer_entry` ——它内部走 CRYPTO-006 的 `process_verified_entry`，
-   Commit 合并后 epoch **恰好 +1** 并把 MLS 状态 `export_to_store` + 快照落库。
+   Commit 合并后 epoch **恰好 +1**、成员增删按声明的凭据写回快照，并把 MLS 状态 `export_to_store` + 快照落库。
 2. **应用消息落库**：解密出的正文写成正式消息行（STORAGE-008 `apply_verified_entry`），
    message id 由 `(group_id, 日志序号)` 确定性派生（`applied_message_id`），因此**重放幂等**；
    正文不是合法 UTF-8 → 记 skipped（不写半条）。
@@ -925,12 +926,29 @@ ApplyReport { applied, stale, unsupported, needs_catchup }   // skipped() = stal
    - 其它（如 `STATE_CORRUPTED`）→ **向上抛错**，游标不前进。
 4. **游标只在 apply 之后前进**：条目落库与游标是同一次 storage 快照写入。
 
+### 控制提交成员凭据（task-91）
+
+日志候选的 control metadata 现在可携带 PROTOCOL-004 字段 59/60（新增/移除成员凭据）：
+
+- 提交侧（`group_node::resolve_control_metadata`）：`invite` 从本地快照的 `pending_members` 取凭据、
+  `remove` 从 `pending_removed` 取凭据；只有数量与 pending 计数完全一致才填，否则留空（保留旧的“无法证明”语义）。
+  结果通过 node-services 的 `CandidateControlMetadata.added_credentials/removed_credentials`（serde 默认空）写进候选，
+  签名原文覆盖这两个字段。
+- 应用侧（`sync_worker::apply_verified_page`）：把候选里的两个列表填进 `PeerEntryInput.added_members/removed_members`；
+  `group_process_peer_entry` 会核对“声明数量 == 真实 MLS 增删数量”，因此只有真正的 invite/remove 提交才会写回成员集合，
+  声明与提交不符仍显式失败（不会被“宽容”应用）。
+- 报告：`ApplyReport` 新增 `added_credentials` / `removed_credentials`（真正应用或显式挂起的控制提交携带的凭据）与
+  `pending_controls`（本机 pending 回显、或本机落后/epoch 过期而只能挂起的控制提交数）。旧候选没有列表时行为不变
+  （仍是 `unsupported` 计数，绝不伪造身份）。
+
 ### 复现命令（全程离线）
 
 ~~~powershell
 . .\tools\activate.ps1
-cargo test --offline -p chat-core --test sync_apply   # 4 passed
-cargo test --offline -p chat-core                     # 208 passed（既有 200 继续通过，0 failed）
+cargo test --offline -p chat-core --test sync_apply      # 4 passed
+cargo test --offline -p chat-core --test sync_membership # 1 passed（task-91 新增）
+cargo test --offline -p chat-core                        # 226 passed（既有 225 继续通过，0 failed）
+cargo test --offline -p chat-protocol                    # 88 passed（lib 74 + vectors 14）
 ~~~
 
 ### 证据
@@ -944,6 +962,9 @@ cargo test --offline -p chat-core                     # 208 passed（既有 200 
   （无群快照）→ 两条条目 `unsupported == 2`、applied 0，但游标前进到 2。
 - `sync_apply::applying_a_control_commit_advances_the_epoch`：alice 提交真 SelfUpdate 控制提交 →
   bob 拉取应用 → 快照 `epoch == before + 1`（控制提交真的合进了 MLS）。
+- `sync_membership::invite_and_remove_commits_with_credentials_change_membership`（新）：alice 的真实 invite 提交
+  （携带 carol 凭据）→ bob 侧 apply → `applied == 1`、`unsupported == 0`、`added_credentials == [carol]`、成员集合出现 carol；
+  随后真实 remove 提交（携带 carol 凭据）→ `removed_credentials == [carol]`、成员集合移除 carol、epoch 依次 1→2→3。
 
 ### 已知限制
 
@@ -953,8 +974,9 @@ cargo test --offline -p chat-core                     # 208 passed（既有 200 
 2. **策略语义不经拉取同步**：`set_role` / `transfer_ownership` 等角色变更需要外层声明的目标成员，
    日志里只有 `domain_target_digest`，故 apply 阶段**不猜测策略**（角色按本地保持不变）；
    角色同步仍走显式 `group_process_peer_entry(policy_intent)` 路径。
-3. **成员增删提交**（invite / remove）同样缺少“声明身份”，apply 阶段会按 `INVALID_CONTROL_RESULT`
-   跳过并计数；需要控制元数据扩展（PROTOCOL-004 目标摘要 → 成员身份）后再打开。
+3. **成员增删提交已可应用（task-91）**：候选携带 PROTOCOL-004 字段 59/60 时按声明的凭据写回成员集合；旧候选
+   （无列表）或声明数量与真实 Commit 不符时仍按 `INVALID_CONTROL_RESULT`/unsupported 显式跳过；角色策略语义仍未从
+   拉取路径猜测（见上一条）。
 4. `MISSING_LOG_ENTRIES` 复用 `ResyncReason::GapTooLarge` 表达“本机 MLS 落后”（`ResyncReason`
    属于 chat-sync 的日志对齐语义，本包不改它的枚举）。
 5. 应用阶段每条消息一次 storage 事务；大批量页（上百条）会变慢，尚未批处理。

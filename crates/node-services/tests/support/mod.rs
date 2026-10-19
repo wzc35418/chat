@@ -313,6 +313,8 @@ impl Harness {
             control_metadata: control_metadata.map(|(operation, target)| CandidateControlMetadata {
                 operation: operation.to_owned(),
                 target_digest: hex_encode(&target),
+                added_credentials: Vec::new(),
+                removed_credentials: Vec::new(),
             }),
         };
         // 客户端按协议上限构造；节点策略上限（更小）由服务层显式拒绝。
@@ -391,4 +393,3 @@ impl Harness {
         self.service.node_public_key()
     }
 }
-

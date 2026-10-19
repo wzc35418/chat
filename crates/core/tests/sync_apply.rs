@@ -337,6 +337,8 @@ impl Fixture {
             control_metadata: Some(CandidateControlMetadata {
                 operation: "set_role".to_owned(),
                 target_digest: hex_encode(&[0x33_u8; 32]),
+                added_credentials: Vec::new(),
+                removed_credentials: Vec::new(),
             }),
         };
         block_on(self.node.client(&device_id_text(ALICE_SEED), ALICE_SEED).append_entry(&candidate))

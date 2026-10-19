@@ -254,7 +254,7 @@ fn revocation_takes_effect_immediately_and_is_idempotent() {
     assert!(
         harness
             .service
-            .revoke_capability(&issued.token_id, "operator_request", revoked_ms)
+            .revoke_capability(&issued.token_id, &device_id, "operator_request", revoked_ms)
             .expect("revocation recorded")
     );
     let error = harness
@@ -271,7 +271,7 @@ fn revocation_takes_effect_immediately_and_is_idempotent() {
     assert!(
         !harness
             .service
-            .revoke_capability(&issued.token_id, "operator_request", revoked_ms + 1)
+            .revoke_capability(&issued.token_id, &device_id, "operator_request", revoked_ms + 1)
             .expect("idempotent revocation")
     );
     // 注意：无状态令牌是确定性的（同一 (对象, 设备, 用途, 时间窗) 逐字节相同），
@@ -344,11 +344,11 @@ fn expired_revocations_are_purged_but_recent_ones_survive() {
     let old_ms = u64::try_from(NOW).expect("now") * 1_000;
     harness
         .service
-        .revoke_capability(&retired.token_id, "operator_request", old_ms)
+        .revoke_capability(&retired.token_id, &device_id, "operator_request", old_ms)
         .expect("old revocation");
     harness
         .service
-        .revoke_capability(&recent.token_id, "operator_request", old_ms + retention_ms + 1)
+        .revoke_capability(&recent.token_id, &device_id, "operator_request", old_ms + retention_ms + 1)
         .expect("recent revocation");
     let now_ms = old_ms + retention_ms + 2;
     let removed = harness
@@ -371,4 +371,135 @@ fn expired_revocations_are_purged_but_recent_ones_survive() {
     );
 }
 
+/// CAP-AUTHZ：默认策略下只有签发设备能撤销自己的令牌。
+#[test]
+fn revoke_is_limited_to_the_issuing_device_by_default() {
+    let (mut harness, device_id) = registered(38);
+    let other = Harness::device(39);
+    harness.register(&other, NOW).expect("second device");
+    let issued = harness
+        .service
+        .issue_capability_with_id(
+            &object_text(51),
+            &device_id,
+            CapabilityScope::BlobDownload,
+            60,
+            NOW,
+        )
+        .expect("token issued");
+    assert_eq!(
+        harness
+            .service
+            .capability_issuer(&issued.token_id)
+            .expect("issuer lookup"),
+        Some(device_id.clone())
+    );
+    let revoked_ms = u64::try_from(NOW).expect("now") * 1_000;
+    let error = harness
+        .service
+        .revoke_capability(&issued.token_id, &other.device_id, "operator_request", revoked_ms)
+        .expect_err("a foreign device cannot revoke the token");
+    assert_eq!(error.code(), "PERMISSION_DENIED");
+    assert!(
+        !harness
+            .service
+            .capability_revoked(&issued.token_id)
+            .expect("lookup"),
+        "the rejected revocation writes nothing"
+    );
+    assert!(
+        harness
+            .service
+            .revoke_capability(&issued.token_id, &device_id, "operator_request", revoked_ms)
+            .expect("issuer revokes its own token")
+    );
+    let record = harness
+        .service
+        .revocation_record(&issued.token_id)
+        .expect("record lookup")
+        .expect("record exists");
+    assert_eq!(record.authorization, "self");
+    assert_eq!(record.revoked_by_device, device_id);
+    assert_eq!(record.reason, "operator_request");
+}
 
+/// CAP-AUTHZ：放宽策略允许跨设备撤销，但必须留下审计依据。
+#[test]
+fn relaxed_policy_allows_cross_device_revocation_with_an_audit_trail() {
+    let mut policy = NodeAuthPolicy::default();
+    policy.capability.revoke.self_only = false;
+    let mut harness = Harness::in_memory_with(policy);
+    let issuer = Harness::device(40);
+    let operator = Harness::device(41);
+    harness.register(&issuer, NOW).expect("issuer registers");
+    harness.register(&operator, NOW).expect("operator registers");
+    let object = object_text(52);
+    let token = harness
+        .service
+        .issue_capability(&object, &issuer.device_id, CapabilityScope::BlobDownload, 60, NOW)
+        .expect("token issued");
+    let token_id = chat_node_services::capability::capability_token_id(&token).expect("token id");
+    let revoked_ms = u64::try_from(NOW).expect("now") * 1_000;
+    assert!(
+        harness
+            .service
+            .revoke_capability(&token_id, &operator.device_id, "admin_revocation", revoked_ms)
+            .expect("relaxed policy allows the operator")
+    );
+    let record = harness
+        .service
+        .revocation_record(&token_id)
+        .expect("record lookup")
+        .expect("record exists");
+    assert_eq!(record.authorization, "policy_relaxed");
+    assert_eq!(record.revoked_by_device, operator.device_id);
+    assert_eq!(record.reason, "admin_revocation");
+    let error = harness
+        .service
+        .verify_capability(&token, &object, &issuer.device_id, CapabilityScope::BlobDownload, NOW + 1)
+        .expect_err("revoked token is rejected");
+    assert_eq!(error.code(), "CAPABILITY_REVOKED");
+}
+
+/// CAP-AUTHZ：未签发的 token_id → NOT_FOUND；重复撤销幂等且保留首次记录。
+#[test]
+fn revoking_an_unknown_token_id_is_not_found_and_repeats_are_idempotent() {
+    let (mut harness, device_id) = registered(42);
+    let revoked_ms = u64::try_from(NOW).expect("now") * 1_000;
+    let unknown = "a".repeat(64);
+    let error = harness
+        .service
+        .revoke_capability(&unknown, &device_id, "operator_request", revoked_ms)
+        .expect_err("an unknown token id cannot be revoked");
+    assert_eq!(error.code(), "CAPABILITY_TOKEN_NOT_FOUND");
+    assert!(harness.service.revocation_record(&unknown).expect("lookup").is_none());
+    let issued = harness
+        .service
+        .issue_capability_with_id(
+            &object_text(53),
+            &device_id,
+            CapabilityScope::BlobDownload,
+            60,
+            NOW,
+        )
+        .expect("token issued");
+    assert!(
+        harness
+            .service
+            .revoke_capability(&issued.token_id, &device_id, "first_reason", revoked_ms)
+            .expect("first revocation")
+    );
+    assert!(
+        !harness
+            .service
+            .revoke_capability(&issued.token_id, &device_id, "second_reason", revoked_ms + 1)
+            .expect("repeat revocation is idempotent")
+    );
+    let record = harness
+        .service
+        .revocation_record(&issued.token_id)
+        .expect("lookup")
+        .expect("record");
+    assert_eq!(record.reason, "first_reason", "the first reason is kept");
+    assert_eq!(record.revoked_at_ms, i64::try_from(revoked_ms).expect("ms"));
+}

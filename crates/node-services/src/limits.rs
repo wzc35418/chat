@@ -408,6 +408,22 @@ impl CleanupPolicy {
     }
 }
 
+/// CAP-AUTHZ：撤销授权策略。
+///
+/// 默认 `self_only = true`：只有**签发该令牌的设备**能撤销它（任何设备都能撤销任何令牌是实现缺陷）。
+/// 部署侧显式放宽后，跨设备撤销会写入审计列（`authorization = policy_relaxed`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevokePolicy {
+    /// 只允许签发设备撤销自己的令牌。
+    pub self_only: bool,
+}
+
+impl Default for RevokePolicy {
+    fn default() -> Self {
+        Self { self_only: true }
+    }
+}
+
 /// CAP 包：能力令牌强制模式策略。
 ///
 /// 默认**关闭**（`required = false`），因此既有客户端与既有 HTTP 调用路径完全不变；
@@ -418,6 +434,8 @@ pub struct CapabilityPolicy {
     pub required: bool,
     /// 节点签发能力令牌的有效期上限（秒，硬上限仍是 `MAX_CAPABILITY_TTL_SECONDS`）。
     pub max_ttl_seconds: u64,
+    /// CAP-AUTHZ：撤销授权策略（默认只允许签发设备撤销）。
+    pub revoke: RevokePolicy,
 }
 
 /// 能力令牌默认有效期上限（秒）。
@@ -428,6 +446,7 @@ impl Default for CapabilityPolicy {
         Self {
             required: false,
             max_ttl_seconds: DEFAULT_CAPABILITY_MAX_TTL_SECONDS,
+            revoke: RevokePolicy::default(),
         }
     }
 }
@@ -465,9 +484,17 @@ impl CapabilityPolicy {
                 .map_err(|_| NodeError::InvalidConfig("capability max ttl env"))?,
             Err(_) => DEFAULT_CAPABILITY_MAX_TTL_SECONDS,
         };
+        let self_only = match std::env::var("CHAT_NODE_CAPABILITY_REVOKE_ANY_DEVICE") {
+            Ok(value) => !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
+            Err(_) => true,
+        };
         let policy = Self {
             required,
             max_ttl_seconds,
+            revoke: RevokePolicy { self_only },
         };
         policy.validate()?;
         Ok(policy)

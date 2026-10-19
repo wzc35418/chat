@@ -149,6 +149,21 @@ pub const MAX_REVOCATION_REASON_BYTES: usize = 128;
 /// token_id 派生域（与签名域分离）。
 const CAPABILITY_TOKEN_ID_DOMAIN: &[u8] = b"chat/p1/node-capability-token-id/v1";
 
+/// 撤销记录（审计用：谁撤销的、依据什么授权）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevocationRecord {
+    /// 令牌标识。
+    pub token_id: String,
+    /// 撤销时刻（Unix 毫秒）。
+    pub revoked_at_ms: i64,
+    /// 调用方给的原因短语。
+    pub reason: String,
+    /// 执行撤销的设备。
+    pub revoked_by_device: String,
+    /// 授权依据：`self`（签发设备自己）或 `policy_relaxed`（放宽策略下的跨设备撤销）。
+    pub authorization: String,
+}
+
 /// 签发结果：令牌文本 + 可撤销标识。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssuedCapability {
@@ -197,30 +212,69 @@ impl NodeService {
         Ok(IssuedCapability { token, token_id })
     }
 
-    /// 撤销一个能力令牌（幂等：重复撤销保持首次的 revoked_at_ms 与 reason）。
+    /// 撤销一个能力令牌（**带授权判定**；幂等：重复撤销保持首次的 revoked_at_ms 与 reason）。
+    ///
+    /// 授权（CAP-AUTHZ）：
+    /// - 未登记的 token_id（从未由本节点签发）→ `CAPABILITY_TOKEN_NOT_FOUND`；
+    /// - 默认策略 `revoke.self_only = true`：调用方设备必须**就是签发设备**，否则 `PERMISSION_DENIED`；
+    /// - 放宽策略（`self_only = false`）允许跨设备撤销，但会在撤销记录里留下
+    ///   `authorization = policy_relaxed` 与调用方设备（审计依据）。
     ///
     /// 返回 true 表示"本次真的写入了新的撤销记录"，false 表示此前已撤销。
     pub fn revoke_capability(
         &mut self,
         token_id: &str,
+        caller_device_id: &str,
         reason: &str,
         now_ms: u64,
     ) -> NodeResult<bool> {
         validate_timestamp("now", now_ms / 1_000)?;
         validate_revocation_reason(reason)?;
+        validate_bounded_id("device id", caller_device_id, MAX_DEVICE_ID_BYTES)?;
         if token_id.len() != 64 || !token_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(NodeError::InvalidRequest("token id"));
         }
+        let issuer = self
+            .capability_issuer(token_id)?
+            .ok_or(NodeError::CapabilityTokenNotFound)?;
+        let self_only = self.policy().capability.revoke.self_only;
+        let is_issuer = issuer == caller_device_id;
+        if !is_issuer && self_only {
+            return Err(NodeError::PermissionDenied);
+        }
+        let authorization = if is_issuer { "self" } else { "policy_relaxed" };
         let now_ms = i64::try_from(now_ms).map_err(|_| NodeError::InvalidRequest("now"))?;
         let inserted = self
             .connection_mut()
             .execute(
-                "INSERT OR IGNORE INTO capability_token_revocations (token_id, revoked_at_ms, reason)
-                 VALUES (?1, ?2, ?3)",
-                rusqlite::params![token_id, now_ms, reason],
+                "INSERT OR IGNORE INTO capability_token_revocations
+                     (token_id, revoked_at_ms, reason, revoked_by_device, authorization)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![token_id, now_ms, reason, caller_device_id, authorization],
             )
             .map_err(|_| NodeError::StorageUnavailable)?;
         Ok(inserted > 0)
+    }
+
+    /// 撤销记录（含执行撤销的设备与授权依据；未撤销 → None）。审计/测试用。
+    pub fn revocation_record(&self, token_id: &str) -> NodeResult<Option<RevocationRecord>> {
+        self.connection()
+            .query_row(
+                "SELECT token_id, revoked_at_ms, reason, revoked_by_device, authorization
+                   FROM capability_token_revocations WHERE token_id = ?1",
+                rusqlite::params![token_id],
+                |row| {
+                    Ok(RevocationRecord {
+                        token_id: row.get(0)?,
+                        revoked_at_ms: row.get(1)?,
+                        reason: row.get(2)?,
+                        revoked_by_device: row.get(3)?,
+                        authorization: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| NodeError::StorageUnavailable)
     }
 
     /// 清理超过保留期的撤销记录，返回删除条数。
@@ -293,11 +347,44 @@ impl NodeService {
         };
         let payload = grant.encode_payload();
         let signature: Signature = self.signing_key().sign(&payload);
-        Ok(format!(
+        let token = format!(
             "{CAPABILITY_TOKEN_PREFIX}{}.{}",
             hex_encode(&payload),
             hex_encode(&signature.to_bytes())
-        ))
+        );
+        // CAP-AUTHZ：签发时记录 token_id → 签发设备，撤销时据此做授权判定（令牌本身仍不落库）。
+        self.record_capability_issuer(&token, device_id, now)?;
+        Ok(token)
+    }
+
+    /// 记录令牌的签发设备（幂等：同 token_id 只保留首次签发记录）。
+    fn record_capability_issuer(&mut self, token: &str, device_id: &str, now: u64) -> NodeResult<()> {
+        let token_id = capability_token_id(token)?;
+        let issued_at_ms = i64::try_from(now)
+            .ok()
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .ok_or(NodeError::InvalidRequest("now"))?;
+        self.connection_mut()
+            .execute(
+                "INSERT OR IGNORE INTO capability_token_issuers
+                     (token_id, issuer_device_id, issued_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![token_id, device_id, issued_at_ms],
+            )
+            .map_err(|_| NodeError::StorageUnavailable)?;
+        Ok(())
+    }
+
+    /// 令牌的签发设备（未登记签发记录 → None，撤销时按 NOT_FOUND 处理）。
+    pub fn capability_issuer(&self, token_id: &str) -> NodeResult<Option<String>> {
+        self.connection()
+            .query_row(
+                "SELECT issuer_device_id FROM capability_token_issuers WHERE token_id = ?1",
+                rusqlite::params![token_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| NodeError::StorageUnavailable)
     }
 
     /// 校验能力令牌：绑定（对象/设备/用途）+ 过期 + 节点身份 + 签名。

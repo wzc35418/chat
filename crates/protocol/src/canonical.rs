@@ -124,6 +124,9 @@ pub mod field {
     pub const CONTROL_DOMAIN_TARGET_DIGEST: u16 = 56;
     // 附件引用可选 metadata（密钥描述符等，≤512 字节）。
     pub const CONTENT_ATTACHMENT_METADATA: u16 = 57;
+    // 控制提交携带的成员凭据（UTF-8 列表，单个 ≤128B、总数 ≤64）。
+    pub const CONTROL_ADDED_CREDENTIALS: u16 = 59;
+    pub const CONTROL_REMOVED_CREDENTIALS: u16 = 60;
 }
 
 /// 已知安全字段号表。编码/解码都拒绝表外字段号。
@@ -185,6 +188,8 @@ pub const KNOWN_FIELD_IDS: &[u16] = &[
     field::CONTROL_DOMAIN_OPERATION,
     field::CONTROL_DOMAIN_TARGET_DIGEST,
     field::CONTENT_ATTACHMENT_METADATA,
+    field::CONTROL_ADDED_CREDENTIALS,
+    field::CONTROL_REMOVED_CREDENTIALS,
 ];
 
 /// 判断字段号是否属于冻结安全字段集合。

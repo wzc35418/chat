@@ -21,6 +21,8 @@ fn text(value: &str) -> CandidateControlMetadata {
     CandidateControlMetadata {
         operation: value.to_owned(),
         target_digest: hex_encode(&[0x33_u8; 32]),
+        added_credentials: Vec::new(),
+        removed_credentials: Vec::new(),
     }
 }
 
@@ -218,4 +220,3 @@ fn domain_texts_map_to_the_frozen_protocol_enum() {
         assert_ne!(parsed.target_digest, chat_protocol::Digest::ZERO);
     }
 }
-

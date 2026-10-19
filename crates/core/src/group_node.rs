@@ -633,10 +633,53 @@ pub fn resolve_control_metadata(
             "the declared control intent is incompatible with the pending commit",
         ));
     }
+    // 提交携带成员凭据：同步侧凭这些凭据把真实 MLS 增删写回成员集合（旧快照缺凭据时留空，
+    // 由同步侧显式计为无法应用，绝不伪造身份）。
+    let (added_credentials, removed_credentials) = submitted_credentials(view, pending, intent);
     Ok(CandidateControlMetadata {
         operation: intent.node_operation().to_owned(),
         target_digest: intent.target_digest(pending, local_device_id),
+        added_credentials,
+        removed_credentials,
     })
+}
+
+/// 从本地快照证明本次提交的新增/移除成员凭据。
+///
+/// 只有数量与 pending 计数完全一致时才填（否则返回空列表，保留旧的“无法证明”语义）。
+fn submitted_credentials(
+    view: &GroupView,
+    pending: &PendingControl,
+    intent: &ControlIntent,
+) -> (Vec<String>, Vec<String>) {
+    match intent {
+        ControlIntent::Invite => {
+            let added: Vec<String> = view
+                .pending_members
+                .iter()
+                .filter(|member| member.pending)
+                .map(|member| member.credential.clone())
+                .collect();
+            if u32::try_from(added.len()).ok() == Some(pending.added) {
+                (added, Vec::new())
+            } else {
+                (Vec::new(), Vec::new())
+            }
+        }
+        ControlIntent::RemoveMember { .. } | ControlIntent::LeaveSelf => {
+            let removed: Vec<String> = view
+                .pending_removed
+                .iter()
+                .map(|member| member.credential.clone())
+                .collect();
+            if u32::try_from(removed.len()).ok() == Some(pending.removed) {
+                (Vec::new(), removed)
+            } else {
+                (Vec::new(), Vec::new())
+            }
+        }
+        _ => (Vec::new(), Vec::new()),
+    }
 }
 
 /// 无 intent 的兼容入口能推断出的语义（只覆盖**唯一可能**的形态，其余显式失败）。

@@ -381,6 +381,8 @@ fn candidate(
             Some(CandidateControlMetadata {
                 operation: "invite".into(),
                 target_digest: hex_encode(&[0x33_u8; 32]),
+                added_credentials: Vec::new(),
+                removed_credentials: Vec::new(),
             })
         } else {
             None
@@ -1572,6 +1574,8 @@ fn control_candidate_struct(
         control_metadata: Some(CandidateControlMetadata {
             operation: "invite".into(),
             target_digest: hex_encode(&[0x33_u8; 32]),
+            added_credentials: Vec::new(),
+            removed_credentials: Vec::new(),
         }),
     }
 }
@@ -1583,6 +1587,8 @@ async fn domain_operation_declaration_is_accepted_and_visible_in_the_log_api() {
     candidate.control_metadata = Some(CandidateControlMetadata {
         operation: "set_role".into(),
         target_digest: hex_encode(&[0x33_u8; 32]),
+        added_credentials: Vec::new(),
+        removed_credentials: Vec::new(),
     });
     let declaration = CandidateDomainOperation {
         operation: "transfer_ownership".into(),
@@ -1623,6 +1629,8 @@ async fn illegal_domain_operation_declarations_are_rejected() {
     candidate.control_metadata = Some(CandidateControlMetadata {
         operation: "invite".into(),
         target_digest: hex_encode(&[0x33_u8; 32]),
+        added_credentials: Vec::new(),
+        removed_credentials: Vec::new(),
     });
     let declaration = CandidateDomainOperation {
         operation: "transfer_ownership".into(),
@@ -1678,6 +1686,7 @@ fn capability_policy(required: bool) -> NodeAuthPolicy {
         capability: chat_node_services::limits::CapabilityPolicy {
             required,
             max_ttl_seconds: 3_600,
+            revoke: chat_node_services::limits::RevokePolicy::default(),
         },
         ..NodeAuthPolicy::default()
     }
@@ -1936,3 +1945,57 @@ async fn enforced_mode_requires_a_live_token_for_mailbox_reads() {
     assert_eq!(denied.error_code(), "CAPABILITY_REVOKED");
 }
 
+// ---------------------------------------------------------------- CAP-AUTHZ 撤销授权
+
+/// CAP-AUTHZ：撤销只允许**签发设备本人**；未知 token_id → 404。
+#[tokio::test]
+async fn revocation_is_limited_to_the_issuing_device_over_http() {
+    let (node, group) = setup(NodeAuthPolicy::default()).await;
+    let source_seq = append_attachment_entry(&node, &group, 21).await;
+    let blob = object_text(148);
+    let begin = begin_blob(&node, 21, &group, &operation_text(248), &blob, source_seq, 4, 4, 1).await;
+    assert_eq!(begin.status, 200);
+    let upload_id = begin.json()["session"]["upload_id"]
+        .as_str()
+        .expect("upload id")
+        .to_owned();
+    let issued = issue_capability(&node, 21, &upload_id, "blob:upload", Some(120)).await;
+    assert_eq!(issued.status, 200);
+    let token_id = issued.json()["capability"]["token_id"]
+        .as_str()
+        .expect("token id")
+        .to_owned();
+
+    // 另一台已登记设备（22）撤销别人的令牌 → 403 PERMISSION_DENIED，且令牌仍然可用。
+    let denied = revoke_token(&node, 22, &token_id).await;
+    assert_eq!(
+        denied.status, 403,
+        "a foreign device must be rejected: {:?}",
+        String::from_utf8_lossy(&denied.body)
+    );
+    assert_eq!(denied.error_code(), "PERMISSION_DENIED");
+    let token = issued.json()["capability"]["token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    let still_ok = put_chunk_with_capability(&node, 21, &upload_id, 0, b"head", &token).await;
+    assert_eq!(
+        still_ok.status, 200,
+        "the rejected revocation must not take effect: {:?}",
+        String::from_utf8_lossy(&still_ok.body)
+    );
+
+    // 从未签发的 token_id → 404 CAPABILITY_TOKEN_NOT_FOUND。
+    let unknown = "a".repeat(64);
+    let missing = revoke_token(&node, 21, &unknown).await;
+    assert_eq!(missing.status, 404, "{:?}", String::from_utf8_lossy(&missing.body));
+    assert_eq!(missing.error_code(), "CAPABILITY_TOKEN_NOT_FOUND");
+
+    // 签发设备自己撤销 → 200 + revoked=true（幂等：第二次 revoked=false）。
+    let self_revoke = revoke_token(&node, 21, &token_id).await;
+    assert_eq!(self_revoke.status, 200, "{:?}", String::from_utf8_lossy(&self_revoke.body));
+    assert_eq!(self_revoke.json()["revoked"], true);
+    let again = revoke_token(&node, 21, &token_id).await;
+    assert_eq!(again.status, 200);
+    assert_eq!(again.json()["revoked"], false);
+}
