@@ -96,6 +96,52 @@ impl MlsDevice {
         Ok(bytes)
     }
 
+    /// GROUPS-004：用**外部设备**的 KeyPackage 建群并返回 Welcome（不持有对方设备句柄）。
+    ///
+    /// 与 [`Self::create_and_invite`] 的唯一差别：对方设备不在本进程里，因此用
+    /// `expected_credential` 做**身份绑定校验**（MLS `validate` 已验签 KeyPackage；这里再要求
+    /// leaf 凭据逐字节等于期望值）。其余流程（建群、加成员、提交并合并引导 commit、返回 Welcome）一致。
+    pub fn create_and_invite_external(
+        &mut self,
+        key_package: &[u8],
+        expected_credential: &str,
+    ) -> Result<Vec<u8>> {
+        ensure!(self.group.is_none(), "MLS group already initialized");
+        ensure!(
+            !expected_credential.is_empty(),
+            "the expected invitee credential must not be empty"
+        );
+        let key_package = KeyPackageIn::tls_deserialize_exact(key_package)?
+            .validate(self.provider.crypto(), ProtocolVersion::Mls10)
+            .context("validate MLS KeyPackage")?;
+        ensure!(
+            key_package.leaf_node().credential().serialized_content()
+                == expected_credential.as_bytes(),
+            "the invitee key package credential does not match the expected credential"
+        );
+        let config = MlsGroupCreateConfig::builder()
+            .ciphersuite(SUITE)
+            .use_ratchet_tree_extension(true)
+            .build();
+        let mut group = MlsGroup::new_with_group_id(
+            &self.provider,
+            &self.signer,
+            &config,
+            GroupId::from_slice(uuid::Uuid::new_v4().as_bytes()),
+            self.credential.clone(),
+        )
+        .context("create MLS group")?;
+        let (_, welcome, _) = group
+            .add_members(&self.provider, &self.signer, &[key_package])
+            .context("stage MLS member addition")?;
+        group
+            .merge_pending_commit(&self.provider)
+            .context("merge bootstrap pending commit")?;
+        let bytes = welcome.tls_serialize_detached()?;
+        self.group = Some(group);
+        Ok(bytes)
+    }
+
     pub fn join(&mut self, welcome: &[u8], creator: &MlsDevice) -> Result<()> {
         ensure!(self.group.is_none(), "MLS group already initialized");
         let message = MlsMessageIn::tls_deserialize_exact(welcome)?;

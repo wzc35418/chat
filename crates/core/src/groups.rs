@@ -1180,6 +1180,112 @@ pub fn create_group(
     create_group_with_welcome(device, bootstrap_peer, store, request).map(|(view, _)| view)
 }
 
+/// GROUPS-004：用**真实被邀请者**的 KeyPackage 建群（Welcome 真正可用）。
+///
+/// 与 [`create_group_with_welcome`] 的差别：被邀请者不在本进程里，因此只有
+/// `invitee_key_package`（对方设备导出的 KeyPackage 字节）与 `invitee_credential`；
+/// 建群走 crypto 的 `create_and_invite_external`（MLS 验签 + 凭据绑定），其余
+/// （校验、快照落库、凭据目录、撤销播种）与既有建群路径一致。
+///
+/// 任何校验失败都在写入之前拒绝（`INVALID_CANDIDATE` / `INVALID_INPUT`）。
+pub fn create_group_with_invitee_key_package(
+    device: &mut MlsDevice,
+    invitee_credential: &str,
+    invitee_key_package: &[u8],
+    store: &mut Store,
+    request: &CreateGroupRequest,
+) -> GroupResult<(GroupView, Vec<u8>)> {
+    validate_name(&request.name)?;
+    validate_credential(&request.local_credential)?;
+    validate_credential(invitee_credential)?;
+    if request.policy_version != GROUP_POLICY_VERSION {
+        return Err(GroupError::new(
+            "INVALID_POLICY_TRANSITION",
+            "only the current group policy version is supported",
+        ));
+    }
+    if invitee_credential == request.local_credential {
+        return Err(GroupError::invalid_input(
+            "the invitee must not be the local device",
+        ));
+    }
+    if !request.members.is_empty() {
+        return Err(GroupError::invalid_input(
+            "the external-invitee variant bootstraps exactly one peer",
+        ));
+    }
+    if invitee_key_package.is_empty() {
+        return Err(GroupError::invalid_candidate(
+            "the invitee key package must not be empty",
+        ));
+    }
+    let welcome = device
+        .create_and_invite_external(invitee_key_package, invitee_credential)
+        .map_err(|_| {
+            GroupError::invalid_candidate(
+                "the MLS group could not be bootstrapped with the invitee key package",
+            )
+        })?;
+    let mls_group_key = device
+        .group_key()
+        .map_err(|_| GroupError::corrupted("bootstrapped MLS group has no group key"))?;
+    device.export_to_store(store).map_err(|_| {
+        GroupError::new(
+            "STORAGE_FAILURE",
+            "the MLS group state could not be persisted",
+        )
+    })?;
+    let epoch = device
+        .epoch()
+        .map_err(|_| GroupError::corrupted("MLS group epoch is unavailable"))?;
+    let group_id = protocol_group_id_for(&mls_group_key)
+        .map_err(|_| GroupError::corrupted("protocol group id could not be derived"))?;
+    let record = GroupRecord {
+        version: SNAPSHOT_VERSION,
+        group_id,
+        mls_group_key,
+        name: request.name.clone(),
+        created_at_ms: now_ms(),
+        control_head: ControlHead::ZERO.to_hex(),
+        policy_version: 1,
+        mls_epoch: epoch,
+        verified_sequence: 0,
+        verified_log_hash: Digest::ZERO.to_hex(),
+        members: vec![
+            RecordMember {
+                credential: request.local_credential.clone(),
+                role: MemberRole::Owner.as_u64(),
+                muted: false,
+                is_local: true,
+                joined_sequence: 1,
+            },
+            RecordMember {
+                credential: invitee_credential.to_owned(),
+                role: MemberRole::Member.as_u64(),
+                muted: false,
+                is_local: false,
+                joined_sequence: 1,
+            },
+        ],
+        pending_members: Vec::new(),
+        pending_removed: Vec::new(),
+        last_control_cleared: None,
+        dissolved: false,
+        dissolved_at_ms: 0,
+        left_at_ms: 0,
+        leaving_at_ms: 0,
+        pending_proposal: None,
+        revoked_devices: Vec::new(),
+    };
+    record.validate()?;
+    let _ = domain_snapshot(&record)?;
+    let saved = persist_snapshot(store, &record, epoch)?;
+    sync_credential_directory(store, &record)?;
+    let mut view = project(&record, epoch, None, saved);
+    seed_after_creation(store, &mut view);
+    Ok((view, welcome))
+}
+
 /// GROUPS-002：读取正式群快照（库离线也返回最后正式状态，不联网）。
 ///
 /// - 快照记录不存在 → `INVALID_TARGET`（未知群，绝不臆造）；

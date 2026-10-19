@@ -1035,12 +1035,11 @@ group_create_with_welcome(name, bootstrap_credential, local_credential)
   （跨设备入群需要后续把真实 KeyPackage 作为入参）；
 - 测试：[crates/ffi/tests/groups_create_welcome.rs](../../crates/ffi/tests/groups_create_welcome.rs)（3 个，真库 + 真 MLS）。
 
+## GROUPS-004 · FFI 建群（真实被邀请者 KeyPackage，2026-10-20）
 
+新增 `group_create_with_invitee_key_package(name, invitee_credential, key_package_bytes, local_credential) -> CreatedGroupFfi`。
 
-
-
-
-
-
-
+- 与 `group_create_with_welcome` 只有来源不同：KeyPackage 由**另一台设备**导出后传入，因此返回的 Welcome 对方真的能用；
+- 空 KeyPackage → `INVALID_INPUT`；Welcome 超过 64 KiB → `CONTENT_TOO_LARGE`；空 Welcome → `STATE_CORRUPTED`；
+- `CreatedGroupFfi` 里的 `invite`（`GroupInviteMeta`）与快照逐字段一致，可直接配合邀请投递（GROUPS-019）使用。
 

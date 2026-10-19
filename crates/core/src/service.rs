@@ -1478,6 +1478,45 @@ impl ConversationCore {
     }
 
     /// GROUPS-002：读取正式群快照（不联网）。
+    /// GROUPS-004：用**真实被邀请者**的 KeyPackage 建群并返回 Welcome（Welcome 真正可用）。
+    ///
+    /// `local_credential` 为空串时使用持久身份的设备 ID。
+    pub fn group_create_with_invitee_key_package(
+        &mut self,
+        name: &str,
+        local_credential: &str,
+        invitee_credential: &str,
+        invitee_key_package: &[u8],
+    ) -> anyhow::Result<(GroupView, Vec<u8>)> {
+        let local = if local_credential.trim().is_empty() {
+            self.persisted_device_id()?
+        } else {
+            local_credential.trim().to_owned()
+        };
+        let mut device = MlsDevice::new(&local).map_err(|_| {
+            anyhow::Error::new(crate::groups::GroupError::from(
+                chat_storage::formal::StorageError::StateCorrupted(
+                    "the local MLS device could not be created".to_owned(),
+                ),
+            ))
+        })?;
+        let request = CreateGroupRequest {
+            name: name.to_owned(),
+            local_credential: local,
+            policy_version: GROUP_POLICY_VERSION,
+            members: Vec::new(),
+        };
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        crate::groups::create_group_with_invitee_key_package(
+            &mut device,
+            invitee_credential.trim(),
+            invitee_key_package,
+            store,
+            &request,
+        )
+        .map_err(anyhow::Error::new)
+    }
     pub fn group_snapshot(&self, group_id: &str) -> anyhow::Result<GroupView> {
         let guard = self.store_guard()?;
         let store = guard.as_ref().ok_or_else(closed)?;

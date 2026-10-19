@@ -785,6 +785,49 @@ impl GroupFfi {
         })
     }
 
+    /// GROUPS-004：用**真实被邀请者**的 KeyPackage 建群并返回 Welcome。
+    ///
+    /// 与 `group_create_with_welcome` 的区别只有来源：被邀请者的 KeyPackage 由**另一台设备**
+    /// 导出并传进来（不是本进程临时设备），因此拿到的 Welcome 对方真的能用来入群。
+    pub fn group_create_with_invitee_key_package(
+        &self,
+        name: String,
+        invitee_credential: String,
+        key_package_bytes: Vec<u8>,
+        local_credential: String,
+    ) -> Result<CreatedGroupFfi, FfiError> {
+        if key_package_bytes.is_empty() {
+            return Err(invalid_input("invitee key package must not be empty"));
+        }
+        let mut core = self.lock()?;
+        let (view, welcome_bytes) = core
+            .group_create_with_invitee_key_package(
+                &name,
+                &local_credential,
+                &invitee_credential,
+                &key_package_bytes,
+            )
+            .map_err(|error| failure!(error))?;
+        if welcome_bytes.len() > chat_core::groups::MAX_GROUP_INVITE_WELCOME_BYTES {
+            return Err(FfiError::Store {
+                code: "CONTENT_TOO_LARGE".to_owned(),
+                reason: "the invite welcome exceeds 64 KiB".to_owned(),
+            });
+        }
+        if welcome_bytes.is_empty() {
+            return Err(FfiError::Store {
+                code: "STATE_CORRUPTED".to_owned(),
+                reason: "group creation produced an empty welcome".to_owned(),
+            });
+        }
+        let invite = invite_of(&view, &local_credential, &invitee_credential);
+        Ok(CreatedGroupFfi {
+            view: group_view(view),
+            welcome_bytes,
+            invite,
+        })
+    }
+
     /// GROUPS-002：读取正式群快照。
     pub fn group_snapshot(&self, group_id: String) -> Result<GroupViewFfi, FfiError> {
         let core = self.lock()?;

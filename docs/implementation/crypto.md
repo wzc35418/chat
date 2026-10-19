@@ -831,3 +831,17 @@ decrypt_attachment_chunk(key: FileKey, ctx: ChunkContext, chunk: CipherChunk) ->
 
 限制：本方法只暂存一次提交；合并/丢弃仍需走既有 T2 路径（`merge_accepted_pending` / `discard`）。
 
+## GROUPS-004 · create_and_invite_external（2026-10-20）
+
+原先只有 `create_and_invite(key_package, peer: &MlsDevice)`：对方设备必须在**本进程**里（要用它的凭据与签名钥做绑定比对）。
+对方在另一台机器上时无法调用，导致 R-167 的 Welcome 只绑定内部临时设备（外部设备入群会被 `WELCOME_NOT_AUTHORIZED`）。
+
+新增（既有函数**未改**）：
+
+    MlsDevice::create_and_invite_external(&mut self, key_package: &[u8], expected_credential: &str) -> Result<Vec<u8>>
+      - KeyPackageIn 反序列化 + MLS validate（验签）；
+      - leaf 凭据 `serialized_content()` 必须逐字节等于 expected_credential，否则显式失败；
+      - 其余（建群、add_members、合并引导 commit、返回 Welcome）与 create_and_invite 一致。
+
+限制：仍只支持**单个**外部被邀请者（多人邀请走既有 AddMembers 提交路径）。
+

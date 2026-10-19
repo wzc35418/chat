@@ -1689,5 +1689,30 @@ GroupFfi.group_create_with_welcome(name, bootstrap_credential, local_credential)
 `WELCOME_NOT_AUTHORIZED` 拒绝。也就是说本轮提供的 Welcome 字节可用于**投递/取回**（GROUPS-019），
 但真正的跨设备入群还需要后续把真实被邀请者的 KeyPackage 作为入参（见 identity.md/groups.md 的 GROUPS-004 缺口）。
 
+## GROUPS-004 · 真实被邀请者 KeyPackage 建群（2026-10-20）
 
+### 接口
+
+    core:  create_group_with_invitee_key_package(device, invitee_credential, invitee_key_package, store, request) -> (GroupView, Vec<u8>)
+    service: ConversationCore::group_create_with_invitee_key_package(name, local_credential, invitee_credential, invitee_key_package)
+    ffi:   group_create_with_invitee_key_package(name, invitee_credential, key_package_bytes, local_credential) -> CreatedGroupFfi
+
+语义：被邀请者不在本进程，传入**对方设备导出的 KeyPackage 字节**；建群走 `create_and_invite_external`（MLS 验签 + 凭据绑定），
+其余（名称/凭据/策略校验、快照落库、凭据目录、撤销播种）与既有建群路径一致。任何校验失败都在写入之前拒绝。
+
+### 核心证据（`crates/core/tests/groups_create_invitee.rs`，3 例真双设备双库）
+
+- `an_external_invitee_joins_with_the_welcome_from_the_real_key_package`：**B 生成 key_package → A 用它建群拿 Welcome → B 用该 Welcome `group_join_from_welcome` 成功入群**；两侧 epoch/成员/角色一致、两侧快照都落库（这是 R-167 的直接修复证据）；
+- `a_credential_mismatch_is_rejected_without_any_write`：期望凭据写错 → `INVALID_CANDIDATE`，且群列表为空（无写入）；
+- `a_corrupted_key_package_is_rejected_without_any_write`：截断/乱码/单字节/空包 → `INVALID_CANDIDATE`，无写入。
+
+### 验收
+
+- `cargo test --offline -p chat-crypto -p chat-core -p chat-ffi` → **EXIT=0，410 passed，0 警告**（既有 63/251/93 继续通过）。
+
+### 已知限制
+
+1. 只支持单被邀请者的引导路径（额外成员仍走 pending Add 提交）；
+2. 被邀请者凭据由调用方给出，绑定校验只保证 KeyPackage 的 leaf 凭据与之一致（账户级授权仍属身份层）；
+3. FFI 侧 Welcome 上限 64 KiB（与邀请 blob 一致）。
 
