@@ -9,6 +9,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 chat-core.workspace = true
+# GROUPS-004：导出本机 MLS KeyPackage / 接受 Welcome 需要直接用 MLS 设备句柄
+# （KeyPackage 的私钥材料只存在于该设备实例的内存 provider 里）。
+# 该依赖本来就在 [workspace.dependencies] 与本 crate 的 dev-dependencies 里，这里只是提升为正式依赖。
+chat-crypto.workspace = true
 chat-identity.workspace = true
 # SYNC-003：常驻同步对象要自己装配 NodeClient 并读持久身份种子/拉取游标。
 chat-node-client = { path = "../node-client" }

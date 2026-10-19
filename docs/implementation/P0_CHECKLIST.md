@@ -154,3 +154,11 @@ RUST_EXIT=0  LOCKED_EXIT=0  VERIFY_EXIT=0  GRADLE_EXIT=0  ANDROID_EXIT=0
 - [x] **身份设备登记与撤销集合**：（本轮在做）`identity_devices` 迁移 0013 + register/list/revoke（不能撤销本机）+ 恢复导入登记。
 - [x] **插件私有 KV 迁移**：Keep/Namespace 双策略，原键保留、重跑幂等、超配额预检拒绝。
 - [x] **落地到可人工验证**：`docs/manual-test-guide.md`（12 节）+ `tools/demo.ps1`（起节点/健康检查/粘贴配置/停止），实测 `node health: OK`。
+
+## 2026-10-20 第二批收尾（第 64 轮）
+
+- [x] **邀请闭环**：KeyPackage 导出 → 建群拿可用 Welcome → 节点投递/取回（可按被邀请者过滤）→ 接受入群（端到端有测试）。
+- [x] **审计落库**（0009）+ `GET /v1/audit`（过滤/白名单/关闭显式）+ `kind=invite`。
+- [x] **设备登记与撤销**（0013）+ 撤销随控制提交传播（字段 61 / 操作值 14）+ 账户级播种。
+- [x] **可验证性**：`docs/manual-test-guide.md`、`tools/demo.ps1`、`tools/verify-all.ps1`。
+- 未完成（正式 P0 验收前必须补）：插件沙箱/签名、真实中继、OS 凭据库、PRESENTATION 收敛、后台通知。

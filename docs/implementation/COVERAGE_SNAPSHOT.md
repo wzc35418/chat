@@ -136,3 +136,10 @@
 - Rust：**1034 passed / 0 failed**；Gradle 11 个任务（含 pluginSmoke/pluginJvmSmoke）；Android APK 绿；verify PASS。
 - 迁移：storage 0001–0013、node-services 0001–0008。
 - 新增可人工验证入口：`docs/manual-test-guide.md` + `tools/demo.ps1`。
+
+## 2026-10-20 第二批基线（第 64 轮）
+
+- Rust：**1093 passed / 0 failed**；Gradle 11 任务；Android APK；verify PASS。
+- 迁移：storage 0001–0013、node-services 0001–0009。
+- 手工验证入口：`docs/manual-test-guide.md`（13 节）+ `tools/demo.ps1` + `tools/verify-all.ps1`。
+- 距 A 口径剩余：插件沙箱/签名、真实中继、OS 凭据库、PRESENTATION 收敛、后台通知、KeyPackage 跨重启。

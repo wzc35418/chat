@@ -1042,4 +1042,19 @@ group_create_with_welcome(name, bootstrap_credential, local_credential)
 - 与 `group_create_with_welcome` 只有来源不同：KeyPackage 由**另一台设备**导出后传入，因此返回的 Welcome 对方真的能用；
 - 空 KeyPackage → `INVALID_INPUT`；Welcome 超过 64 KiB → `CONTENT_TOO_LARGE`；空 Welcome → `STATE_CORRUPTED`；
 - `CreatedGroupFfi` 里的 `invite`（`GroupInviteMeta`）与快照逐字段一致，可直接配合邀请投递（GROUPS-019）使用。
+## 导出本机 KeyPackage 与接受 Welcome（2026-10-18）
+
+~~~text
+IdentityFfi.export_key_package() -> Vec<u8>                       // 单次使用、只含公钥材料
+IdentityFfi.join_group_from_welcome(name, welcome_bytes, invite: InviteMetaFfi) -> GroupJoinedFfi
+GroupJoinedFfi { group_id, epoch, members }
+~~~
+
+- 导出复用 crypto 的 `MlsDevice::key_package()`（未改 crypto）；每次导出不同（单次使用语义）；
+- 需持久化身份（纯内存 → `INVALID_STATE_TRANSITION`；关闭 → `CORE_CLOSED`）；字节原样返回不截断；
+- MLS 设备句柄缓存在对象状态里，`join_group_from_welcome` 用同一实例接受 Welcome（否则 KeyPackage 私钥材料丢失）；
+- 与 `GroupFfi.group_create_with_invitee_key_package` 配对即构成完整邀请闭环：
+  B 导出 KeyPackage → A 建群拿 Welcome → B 接受加入；
+- 测试：[crates/ffi/tests/key_package_export.rs](../../crates/ffi/tests/key_package_export.rs)（3 个，含端到端入群）。
+
 

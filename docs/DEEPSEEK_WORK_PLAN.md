@@ -56,6 +56,7 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 - [x] **R-09（Lead）：Kotlin 本地存储接口与展示投影。** `shared/core-api/.../LocalStore.kt`（StoredDraft/StoredConversation/StoredMessage/StoredPage/VerifiedMessageInput/LocalStore/LocalStoreException）、`shared/presentation/.../display/CoreProjection.kt`（存储事实 → DraftEvidence/ConversationSummaryView/MessageDisplayView，未知状态安全回退、无 unread 保持 null），`DraftEvidence` 增加 `submissionId`（明确“提交 ID 不是节点回执”），`ConversationSummaryView.unreadCount` 改为可空。验证：`presentationChecks` 新增 `checkCoreProjection` 通过（queued/prepared 都不得显示已接受、未知状态回退本地草稿、null unread 不伪造 0、投影分页直接喂 DS-08 合并器后去重与代次校验仍成立）。
 - [x] **R-11：真实身份/口令加好友接界面（第二个竖直切片）。** Rust 侧 `crates/ffi/src/identity_ffi.rs`（`IdentityFfi`：create/account/create_invite/preview_invite/accept_invite/contacts/confirm_identity_change/shutdown，复用既有 `FfiError`，12 个测试）；Kotlin 侧 `shared/core-api/.../Identity.kt`、`shared/core-bridge/.../{IdentityFactory,NativeIdentityService}.kt`、`shared/presentation/.../display/IdentityPresentation.kt`（验签结果/错误码映射/联系人状态/IdentityChanged 强制禁发）、`preview/PreviewIdentityModels.kt`、`shared/ui/.../RealIdentityPanel.kt`（侧栏“真实身份（本机）”入口）。验证：`:apps:desktop:identitySmoke` PASS（两个真实身份互相校验：指纹一致、篡改→INVALID_SIGNATURE、自签→INVALID_TARGET、accept→requested 且禁发、关闭后需密钥调用→CORE_CLOSED）；`presentationChecks` 新增 `checkIdentityPresentation`；`previewSnapshot` 新增两张真实身份面板截图（面板里的账户/指纹/口令/联系人全部是当场真实生成的结果）。
 - [x] **R-12：SYNC 重试/退避与信箱轮询状态机。** `crates/sync/src/{retry,mailbox,send,clock,ids,error}.rs`：指数退避（1s×2 上限 60s、抖动 ±20%、Retry-After 作下界且夹到 5 分钟、预算耗尽终态、只有成功才重置计数）、信箱轮询（游标只前进、同 id 去重且内容不同 `INVALID_CANDIDATE`、乱序暂存 512 条、双预算、ACK 失败保留进度、空页退避）、发送调度（SubmissionId 由 draft/epoch/attempt 确定性派生、unknown 只 QueryExisting 不重发不重加密、租约语义与 storage 一致）。验证：`cargo test -p chat-sync` 33 passed，clippy 0 警告。
+- [x] **R-171：导出本机 KeyPackage（KPEXPORT）——邀请闭环端到端打通。** `IdentityFfi.export_key_package() -> Vec<u8>`（调 crypto 既有 `key_package()`，**crypto 未改**；每次新 KeyPackage、两次字节不同；只含公钥材料）+ `join_group_from_welcome(name, welcome, invite) -> GroupJoinedFfi`（导出用的设备实例必须由同一对象持有，否则包无人能接受）。**作用域外两处最小改动**：`crates/ffi/Cargo.toml` 把 `chat-crypto` 从 dev-dep 提升为正式依赖（无新依赖）；新增 join 方法。验证：`cargo test -p chat-ffi` → 96 passed（新增 3，含**端到端**：B 导出 → A 用其建群 → B 加入，group_id/epoch/成员两侧一致）。**限制**：KeyPackage 私钥材料是**内存态**，重开对象后需重新导出，join 必须与 export 同一对象。
 - [x] **R-170（Lead）：群面板接完整邀请链路（R-166 的"无提交按钮"限制解除）。** `GroupService.createWithInviteeKeyPackage` + `CreatedGroup{snapshot, welcomeBytes, invite}` 模型与桥接；群面板「邀请投递」区改为四步真实链路：**选 KeyPackage（.kp 文件）→ 用它建群（Welcome 绑定该设备）→ 提交邀请到节点（显示真实回执 seq/submissionId）→ 取回邀请**，按钮启用条件严格（无 .kp 不建群、无建群结果不提交）；`docs/manual-test-guide.md` 增第 13 节完整手工步骤与限制。验证：`:apps:desktop:compileKotlin` 通过（两轮修复：缺失 import、误用不存在的 service 获取函数，改用既有 `withGroup` 包装）。
 - [x] **R-169：真实被邀请者 KeyPackage 建群（GROUPS-004 闭环）。** crypto 新增 `create_and_invite_external(key_package, expected_credential)`（反序列化 + **MLS 验签** + leaf 凭据**逐字节**等于期望值；既有 `create_and_invite` 未改）；core 新增 `create_group_with_invitee_key_package(...) -> (GroupView, Welcome)`（复用同一套名称/凭据/策略校验 + 快照落库 + 凭据目录 + 撤销播种）；service/ffi 追加同名入口。**核心证据（真双设备双库）**：B 生成 KeyPackage → A 用它建群拿 Welcome → **B 用该 Welcome `group_join_from_welcome` 成功入群**，两侧 epoch/成员/角色一致；凭据不匹配/包损坏 → `INVALID_CANDIDATE` 且 **`group_list` 为空（无写入）**。验证：`cargo test -p chat-crypto -p chat-core -p chat-ffi` → **410 passed**（既有 63/251/93 继续通过 + 3）。
 - [x] **R-167：建群返回 Welcome 字节（INVWELCOME）。** `GroupFfi.group_create_with_welcome(name, bootstrap_credential, local_credential) -> CreatedGroupFfi{view, welcome_bytes, invite}`：返回快照 + **MLS Welcome 原文**（不截断不改写、无密钥）+ 与快照逐字段一致的 `InviteMetaFfi`；Welcome > 64 KiB → `CONTENT_TOO_LARGE`、空 Welcome → `STATE_CORRUPTED`（显式不静默）；既有 `group_create` 行为不变。验证：`cargo test -p chat-ffi` → 93 passed（新增 3）。**关键限制（已写文档）**：bootstrap 成员设备是 core 内部临时创建的，Welcome 绑定其一次性 KeyPackage → **外部真实设备拿它入群会被 `WELCOME_NOT_AUTHORIZED` 拒绝**；闭环需把真实被邀请者 KeyPackage 作为入参（GROUPS-004 缺口）。
@@ -283,6 +284,8 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 | 2026-10-18 | DS-12 | `shared/presentation/.../display/MarkdownModel.kt`；`shared/ui/.../MarkdownText.kt`；`PreviewChatScreen.kt`（消息卡片 + 样例发送框）、`PreviewChatModels.kt`；验证在 `PresentationChecks.kt` | `presentationChecks` 的 DS-12 组通过：标题/列表/引用/围栏与行内代码/粗体/斜体/删除线/链接解析正确；`<script>` 只作为文字保留（模型无 HTML 节点）；`javascript:` 链接降级为不可点击并给原因、`https` 保留；围栏内 Markdown 标记不解析；反斜杠转义与未闭合标记按普通文字处理；超长输入标记 `truncated` 并截断到上限；空内容回退 `（空消息）`；文本消息返回 Markdown、附件返回 null；输入命令覆盖选区包裹、空选区选中占位、链接模板与越界夹取。截图 `preview-desktop-accepted.png` 等 16 张已复核，消息卡片显示标题/列表/引用/行内代码/链接，发送框显示格式工具栏与 8192 字节计数 | 链接打开能力未接入（只显示文字与地址）；P0 实验页面仍按纯文本显示加密往返结果；Markdown 只在展示层解析，正式消息存储仍是纯文本正文 |
 | 2026-10-18 | DS-11 | `shared/presentation/.../display/PagingPresentation.kt`；`shared/presentation/.../preview/PreviewPagingSample.kt`；`PreviewChatScreen.kt`、`PreviewSnapshot.kt`；验证在 `PresentationChecks.kt` | `presentationChecks` 的 DS-11 组通过：加载中不给可点动作、失败提供单次重试并带语义播报、还有更多/没有更多/空列表映射正确；预览样例经 DS-08 合并器真实跑“成功→失败→重试成功→到底”，失败不丢已加载结果、加载中重复点击不产生第二次请求、到底后重置。截图 `preview-desktop-paging-failed.png`、`preview-desktop-paging-no-more.png`、`preview-compact-paging-failed.png` 已检查 | 只映射展示提示，未查询真实列表/消息游标；“加载中”提示由纯状态用例覆盖（样例脚本同步完成，界面不出现真实等待） |
 
+最终轮验证（2026-10-20，R-171，本批收尾）：`cargo test --workspace --offline` → **Rust 合计 1093 个测试通过 / 0 失败**；`cargo check --workspace --locked --offline` 通过；`tools/verify-project.cjs` PASS；Gradle 11 任务（含 pluginSmoke/pluginJvmSmoke）`BUILD SUCCESSFUL`（33s）；Android `assembleDebug` `BUILD SUCCESSFUL`（1m）。**`tools/verify-all.ps1` 全链路实跑**：disk/rust-check/verify-project/gradle PASS，android 因**并行编辑中的队友代码**（`chat_crypto` 未声明依赖）失败——队友完成后单独重跑 Android 绿；脚本本身行为正确（失败不中断、汇总、退出码非 0），已在文档记录这一并发构建教训。
+
 第六十六轮验证（2026-10-20，R-170）：`cargo test --workspace --offline` → **Rust 合计 1090 个测试通过 / 0 失败**；`tools/verify-project.cjs` PASS；Gradle 11 任务（含 pluginSmoke/pluginJvmSmoke）`BUILD SUCCESSFUL`。面板现已能走完"选 KeyPackage → 建群 → 提交邀请 → 取回邀请"。
 
 第六十五轮验证（2026-10-20，R-169）：`cargo test --workspace --offline` → **Rust 合计 1090 个测试通过 / 0 失败**（上轮 1087；crypto 66、core 254、ffi 96）；`tools/verify-project.cjs` PASS；Gradle 11 任务（含 pluginSmoke/pluginJvmSmoke）`BUILD SUCCESSFUL`（1m 35s）。**R-167 遗留的 bootstrap KeyPackage 限制已解除**（真实设备现在能凭 Welcome 入群）。
@@ -480,3 +483,43 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 
 **未覆盖**：Gradle/Android 两个阶段本次以 `-Skip` 运行（单次全量约数分钟，留给主控在发布前跑）；脚本未做并行化（`--max-workers=1` 是刻意保守）。
 
+
+## 第二批（第 48–64 轮）批次总结（2026-10-20）
+
+### 交付规模
+
+- 轮次：**17 轮**（R-140 … R-171），每轮真实代码 + 全量验证 + 文档同步，全部推送 `main`。
+- Rust 测试：1006 → **1093**（+87）。迁移：storage 0012 → **0013**；node-services 0008 → **0009**。
+- 新增入口：`docs/manual-test-guide.md`（13 节）、`tools/demo.ps1`（一键起节点）、`tools/verify-all.ps1`（一键全量回归）。
+
+### 本批真正打通的能力
+
+1. **重连**：策略 + Session 状态机 + 重放窗口（含真实回环 drop→reconnect→replay 测试）。
+2. **插件**：安装落库事务（库+宿主补偿）、私有 KV 升级迁移（Keep/Namespace）、残留清理、真 JVM 加载执行。
+3. **节点运维**：启动前配置校验（不建库）、审计（内存环 + **落库 0009** + 保留期清理）、`GET /v1/audit`（过滤 + kind 白名单）、`kind=invite`。
+4. **身份**：设备登记/撤销集合（0013）、恢复导入登记、KeyPackage 导出。
+5. **群邀请闭环（本批最大成果）**：协议字段 61 + `RevokeDevice` 操作、撤销随提交传播、账户级撤销播种、邀请 blob 编解码 + 节点投递/取回（可按被邀请者过滤）、**真实被邀请者 KeyPackage 建群 → Welcome 可真正入群**、面板四步链路。
+
+### 期间修掉的真实缺陷
+
+- 邀请取回用**定长解码**解变长 blob → 恒返回 `None`（端到端测试才暴露）。
+- `pluginJvmSmoke` 发现 `unload` 未清空动作表。
+- 队友误判「需改 7 个 core 测试文件」（实为 1 处字面量）后自查更正。
+- 我本人两次失误：面板 `Text("")` 残留导致语法错误、误用不存在的 helper 名——均已修正并记录。
+
+### 仍然缺的（A 口径未完成）
+
+1. **插件沙箱 / 签名信任链**（同 JVM 无隔离；`trusted` 只是布尔确认）。
+2. **真实中继 / 跨网段 / NAT 穿透**（只有回环与 LAN 绑定验证）。
+3. **OS 凭据库**（当前 DPAPI 文件封装 + 演示口令）。
+4. **PRESENTATION 完全收敛**（门面已有，界面仍分散调用）。
+5. **后台收消息通知**（只在手动触发时出现）。
+6. **KeyPackage 私钥内存态**（重开对象需重新导出）。
+7. 设备撤销**不广播**、审计无分页游标、插件安装「库+宿主」非严格原子。
+
+### 建议的下一阶段优先级
+
+1. 插件沙箱与签名（安全边界，用户可直接感知）；
+2. 传输中继 + 真实跨网段（否则「聊天」只能同机验证）；
+3. KeyPackage/MLS 设备状态加密落库（让邀请可跨重启）；
+4. PRESENTATION 收敛 + 后台通知（可用性）。

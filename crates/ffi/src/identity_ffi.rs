@@ -209,6 +209,9 @@ struct IdentityState {
     /// 持久化模式的库路径与主密钥（恢复文件导出/导入需要自行重开库）。
     database: Option<String>,
     master_key_hex: Option<String>,
+    /// 本机的 MLS 设备（懒创建）：导出 KeyPackage 与接受 Welcome 必须用**同一个实例**
+    /// （KeyPackage 的私钥材料只在该实例的内存 provider 里）。
+    mls_device: Option<chat_crypto::engine::MlsDevice>,
     clock: Clock,
     closed: bool,
 }
@@ -365,6 +368,17 @@ fn restore_persisted(
     Ok(())
 }
 
+/// 加入群的结果（纯数据）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupJoinedFfi {
+    /// 协议群 ID。
+    pub group_id: String,
+    /// 加入后的已提交 epoch。
+    pub epoch: u64,
+    /// 成员凭据集合（按快照顺序）。
+    pub members: Vec<String>,
+}
+
 /// 设备集合里的一台设备（纯数据：公钥是公开材料，不含任何私钥）。
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct DeviceViewFfi {
@@ -393,6 +407,23 @@ struct LocalDeviceContext {
     display_name: String,
     public_key: Option<[u8; 32]>,
     now_ms: u64,
+}
+
+/// 取（或懒创建）本机的 MLS 设备实例（KeyPackage 的私钥材料只在这个实例里）。
+fn local_mls_device(
+    state: &mut IdentityState,
+) -> Result<&mut chat_crypto::engine::MlsDevice, FfiError> {
+    if state.mls_device.is_none() {
+        let credential = state.view.device_id.clone();
+        let device = chat_crypto::engine::MlsDevice::new(&credential).map_err(|error| {
+            state_error("STATE_CORRUPTED", &format!("MLS device failed: {error}"))
+        })?;
+        state.mls_device = Some(device);
+    }
+    state
+        .mls_device
+        .as_mut()
+        .ok_or_else(|| state_error("STATE_CORRUPTED", "the MLS device is unavailable"))
 }
 
 /// 设备集合错误 → FFI 错误（稳定码原样透出：`DEVICE_SELF_REVOKE` 等）。
@@ -475,6 +506,7 @@ impl IdentityFfi {
                 core,
                 database,
                 master_key_hex,
+                mls_device: None,
                 clock,
                 closed: false,
             }),
@@ -910,6 +942,7 @@ impl IdentityFfi {
             core: None,
             database: Some(database_path),
             master_key_hex: Some(master_key_hex),
+            mls_device: None,
             clock: system_now_ms,
             closed: true,
         };
@@ -917,6 +950,102 @@ impl IdentityFfi {
         Ok(Arc::new(Self {
             state: Mutex::new(state),
         }))
+    }
+
+    /// GROUPS-004：导出本机 MLS **KeyPackage**（邀请闭环里 B 侧要交给 A 的字节）。
+    ///
+    /// - 需要**已加载的持久身份**（纯内存对象 → `INVALID_STATE_TRANSITION`；关闭 → `CORE_CLOSED`）；
+    /// - 调 crypto 既有 `MlsDevice::key_package()`：**每次都是新的单次 KeyPackage**，
+    ///   因此两次导出**不同**（同一个包不能用两次）；
+    /// - 字节**原样返回**，不截断、不改写；KeyPackage 只含**公钥材料**（凭据 + 签名公钥 + 一次性
+    ///   init 公钥），不含任何私钥；
+    /// - 本机 MLS 设备句柄被缓存：随后 `join_group_from_welcome` 用的就是同一个实例
+    ///   （KeyPackage 的私钥材料只在该实例里）。
+    pub fn export_key_package(&self) -> Result<Vec<u8>, FfiError> {
+        let mut state = self.lock()?;
+        state.require_open()?;
+        if state.database.is_none() || state.master_key_hex.is_none() {
+            return Err(state_error(
+                "INVALID_STATE_TRANSITION",
+                "key package export requires the persistent identity (open_persisted)",
+            ));
+        }
+        let device = local_mls_device(&mut state)?;
+        device.key_package().map_err(|error| {
+            state_error("STATE_CORRUPTED", &format!("MLS key package failed: {error}"))
+        })
+    }
+
+    /// GROUPS-004：用**刚导出的 KeyPackage**换来的 Welcome 加入群（同一台本机设备）。
+    ///
+    /// 前置：先 `export_key_package`（同一个实例持有该 KeyPackage 的私钥材料）；
+    /// 失败码：没有导出过 → `INVALID_STATE_TRANSITION`；Welcome/元数据不符 →
+    /// `WELCOME_NOT_AUTHORIZED` / `STATE_CORRUPTED`。
+    pub fn join_group_from_welcome(
+        &self,
+        name: String,
+        welcome_bytes: Vec<u8>,
+        invite: crate::groups_ffi::InviteMetaFfi,
+    ) -> Result<GroupJoinedFfi, FfiError> {
+        let mut state = self.lock()?;
+        state.require_open()?;
+        let Some(mut device) = state.mls_device.take() else {
+            return Err(state_error(
+                "INVALID_STATE_TRANSITION",
+                "export a key package before joining a group",
+            ));
+        };
+        let Some(database) = state.database.clone() else {
+            return Err(state_error(
+                "INVALID_STATE_TRANSITION",
+                "group join requires the persistent identity (open_persisted)",
+            ));
+        };
+        let Some(master_key_hex) = state.master_key_hex.clone() else {
+            return Err(state_error(
+                "INVALID_STATE_TRANSITION",
+                "group join requires the persistent identity (open_persisted)",
+            ));
+        };
+        let acceptance = chat_crypto::control::WelcomeAcceptance {
+            group_id: invite.mls_group_id.clone(),
+            expected_epoch: invite.epoch,
+            members: invite.members.clone(),
+        };
+        // 释放库写锁（join 要写 MLS 群状态与快照）。
+        if let Some(core) = state.core.take() {
+            core.close();
+        }
+        let outcome = (|| -> Result<GroupJoinedFfi, FfiError> {
+            let mut store = open_formal_store(&database, &master_key_hex)?;
+            let view = chat_core::groups::group_join_from_welcome(
+                &mut device,
+                &mut store,
+                &name,
+                &welcome_bytes,
+                &acceptance,
+                &invite.invitee_credential,
+                &invite.owner_credential,
+            )
+            .map_err(|error| state_error(error.code(), &error.to_string()))?;
+            Ok(GroupJoinedFfi {
+                group_id: view.group_id,
+                epoch: view.epoch,
+                members: view
+                    .members
+                    .iter()
+                    .map(|member| member.credential.clone())
+                    .collect(),
+            })
+        })();
+        let restored = restore_persisted(&mut state, &database, &master_key_hex);
+        // 无论成败都把设备句柄放回去（失败也不静默丢状态）。
+        state.mls_device = Some(device);
+        match (outcome, restored) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 
     /// GROUPS-CTRLREV：对库里**所有群**播种一次账户级撤销集合，返回新增条数合计。

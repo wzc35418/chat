@@ -896,6 +896,37 @@ IdentityFfi.seed_revoked_devices_for_all_groups() -> u32   // 返回新增条数
 建群时账户已有撤销设备 → 视图 `seeded_revoked_devices=1` 且列表计数 1；建群后写入撤销 →
 `seed_revoked_devices_for_all_groups` 两个群各 +1（合计 2）、重复调用 0、落盘计数都为 1；
 恢复导入到"已有群 + 已有撤销"的库 → 导入后列表计数立刻为 1，再用恢复身份播种返回 0。
+### 导出本机 MLS KeyPackage（邀请闭环 B 侧，2026-10-18）
+
+~~~text
+IdentityFfi.export_key_package() -> Vec<u8>
+IdentityFfi.join_group_from_welcome(name, welcome_bytes, invite: InviteMetaFfi) -> GroupJoinedFfi
+GroupJoinedFfi { group_id, epoch, members }
+~~~
+
+- `export_key_package` 调 crypto 既有 `MlsDevice::key_package()`（**未改 crypto**）：
+  **每次都是新的单次 KeyPackage**，两次导出字节不同，同一个包不能用两次；
+- 需要**已加载的持久身份**：纯内存对象 → `INVALID_STATE_TRANSITION`；关闭后 → `CORE_CLOSED`；
+- 字节**原样返回**、不截断；KeyPackage 只含**公钥材料**（凭据、签名公钥、一次性 init 公钥），不含任何私钥；
+- 本机 MLS 设备句柄被缓存在对象状态里，因此随后的 `join_group_from_welcome` 用的是**同一个实例**
+  （KeyPackage 的私钥材料只在该实例的内存 provider 里）；
+- `join_group_from_welcome` 前置：先导出过 KeyPackage（否则 `INVALID_STATE_TRANSITION`）；
+  Welcome/元数据与邀请不符 → `WELCOME_NOT_AUTHORIZED` / `STATE_CORRUPTED`。
+
+### 证据
+
+[crates/ffi/tests/key_package_export.rs](../../crates/ffi/tests/key_package_export.rs)（3 个，真库 + 真 OpenMLS）：
+两次导出都 >100 字节且**互不相同**；**端到端**——导出方（B）导出 KeyPackage → 另一个库用
+`GroupFfi.group_create_with_invitee_key_package` 建群拿到 Welcome → 导出方用
+`join_group_from_welcome` 成功入群，group_id/epoch/成员两侧一致（alice + B 设备）；
+纯内存对象 `INVALID_STATE_TRANSITION`、关闭后 `CORE_CLOSED`。
+
+复现：`cargo test --offline -p chat-ffi --test key_package_export` → 3 passed；
+`cargo test --offline -p chat-ffi` → **96 passed**。
+
+**依赖说明**：crates/ffi 把 `chat-crypto` 从 dev-dependencies 提升为正式依赖（它本来就在根
+`[workspace.dependencies]` 里，没有引入新依赖）——KeyPackage 的私钥材料只存在于设备实例内，FFI 必须直接持有该实例。
+
 
 
 
