@@ -435,6 +435,23 @@ cargo test --offline -p chat-core                                # 76 passed（�
 5. **一个 transport 绑定一个群 + 一条 source 条目**：多附件（不同 source seq）需要按消息构造 transport 或多绑定表；本轮按“一消息一附件一组”的切片构造。
 6. **节点授权需先有本设备的已接受日志条目**：附件上传前必须已有一条本设备条目（测试用 append 真实写入），不存在“先传附件再发消息”的路径。
 
+### 接入常驻运行时（SYNC-003 收口，2026-10-19）
+
+回收已经接进 `SyncRuntime` 的循环，作为**低频阶段**（默认每 10 分钟一次，可配 0 关闭；宽限期默认 1 小时）：
+
+```text
+config.with_attachment_gc(interval_ms, grace_ms)   // 0 = 关闭
+// SyncStatusView 新增：gc_removed_total / gc_last_error_code / gc_next_attempt_at_ms
+```
+
+每轮顺序：outbox → **附件回收** → stop 检查 → 拉取 → 等待。失败只写自己的状态并退避，
+不阻塞 outbox/拉取、也不占它们的失败预算；`stop()` 在阶段边界生效。详见 sync.md 的同名小节，
+证据：[crates/core/tests/sync_runtime_gc.rs](../../crates/core/tests/sync_runtime_gc.rs)（3 例：回收计数增长、
+关闭时不回收、回收失败不影响拉取）。
+
+限制：缓存目录清理仍由 `collect_unreferenced_attachments` 负责；回收与拉取共用同一库句柄（单轮多占几毫秒）；
+宽限期由部署侧给（建议 ≥ 1 小时）。
+
 ## 两阶段回收与崩溃恢复（ATTACHMENTS-008 存储侧，2026-10-19，Windows x64）
 
 以前只有缓存目录回收（`collect_unreferenced_attachments`，纯本地文件系统）。本轮补**正式库**的两阶段回收：

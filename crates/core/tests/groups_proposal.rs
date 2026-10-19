@@ -12,7 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chat_core::groups::{
     CreateGroupRequest, GroupBootstrapPeer, GroupView, PeerEntryInput, PeerEntryOutcome,
     ProposalEntryInput, create_group_with_welcome, dissolve_group, group_commit_proposals,
-    group_join_from_welcome, group_prepare_leave, group_process_peer_entry, group_process_proposal,
+    group_join_from_welcome, group_list, group_prepare_leave, group_process_peer_entry,
+    group_process_proposal,
     group_snapshot,
 };
 use chat_crypto::control::{CommitExpectation, WelcomeAcceptance};
@@ -379,3 +380,54 @@ fn dissolved_group_rejects_the_proposal_flow() {
         frozen
     );
 }
+
+/// 列表摘要：pending（待收口线索）与 pending_proposal（已收下待打包的提案）可区分。
+#[test]
+fn group_list_separates_pending_proposal_from_the_leaving_hint() {
+    let mut fixture = bob_owned_fixture();
+    let group_id = fixture.group_id.clone();
+    // 初始：两者都是 false。
+    let list = group_list(&fixture.store_a).expect("list a");
+    let summary = by_group(&list, &group_id);
+    assert!(!summary.pending_proposal);
+    assert!(!summary.pending);
+
+    // alice 发起自移除提案：本机只是「待收口线索」（leaving），没有已收下的提案。
+    let proposal = group_prepare_leave(&mut fixture.alice, &mut fixture.store_a, &group_id)
+        .expect("prepare self-removal");
+    let list = group_list(&fixture.store_a).expect("list a after prepare");
+    let summary = by_group(&list, &group_id);
+    assert!(summary.pending, "the local leaving hint is pending");
+    assert!(
+        !summary.pending_proposal,
+        "no proposal has been received for committing yet"
+    );
+
+    // bob（群主）收下提案：他那边 pending_proposal = true（有待打包的提案）。
+    group_process_proposal(
+        &mut fixture.bob,
+        &mut fixture.store_b,
+        &ProposalEntryInput::new(group_id.clone(), 1, "alice", proposal.proposal.clone()),
+    )
+    .expect("bob processes the proposal");
+    let list = group_list(&fixture.store_b).expect("list b");
+    let summary = by_group(&list, &group_id);
+    assert!(
+        summary.pending_proposal,
+        "a received proposal awaiting commit is reported"
+    );
+    assert!(summary.pending, "pending is the union of the two hints");
+}
+
+/// 按群 ID 取摘要（列表顺序由 storage 决定）。
+fn by_group(
+    list: &chat_core::groups::GroupListView,
+    group_id: &str,
+) -> chat_core::groups::GroupSummaryView {
+    list.groups
+        .iter()
+        .find(|summary| summary.group_id == group_id)
+        .cloned()
+        .expect("summary present")
+}
+

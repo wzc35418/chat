@@ -1401,6 +1401,37 @@ cargo test --offline -p chat-core                            # 180 passed（既�
 - `group_node::transfer_ownership_publishes_transfer_metadata_and_is_accepted`：节点元数据是
   `transfer_ownership`、接受后原群主 admin。
 - 复现：`cargo test --offline -p chat-core` → 232 passed（既有 226 继续通过）。
+## 群列表摘要带禁言与待收口信息（GROUPS-002 列表侧，2026-10-18）
+
+`GroupSummaryView` 新增两个字段（与既有 `pending` **语义分开**）：
+
+| 字段 | 含义 |
+|---|---|
+| `muted_members: u32` | **确认成员**里被禁言的人数（pending 成员不计） |
+| `pending_proposal: bool` | 是否有一条**收下的对端**提案等待本机打包（自己发起的提案不算） |
+| `pending`（既有） | "待收口线索"：本机已发起自移除（`leaving_at_ms`）**或** 有提案待打包 |
+
+- 本机发起自移除提案 → `pending=true`、`pending_proposal=false`（区分得开）；
+- 对端提案已收下 → `pending_proposal=true`（`pending` 也为真，它是两者的并集）。
+
+`group_list` 仍然**只读快照**（`grpmeta/` 命名空间，最多 256 条）、**不导入 MLS 设备**、不解密；
+损坏条目继续计入 `skipped`。FFI（`GroupSummaryFfi`）同步透出这两个字段。
+
+### 证据
+
+- `groups_list::list_reports_muted_members`：禁言 ✓ 计数 1、解除 ✓ 归 0；禁言不算"待打包提案"。
+- `groups_list::corrupted_entries_are_skipped_and_reported`：损坏条目 skipped=1，新字段保持确定值。
+- `groups_proposal::group_list_separates_pending_proposal_from_the_leaving_hint`：
+  发起方 `pending=true / pending_proposal=false`，收下方 `pending_proposal=true`。
+- FFI：`groups_list_ffi::group_list_reports_states_and_skips_corrupted_entries` 断言默认 0/false，
+  `group_set_muted` 后 `muted_members=1`。
+
+### 已知限制
+
+1. **"禁言 2 人"目前无法端到端构造**：core 没有独立的"邀请成员"入口（建群只带一个 bootstrap peer，
+   且群主不能禁言自己），因此测试只能验证 1 人被禁言的计数；计数逻辑本身按确认成员全量统计。
+2. `pending_proposal` 只统计"作者不是本机"的提案：本机自己发起的（自移除）走 `pending` 的 leaving 线索。
+
 
 
 

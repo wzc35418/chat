@@ -107,6 +107,29 @@ fn group_list_reports_states_and_skips_corrupted_entries() {
         .find(|summary| summary.group_id == second.group_id)
         .expect("group two summary");
     assert_eq!(two.name, "群二（改名）", "renames are reflected immediately");
+    // 新字段：禁言计数与"待打包对端提案"标记都透出（默认 0 / false）。
+    for summary in &list.groups {
+        assert_eq!(summary.muted_members, 0, "no member is muted by default");
+        assert!(!summary.pending_proposal, "no received proposal by default");
+        assert!(!summary.pending);
+    }
+
+    // 禁言一名成员 → FFI 里 muted_members = 1。
+    ffi.group_set_muted(
+        first.group_id.clone(),
+        "alice".to_owned(),
+        "bob".to_owned(),
+        true,
+    )
+    .expect("mute bob");
+    let list = ffi.group_list().expect("group list after mute");
+    let one = list
+        .groups
+        .iter()
+        .find(|summary| summary.group_id == first.group_id)
+        .expect("group one summary");
+    assert_eq!(one.muted_members, 1, "the muted member is counted");
+    assert!(!one.pending_proposal, "muting is not a pending proposal");
 
     // 关闭后显式 CORE_CLOSED。
     ffi.shutdown();

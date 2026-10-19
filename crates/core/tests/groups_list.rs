@@ -153,7 +153,39 @@ fn corrupted_entries_are_skipped_and_reported() {
     assert_eq!(list.groups.len(), 1, "只有完好的那条被列出");
     assert_eq!(list.skipped, 1, "损坏条目计入 skipped，不静默丢弃");
     assert_eq!(list.groups[0].group_id, normal.group_id);
+    // 新字段在损坏条目场景下也保持确定值（不因跳过错位）。
+    assert_eq!(list.groups[0].muted_members, 0);
+    assert!(!list.groups[0].pending_proposal);
 }
+#[test]
+fn list_reports_muted_members() {
+    let dir = FixtureDir::new();
+    let mut store = dir.open();
+    let group = create(&mut store, "禁言群", "alice", "bob");
+    // 初始：没有禁言、没有待打包提案。
+    let list = group_list(&store).expect("group list");
+    let summary = by_id(&list, &group.group_id);
+    assert_eq!(summary.muted_members, 0);
+    assert!(!summary.pending_proposal);
+    assert!(!summary.pending);
+
+    // 禁言一名成员（bob）→ muted_members = 1；禁言不是"待打包提案"。
+    // 注意：core 目前没有"邀请成员"入口（建群只带一个 bootstrap peer，且群主不能禁言自己），
+    // 因此端到端只能构造 1 人被禁言；计数逻辑本身按**确认成员全量**统计。
+    chat_core::groups::set_muted(&mut store, &group.group_id, "alice", "bob", true)
+        .expect("mute bob");
+    let list = group_list(&store).expect("group list");
+    let summary = by_id(&list, &group.group_id);
+    assert_eq!(summary.muted_members, 1, "the muted confirmed member is counted");
+    assert!(!summary.pending_proposal, "muting is not a pending proposal");
+
+    // 解除 → 归 0。
+    chat_core::groups::set_muted(&mut store, &group.group_id, "alice", "bob", false)
+        .expect("unmute bob");
+    let list = group_list(&store).expect("group list");
+    assert_eq!(by_id(&list, &group.group_id).muted_members, 0);
+}
+
 
 #[test]
 fn storage_list_bounds_are_enforced() {

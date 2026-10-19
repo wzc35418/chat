@@ -6,6 +6,54 @@
 
 返回类型与字段约束见 [类型字典](TYPES.md)，事务编号见 [事务和并发约定](TRANSACTIONS.md)，纵向流程见 [关键调用链](FLOWS.md)。所有 Result<T> 表示显式可恢复错误，不允许安全验证失败后继续推进。
 
+## 常驻运行时的附件回收阶段（SYNC-003 收口，2026-10-19，Windows x64）
+
+回收（ATTACHMENTS-008 的两阶段回收）以前只能由调用方手工驱动。本轮把它接进常驻循环，成为一个
+**低频**阶段：默认每 10 分钟一次、可通过配置关闭。
+
+代码：[crates/core/src/sync_runtime.rs](../../crates/core/src/sync_runtime.rs)；
+测试：[crates/core/tests/sync_runtime_gc.rs](../../crates/core/tests/sync_runtime_gc.rs)（3 个，真库）。
+
+### 配置
+
+```text
+SyncRuntimeConfig {
+    ...,
+    gc_interval_ms: u64,   // 0 = 关闭；默认 DEFAULT_GC_INTERVAL_MS = 10 分钟
+    gc_grace_ms: i64,      // 宽限期；默认 DEFAULT_GC_GRACE_MS = 1 小时
+}
+// builder：config.with_attachment_gc(interval_ms, grace_ms)
+```
+
+### 循环里的位置与语义
+
+每轮顺序：**outbox（阶段 0）→ 附件回收（阶段 0.5）→ stop 检查 → 拉取（阶段 1）→ 等待**。
+
+1. **低频**：只有 `now >= gc_next_attempt_at_ms` 才跑；成功后下一次 = now + `gc_interval_ms`。
+2. **两阶段**：一次调用 = `plan_attachment_gc`（只读）→ `execute_attachment_gc`（先标记 gc_pending 再删除），
+   单轮最多一页（`MAX_ATTACHMENT_GC_BATCH = 256`）。
+3. **失败隔离**：回收失败只写 `gc_last_error_code` 并按 `pull_policy.failure_delay_for` 退避
+   （被 `policy.clamp` 夹在 [min,max] 轮等待内），**不影响** outbox 与拉取，也不占它们的失败预算。
+4. **状态可见**：`SyncStatusView` 新增 `gc_removed_total` / `gc_last_error_code` / `gc_next_attempt_at_ms`。
+5. **stop 在任务边界生效**：回收阶段前与拉取阶段前各检查一次停止信号，正在执行的阶段不被中断。
+
+### 证据（ @@cargo test --offline -p chat-core --test sync_runtime_gc@@，3 passed ）
+
+- `expired_unreferenced_attachments_are_reclaimed_and_counted`：真库里两个超期无引用附件（带密钥）被回收、
+  `gc_removed_total == 2`、`gc_last_error_code` 为空；被消息引用的与宽限期内的附件都保留。
+- `gc_disabled_keeps_the_counter_at_zero`：`interv​al = 0` 时跑过 3 轮以上，`gc_removed_total` 恒为 0，
+  附件原样保留。
+- `a_failing_gc_never_blocks_the_pull_loop`：非法宽限期（-1）让回收必然失败 → `gc_last_error_code = INVALID_INPUT`、
+  计数不增、`rounds` 继续增长（循环没有被回收拖住），附件未被删除。
+
+### 已知限制
+
+1. **只有回收阶段，没有缓存目录清理**：磁盘密文缓存仍由 `collect_unreferenced_attachments` 负责。
+2. **回收与拉取共用一个库句柄**：单轮回收会占用该轮的一点时间（两阶段各一次短事务），因此在最坏情况下
+   会让该轮拉取晚几毫秒开始；没有单独线程。
+3. **宽限期由部署侧给**：给得太小会把“正在上传/投递”的附件误判为孤儿（outbox 引用会被护栏挡住，
+   但更复杂的流水线仍建议 ≥ 1 小时）。
+
 ## 作者账户：凭据目录映射（SYNC-002 补全，2026-10-19，Windows x64）
 
 同步 apply 与应用消息落库以前用**确定性占位**把作者凭据变成账户 ID，别的设备无法把它对上真实账户。

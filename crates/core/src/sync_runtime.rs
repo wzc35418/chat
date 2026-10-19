@@ -76,6 +76,11 @@ pub const DEFAULT_ROUND_WAIT_MAX_MS: u64 = 5_000;
 /// 连续失败多少轮后停止自动重试（与 sync 的失败预算一致）。
 pub const DEFAULT_MAX_FAILURES: u32 = 8;
 
+/// 附件回收阶段的默认间隔（毫秒）：10 分钟（低频；`0` 关闭）。
+pub const DEFAULT_GC_INTERVAL_MS: u64 = 10 * 60 * 1_000;
+/// 附件回收的默认宽限期（毫秒）：1 小时（覆盖令牌/任务的较长生命周期）。
+pub const DEFAULT_GC_GRACE_MS: i64 = 60 * 60 * 1_000;
+
 /// 循环状态。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncState {
@@ -114,6 +119,12 @@ pub struct SyncStatusView {
     pub outbox_last_error_code: Option<&'static str>,
     /// 下一次允许执行 outbox 的时间（Unix 毫秒；**与拉取退避互相独立**）。
     pub outbox_next_attempt_at_ms: i64,
+    /// 本进程生命周期内回收的附件数（两阶段回收：计划 → 标记 → 删除）。
+    pub gc_removed_total: u64,
+    /// 最近一次回收失败的稳定错误码（未失败为 None）。
+    pub gc_last_error_code: Option<&'static str>,
+    /// 下一次允许执行回收的时间（Unix 毫秒；**与拉取/outbox 退避互相独立**）。
+    pub gc_next_attempt_at_ms: i64,
 }
 
 impl SyncStatusView {
@@ -130,6 +141,9 @@ impl SyncStatusView {
             outbox_unknown_total: 0,
             outbox_last_error_code: None,
             outbox_next_attempt_at_ms: now_ms,
+            gc_removed_total: 0,
+            gc_last_error_code: None,
+            gc_next_attempt_at_ms: now_ms,
         }
     }
 
@@ -285,6 +299,10 @@ pub struct SyncRuntimeConfig {
     pub outbox_engine: Option<Box<dyn CryptoEngine + Send>>,
     /// outbox 的节点提交端口（实现方必须幂等）。未注入时 outbox 不执行。
     pub outbox_submitter: Option<Box<dyn NodeSubmitter + Send>>,
+    /// 附件两阶段回收的间隔（毫秒；**0 = 关闭**，默认 10 分钟）。低频阶段：每轮至多跑一次。
+    pub gc_interval_ms: u64,
+    /// 回收宽限期（毫秒）：`created_at > now - grace` 的附件一律保留（默认 1 小时）。
+    pub gc_grace_ms: i64,
 }
 
 impl SyncRuntimeConfig {
@@ -311,6 +329,8 @@ impl SyncRuntimeConfig {
             enabled_outbox: true,
             outbox_engine: None,
             outbox_submitter: None,
+            gc_interval_ms: DEFAULT_GC_INTERVAL_MS,
+            gc_grace_ms: DEFAULT_GC_GRACE_MS,
         })
     }
 
@@ -329,6 +349,13 @@ impl SyncRuntimeConfig {
     /// 关闭 outbox 批执行（对照实验/只做拉取的部署）。
     pub fn without_outbox(mut self) -> Self {
         self.enabled_outbox = false;
+        self
+    }
+
+    /// 配置附件回收阶段（`interval_ms = 0` 关闭；`grace_ms` 是宽限期）。
+    pub fn with_attachment_gc(mut self, interval_ms: u64, grace_ms: i64) -> Self {
+        self.gc_interval_ms = interval_ms;
+        self.gc_grace_ms = grace_ms;
         self
     }
 
@@ -371,6 +398,8 @@ impl std::fmt::Debug for SyncRuntimeConfig {
             .field("enabled_outbox", &self.enabled_outbox)
             .field("outbox_engine", &self.outbox_engine.is_some())
             .field("outbox_submitter", &self.outbox_submitter.is_some())
+            .field("gc_interval_ms", &self.gc_interval_ms)
+            .field("gc_grace_ms", &self.gc_grace_ms)
             .finish_non_exhaustive()
     }
 }
@@ -528,6 +557,9 @@ fn run_loop(config: SyncRuntimeConfig, shared: Arc<Shared>) -> SyncResult<Store>
     let mut outbox_accepted_total = 0_u64;
     let mut outbox_unknown_total = 0_u64;
     let mut outbox_next_attempt_at_ms = 0_i64;
+    let mut gc_removed_total = 0_u64;
+    let mut gc_failures = 0_u32;
+    let mut gc_next_attempt_at_ms = 0_i64;
     loop {
         // 任务边界：每一轮开始前检查停止信号（不打断正在执行的那一个任务）。
         if shared.stopping() {
@@ -575,6 +607,42 @@ fn run_loop(config: SyncRuntimeConfig, shared: Arc<Shared>) -> SyncResult<Store>
                             status.outbox_next_attempt_at_ms = next;
                         });
                     }
+                }
+            }
+        }
+        // 阶段 0.5（附件回收）：低频两阶段回收（计划 → 标记 → 删除）。
+        // 失败只写自己的状态并退避，不影响 outbox 与拉取；间隔为 0 时整段跳过。
+        if config.gc_interval_ms > 0 && now >= gc_next_attempt_at_ms {
+            match attachment_gc_once(
+                backend.store_mut(),
+                SystemClock.now_unix_ms(),
+                config.gc_grace_ms,
+            ) {
+                Ok(removed) => {
+                    gc_failures = 0;
+                    gc_removed_total = gc_removed_total.saturating_add(removed);
+                    let interval = i64::try_from(config.gc_interval_ms).unwrap_or(i64::MAX);
+                    let next = SystemClock.now_unix_ms().saturating_add(interval);
+                    gc_next_attempt_at_ms = next;
+                    shared.update(|status| {
+                        status.gc_removed_total = gc_removed_total;
+                        status.gc_last_error_code = None;
+                        status.gc_next_attempt_at_ms = next;
+                    });
+                }
+                Err(code) => {
+                    // 回收自己的失败预算与退避：与拉取/outbox 完全独立。
+                    gc_failures = gc_failures.saturating_add(1);
+                    let delay = config
+                        .policy
+                        .clamp(config.pull_policy.failure_delay_for(gc_failures) as u64);
+                    let next = SystemClock.now_unix_ms().saturating_add(delay as i64);
+                    gc_next_attempt_at_ms = next;
+                    shared.update(|status| {
+                        status.gc_removed_total = gc_removed_total;
+                        status.gc_last_error_code = Some(code);
+                        status.gc_next_attempt_at_ms = next;
+                    });
                 }
             }
         }
@@ -667,6 +735,17 @@ fn run_loop(config: SyncRuntimeConfig, shared: Arc<Shared>) -> SyncResult<Store>
             return Ok(backend.into_store());
         }
     }
+}
+
+/// 跑一次附件两阶段回收：计划（只读）→ 执行（先标记再删除）。
+///
+/// 返回本次真正删除的附件数；失败返回附件层的稳定错误码文本（原样进 `gc_last_error_code`）。
+fn attachment_gc_once(store: &mut Store, now_ms: i64, grace_ms: i64) -> Result<u64, &'static str> {
+    let plan = crate::attachments::plan_attachment_gc(store, now_ms, grace_ms)
+        .map_err(|error| error.code())?;
+    let report = crate::attachments::execute_attachment_gc(store, &plan)
+        .map_err(|error| error.code())?;
+    Ok(u64::from(report.removed))
 }
 
 fn finish(shared: &Shared, reason: &'static str) {

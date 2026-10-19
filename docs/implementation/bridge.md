@@ -896,3 +896,31 @@ cargo test --offline -p chat-ffi                                 # 60 passed（�
 
 
 ~~~
+
+## 第二批 32 轮期间新增的 FFI 面（补齐被截断章节的汇总，2026-10-19）
+
+> 本节由 Lead 据各轮实现记录重建：bridge.md 曾在一次整文件重写中被截断（1002→796 行），
+> 后续各轮又陆续追加了多节；这里给出**当前有效方法的汇总表**，避免历史细节丢失后无从查证。
+
+| 对象 | 方法 | 语义要点 | 证据 |
+|---|---|---|---|
+| `LocalStoreFfi` | `open/create_draft/list_conversations/list_messages/message_attachment_ids/draft_status/cancel_draft/poll_events/send_*` | 发送编排 + 事件拉取 + 附件 id 查询（不解密） | core 232 / ffi 60 |
+| `IdentityFfi` | `create/open_persisted/account/contacts/create_invite/preview_invite/accept_invite/confirm_identity_change` + `open_recovery_target/export_recovery_bundle/import_recovery_bundle` | 身份 + **恢复文件**（空库约束、非空库拒绝不覆盖） | identity 56 / ffi 60 |
+| `AttachmentFfi` | `new/open/import/status/export/cancel/upload/download/records` | 导入导出、上传下载（回执 written_bytes）、批量记录（显示名/大小/状态） | core 232 / ffi 60 |
+| `GroupFfi` | `open + group_create/snapshot/list/set_role/set_muted/rename/remove_member/accept_pending/discard_pending`、`group_submit_control/group_accept_with_receipt`、`group_prepare_leave/process_proposal/commit_proposals/submit_proposal` | 治理 + 节点回执 + **自移除提案编排**（提交侧需群主/管理员，提案人不得自打包） | core 232 / ffi 60 |
+| `SyncFfi` | `open/start/stop/status/shutdown` | 常驻同步（游标未初始化显式失败、不自动启动） | core 232 / ffi 60 |
+| `PluginsFfi` | `new/open + manifest_validate/install/start/stop/dispatch/finish_dispatch/uninstall/storage_get/storage_set/list_plugins/shutdown` | 宿主状态机与**派发计划**；**不加载也不执行插件代码**；持久化模式（迁移 0010） | ffi 60 / pluginSmoke PASS |
+
+**跨对象共同约定**：错误统一 `FfiError::Store{code, reason}`，code 为 PROTOCOL-014 冻结码；同一库同一时刻只允许一个对象持有写锁（否则 `STORAGE_LOCKED`）；Kotlin 侧一律经 `shared/core-bridge` 的 `Native*Service` 串行化调用。
+## 群列表摘要新字段（GroupSummaryFfi，2026-10-18）
+
+~~~text
+GroupSummaryFfi { group_id, name, epoch, role, policy_version, dissolved, left, pending,
+                  muted_members: u32,      // 确认成员里被禁言的人数
+                  pending_proposal: bool } // 已收下、等本机打包的对端提案（与 pending 分开）
+~~~
+
+- `pending` 仍是"待收口线索"（自己发起自移除 **或** 有待打包提案）；
+- `pending_proposal` 只表示"**收下的对端**提案等本机打包"（自己发起的提案不算）；
+- `group_list` 依旧只读快照、不导入 MLS 设备、损坏条目计入 `skipped`。
+

@@ -485,6 +485,10 @@ pub struct GroupSummaryFfi {
     pub left: bool,
     /// 本机有待收口线索（已发起自移除提案或已收下待打包提案）。
     pub pending: bool,
+    /// 被禁言的确认成员数（列表页展示用）。
+    pub muted_members: u32,
+    /// 是否有已收下、等本机打包的对端提案（与 `pending` 的"待收口线索"语义分开）。
+    pub pending_proposal: bool,
 }
 
 /// 群列表结果：`skipped` 是被跳过的损坏条目数（绝不静默丢弃）。
@@ -506,6 +510,8 @@ fn summary_ffi(view: &chat_core::groups::GroupSummaryView) -> GroupSummaryFfi {
         dissolved: view.dissolved,
         left: view.left,
         pending: view.pending,
+        muted_members: view.muted_members,
+        pending_proposal: view.pending_proposal,
     }
 }
 

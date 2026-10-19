@@ -2917,6 +2917,10 @@ pub struct GroupSummaryView {
     pub left: bool,
     /// 本机有待收口的线索：已发起自移除提案（`leaving_at_ms`）或已收下待打包的提案。
     pub pending: bool,
+    /// 被禁言的确认成员数（列表页展示用；pending 成员不计）。
+    pub muted_members: u32,
+    /// 是否有一条**已收下、等待本机打包**的对端提案（与 `pending` 的"待收口线索"语义分开）。
+    pub pending_proposal: bool,
 }
 
 /// 群列表结果（`skipped` 是被跳过的损坏条目数，绝不静默丢弃）。
@@ -2971,6 +2975,26 @@ fn summary_from_key(
         .find(|member| member.is_local)
         .map(|member| role_of(member.role))
         .unwrap_or(MemberRole::Member);
+    // 本机凭据（用于区分"自己发起的提案"与"收下的对端提案"）。
+    let local_credential = record
+        .members
+        .iter()
+        .find(|member| member.is_local)
+        .map(|member| member.credential.as_str());
+    // 只统计"收下的对端提案"：本机自己发起的（例如自移除）属于 pending 的 leaving 线索。
+    let received_proposal = record
+        .pending_proposal
+        .as_ref()
+        .is_some_and(|proposal| Some(proposal.author.as_str()) != local_credential);
+    // 禁言数只看**确认成员**（pending 成员还没入群，不参与策略层）。
+    let muted_members = u32::try_from(
+        record
+            .members
+            .iter()
+            .filter(|member| member.muted)
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
     Ok(Some(GroupSummaryView {
         group_id: record.group_id.clone(),
         name: record.name.clone(),
@@ -2979,7 +3003,12 @@ fn summary_from_key(
         policy_version: record.policy_version,
         dissolved: record.dissolved,
         left: record.left_at_ms > 0,
+        // "待收口线索"：本机已发起自移除提案，或已收下待打包的提案。
         pending: record.leaving_at_ms > 0 || record.pending_proposal.is_some(),
+        muted_members,
+        // 与 pending 分开：只有"已收下待本机打包的**对端**提案"才为 true
+        // （本机自己发起的提案走 pending 的 leaving 线索）。
+        pending_proposal: received_proposal,
     }))
 }
 
