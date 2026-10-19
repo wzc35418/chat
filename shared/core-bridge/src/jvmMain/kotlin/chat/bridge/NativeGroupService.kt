@@ -65,6 +65,29 @@ class NativeGroupService(
         }
     }
 
+    override suspend fun createWithInviteeKeyPackage(
+        name: String,
+        inviteeCredential: String,
+        keyPackageBytes: ByteArray,
+        localCredential: String,
+    ): chat.api.CreatedGroup = call {
+        val created = it.groupCreateWithInviteeKeyPackage(name, inviteeCredential, keyPackageBytes, localCredential)
+        chat.api.CreatedGroup(
+            snapshot = created.view.toSnapshot(),
+            welcomeBytes = created.welcomeBytes,
+            invite = chat.api.GroupInviteMeta(
+                groupId = created.invite.groupId,
+                mlsGroupId = created.invite.mlsGroupId,
+                name = created.invite.name,
+                inviterCredential = created.invite.inviterCredential,
+                ownerCredential = created.invite.ownerCredential,
+                inviteeCredential = created.invite.inviteeCredential,
+                members = created.invite.members,
+                epoch = created.invite.epoch.toInt(),
+            ),
+        )
+    }
+
     override suspend fun submitInvite(
         groupId: String,
         meta: chat.api.GroupInviteMeta,

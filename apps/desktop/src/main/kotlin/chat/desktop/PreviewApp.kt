@@ -49,6 +49,8 @@ import chat.presentation.preview.updateSendNodeUrl
 import chat.presentation.preview.withSendStep
 import chat.presentation.preview.withMessageCards
 import chat.presentation.preview.updateInvitee
+import chat.presentation.preview.updateInviteeKeyPackagePath
+import chat.presentation.preview.withCreatedGroup
 import chat.presentation.preview.withFetchedInvite
 import chat.presentation.preview.withInviteReceipt
 import chat.presentation.preview.withMessagePreview
@@ -580,6 +582,65 @@ fun main() = application {
             }
         },
         updateInvitee = { value -> groupState = groupState.updateInvitee(value) },
+        chooseInviteeKeyPackage = {
+            runCatching {
+                val picker = DesktopFilePicker(null)
+                val chosen = picker.chooseImportFile("选择被邀请者的 KeyPackage（.kp）")
+                groupState = groupState.updateInviteeKeyPackagePath(chosen.path)
+            }.onFailure { groupState = groupState.withError("INVALID_INPUT", it.message) }
+        },
+        createGroupWithKeyPackage = {
+            scope.launch {
+                val path = groupState.inviteeKeyPackagePath
+                if (path.isBlank()) {
+                    groupState = groupState.withError("INVALID_INPUT", "先选择被邀请者的 KeyPackage 文件")
+                    return@launch
+                }
+                groupState = groupState.beginBusy()
+                runCatching {
+                    val bytes = java.io.File(path).readBytes()
+                    withGroup { service ->
+                        service.createWithInviteeKeyPackage(
+                            name = groupState.createName.ifBlank { "新群" },
+                            inviteeCredential = groupState.inviteeCredential.ifBlank { "invitee" },
+                            keyPackageBytes = bytes,
+                            localCredential = groupState.inviteeCredential.ifBlank { "local" },
+                        )
+                    }.getOrThrow()
+                }.onSuccess { created ->
+                    groupState = groupState.withCreatedGroup(created)
+                }.onFailure { error ->
+                    groupState = groupState.withError(
+                        (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                        error.message,
+                    )
+                }
+            }
+        },
+        submitInvite = {
+            scope.launch {
+                val created = groupState.createdGroup ?: return@launch
+                groupState = groupState.beginBusy()
+                runCatching {
+                    withGroup { service ->
+                        service.submitInvite(
+                            created.invite.groupId,
+                            created.invite,
+                            created.welcomeBytes,
+                            storeState.sendNodeUrl.trim(),
+                            storeState.sendNodeId.trim(),
+                            storeState.sendNodePublicKey.trim().ifEmpty { null },
+                        )
+                    }.getOrThrow()
+                }.onSuccess { groupState = groupState.withInviteReceipt(it) }
+                    .onFailure { error ->
+                        groupState = groupState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
         fetchInvite = {
             scope.launch {
                 val snapshot = groupState.snapshot ?: return@launch

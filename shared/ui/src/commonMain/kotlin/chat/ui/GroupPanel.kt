@@ -48,6 +48,8 @@ data class GroupHandlers(
     val loadGroupList: () -> Unit = {},
     val selectGroup: (String) -> Unit = {},
     val updateInvitee: (String) -> Unit = {},
+    val chooseInviteeKeyPackage: () -> Unit = {},
+    val createGroupWithKeyPackage: () -> Unit = {},
     val submitInvite: () -> Unit = {},
     val fetchInvite: () -> Unit = {},
 ) {
@@ -196,13 +198,28 @@ fun GroupPanel(
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     TextButton(
+                        onClick = handlers.chooseInviteeKeyPackage,
+                        enabled = state.ready && !state.busy,
+                        modifier = Modifier.semantics { contentDescription = "选择被邀请者的 KeyPackage" },
+                    ) { Text("选 KeyPackage", style = MaterialTheme.typography.labelMedium) }
+                    TextButton(
+                        onClick = handlers.createGroupWithKeyPackage,
+                        enabled = state.ready && !state.busy && state.inviteeKeyPackagePath.isNotBlank(),
+                        modifier = Modifier.semantics { contentDescription = "用 KeyPackage 建群" },
+                    ) { Text("用它建群", style = MaterialTheme.typography.labelMedium) }
+                    TextButton(
+                        onClick = handlers.submitInvite,
+                        enabled = state.ready && !state.busy && state.createdGroup != null,
+                        modifier = Modifier.semantics { contentDescription = "提交邀请到节点" },
+                    ) { Text("提交邀请", style = MaterialTheme.typography.labelMedium) }
+                    TextButton(
                         onClick = handlers.fetchInvite,
                         enabled = state.ready && !state.busy,
                         modifier = Modifier.semantics { contentDescription = "从节点取回邀请" },
                     ) { Text("取回邀请", style = MaterialTheme.typography.labelMedium) }
                 }
                 Text(
-                    "注意：提交邀请需要真实 Welcome 字节，本面板不持有（由建群/邀请流程产出）；这里只提供取回。",
+                    "流程：选对方 KeyPackage → 用它建群（Welcome 绑定该设备，可真正入群）→ 提交邀请到节点；对方取回后接受即可入群。",
                     style = MaterialTheme.typography.labelSmall,
                     color = Color(0xFFB3261A),
                 )

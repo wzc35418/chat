@@ -120,3 +120,19 @@ curl.exe -i http://127.0.0.1:8080/v1/health
 2. 用 `--info` 重跑 Gradle，看第一个 `e: ` 报错
 3. Rust 侧：`$env:CARGO_TARGET_DIR="C:\Users\35828\AppData\Local\Temp\chat-verify-target"; cargo test --offline -p <crate>`
 4. 数据库被占用：同库同一时刻只能一个 FFI 对象（`STORAGE_LOCKED`）——先关其它面板/对象
+
+## 13. 群邀请闭环（GROUPS-004，R-169/R-170 后可用）
+
+前提：节点在线；双方各自已有真实身份。
+
+1. **B 侧准备 KeyPackage**：B 在自己的预览实例里导出自己的 KeyPackage 字节（当前可用 `group_create_with_invitee_key_package` 的同源 API；若面板尚无导出按钮，用自动化路径 `crates/crypto` 的 `key_package()` 生成后把字节存成 `.kp` 文件）。
+   - 注意：**KeyPackage 单次使用**，同一份只能用于建一次群。
+2. **A 侧建群**：群面板「邀请投递」→「选 KeyPackage」挑那个 `.kp` → 填被邀请者凭据 →「用它建群」。
+   - 预期：提示"已用对方 KeyPackage 建群：epoch 1，Welcome N 字节（可用于提交邀请）"。
+3. **A 侧提交邀请**：确认节点地址/节点 ID 已填 →「提交邀请」。
+   - 预期：显示真实回执 `seq` + `submissionId`；节点不可达 → `NODE_UNAVAILABLE`（不是假成功）。
+4. **B 侧取回并接受**：群面板「取回邀请」→ 看到群名/epoch/被邀请者/Welcome 字节数 →（接受动作见 GROUPS-017）。
+   - 预期：B 入群后 epoch 与成员与 A 一致。
+5. **验证审计**：`GET /v1/audit?kind=invite` 能看到这次邀请（含 group_id/request_id）。
+
+**已知限制**：面板暂无"导出自己 KeyPackage"按钮（需用底层 API 生成 `.kp`）；邀请一次只带**一个**被邀请者。

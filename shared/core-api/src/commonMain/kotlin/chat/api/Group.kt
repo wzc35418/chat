@@ -43,6 +43,18 @@ interface GroupService {
     /** 建群（本机为 owner；引导成员由本进程临时设备承担）。 */
     suspend fun createGroup(name: String): GroupSnapshot
 
+    /**
+     * 用**真实被邀请者的 KeyPackage** 建群，返回快照与可用的 Welcome 字节。
+     *
+     * 这是 GROUPS-004 的闭环：返回的 Welcome 能被该设备真正接受入群。
+     */
+    suspend fun createWithInviteeKeyPackage(
+        name: String,
+        inviteeCredential: String,
+        keyPackageBytes: ByteArray,
+        localCredential: String,
+    ): CreatedGroup
+
     /** 把邀请（元数据 + Welcome）提交到节点；回执真实、幂等可重投。 */
     suspend fun submitInvite(
         groupId: String,
@@ -130,4 +142,11 @@ data class InviteReceipt(
 data class GroupInviteBlob(
     val meta: GroupInviteMeta,
     val welcomeBytes: ByteArray,
+)
+
+/** 建群结果：快照 + 可用的 Welcome 字节 + 与之一致的邀请元数据。 */
+data class CreatedGroup(
+    val snapshot: GroupSnapshot,
+    val welcomeBytes: ByteArray,
+    val invite: GroupInviteMeta,
 )
