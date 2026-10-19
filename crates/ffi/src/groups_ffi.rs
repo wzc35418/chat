@@ -555,6 +555,17 @@ pub struct InviteReceiptFfi {
     pub node_id: String,
 }
 
+/// 建群结果：快照 + **原始 Welcome 字节** + 与之逐字段一致的邀请元数据。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CreatedGroupFfi {
+    /// 群快照（与 `group_snapshot` 同形）。
+    pub view: GroupViewFfi,
+    /// MLS Welcome 原文（邀请投递需要；不截断、不改写）。
+    pub welcome_bytes: Vec<u8>,
+    /// 与快照一致的邀请元数据（被邀请者 = 引导成员）。
+    pub invite: InviteMetaFfi,
+}
+
 /// 一条可投递/可接受的入群邀请（纯数据，不含任何私钥）。
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct GroupInviteBlobFfi {
@@ -562,6 +573,46 @@ pub struct GroupInviteBlobFfi {
     pub meta: InviteMetaFfi,
     /// MLS Welcome 字节（加入凭据；不含私钥材料）。
     pub welcome_bytes: Vec<u8>,
+}
+
+/// 由建群快照推导与之一致的邀请元数据（被邀请者 = 引导成员）。
+///
+/// 成员集合取「确认成员 ∪ pending 成员」的凭据（去重、保持出现顺序）：引导成员在新建群里是
+/// pending，因此必须在集合里；群主取快照里的 owner 成员（没有则回退到本机凭据）。
+fn invite_of(
+    view: &GroupView,
+    local_credential: &str,
+    bootstrap_credential: &str,
+) -> InviteMetaFfi {
+    let mut members: Vec<String> = Vec::new();
+    for member in view.members.iter().chain(view.pending_members.iter()) {
+        if !members.contains(&member.credential) {
+            members.push(member.credential.clone());
+        }
+    }
+    let owner_credential = view
+        .members
+        .iter()
+        .find(|member| group_role_code(member.role) == "owner")
+        .or_else(|| view.members.iter().find(|member| member.is_local))
+        .map(|member| member.credential.clone())
+        .unwrap_or_else(|| local_credential.trim().to_owned());
+    let inviter_credential = view
+        .members
+        .iter()
+        .find(|member| member.is_local)
+        .map(|member| member.credential.clone())
+        .unwrap_or_else(|| local_credential.trim().to_owned());
+    InviteMetaFfi {
+        group_id: view.group_id.clone(),
+        mls_group_id: view.mls_group_key.clone(),
+        name: view.name.clone(),
+        inviter_credential,
+        owner_credential,
+        invitee_credential: bootstrap_credential.trim().to_owned(),
+        members,
+        epoch: view.epoch,
+    }
 }
 
 /// 节点端点必须显式配置（空串 → `INVALID_TARGET`，不静默回退）。
@@ -690,6 +741,48 @@ impl GroupFfi {
             .group_create(&name, &local_credential, &bootstrap_credential, members)
             .map_err(|error| failure!(error))?;
         Ok(group_view(view))
+    }
+
+    /// GROUPS-001：建群并返回**原始 Welcome 字节**（邀请投递的 Welcome 来源）。
+    ///
+    /// - 语义与 `group_create` 完全一致（同一份校验与落库路径），只是把 Welcome 原文一并返回；
+    /// - `welcome_bytes` 超过 64 KiB → `CONTENT_TOO_LARGE`（**绝不静默截断**）；
+    /// - `invite` 与快照逐字段一致：被邀请者 = 引导成员，群主 = 快照里的 owner 成员，
+    ///   成员集合 = 确认成员 ∪ pending 成员，epoch = 快照 epoch；
+    /// - 纯内存对象（未入库身份且 `local_credential` 为空）→ `INVALID_STATE_TRANSITION`。
+    pub fn group_create_with_welcome(
+        &self,
+        name: String,
+        bootstrap_credential: String,
+        local_credential: String,
+    ) -> Result<CreatedGroupFfi, FfiError> {
+        let mut core = self.lock()?;
+        let (view, welcome_bytes) = core
+            .group_create_with_welcome(
+                &name,
+                &local_credential,
+                &bootstrap_credential,
+                Vec::new(),
+            )
+            .map_err(|error| failure!(error))?;
+        if welcome_bytes.len() > chat_core::groups::MAX_GROUP_INVITE_WELCOME_BYTES {
+            return Err(FfiError::Store {
+                code: "CONTENT_TOO_LARGE".to_owned(),
+                reason: "the invite welcome exceeds 64 KiB".to_owned(),
+            });
+        }
+        if welcome_bytes.is_empty() {
+            return Err(FfiError::Store {
+                code: "STATE_CORRUPTED".to_owned(),
+                reason: "group creation produced an empty welcome".to_owned(),
+            });
+        }
+        let invite = invite_of(&view, &local_credential, &bootstrap_credential);
+        Ok(CreatedGroupFfi {
+            view: group_view(view),
+            welcome_bytes,
+            invite,
+        })
     }
 
     /// GROUPS-002：读取正式群快照。

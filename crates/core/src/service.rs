@@ -1431,6 +1431,52 @@ impl ConversationCore {
             .map_err(anyhow::Error::new)
     }
 
+    /// GROUPS-001：建群并**保留**引导 Welcome 字节（邀请投递需要原始 Welcome）。
+    ///
+    /// 语义与 [`group_create`] 完全一致（同一份校验与落库路径），只是把
+    /// `create_group_with_welcome` 产生的 Welcome 原文一并返回（不截断、不改写）。
+    pub fn group_create_with_welcome(
+        &mut self,
+        name: &str,
+        local_credential: &str,
+        bootstrap_credential: &str,
+        members: Vec<GroupMemberKeyPackage>,
+    ) -> anyhow::Result<(GroupView, Vec<u8>)> {
+        let local = if local_credential.trim().is_empty() {
+            self.persisted_device_id()?
+        } else {
+            local_credential.trim().to_owned()
+        };
+        let mut device = MlsDevice::new(&local).map_err(|_| {
+            anyhow::Error::new(crate::groups::GroupError::from(
+                chat_storage::formal::StorageError::StateCorrupted(
+                    "the local MLS device could not be created".to_owned(),
+                ),
+            ))
+        })?;
+        let peer = MlsDevice::new(bootstrap_credential.trim()).map_err(|_| {
+            anyhow::Error::new(crate::groups::GroupError::from(
+                chat_storage::formal::StorageError::StateCorrupted(
+                    "the bootstrap MLS device could not be created".to_owned(),
+                ),
+            ))
+        })?;
+        let request = CreateGroupRequest {
+            name: name.to_owned(),
+            local_credential: local,
+            policy_version: GROUP_POLICY_VERSION,
+            members,
+        };
+        let bootstrap = GroupBootstrapPeer {
+            credential: bootstrap_credential.trim().to_owned(),
+            device: &peer,
+        };
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
+        crate::groups::create_group_with_welcome(&mut device, &bootstrap, store, &request)
+            .map_err(anyhow::Error::new)
+    }
+
     /// GROUPS-002：读取正式群快照（不联网）。
     pub fn group_snapshot(&self, group_id: &str) -> anyhow::Result<GroupView> {
         let guard = self.store_guard()?;

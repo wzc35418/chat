@@ -1020,6 +1020,21 @@ GroupFfi.group_fetch_invite(group_id, endpoint_url, node_id, node_public_key_hex
 - core 侧对应 `fetch_group_invite_for`（`fetch_group_invite` 是 `None` 别名），
   `ConversationCore::group_fetch_invite` 追加 `invitee_credential` 参数；
 - 测试：[crates/ffi/tests/groups_invite_ffi.rs](../../crates/ffi/tests/groups_invite_ffi.rs)（5 个，真节点）。
+## 建群返回 Welcome（GroupFfi.group_create_with_welcome，2026-10-18）
+
+~~~text
+group_create_with_welcome(name, bootstrap_credential, local_credential)
+    -> CreatedGroupFfi { view: GroupViewFfi, welcome_bytes: Vec<u8>, invite: InviteMetaFfi }
+~~~
+
+- 与 `group_create` 同一路径，额外返回 MLS Welcome 原文（纯数据、无密钥）；
+- Welcome > 64 KiB → `CONTENT_TOO_LARGE`（不截断）；空 Welcome → `STATE_CORRUPTED`；
+- `invite` 与快照逐字段一致（被邀请者 = 引导成员，群主/邀请者 = 快照 owner/本机，成员 = 确认 ∪ pending）；
+- 既有 `group_create` 行为不变；
+- 限制：Welcome 绑定 core 内部一次性 bootstrap 设备 key package，外部设备接受会 `WELCOME_NOT_AUTHORIZED`
+  （跨设备入群需要后续把真实 KeyPackage 作为入参）；
+- 测试：[crates/ffi/tests/groups_create_welcome.rs](../../crates/ffi/tests/groups_create_welcome.rs)（3 个，真库 + 真 MLS）。
+
 
 
 

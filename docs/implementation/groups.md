@@ -1661,5 +1661,33 @@ GroupFfi.group_fetch_invite(group_id, endpoint_url, node_id, node_public_key_hex
 按 bob 只拿 bob、按 carol 只拿 carol、不过滤拿最近的 carol（旧行为）、未知凭据 `None` 不报错。
 
 复现：`cargo test --offline -p chat-ffi --test groups_invite_ffi` → 5 passed。
+### 建群返回 Welcome 字节（GroupFfi，2026-10-18）
+
+~~~text
+GroupFfi.group_create_with_welcome(name, bootstrap_credential, local_credential)
+    -> CreatedGroupFfi { view: GroupViewFfi, welcome_bytes: Vec<u8>, invite: InviteMetaFfi }
+~~~
+
+- 与 `group_create` 走**同一份**校验与落库路径（core 的 `create_group_with_welcome`），
+  额外把 MLS Welcome **原文**一并返回（不截断、不改写、不含私钥）；
+- `welcome_bytes` 超过 64 KiB → `CONTENT_TOO_LARGE`；产生空 Welcome → `STATE_CORRUPTED`（显式，绝不静默）；
+- `invite` 与快照逐字段一致：`group_id`/`mls_group_id`/`name`/`epoch` 取快照，
+  被邀请者 = 引导成员，邀请者/群主 = 快照里的本机（owner）成员，成员集合 = 确认成员 ∪ pending 成员；
+- 既有 `group_create` 行为不变（仍只返回快照）。
+
+证据：[crates/ffi/tests/groups_create_welcome.rs](../../crates/ffi/tests/groups_create_welcome.rs)（3 个，真库 + 真 MLS）：
+建群 → Welcome 非空且 ≤64 KiB、快照/元数据逐字段一致（群主 alice、被邀请者 bob、成员 alice+bob、epoch=1）、
+`group_snapshot` 与 invite 的 epoch/群键一致；Welcome 是**真实 MLS Welcome**（外来设备解析通过、
+但被 `WELCOME_NOT_AUTHORIZED` 拒绝 —— 垃圾字节会在解析阶段就失败）；既有 `group_create` 仍只有快照；
+空 `local_credential` + 库内无身份 → `INVALID_STATE_TRANSITION`。
+
+复现：`cargo test --offline -p chat-ffi --test groups_create_welcome` → 3 passed；
+`cargo test --offline -p chat-ffi` → **93 passed**。
+
+**已知限制（重要）**：本切片里建群的 bootstrap 成员设备是 core **内部临时创建**的（crypto 只有双人引导路径），
+因此 Welcome 绑定的是那个一次性 key package —— 外部真实设备拿着这份 Welcome 会被
+`WELCOME_NOT_AUTHORIZED` 拒绝。也就是说本轮提供的 Welcome 字节可用于**投递/取回**（GROUPS-019），
+但真正的跨设备入群还需要后续把真实被邀请者的 KeyPackage 作为入参（见 identity.md/groups.md 的 GROUPS-004 缺口）。
+
 
 
