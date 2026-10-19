@@ -614,3 +614,46 @@ shutdown_transport(handle: EndpointHandle, deadline: Duration) -> Result<Shutdow
 2. 抖动不是安全随机：splitmix64 只用于打散同时重试，不能用于密钥/令牌。
 3. 没有全局重试预算：每个 ReconnectAttempts 实例独立计数，多会话并发时的总预算由宿主聚合。
 
+## TRANSPORT-009 · 真实重连接入 Session（2026-10-19，Windows x64）
+
+策略层（`reconnect.rs`）已有确定性退避与预算；本轮把它**接入会话**：断线检测、重连计划、
+断线期间发送显式失败、重连后保留出站序号与重放窗口，并按序重放。仍不持有 socket：真实拨号由宿主完成。
+
+代码：[crates/transport/src/session.rs](../../crates/transport/src/session.rs)（纯追加）、
+[crates/transport/src/error.rs](../../crates/transport/src/error.rs)（两个新变体）；
+测试：[crates/transport/tests/reconnect_session.rs](../../crates/transport/tests/reconnect_session.rs)（4 个，含真回环 iroh）。
+
+### 公开面（`TransportSession` 追加方法）
+
+    on_disconnected(code, now_ms) -> ReconnectState        // 状态机到 Disconnected + 记录错误码与退避
+    reconnect_plan(now_ms) -> Result<ReconnectSchedule, ReconnectError>   // 预算内给出调度，超预算 RECONNECT_BUDGET_EXHAUSTED
+    mark_reconnected() -> Result<ConnectionState>          // 复位 attempts，保留出站序号与重放窗口
+    reconnect_state() -> ReconnectState                    // attempts / last_error_code / next_attempt_ms
+    ensure_sendable() -> Result<()>                        // 断线时 SESSION_DISCONNECTED
+    allocate_outgoing_frame() -> Result<u64>               // 分配序号并登记重放窗口
+    queue_frame_for_replay(seq) -> Result<()> / replay_frames() -> Vec<u64> / acknowledge_replay(seq) -> bool
+    replay_window() -> usize / set_replay_window(window) -> Result<()>   // 默认 16，上限 256
+
+新增错误变体（`TransportError`）：`SESSION_DISCONNECTED`、`REPLAY_WINDOW_FULL{limit}`。
+
+### 语义
+
+1. 断线检测：`on_disconnected` 把状态机推进到 `Disconnected`（幂等），记录稳定错误码并算好下次尝试时间；不消耗重连预算。
+2. 重连计划：`reconnect_plan` 消耗一次尝试并返回 `{attempt, delay_ms, next_attempt_ms}`；超过 `max_attempts` 返回 `ReconnectError::BudgetExhausted`（码 `RECONNECT_BUDGET_EXHAUSTED`），被拒绝的那次不计数。
+3. 断线期间发送必须显式失败：`ensure_sendable()` 返回 `SESSION_DISCONNECTED`（既有发送管线的 `SESSION_NOT_USABLE` 语义不变，两者互补）。
+4. 重连成功：`mark_reconnected()` 走 Connect/Connected 并复位 attempts，出站序号 `next_seq()` 与 `replay_frames()` 原样保留；重放顺序即入队顺序，对端确认后 `acknowledge_replay` 移出窗口。
+5. 窗口有界：默认 16（`DEFAULT_REPLAY_WINDOW`），`set_replay_window` 允许 1..=256；满时 `REPLAY_WINDOW_FULL`，且失败不会推进序号。
+
+### 证据（cargo test --offline -p chat-transport，78 passed）
+
+- disconnect_blocks_sending_and_reconnect_preserves_seq_and_replay_window：序号 0/1 入窗 → 断线后 ensure_sendable 返回 SESSION_DISCONNECTED 且序号/窗口不变 → reconnect_plan(attempt 1) → mark_reconnected 复位 attempts 并保留 next_seq=2、replay=[0,1] → 按序重放并逐个确认 → 重连后新序号 2 不断档。
+- replay_window_is_bounded_and_reports_window_full：窗口设为 2 后第三帧 REPLAY_WINDOW_FULL 且序号不前进，确认一帧后恢复；窗口 0 与 257 被拒绝。
+- reconnect_budget_exhaustion_is_explicit_after_the_default_policy：默认预算 5 次内给出调度，第 6 次显式 RECONNECT_BUDGET_EXHAUSTED，attempts 仍为 5，状态带码与下次尝试时间。
+- real_loopback_disconnect_then_reconnect_continues_sending（真回环 iroh）：未协商连接被拒（既有语义）→ 建连并发送 seq 0 → 关闭连接后 detected + ensure_sendable 失败 → 计划重连、重建连接、mark_reconnected → 序号仍为 1、窗口仍含 0 → 发送 seq 1 成功、窗口剩 [1]。
+
+### 已知限制
+
+1. `reconnect_plan` 只算调度，不重建连接、不重放帧；宿主必须先真实拨号成功再 `mark_reconnected`，再按 `replay_frames()` 逐帧重发。
+2. 重放窗口只存序号，不缓存帧内容（发送管线按帧号重发）。
+3. 会话层去重仍由帧层（STALE_FRAME / 分片重组）负责；本层不新增对端 seq 去重。
+

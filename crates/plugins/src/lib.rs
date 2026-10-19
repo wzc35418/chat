@@ -17,6 +17,7 @@
 
 pub mod error;
 pub mod host;
+pub mod install;
 pub mod limits;
 pub mod manifest;
 pub mod package;
@@ -25,6 +26,7 @@ pub mod storage;
 
 pub use error::{CODE_TABLE, PluginError, Result};
 pub use host::{DispatchPlan, PluginHost, PluginRuntime};
+pub use install::{InstallOutcome, InstallTransaction};
 pub use limits::{HARD_MAX_COUNT, HARD_MAX_LIMIT_BYTES, HARD_MAX_TIMEOUT_MS, PluginLimits};
 pub use manifest::{
     CURRENT_MANIFEST_SCHEMA, CURRENT_SDK_VERSION, ExtensionPoint, MAX_ENTRY_CLASS_BYTES,
@@ -34,7 +36,7 @@ pub use manifest::{
 pub use package::{
     MANIFEST_FILE, MAX_ENTRY_COUNT, MAX_ENTRY_NAME_BYTES, MAX_PACKAGE_BYTES,
     MAX_UNCOMPRESSED_BYTES, SPI_DIRECTORY, PackageEntryView, PackageInspection,
-    inspect_plugin_package, list_package_entries,
+    inspect_plugin_package, list_package_entries, package_manifest_json,
 };
 pub use registry::{ExtensionPointRegistry, RegistrationOutcome};
 pub use storage::{PluginStorage, StorageUsage};

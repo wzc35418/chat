@@ -705,4 +705,56 @@ const MANIFEST_FILE = "manifest.json";  SPI_DIRECTORY = "META-INF/services/"
    安全边界是"结构 + 清单 + SPI 一致"，不是加密校验。
 3. **不做签名校验**：包签名/信任链不在本轮（P4 的信任确认另行设计）。
 4. **ZIP64/多卷/加密 ZIP 未支持**：相关标记会落成 `PLUGIN_PACKAGE_CORRUPTED` / `TOO_LARGE`。
+## 插件安装事务（INSTALL，2026-10-18）
+
+真加载插件前的第二步：把"校验过的包"原子地装进宿主。新增 [crates/plugins/src/install.rs](../../crates/plugins/src/install.rs)。
+
+### 公开面
+
+~~~text
+InstallTransaction::begin(package_bytes, limits) -> Result<InstallTransaction>
+transaction.inspection() / manifest() / limits() / is_staged() / is_finished()
+transaction.stage() -> Result<()>            // 幂等；宿主仍未改变
+transaction.commit(&mut PluginHost) -> Result<InstallOutcome>
+transaction.rollback()                       // 放弃；宿主不受影响
+InstallOutcome::Installed { plugin_id, version }
+InstallOutcome::Upgraded  { plugin_id, from, to }
+~~~
+
+### 版本语义（commit 时判定）
+
+| 情形 | 结果 |
+|---|---|
+| 未安装 | `InstallOutcome::Installed` |
+| 包版本 **高于**已装 | `InstallOutcome::Upgraded { from, to }`（运行中的插件升级后**仍然运行**） |
+| 包版本 **等于**已装 | `PLUGIN_STATE_CONFLICT`（本切片不做重装） |
+| 包版本 **低于**已装 | `PLUGIN_VERSION_DOWNGRADE`（新稳定码，不做降级） |
+| 未 stage / 已结束 | `PLUGIN_PACKAGE_CORRUPTED`（事务状态自洽检查） |
+
+### 原子性
+
+- `begin` 失败（包损坏/缺清单/缺入口/SPI 不符/超限）→ **事务对象根本不存在**，宿主零写入；
+- `stage` 只改事务内部状态，宿主零写入；
+- `commit` 先停旧运行时（注销扩展点）→ 换清单 → 需要时重新 `start`；
+  任一步失败都会把宿主恢复成提交前的状态（旧清单 + 是否运行的运行态），**绝不留下新旧混合**；
+- `rollback` 后不能再提交（避免"回滚了却偷偷装进去"）。
+
+### 证据
+
+[crates/plugins/tests/install.rs](../../crates/plugins/tests/install.rs)（8 个，测试内构造最小 ZIP）：
+正常安装（暂存阶段宿主干净、提交后可见、事务结束后不可二次提交）；升级返回 from/to；
+同版本 → `PLUGIN_STATE_CONFLICT` 且版本不变；降级 → `PLUGIN_VERSION_DOWNGRADE` 且版本不变；
+commit 前 rollback → 宿主无插件、注册表无注册项且不能再提交；坏包（缺清单/非 ZIP/SPI 不符）不进事务；
+未 stage 直接 commit → 显式失败且宿主干净；运行中的插件升级后仍然运行且扩展点已重新注册。
+
+复现：`cargo test --offline -p chat-plugins --test install` → 8 passed；
+`cargo test --offline -p chat-plugins` → **54 passed**（既有 46 继续通过）。
+
+### 已知限制
+
+1. **不做重装**：同版本冲突而不是覆盖安装（需要显式卸载后重装）。
+2. **不做签名/信任确认**：包校验只覆盖结构与清单一致性（见上一节的限制）。
+3. **升级不迁移私有数据**：storage 命名空间按 plugin id 保留，版本升级不清理/不迁移 KV。
+4. **宿主状态在内存**：事务只作用于 `PluginHost`；落库安装事务（与 0010 迁移的插件表联动）留给 FFI 侧后续任务。
+
 

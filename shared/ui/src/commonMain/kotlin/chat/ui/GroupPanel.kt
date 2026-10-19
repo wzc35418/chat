@@ -160,7 +160,9 @@ fun GroupPanel(
                                 )
                             }
                             Text(
-                                "#" + summary.epoch + " · " + summary.role + " · " + summary.statusLabel(),
+                                "#" + summary.epoch + " · " + summary.role + " · " + summary.statusLabel() +
+                                    if (summary.mutedMembers > 0) " · 禁言 " + summary.mutedMembers + " 人" else "" +
+                                    if (summary.pendingProposal) " · 待打包对端提案" else "",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = Color(0xFF5F6B63),
                             )

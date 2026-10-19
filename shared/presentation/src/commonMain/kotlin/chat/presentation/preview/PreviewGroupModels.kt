@@ -75,6 +75,8 @@ data class GroupSummary(
     val dissolved: Boolean,
     val left: Boolean,
     val pending: Boolean,
+    val mutedMembers: Int = 0,
+    val pendingProposal: Boolean = false,
 )
 
 fun GroupSummary.statusLabel(): String = when {

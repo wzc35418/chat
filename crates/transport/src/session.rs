@@ -11,6 +11,9 @@ use chat_protocol::{DeviceId, REQUIRED_FEATURES, SessionCapabilities};
 
 use crate::error::{Result, TransportError};
 use crate::frame::{FRAME_HARD_MAX_BYTES, FrameLimits};
+use crate::reconnect::{
+    ReconnectAttempts, ReconnectError, ReconnectSchedule, ReconnectState, RetryPolicy,
+};
 use crate::state::{ConnectionEvent, ConnectionState, ConnectionStateMachine};
 
 /// 端点标识字节数（iroh EndpointId 为 32 字节公钥）。
@@ -21,6 +24,10 @@ pub const SESSION_HARD_MAX_QUEUE: usize = 4096;
 pub const SESSION_HARD_MAX_RECONNECT_ATTEMPTS: u32 = 100;
 /// 握手超时硬上限（60 秒）。
 pub const SESSION_HARD_MAX_HANDSHAKE_MS: u64 = 60_000;
+/// 重放窗口默认大小（未确认帧上限；TRANSPORT-009 追加）。
+pub const DEFAULT_REPLAY_WINDOW: usize = 16;
+/// 重放窗口硬上限（TRANSPORT-009 追加）。
+pub const MAX_REPLAY_WINDOW: usize = 256;
 
 /// 传输端点标识。
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -171,6 +178,15 @@ pub struct TransportSession {
     created_at_unix_ms: u64,
     limits: SessionLimits,
     machine: ConnectionStateMachine,
+    // ---- TRANSPORT-009 追加：重连调度与重放窗口（不改变既有字段语义） ----
+    /// 重连尝试状态机（计数/错误码/下次尝试时间）。
+    reconnect: ReconnectAttempts,
+    /// 重放窗口大小（未确认帧上限，默认 [`DEFAULT_REPLAY_WINDOW`]）。
+    replay_window: usize,
+    /// 待重放的出站序号（按入队顺序）。
+    replay_queue: Vec<u64>,
+    /// 下一个出站帧序号（重连后**保持**，从不断档）。
+    next_outgoing_seq: u64,
 }
 
 impl TransportSession {
@@ -202,6 +218,12 @@ impl TransportSession {
         if let Some(negotiated) = &config.negotiated {
             validate_negotiation(negotiated, config.limits)?;
         }
+        // 默认重连策略是常量且已校验；构造失败说明策略常量被改坏，按配置错误显式失败。
+        let reconnect = ReconnectAttempts::new(RetryPolicy::DEFAULT).map_err(|_| {
+            TransportError::InvalidConfig {
+                detail: "default reconnect policy is invalid",
+            }
+        })?;
         Ok(Self {
             local_endpoint: config.local_endpoint,
             local_device: config.local_device,
@@ -211,6 +233,10 @@ impl TransportSession {
             created_at_unix_ms: config.now_unix_ms,
             limits: config.limits,
             machine: ConnectionStateMachine::new(ConnectionState::Disconnected),
+            reconnect,
+            replay_window: DEFAULT_REPLAY_WINDOW,
+            replay_queue: Vec::new(),
+            next_outgoing_seq: 0,
         })
     }
 
@@ -268,6 +294,111 @@ impl TransportSession {
             return Err(TransportError::CapabilityNotNegotiated);
         }
         self.machine.apply(event)
+    }
+
+    // ---------------------------------------------------------------- TRANSPORT-009（追加）
+
+    /// 断线检测：把状态机推进到 `Disconnected`，并记录错误码与退避计划。
+    ///
+    /// 不消耗重连预算（[`Self::reconnect_plan`] 才消耗）；重复调用幂等。
+    pub fn on_disconnected(&mut self, code: &'static str, now_ms: u64) -> ReconnectState {
+        if !self.machine.state().is_terminal() {
+            let _ = self.machine.apply(ConnectionEvent::Disconnect);
+        }
+        self.reconnect.on_disconnected(code, now_ms)
+    }
+
+    /// 计算一次重连计划：预算内返回调度（延迟 + 下次尝试时间），超预算返回显式错误码。
+    ///
+    /// 只算调度，不重建连接；真实拨号由宿主完成，成功后调用 [`Self::mark_reconnected`]。
+    pub fn reconnect_plan(
+        &mut self,
+        now_ms: u64,
+    ) -> core::result::Result<ReconnectSchedule, ReconnectError> {
+        self.reconnect.next_attempt(now_ms)
+    }
+
+    /// 标记重连成功：清空尝试计数与错误，**保留**出站序号与待重放帧。
+    pub fn mark_reconnected(&mut self) -> Result<ConnectionState> {
+        self.machine.apply(ConnectionEvent::Connect)?;
+        let state = self.machine.apply(ConnectionEvent::Connected)?;
+        self.reconnect.record_success();
+        Ok(state)
+    }
+
+    /// 重连调度状态快照（attempts / last_error_code / next_attempt_ms）。
+    pub fn reconnect_state(&self) -> ReconnectState {
+        self.reconnect.state()
+    }
+
+    /// 断线期间发送必须显式失败（`SESSION_DISCONNECTED`）；可用时返回 Ok。
+    pub fn ensure_sendable(&self) -> Result<()> {
+        if self.machine.state().is_usable() {
+            return Ok(());
+        }
+        Err(TransportError::SessionDisconnected {
+            detail: "reconnect before sending frames",
+        })
+    }
+
+    /// 下一个出站帧序号（尚未分配）。
+    pub const fn next_seq(&self) -> u64 {
+        self.next_outgoing_seq
+    }
+
+    /// 分配下一个出站帧序号并登记到重放窗口（满 → `REPLAY_WINDOW_FULL`）。
+    pub fn allocate_outgoing_frame(&mut self) -> Result<u64> {
+        let seq = self.next_outgoing_seq;
+        self.queue_frame_for_replay(seq)?;
+        self.next_outgoing_seq = self.next_outgoing_seq.saturating_add(1);
+        Ok(seq)
+    }
+
+    /// 把某个出站序号登记进重放窗口（按调用顺序排队；窗口满 → `REPLAY_WINDOW_FULL`）。
+    pub fn queue_frame_for_replay(&mut self, seq: u64) -> Result<()> {
+        if self.replay_queue.len() >= self.replay_window {
+            return Err(TransportError::ReplayWindowFull {
+                limit: self.replay_window,
+            });
+        }
+        self.replay_queue.push(seq);
+        Ok(())
+    }
+
+    /// 当前待重放的出站序号（按入队顺序）。
+    pub fn replay_frames(&self) -> Vec<u64> {
+        self.replay_queue.clone()
+    }
+
+    /// 对端确认后移出重放窗口（返回是否真的移除了）。
+    pub fn acknowledge_replay(&mut self, seq: u64) -> bool {
+        match self.replay_queue.iter().position(|value| *value == seq) {
+            Some(index) => {
+                self.replay_queue.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 重放窗口大小（默认 [`DEFAULT_REPLAY_WINDOW`]）。
+    pub const fn replay_window(&self) -> usize {
+        self.replay_window
+    }
+
+    /// 调整重放窗口（1..=[`MAX_REPLAY_WINDOW`]；已排队条目按新上限截断最旧的）。
+    pub fn set_replay_window(&mut self, window: usize) -> Result<()> {
+        if window == 0 || window > MAX_REPLAY_WINDOW {
+            return Err(TransportError::InvalidConfig {
+                detail: "replay window must be within 1..=256",
+            });
+        }
+        self.replay_window = window;
+        if self.replay_queue.len() > window {
+            let excess = self.replay_queue.len() - window;
+            self.replay_queue.drain(..excess);
+        }
+        Ok(())
     }
 }
 

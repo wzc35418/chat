@@ -52,6 +52,8 @@ class NativeGroupService(
                             dissolved = it.dissolved,
                             left = it.left,
                             pending = it.pending,
+                            mutedMembers = it.mutedMembers.toInt(),
+                            pendingProposal = it.pendingProposal,
                         )
                     },
                     skipped = list.skipped.toInt(),

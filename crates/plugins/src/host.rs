@@ -214,6 +214,14 @@ impl PluginHost {
         Ok(true)
     }
 
+    /// INSTALL：把已校验清单写入/替换到宿主（**不做版本判定**，由安装事务负责）。
+    ///
+    /// 只改 manifest 表：注册项与运行时句柄由安装事务在替换前后显式处理，
+    /// 因此这里不会留下"清单换了但注册项还是旧的"的半状态。
+    pub(crate) fn replace_manifest(&mut self, manifest: PluginManifest) -> Option<PluginManifest> {
+        self.manifests.insert(manifest.id.clone(), manifest)
+    }
+
     /// 扩展点注册表（只读）。
     pub fn registry(&self) -> &ExtensionPointRegistry {
         &self.registry

@@ -375,6 +375,21 @@ pub fn inspect_plugin_package(bytes: &[u8], limits: &PluginLimits) -> Result<Pac
     })
 }
 
+/// 取出包根 `manifest.json` 的文本内容（stored 条目；安装事务据此拿强类型清单）。
+pub fn package_manifest_json(bytes: &[u8]) -> Result<String> {
+    if bytes.len() > MAX_PACKAGE_BYTES {
+        return Err(PluginError::PackageTooLarge {
+            detail: "package exceeds 8 MiB",
+        });
+    }
+    let entries = parse_central_directory(bytes)?;
+    let manifest_entry = entries
+        .iter()
+        .find(|entry| entry.name == MANIFEST_FILE)
+        .ok_or(PluginError::PackageMissingManifest)?;
+    Ok(read_text_entry(bytes, manifest_entry)?.to_owned())
+}
+
 /// 包内条目摘要（诊断/预览用；只读 central directory，不读内容）。
 pub fn list_package_entries(bytes: &[u8]) -> Result<Vec<PackageEntryView>> {
     if bytes.len() > MAX_PACKAGE_BYTES {

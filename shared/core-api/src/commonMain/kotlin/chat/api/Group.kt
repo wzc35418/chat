@@ -72,7 +72,12 @@ data class GroupSummaryEntry(
     val policyVersion: Long,
     val dissolved: Boolean,
     val left: Boolean,
+    /** 待收口线索：自己发起自移除，或有提案待打包。 */
     val pending: Boolean,
+    /** 确认成员里被禁言的人数。 */
+    val mutedMembers: Int = 0,
+    /** 是否有一条**对端**提案等本机打包。 */
+    val pendingProposal: Boolean = false,
 )
 
 data class GroupList(

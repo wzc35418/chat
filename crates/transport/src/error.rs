@@ -63,6 +63,10 @@ pub enum TransportError {
     TransportTimeout { detail: &'static str },
     /// 连接/流已关闭。
     ConnectionClosed { detail: &'static str },
+    /// 会话当前处于断线状态（重连前不能发送）。
+    SessionDisconnected { detail: &'static str },
+    /// 重放窗口已满（未确认帧过多，必须先确认或放弃）。
+    ReplayWindowFull { limit: usize },
 }
 
 impl TransportError {
@@ -91,6 +95,8 @@ impl TransportError {
             TransportError::PeerUnreachable { .. } => "PEER_UNREACHABLE",
             TransportError::TransportTimeout { .. } => "TRANSPORT_TIMEOUT",
             TransportError::ConnectionClosed { .. } => "CONNECTION_CLOSED",
+            TransportError::SessionDisconnected { .. } => "SESSION_DISCONNECTED",
+            TransportError::ReplayWindowFull { .. } => "REPLAY_WINDOW_FULL",
         }
     }
 
@@ -170,6 +176,12 @@ impl fmt::Display for TransportError {
             }
             TransportError::ConnectionClosed { detail } => {
                 write!(formatter, "connection closed: {detail}")
+            }
+            TransportError::SessionDisconnected { detail } => {
+                write!(formatter, "session is disconnected: {detail}")
+            }
+            TransportError::ReplayWindowFull { limit } => {
+                write!(formatter, "replay window is full ({limit} frames)")
             }
         }
     }

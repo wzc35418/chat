@@ -77,6 +77,13 @@ pub enum PluginError {
     PackageUnsupportedCompression { detail: &'static str },
     /// 包内文件不是合法 UTF-8（清单/SPI 必须是文本）。
     PackageNotText { detail: &'static str },
+    /// INSTALL：目标版本低于已安装版本（不做降级）。
+    VersionDowngrade {
+        /// 已安装版本。
+        from: crate::manifest::PluginVersion,
+        /// 包里的版本。
+        to: crate::manifest::PluginVersion,
+    },
 }
 
 impl PluginError {
@@ -114,6 +121,7 @@ impl PluginError {
                 "PLUGIN_PACKAGE_UNSUPPORTED_COMPRESSION"
             }
             PluginError::PackageNotText { .. } => "PLUGIN_PACKAGE_NOT_TEXT",
+            PluginError::VersionDowngrade { .. } => "PLUGIN_VERSION_DOWNGRADE",
         }
     }
 
@@ -204,6 +212,11 @@ impl fmt::Display for PluginError {
             PluginError::PackageNotText { detail } => {
                 write!(formatter, "plugin package entry is not valid UTF-8: {detail}")
             }
+            PluginError::VersionDowngrade { from, to } => write!(
+                formatter,
+                "plugin downgrade is not allowed: installed {:?} -> package {:?}",
+                from, to
+            ),
         }
     }
 }
@@ -214,7 +227,7 @@ impl std::error::Error for PluginError {}
 pub type Result<T> = core::result::Result<T, PluginError>;
 
 /// 插件层稳定码全量，供唯一性测试与文档码表使用。
-pub const CODE_TABLE: [&str; 29] = [
+pub const CODE_TABLE: [&str; 30] = [
     "INVALID_PLUGIN_PACKAGE",
     "PLUGIN_ID_CONFLICT",
     "SDK_INCOMPATIBLE",
@@ -244,6 +257,7 @@ pub const CODE_TABLE: [&str; 29] = [
     "PLUGIN_PACKAGE_DUPLICATE_ENTRY",
     "PLUGIN_PACKAGE_UNSUPPORTED_COMPRESSION",
     "PLUGIN_PACKAGE_NOT_TEXT",
+    "PLUGIN_VERSION_DOWNGRADE",
 ];
 
 #[cfg(test)]
