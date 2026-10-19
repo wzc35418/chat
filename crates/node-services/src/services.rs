@@ -22,6 +22,8 @@ use crate::limits::{
     BlobPolicy, CapabilityPolicy, GroupLogPolicy, MAX_ACCOUNT_ID_BYTES, MAX_DEVICE_ID_BYTES,
     MAX_HTTP_BODY_BYTES, CleanupPolicy, MAX_NODE_ID_BYTES, MailboxPolicy, RateLimitPolicy,
 };
+use crate::audit::{AuditEvent, AuditLog};
+use crate::config_validation::NodeConfigValidation;
 use crate::registration::{DeviceRegistration, RegisterDeviceRequest};
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_initial.sql");
@@ -80,7 +82,7 @@ impl Default for NodeAuthPolicy {
 }
 
 impl NodeAuthPolicy {
-    fn validate(&self) -> NodeResult<()> {
+    pub(crate) fn validate(&self) -> NodeResult<()> {
         if self.max_devices_per_account == 0 || self.max_devices_per_account > 32 {
             return Err(NodeError::InvalidConfig("max devices per account"));
         }
@@ -201,6 +203,8 @@ impl std::fmt::Debug for NodeService {
 /// 独立节点库上的服务对象。一个进程内单连接串行执行，事务由本对象控制。
 pub struct NodeService {
     connection: Connection,
+    /// NODE-018：内存环形审计日志（只含元数据，不含正文/密钥）。
+    audit: AuditLog,
     signing_key: SigningKey,
     node_public_key: [u8; 32],
     node_id: String,
@@ -210,12 +214,15 @@ pub struct NodeService {
 impl NodeService {
     /// 打开（或创建）独立节点库并固定节点身份。
     pub fn open(path: &Path, config: NodeServiceConfig) -> NodeResult<Self> {
+        // NODE-018：先校验配置再建库——非法配置不留下任何文件。
+        NodeConfigValidation::validate(&config)?;
         let connection = Connection::open(path)?;
         Self::initialize(connection, config)
     }
 
     /// 内存节点库，供测试与本地实验使用；语义与文件库一致。
     pub fn open_in_memory(config: NodeServiceConfig) -> NodeResult<Self> {
+        NodeConfigValidation::validate(&config)?;
         let connection = Connection::open_in_memory()?;
         Self::initialize(connection, config)
     }
@@ -244,11 +251,53 @@ impl NodeService {
         }
         Ok(Self {
             connection,
+            audit: AuditLog::default(),
             signing_key,
             node_public_key,
             node_id: config.node_id,
             policy: config.policy,
         })
+    }
+
+    // ---------------------------------------------------------------- NODE-018 审计
+
+    /// 记录一条审计事件（关闭审计时丢弃；只允许元数据）。
+    pub fn record_audit(&mut self, event: AuditEvent) {
+        self.audit.record(event);
+    }
+
+    /// 最近 `limit` 条审计事件（最旧的在前；不返回正文/密钥）。
+    pub fn audit_tail(&self, limit: usize) -> Vec<AuditEvent> {
+        self.audit.tail(limit)
+    }
+
+    /// 当前审计条数。
+    pub fn audit_len(&self) -> usize {
+        self.audit.len()
+    }
+
+    /// 审计是否开启。
+    pub const fn audit_enabled(&self) -> bool {
+        self.audit.enabled()
+    }
+
+    /// 打开/关闭审计。
+    ///
+    /// 关闭时若策略允许**跨设备撤销**（`capability.revoke.self_only = false`）则拒绝：
+    /// 放宽撤销必须留下审计依据，否则等于没有追责链路（`INVALID_CONFIG`）。
+    pub fn set_audit_enabled(&mut self, enabled: bool) -> NodeResult<()> {
+        if !enabled && !self.policy.capability.revoke.self_only {
+            return Err(NodeError::InvalidConfig(
+                "relaxed capability revocation requires the audit trail",
+            ));
+        }
+        self.audit.set_enabled(enabled);
+        Ok(())
+    }
+
+    /// 清空审计记录（保留容量与开关；运维/测试用）。
+    pub fn clear_audit(&mut self) {
+        self.audit.clear();
     }
 
     /// 节点标识。

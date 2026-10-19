@@ -3,9 +3,11 @@
 //! 群日志（NODE-005~008）在 group，密文信箱（NODE-009~011）在 mailbox。
 //! P0 isolated SQLite acceptance experiment is in p0_accept; product node remains incomplete.
 #![forbid(unsafe_code)]
+pub mod audit;
 pub mod auth;
 pub mod blob;
 pub mod canonical;
+pub mod config_validation;
 pub mod capability;
 pub mod cleanup;
 pub mod error;

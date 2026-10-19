@@ -756,5 +756,45 @@ commit 前 rollback → 宿主无插件、注册表无注册项且不能再提�
 2. **不做签名/信任确认**：包校验只覆盖结构与清单一致性（见上一节的限制）。
 3. **升级不迁移私有数据**：storage 命名空间按 plugin id 保留，版本升级不清理/不迁移 KV。
 4. **宿主状态在内存**：事务只作用于 `PluginHost`；落库安装事务（与 0010 迁移的插件表联动）留给 FFI 侧后续任务。
+## 插件安装落库事务（FFI + 0010 插件表，2026-10-18）
+
+内存安装事务（上一节）只管宿主；本轮把"安装"变成**可重开仍然生效**的落库操作。
+
+### PluginsFfi（持久化模式）
+
+~~~text
+PluginsFfi.install_package(bytes, trusted) -> InstallOutcomeFfi
+InstallOutcomeFfi { plugin_id, version, upgraded_from: Option<String> }
+PluginInfoFfi     { plugin_id, running, extension_points, version, manifest: ManifestViewFfi }
+~~~
+
+- `trusted == false` → `PLUGIN_TRUST_REQUIRED`（**库与宿主都不变**）；
+- 包结构/清单/SPI 校验失败 → 对应 `PLUGIN_PACKAGE_*` 码（事务没建立，零写入）；
+- 版本判定读**库里已装行**：同版本 → `PLUGIN_STATE_CONFLICT`、更低 → `PLUGIN_VERSION_DOWNGRADE`；
+- 通过后：① 一次 storage 事务 upsert 0010 `plugins` 行；② 再提交到内存宿主；
+  宿主提交失败 → 把库恢复成提交前那一行（升级）或删掉新行（首次安装）；
+- 未持久化对象调用 → `INVALID_STATE_TRANSITION`（纯内存宿主没有库可写）。
+
+`list_plugins` 现在同时给出 `version` 与清单公开投影（`ManifestViewFfi`），因此**重开对象后**
+也能看到刚安装的版本与 manifest。
+
+### 证据
+
+[crates/ffi/tests/plugins_install_persist.rs](../../crates/ffi/tests/plugins_install_persist.rs)（5 个，真临时加密库）：
+安装 → 列表立刻可见版本/清单 → 重开仍可见且库里只有 1 行；升级返回 `upgraded_from="1.0.0"`、
+重开一致且仍 1 行；未信任 `PLUGIN_TRUST_REQUIRED` / 坏包 `PLUGIN_PACKAGE_CORRUPTED` /
+降级 `PLUGIN_VERSION_DOWNGRADE` 三种失败后版本与库都不变；同版本连续两次 →
+`PLUGIN_STATE_CONFLICT` 且库里只剩一行；纯内存对象调用 → `INVALID_STATE_TRANSITION`。
+
+复现：`cargo test --offline -p chat-ffi --test plugins_install_persist` → 5 passed；
+`cargo test --offline -p chat-ffi` → **66 passed**（既有 61 继续通过）。
+
+### 已知限制
+
+1. **trusted 只是一个布尔开关**：本轮没有签名/信任链证据（P4 的信任确认另行设计）；
+2. **库与宿主不是同一个物理事务**：库先写、宿主后提交，宿主失败时用补偿写回（本进程内可见的原子性，
+   进程崩溃在两步之间仍可能留下"库有行、宿主未加载"——重开时会重新加载，属可恢复状态）；
+3. 升级不迁移插件私有 KV（storage 按 plugin id 保留）。
+
 
 

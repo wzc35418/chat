@@ -675,4 +675,27 @@ GET  /v1/mailbox、GET /v1/groups/{id}/log      // 强制模式下也要带未�
   打开强制后无令牌 401 `AUTH_REQUIRED`；带未撤销令牌 200；撤销后 403 `CAPABILITY_REVOKED`。
 - 复现：`cargo test --offline -p chat-node-api` → 24 passed（既有 22 继续通过）。
 
+## NODE-018 · 请求标识与请求级审计（2026-10-19，Windows x64）
+
+每个 HTTP 请求都由中间件生成/透传一个请求标识，并在响应头与审计里贯通：
+
+- 请求头 `x-chat-request-id`：调用方给的值若为 1..=64 字节可打印 ASCII 则原样复用，否则服务端派生 `req-<16 hex>`；
+- 响应头 `x-chat-request-id`：**所有**响应都带（含错误响应）；
+- 审计：每个请求写一条 `{kind: "http", outcome: ok|denied|failed, request_id, at_ms}`；
+  撤销令牌额外写一条 `{kind: "capability_revoke", device_id, outcome, code?, request_id}`（成功/失败都记）。
+
+代码：[crates/node-api/src/handlers.rs](../../crates/node-api/src/handlers.rs)（`request_audit_layer`）、
+[crates/node-api/src/state.rs](../../crates/node-api/src/state.rs)（`RequestId` / `next_request_id` / `record_http_audit`）；
+测试：[crates/node-api/tests/http_contract.rs](../../crates/node-api/tests/http_contract.rs)。
+
+### 证据（`cargo test --offline -p chat-node-api`，31 passed）
+
+- `http_contract::responses_carry_a_request_id_that_is_recorded_in_the_audit_tail`：无请求头时响应带
+  `req-...` 且审计里能找到同一 id（outcome = ok）；调用方透传 `x-chat-request-id` 时响应原样回显、
+  审计使用同一 id。
+
+### 已知限制
+
+1. 中间件只记录 HTTP 级结果；业务级细节（哪些对象、正文摘要）不记录（隐私约束）。
+2. 请求标识由调用方可选提供，节点不做跨节点唯一性保证（只保证本节点内可检索）。
 

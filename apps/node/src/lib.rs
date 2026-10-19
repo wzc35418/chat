@@ -75,6 +75,8 @@ pub struct NodeConfig {
     pub expect_public_key: Option<[u8; 32]>,
     /// CAP 包：附件块端点是否强制能力令牌（默认关闭以保持旧客户端可用）。
     pub require_capability: bool,
+    /// NODE-018：是否记录审计（默认开；`--no-audit` / `CHAT_NODE_AUDIT=0` 关闭）。
+    pub audit: bool,
 }
 
 const DEFAULT_BIND: &'static str = "127.0.0.1:8080";
@@ -88,6 +90,7 @@ const ENV_INIT_SEED: &'static str = "CHAT_NODE_INIT_SEED";
 const ENV_EXPECT_PUBLIC_KEY: &'static str = "CHAT_NODE_EXPECT_PUBLIC_KEY";
 const ENV_REQUIRE_CAPABILITY: &'static str = "CHAT_NODE_CAPABILITY_REQUIRED";
 const ENV_CAPABILITY_MAX_TTL: &'static str = "CHAT_NODE_CAPABILITY_MAX_TTL_SECONDS";
+const ENV_AUDIT: &'static str = "CHAT_NODE_AUDIT";
 
 impl NodeConfig {
     /// 解析命令行参数与环境变量（命令行优先）。
@@ -113,6 +116,14 @@ impl NodeConfig {
             ))?,
         };
 
+        // NODE-018：审计默认开启，只有显式关闭才关闭（与能力令牌开关一样不做“尽力猜测”）。
+        let mut audit = match env(ENV_AUDIT).as_deref() {
+            None => true,
+            Some(value) => parse_flag(value).ok_or(NodeStartError::Config(
+                "CHAT_NODE_AUDIT must be one of 1/true/yes/on/0/false/no/off",
+            ))?,
+        };
+
         let mut arguments = args.into_iter();
         while let Some(argument) = arguments.next() {
             let mut take_value = |name: &'static str| -> Result<String, NodeStartError> {
@@ -130,6 +141,7 @@ impl NodeConfig {
                 }
                 "--allow-public-bind" => allow_public_bind = true,
                 "--require-capability" => require_capability = true,
+                "--no-audit" => audit = false,
                 "--init-seed" => init_seed = true,
                 "--help" | "-h" => return Err(NodeStartError::Config("usage: chat-node --bind <addr> --data-dir <dir> --seed-file <file> [--node-id <id>] [--expect-public-key <hex>] [--allow-public-bind] [--init-seed] [--require-capability]")),
                 other => {
@@ -185,6 +197,7 @@ impl NodeConfig {
             init_seed,
             expect_public_key,
             require_capability,
+            audit,
         })
     }
 
@@ -314,14 +327,16 @@ pub fn spawn_node(config: NodeConfig) -> Result<RunningNode, NodeStartError> {
 
     // 3. 打开服务：迁移、节点身份固定、策略校验都在这里完成。
     let policy = config.rate_limit_policy()?;
-    let service = NodeService::open(
-        &database_path,
-        NodeServiceConfig {
-            node_id: node_id.clone(),
-            signing_seed: seed,
-            policy,
-        },
-    )?;
+    let service_config = NodeServiceConfig {
+        node_id: node_id.clone(),
+        signing_seed: seed,
+        policy,
+    };
+    // NODE-018：建库之前先做完整配置校验，非法配置不留下任何文件。
+    chat_node_services::config_validation::NodeConfigValidation::validate(&service_config)?;
+    let mut service = NodeService::open(&database_path, service_config)?;
+    // 审计开关：默认开；--no-audit 关闭（放宽撤销策略下关闭会被服务层拒绝）。
+    service.set_audit_enabled(config.audit)?;
     // 种子已经进入服务内部，清零本地副本。
     seed.fill(0);
 
@@ -442,6 +457,17 @@ mod tests {
         None
     }
 
+    /// 只让给定变量返回固定值，其余为缺失。
+    fn env_with(name: &'static str, value: &'static str) -> impl Fn(&str) -> Option<String> {
+        move |requested: &str| {
+            if requested == name {
+                Some(value.to_owned())
+            } else {
+                None
+            }
+        }
+    }
+
     #[test]
     fn config_requires_a_seed_file_and_valid_bind() {
         let error = NodeConfig::from_args_and_env(args(&[]), no_env)
@@ -516,6 +542,40 @@ mod tests {
         assert_eq!(parse_flag("On"), Some(true));
         assert_eq!(parse_flag("OFF"), Some(false));
         assert_eq!(parse_flag("2"), None);
+    }
+
+    /// NODE-018：审计默认开启，只有显式 `--no-audit` / `CHAT_NODE_AUDIT=0` 才关闭。
+    #[test]
+    fn audit_is_enabled_by_default_and_can_be_turned_off_explicitly() {
+        let no_env = |_: &str| None;
+        let config = NodeConfig::from_args_and_env(args(&["--seed-file", "seed.bin"]), no_env)
+            .expect("minimal config");
+        assert!(config.audit, "audit is on by default");
+        let config = NodeConfig::from_args_and_env(
+            args(&["--seed-file", "seed.bin", "--no-audit"]),
+            no_env,
+        )
+        .expect("--no-audit");
+        assert!(!config.audit);
+        let config = NodeConfig::from_args_and_env(
+            args(&["--seed-file", "seed.bin"]),
+            env_with(ENV_AUDIT, "0"),
+        )
+        .expect("env off");
+        assert!(!config.audit);
+        let config = NodeConfig::from_args_and_env(
+            args(&["--seed-file", "seed.bin"]),
+            env_with(ENV_AUDIT, "1"),
+        )
+        .expect("env on");
+        assert!(config.audit);
+        // 拼写错误不当成“关闭”。
+        let error = NodeConfig::from_args_and_env(
+            args(&["--seed-file", "seed.bin"]),
+            env_with(ENV_AUDIT, "maybe"),
+        )
+        .expect_err("bad audit flag value must fail startup");
+        assert!(matches!(error, NodeStartError::Config(_)));
     }
 
     #[test]
@@ -624,6 +684,7 @@ mod tests {
             init_seed: false,
             expect_public_key: None,
             require_capability: false,
+            audit: true,
         };
         let running = spawn_node(config.clone()).expect("node starts");
         assert!(running.node_id.starts_with("node-"));

@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path as UrlPath, Request, State};
+use axum::http::HeaderValue;
+use axum::middleware::Next;
 use axum::http::{HeaderMap, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::http::header::CONTENT_TYPE;
@@ -15,6 +17,7 @@ use axum::{Json, Router};
 use chat_node_services::auth::{ChallengePurpose, RequestMeta};
 use chat_node_services::services::AuthenticatedDevice;
 use chat_node_services::canonical::{hex_encode, sha256};
+use chat_node_services::audit::AuditOutcome;
 use chat_node_services::capability::CapabilityScope;
 use chat_node_services::limits::{MAX_BLOB_CHUNK_BODY_BYTES, MAX_HTTP_BODY_BYTES};
 use serde::de::DeserializeOwned;
@@ -31,7 +34,7 @@ use crate::dto::{
     StoreMailboxItemRequestDto, UploadSessionResponseDto, parse_chunk_index,
 };
 use crate::error::ApiError;
-use crate::state::AppState;
+use crate::state::{AppState, REQUEST_ID_HEADER, RequestId};
 
 /// 日志分页默认条数（服务层再按策略上限校验）。
 const DEFAULT_LOG_PAGE_LIMIT: u32 = 50;
@@ -43,6 +46,8 @@ const DEFAULT_MAILBOX_PAGE_LIMIT: u32 = 20;
 /// 公开端点只有挑战签发；其余端点都要求 API-003 已登记设备鉴权。
 /// 逐 IP 限流（API-005）与事件套接字（API-009）尚未在本阶段实现。
 pub fn build_router(state: AppState) -> Router {
+    // NODE-018：每个请求生成/透传 x-chat-request-id，并把结果写进审计。
+    let audit_state = state.clone();
     Router::new()
         // 健康检查：匿名、不鉴权、不限流，只返回公开身份（不含任何秘密）。
         .route("/v1/health", get(health))
@@ -74,7 +79,49 @@ pub fn build_router(state: AppState) -> Router {
             post(complete_blob_upload),
         )
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .layer(axum::middleware::from_fn_with_state(
+            audit_state,
+            request_audit_layer,
+        ))
         .with_state(state)
+}
+
+/// NODE-018：请求级审计中间件。
+///
+/// 语义：
+/// - 生成或透传 `x-chat-request-id`（调用方给的是 1..=64 字节可打印 ASCII 才复用，否则派生）；
+/// - 请求进入前放进 extensions（handler 可取出写进审计）；
+/// - 响应统一带 `x-chat-request-id` 头；
+/// - 记录一条 `http` 审计：结果按状态码分类，错误码能从响应扩展里取到就带上（只记元数据）。
+pub async fn request_audit_layer(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let provided = request
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let request_id = state.next_request_id(provided.as_deref());
+    request
+        .extensions_mut()
+        .insert(RequestId(request_id.clone()));
+    let mut response = next.run(request).await;
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+    let status = response.status();
+    let outcome = if status.is_success() {
+        AuditOutcome::Ok
+    } else if status.as_u16() == 401 || status.as_u16() == 403 || status.as_u16() == 404 {
+        AuditOutcome::Denied
+    } else {
+        AuditOutcome::Failed
+    };
+    let now_ms = state.now().saturating_mul(1_000);
+    state.record_http_audit(&request_id, outcome, None, now_ms);
+    response
 }
 
 fn ensure_body_bounded(state: &AppState, length: usize) -> Result<(), ApiError> {
@@ -417,6 +464,7 @@ pub async fn issue_capability(
 pub async fn revoke_capability(
     State(state): State<AppState>,
     UrlPath(token_id): UrlPath<String>,
+    Extension(request_id): Extension<RequestId>,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
@@ -435,10 +483,27 @@ pub async fn revoke_capability(
         .and_then(|seconds| seconds.checked_mul(1_000))
         .ok_or_else(|| ApiError::invalid_request("node clock is out of range"))?;
     // CAP-AUTHZ：撤销按**调用方设备**授权（默认只允许签发设备撤销自己的令牌；跨设备 → 403）。
-    let revoked = state.with_service(|service| {
-        service.revoke_capability(&token_id, &actor.device_id, &reason, now_ms)
+    let outcome = state.with_service(|service| {
+        let result = service.revoke_capability(&token_id, &actor.device_id, &reason, now_ms);
+        // NODE-018：撤销是敏感动作，无论成败都记一条只含元数据的审计。
+        let mut event = chat_node_services::audit::AuditEvent::new(
+            "capability_revoke",
+            now_ms,
+            if result.is_ok() {
+                AuditOutcome::Ok
+            } else {
+                AuditOutcome::Denied
+            },
+        )
+        .with_device(actor.device_id.clone())
+        .with_request_id(request_id.0.clone());
+        if let Err(error) = &result {
+            event = event.with_code(error.code());
+        }
+        service.record_audit(event);
+        result
     })?;
-    Ok(Json(RevokeCapabilityResponseDto::new(token_id, revoked)).into_response())
+    Ok(Json(RevokeCapabilityResponseDto::new(token_id, outcome)).into_response())
 }
 
 /// CAP-REV：强制模式下的**读端点**能力门（信箱/日志）。

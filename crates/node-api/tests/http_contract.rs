@@ -28,6 +28,8 @@ const SIGNATURE_HEADER: &str = "x-chat-signature";
 
 struct Node {
     address: String,
+    /// 与路由共享的状态句柄：用于断言审计记录（只读）。
+    state: AppState,
     clock: Arc<FixedClock>,
     supervisor: SigningKey,
     account_id: String,
@@ -62,9 +64,11 @@ async fn start_node(max_devices: usize, max_request_body_bytes: usize) -> Node {
     let node_public_key = service.node_public_key();
     let clock = Arc::new(FixedClock::new(START));
     let state = AppState::new(service, clock.clone());
+    let probe = state.clone();
     let address = spawn(build_router(state)).await;
     Node {
         address,
+        state: probe,
         clock,
         supervisor: SigningKey::from_bytes(&[11_u8; 32]),
         account_id: "acct-http-1".into(),
@@ -75,6 +79,7 @@ async fn start_node(max_devices: usize, max_request_body_bytes: usize) -> Node {
 
 struct HttpResponse {
     status: u16,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -86,6 +91,14 @@ impl HttpResponse {
 
     fn error_code(&self) -> String {
         self.json()["error"]["code"].as_str().unwrap_or_default().to_owned()
+    }
+
+    /// 按名字读响应头（大小写不敏感）。
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
     }
 }
 
@@ -125,8 +138,15 @@ fn parse_response(raw: &[u8]) -> HttpResponse {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
         .expect("status code");
+    let headers: Vec<(String, String)> = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+        .collect();
     HttpResponse {
         status,
+        headers,
         body: raw[header_end + 4..].to_vec(),
     }
 }
@@ -460,4 +480,40 @@ async fn malformed_and_oversized_requests_are_rejected() {
     assert_eq!(response.status, 405);
     let response = http(&node.address, "POST", "/v1/unknown", &[], b"{}").await;
     assert_eq!(response.status, 404);
+}
+
+/// NODE-018：响应带 `x-chat-request-id`，并写进审计（含调用方透传的 id）。
+#[tokio::test]
+async fn responses_carry_a_request_id_that_is_recorded_in_the_audit_tail() {
+    let node = start_node(4, 64 * 1024).await;
+    // 第一次：没有请求头 → 服务端派生一个 id，并回写响应头、写进审计。
+    let response = http(&node.address, "GET", "/v1/health", &[], b"").await;
+    assert_eq!(response.status, 200);
+    let generated = response
+        .header("x-chat-request-id")
+        .expect("the response carries a request id")
+        .to_owned();
+    assert!(generated.starts_with("req-"), "unexpected id: {generated}");
+    let tail = node.state.audit_tail(16);
+    assert!(
+        tail.iter().any(|event| {
+            event.kind == "http"
+                && event.request_id.as_deref() == Some(generated.as_str())
+                && event.outcome.as_str() == "ok"
+        }),
+        "the request id must appear in the audit tail: {tail:?}"
+    );
+    // 第二次：调用方透传 id → 响应原样回显，审计里也用同一个 id。
+    let headers = [("x-chat-request-id".to_owned(), "req-client-42".to_owned())];
+    let response = http(&node.address, "GET", "/v1/health", &headers, b"").await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("x-chat-request-id"), Some("req-client-42"));
+    let tail = node.state.audit_tail(16);
+    assert!(
+        tail.iter()
+            .any(|event| event.request_id.as_deref() == Some("req-client-42")),
+        "the propagated id must be recorded: {tail:?}"
+    );
+    // 审计只含元数据：没有 token/正文类字段（结构上就没有这些字段）。
+    assert!(tail.iter().all(|event| !event.kind.is_empty()));
 }

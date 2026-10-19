@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chat_node_services::audit::{AuditEvent, AuditOutcome};
 use chat_node_services::error::{NodeError, NodeResult};
 use chat_node_services::cleanup::CleanupStats;
 use chat_node_services::limits::RateLimitPolicy;
@@ -64,10 +65,21 @@ impl Clock for FixedClock {
     }
 }
 
+/// 请求标识（由中间件生成/校验，写进响应头与审计）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestId(pub String);
+
+/// 请求标识请求头的名字。
+pub const REQUEST_ID_HEADER: &str = "x-chat-request-id";
+/// 请求标识的最大长度。
+pub const MAX_REQUEST_ID_BYTES: usize = 64;
+
 /// axum 共享状态：单连接节点服务 + 时钟 + HTTP 层限流器。
 #[derive(Clone)]
 pub struct AppState {
     service: Arc<Mutex<NodeService>>,
+    /// 请求标识计数器（无请求头时用于派生稳定 id）。
+    request_counter: Arc<AtomicU64>,
     clock: Arc<dyn Clock>,
     rate_limiter: Arc<RateLimiter>,
     /// CAP 包：能力令牌强制开关（启动时从环境变量读，可被显式设置覆盖）。
@@ -96,6 +108,7 @@ impl AppState {
             capability_required: Arc::new(std::sync::atomic::AtomicBool::new(
                 capability_required_from_env(),
             )),
+            request_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -112,6 +125,7 @@ impl AppState {
             capability_required: Arc::new(std::sync::atomic::AtomicBool::new(
                 capability_required_from_env(),
             )),
+            request_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -133,6 +147,50 @@ impl AppState {
     }
 
     /// 用系统时钟建立状态（生产路径）。
+    /// 生成/校验请求标识：调用方提供的 id 必须 1..=64 字节的可打印 ASCII，否则派生新 id。
+    pub fn next_request_id(&self, provided: Option<&str>) -> String {
+        if let Some(value) = provided {
+            let trimmed = value.trim();
+            if !trimmed.is_empty()
+                && trimmed.len() <= MAX_REQUEST_ID_BYTES
+                && trimmed.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+            {
+                return trimmed.to_owned();
+            }
+        }
+        let next = self.request_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("req-{next:016x}")
+    }
+
+    /// 记录一条审计事件（走服务层；只含元数据）。
+    pub fn record_audit(&self, event: AuditEvent) {
+        let _ = self.with_service(|service| {
+            service.record_audit(event);
+            Ok(())
+        });
+    }
+
+    /// 最近 `limit` 条审计事件。
+    pub fn audit_tail(&self, limit: usize) -> Vec<AuditEvent> {
+        self.with_service(|service| Ok(service.audit_tail(limit)))
+            .unwrap_or_default()
+    }
+
+    /// 记录一条 HTTP 层审计（结果分类 + 可选错误码）。
+    pub fn record_http_audit(
+        &self,
+        request_id: &str,
+        outcome: AuditOutcome,
+        code: Option<&'static str>,
+        at_ms: u64,
+    ) {
+        let mut event = AuditEvent::new("http", at_ms, outcome).with_request_id(request_id);
+        if let Some(code) = code {
+            event = event.with_code(code);
+        }
+        self.record_audit(event);
+    }
+
     pub fn with_system_clock(service: NodeService) -> Self {
         Self::new(service, Arc::new(SystemClock))
     }

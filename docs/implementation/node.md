@@ -944,3 +944,53 @@ purge_expired_revocations(now_ms) -> u64    // 保留期 REVOCATION_RETENTION_SE
 2. **撤销表不复制到其它节点**：多节点部署时撤销只在当前节点生效（跨节点撤销名单同步未做）。
 3. **不校验撤销发起者的"是否该管这个令牌"**：只要求设备鉴权；谁能撤销谁的令牌由上层授权策略决定（当前未限制）。
 
+## NODE-018 · 启动配置校验与审计日志（2026-10-19，Windows x64）
+
+节点原先只有零散的策略校验（`NodeAuthPolicy::validate`），且校验发生在**打开数据库之后**；
+审计也完全没有。本轮补上：启动前完整校验（不建库）+ 结构化内存审计 + 请求标识贯通（见 api.md）。
+
+代码：[crates/node-services/src/config_validation.rs](../../crates/node-services/src/config_validation.rs)、
+[crates/node-services/src/audit.rs](../../crates/node-services/src/audit.rs)、
+[crates/node-services/src/services.rs](../../crates/node-services/src/services.rs)；
+测试：[crates/node-services/tests/audit_config.rs](../../crates/node-services/tests/audit_config.rs)（4 个）。
+
+### 启动前校验（`NodeConfigValidation::validate`）
+
+1. `node_id`：1..=128 字节、可打印 ASCII（无空格/控制字符）；
+2. `signing_seed`：不能全零（弱种子）；
+3. `policy`：复用 `NodeAuthPolicy::validate` 的逐项范围校验；
+4. TTL/配额上下限：能力 TTL 1..=3600、信箱/群日志/附件配额必须为正；
+5. capability 策略一致性：强制模式（`required`）下 TTL 不得短于 60 秒。
+
+`NodeService::open` / `open_in_memory` 在**创建连接之前**调用它，因此非法配置返回 `INVALID_CONFIG`
+且**不会留下数据库文件**（`apps/node` 启动路径也在建库前显式调用一次）。
+
+### 审计（`AuditEvent` + `AuditLog`）
+
+    AuditEvent { kind, at_ms, device_id?, group_id?, outcome, code?, request_id? }
+    outcome = ok | denied | failed
+    NodeService::record_audit(event) / audit_tail(limit) / audit_len() / audit_enabled()
+    NodeService::set_audit_enabled(bool) -> NodeResult<()> / clear_audit()
+
+- 环形缓冲上限 `AUDIT_CAPACITY = 1024`，超过丢最旧的；`tail(limit)` 只返回最近 `limit` 条；
+- **只含元数据**：没有正文、令牌、密钥或凭据材料字段；
+- 可在运行期关闭（关闭后不再记录，既有记录仍可读）；**放宽跨设备撤销策略时禁止关闭**
+  （`policy.capability.revoke.self_only = false` + 关闭审计 → `INVALID_CONFIG`，保证追责链路）。
+- `apps/node`：默认开启审计，`--no-audit` 或 `CHAT_NODE_AUDIT=0` 关闭（拼写错误 → 启动失败）。
+
+### 证据（`cargo test --offline -p chat-node-services`，107 passed）
+
+- `audit_config::invalid_config_is_rejected_before_the_database_is_created`：带空格的 node_id 与全零种子都被拒
+  （`INVALID_CONFIG`）且**库文件不存在**；合法配置才建库。
+- `audit_config::config_validation_catches_policy_range_problems`：TTL 为 0、强制模式 TTL < 60s 都被拒。
+- `audit_config::audit_events_carry_metadata_and_the_ring_is_bounded`：字段（kind/at_ms/device/group/outcome/code/request_id）
+  正确；写满 1024 后只保留最新、`tail(3)` 只返回 3 条。
+- `audit_config::audit_can_be_disabled_and_relaxed_revocation_requires_it`：关闭后不再记录但既有记录可读；
+  放宽撤销策略下关闭审计被拒。
+
+### 已知限制
+
+1. 审计只在**内存**：进程重启即丢；持久化审计（WORM/外部日志）不在本轮范围。
+2. 没有按种类/设备的过滤查询，只有 `tail(limit)`；需要结构化检索时应接外部日志。
+3. 时间由宿主时钟（`AppState::now`）给出，固定时钟测试下时间戳是可控的（非安全时间）。
+

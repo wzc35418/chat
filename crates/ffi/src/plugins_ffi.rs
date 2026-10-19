@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use chat_plugins::{
-    DispatchPlan, ExtensionPoint, PluginHost, PluginId, PluginLimits, PluginManifest, PluginRuntime,
-    parse_manifest,
+    DispatchPlan, ExtensionPoint, PluginHost, PluginId, PluginLimits, PluginManifest,
+    PluginRuntime, PluginVersion, parse_manifest,
 };
 use chat_protocol::OperationId;
 use chat_storage::formal::{
@@ -119,6 +119,17 @@ pub struct DispatchPlanViewFfi {
     pub timeout_ms: u64,
 }
 
+/// 安装事务的结果（纯数据）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct InstallOutcomeFfi {
+    /// 插件 ID。
+    pub plugin_id: String,
+    /// 装上的版本（MAJOR.MINOR.PATCH）。
+    pub version: String,
+    /// 升级时是旧版本；首次安装为 None。
+    pub upgraded_from: Option<String>,
+}
+
 /// 插件包结构校验结果（PLUGINS：不执行任何插件代码）。
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct PackageViewFfi {
@@ -149,6 +160,29 @@ pub struct PluginInfoFfi {
     pub running: bool,
     /// 可注册扩展点。
     pub extension_points: Vec<String>,
+    /// 已安装版本（`MAJOR.MINOR.PATCH`）。
+    pub version: String,
+    /// 已安装清单的公开投影（重开对象后同样可见）。
+    pub manifest: ManifestViewFfi,
+}
+
+/// 清单缺失时的占位投影（正常路径不会出现：host 的已装列表明细一致）。
+fn empty_manifest_view() -> ManifestViewFfi {
+    ManifestViewFfi {
+        plugin_id: String::new(),
+        version: String::new(),
+        sdk_version: 0,
+        platform: String::new(),
+        entry_class: String::new(),
+        capabilities: Vec::new(),
+        permissions: Vec::new(),
+        extension_points: Vec::new(),
+    }
+}
+
+/// 版本文本（MAJOR.MINOR.PATCH）。
+fn version_text(version: PluginVersion) -> String {
+    format!("{}.{}.{}", version.major, version.minor, version.patch)
 }
 
 fn manifest_view(manifest: &PluginManifest) -> ManifestViewFfi {
@@ -402,6 +436,88 @@ impl PluginsFfi {
         Ok(plugin_id)
     }
 
+    /// PLUGINS：安装插件包（持久化模式）——校验 + 落库 + 内存宿主登记，**原子**。
+    ///
+    /// 顺序与回滚：
+    /// 1. `InstallTransaction::begin` 做包结构/清单/SPI 校验（失败零写入）；
+    /// 2. 未信任（`trusted == false`）→ `PLUGIN_TRUST_REQUIRED`（库与宿主都不变）；
+    /// 3. 版本判定（读库里已装行）：同版本 → `PLUGIN_STATE_CONFLICT`、更低 → `PLUGIN_VERSION_DOWNGRADE`；
+    /// 4. **一次 storage 事务**写 0010 `plugins` 行（`upsert_plugin`）；
+    /// 5. 再提交到内存宿主；宿主提交失败 → 把库恢复成提交前那一行（升级）或删掉新行（首次安装）。
+    pub fn install_package(
+        &self,
+        bytes: Vec<u8>,
+        trusted: bool,
+    ) -> Result<InstallOutcomeFfi, FfiError> {
+        let mut inner = self.lock()?;
+        if inner.closed {
+            return Err(core_closed());
+        }
+        if !trusted {
+            return Err(FfiError::Store {
+                code: "PLUGIN_TRUST_REQUIRED".to_owned(),
+                reason: "the user has not trusted this plugin package".to_owned(),
+            });
+        }
+        let limits = inner.limits;
+        let mut transaction =
+            chat_plugins::InstallTransaction::begin(&bytes, limits).map_err(failure)?;
+        let manifest_json = chat_plugins::package_manifest_json(&bytes).map_err(failure)?;
+        let manifest = transaction.manifest().clone();
+        let plugin_id = manifest.id.as_str().to_owned();
+        let new_version_text = version_text(manifest.version);
+
+        let Inner { host, store, .. } = &mut *inner;
+        let Some(store) = store.as_mut() else {
+            return Err(crate::local_store::FfiError::Store {
+                code: "INVALID_STATE_TRANSITION".to_owned(),
+                reason: "install_package requires the persistent plugin host".to_owned(),
+            });
+        };
+        // 版本基线取自**库**里的已装行（重开后仍然一致）。
+        let rows = store.load_plugins().map_err(storage_failure)?;
+        let previous = rows.into_iter().find(|row| row.id == plugin_id);
+        let upgraded_from = match &previous {
+            None => None,
+            Some(row) => {
+                let installed = parse_manifest(&row.manifest_json, &limits).map_err(failure)?;
+                if installed.version == manifest.version {
+                    return Err(failure(chat_plugins::PluginError::RegistrationConflict));
+                }
+                if installed.version > manifest.version {
+                    return Err(failure(chat_plugins::PluginError::VersionDowngrade {
+                        from: installed.version,
+                        to: manifest.version,
+                    }));
+                }
+                Some(version_text(installed.version))
+            }
+        };
+        transaction.stage().map_err(failure)?;
+        // ① 落库：单条 upsert 就是一个 storage 事务。
+        store
+            .upsert_plugin(&plugin_id, &manifest_json, STATE_INSTALLED)
+            .map_err(storage_failure)?;
+        // ② 内存宿主提交；失败则把库恢复成提交前的样子。
+        match transaction.commit(host) {
+            Ok(_) => Ok(InstallOutcomeFfi {
+                plugin_id,
+                version: new_version_text,
+                upgraded_from,
+            }),
+            Err(error) => {
+                if let Some(row) = &previous {
+                    // 升级失败：把旧行写回去（同一 upsert 语义）。
+                    let _ = store.upsert_plugin(&row.id, &row.manifest_json, &row.state);
+                } else {
+                    // 首次安装失败：删掉刚写入的行。
+                    let _ = store.delete_plugin(&plugin_id);
+                }
+                Err(failure(error))
+            }
+        }
+    }
+
     /// 启动插件（签发运行时句柄）。
     pub fn start(&self, plugin_id: String) -> Result<(), FfiError> {
         let plugin = Self::plugin_id(&plugin_id)?;
@@ -589,10 +705,15 @@ impl PluginsFfi {
                             .collect()
                     })
                     .unwrap_or_default();
+                let manifest = inner.host.manifest(&plugin);
                 PluginInfoFfi {
                     plugin_id: plugin.as_str().to_owned(),
                     running,
                     extension_points,
+                    version: manifest.map(|view| version_text(view.version)).unwrap_or_default(),
+                    manifest: manifest
+                        .map(manifest_view)
+                        .unwrap_or_else(empty_manifest_view),
                 }
             })
             .collect())

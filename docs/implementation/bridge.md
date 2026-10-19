@@ -939,5 +939,19 @@ PackageViewFfi { plugin_id, plugin_version, entry_class, entry_file, spi_file,
   `PLUGIN_PACKAGE_NOT_TEXT` / `INVALID_PLUGIN_PACKAGE`；关闭后 `CORE_CLOSED`；
 - 限制：清单与 SPI 必须是 stored（method 0）条目（本层不做 inflate），也不校验 CRC/包签名。
 - 测试：[crates/ffi/tests/plugins_package.rs](../../crates/ffi/tests/plugins_package.rs)（1 个，测试内构造最小 ZIP）。
+## 插件安装落库（PluginsFfi.install_package，2026-10-18）
+
+~~~text
+PluginsFfi.install_package(bytes: Vec<u8>, trusted: bool) -> InstallOutcomeFfi
+InstallOutcomeFfi { plugin_id, version, upgraded_from: Option<String> }
+PluginInfoFfi     { plugin_id, running, extension_points, version, manifest: ManifestViewFfi }
+~~~
+
+- 需持久化对象（`PluginsFfi::open`）；纯内存对象 → `INVALID_STATE_TRANSITION`；
+- `trusted=false` → `PLUGIN_TRUST_REQUIRED`；包校验失败 → `PLUGIN_PACKAGE_*`；
+- 同版本 → `PLUGIN_STATE_CONFLICT`、降级 → `PLUGIN_VERSION_DOWNGRADE`（库与宿主都不变）；
+- 成功后 0010 `plugins` 行 upsert + 内存宿主提交；重开 `list_plugins` 仍能看到版本与清单；
+- 测试：[crates/ffi/tests/plugins_install_persist.rs](../../crates/ffi/tests/plugins_install_persist.rs)（5 个，真库）。
+
 
 
