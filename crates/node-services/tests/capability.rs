@@ -224,4 +224,151 @@ fn ttl_and_object_shape_are_bounded() {
     // 默认 TTL 也在允许范围内。
     assert!(DEFAULT_CAPABILITY_TTL_SECONDS <= MAX_CAPABILITY_TTL_SECONDS);
 }
+// ---------------------------------------------------------------- CAP-REV 撤销
+
+#[test]
+fn revocation_takes_effect_immediately_and_is_idempotent() {
+    let (mut harness, device_id) = registered(35);
+    let object = object_text(45);
+    let issued = harness
+        .service
+        .issue_capability_with_id(&object, &device_id, CapabilityScope::BlobDownload, 600, NOW)
+        .expect("token issued with id");
+    assert_eq!(issued.token_id.len(), 64);
+    assert_eq!(
+        chat_node_services::capability::capability_token_id(&issued.token).expect("derived id"),
+        issued.token_id,
+        "token id must be derived deterministically from the token text"
+    );
+    harness
+        .service
+        .verify_capability(
+            &issued.token,
+            &object,
+            &device_id,
+            CapabilityScope::BlobDownload,
+            NOW + 1,
+        )
+        .expect("token verifies before revocation");
+    let revoked_ms = u64::try_from(NOW).expect("now") * 1_000;
+    assert!(
+        harness
+            .service
+            .revoke_capability(&issued.token_id, "operator_request", revoked_ms)
+            .expect("revocation recorded")
+    );
+    let error = harness
+        .service
+        .verify_capability(
+            &issued.token,
+            &object,
+            &device_id,
+            CapabilityScope::BlobDownload,
+            NOW + 2,
+        )
+        .expect_err("revoked token must be rejected");
+    assert_eq!(error.code(), "CAPABILITY_REVOKED");
+    assert!(
+        !harness
+            .service
+            .revoke_capability(&issued.token_id, "operator_request", revoked_ms + 1)
+            .expect("idempotent revocation")
+    );
+    // 注意：无状态令牌是确定性的（同一 (对象, 设备, 用途, 时间窗) 逐字节相同），
+    // 因此这里用**另一个对象**来拿一条不同的令牌。
+    let other_object = object_text(48);
+    let other = harness
+        .service
+        .issue_capability(&other_object, &device_id, CapabilityScope::BlobDownload, 600, NOW)
+        .expect("second token");
+    harness
+        .service
+        .verify_capability(
+            &other,
+            &other_object,
+            &device_id,
+            CapabilityScope::BlobDownload,
+            NOW + 2,
+        )
+        .expect("unrelated token still verifies");
+}
+
+#[test]
+fn legacy_cap1_tokens_still_verify_after_the_revocation_feature_lands() {
+    let (mut harness, device_id) = registered(36);
+    let object = object_text(46);
+    let token = harness
+        .service
+        .issue_capability(&object, &device_id, CapabilityScope::BlobDownload, 60, NOW)
+        .expect("legacy-style issue");
+    assert!(token.starts_with(chat_node_services::capability::CAPABILITY_TOKEN_PREFIX));
+    let grant = harness
+        .service
+        .verify_capability(&token, &object, &device_id, CapabilityScope::BlobDownload, NOW + 1)
+        .expect("cap1 token still verifies");
+    assert_eq!(grant.object_id, object);
+    let token_id = chat_node_services::capability::capability_token_id(&token).expect("id");
+    assert!(
+        !harness
+            .service
+            .capability_revoked(&token_id)
+            .expect("revocation lookup")
+    );
+}
+
+#[test]
+fn expired_revocations_are_purged_but_recent_ones_survive() {
+    let (mut harness, device_id) = registered(37);
+    // 确定性令牌：用不同对象保证两条令牌的 token_id 不同。
+    let retired = harness
+        .service
+        .issue_capability_with_id(
+            &object_text(49),
+            &device_id,
+            CapabilityScope::BlobDownload,
+            60,
+            NOW,
+        )
+        .expect("old token");
+    let recent = harness
+        .service
+        .issue_capability_with_id(
+            &object_text(50),
+            &device_id,
+            CapabilityScope::BlobDownload,
+            60,
+            NOW,
+        )
+        .expect("recent token");
+    let retention_ms = chat_node_services::capability::REVOCATION_RETENTION_SECONDS * 1_000;
+    let old_ms = u64::try_from(NOW).expect("now") * 1_000;
+    harness
+        .service
+        .revoke_capability(&retired.token_id, "operator_request", old_ms)
+        .expect("old revocation");
+    harness
+        .service
+        .revoke_capability(&recent.token_id, "operator_request", old_ms + retention_ms + 1)
+        .expect("recent revocation");
+    let now_ms = old_ms + retention_ms + 2;
+    let removed = harness
+        .service
+        .purge_expired_revocations(now_ms)
+        .expect("purge runs");
+    assert_eq!(removed, 1, "only the out-of-retention record is removed");
+    assert!(
+        !harness
+            .service
+            .capability_revoked(&retired.token_id)
+            .expect("lookup")
+    );
+    assert!(
+        harness
+            .service
+            .capability_revoked(&recent.token_id)
+            .expect("lookup"),
+        "recent revocation must survive the purge"
+    );
+}
+
 

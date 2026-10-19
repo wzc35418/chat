@@ -832,6 +832,67 @@ cargo test --offline -p chat-core                        # 128 passed（本记�
 - **证据**：`cargo test -p chat-core` 中 `group_node` 新增 4 单测 + 2 真节点集成——真节点上转让的日志元数据为 `transfer_ownership` 且目标摘要≠提交摘要，回执接受后 epoch 2、群主易主；同一 pending 用旧入口被拒且节点日志为空。
 - **协议待补**：PROTOCOL-004 无“通用 self_update”值（建议 `PendingControl` 记领域操作或协议加字段）；`set_muted`/`rename_group` 无 MLS 提交不经过映射；`leave_group`/`dissolve_group` 本切片仍不产生 MLS 提交，故 `LeaveSelf`/`Dissolve` 映射已实现并单测但端到端不可达（文档不冒充已运行通路）。
 
+## 接受入群邀请（GROUPS-017，2026-10-19，Windows x64）
+
+入群以前只有底层 `group_join_from_welcome`（调用方要自己拼 `WelcomeAcceptance`）。本轮加一个**邀请语义**的
+入口：接受邀请时把邀请元数据（邀请者/群名/成员集合/epoch）与 Welcome 的实际内容逐项核对。
+
+代码：[crates/core/src/groups.rs](../../crates/core/src/groups.rs)（`GroupInviteMeta` + `accept_group_invite`）；
+测试：[crates/core/tests/groups_invite.rs](../../crates/core/tests/groups_invite.rs)（4 个，真双设备两库）。
+
+### 公开面（新增）
+
+```text
+pub struct GroupInviteMeta {
+    group_id,          // 协议群文本 grp:1:<64 hex>
+    mls_group_id,      // MLS 群 ID（小写 hex），进 WelcomeAcceptance
+    name, inviter_credential, owner_credential, invitee_credential,
+    members: Vec<String>, epoch: u64,
+}
+pub fn accept_group_invite(device, store, welcome: &[u8], invite: &GroupInviteMeta) -> GroupResult<GroupView>
+```
+
+### 关键语义
+
+1. **元数据自校验（写入之前）**：群文本（`INVALID_ID`）、群名（`INVALID_INPUT`）、各凭据、成员集合非空、
+   `epoch >= 1`；被邀请者必须是成员、不能是群主、邀请者必须是成员、邀请者不能邀请自己。
+2. **群 ID 自洽**：`group_id` 必须等于由 `mls_group_id` 推导的协议群文本 → 否则 `STATE_CORRUPTED`
+   （这一步本地可算，因此自相矛盾的邀请在碰 Welcome 之前就被拒）。
+3. **重复接受**：本机已有该群快照 → `INVALID_STATE_TRANSITION`（不再进入 Welcome 路径，避免“已用过的
+   KeyPackage”这类次要错误盖住真正原因）。
+4. **Welcome 复核**：`mls_group_id` / `epoch` / `members` 直接作为 `WelcomeAcceptance` 交给 crypto，由它
+   与 Welcome 里的真实群状态比对；不一致 → crypto 先删掉刚写入 provider 的群状态，**正式库零写入**，
+   本层把 `WELCOME_NOT_AUTHORIZED` 归一为 `STATE_CORRUPTED`（“邀请元数据与 Welcome 不符”）。
+5. **成功**：走既有 `group_join_from_welcome`（快照 + 凭据目录一起写，见 GROUPS-016/STORAGE-016），
+   返回 `role = member` 的投影；若结果是群主（元数据说谎）则 `STATE_CORRUPTED`。
+
+### 复现命令（全程离线）
+
+```powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-core --test groups_invite   # 4 passed
+cargo test --offline -p chat-core                        # 全绿（既有 221 继续通过 + 本轮 4）
+```
+
+### 证据
+
+- `groups_invite::accepting_an_invite_joins_as_a_member_and_writes_the_directory`：正常接受 → `role=member`、
+  群名/epoch/成员集合与邀请一致、快照已落库（群主是 alice）、凭据目录写入 alice+bob 两条。
+- `groups_invite::metadata_mismatches_are_rejected_without_writing_anything`：epoch +1 / 成员集合多一人 /
+  群文本与 MLS 群 ID 不自洽 → `STATE_CORRUPTED`，且**没有群快照、目录为空、设备没有 MLS 群**。
+- `groups_invite::accepting_the_same_invite_twice_is_an_invalid_transition`：第二次接受 →
+  `INVALID_STATE_TRANSITION`，快照的 `state_version`/`epoch` 不变。
+- `groups_invite::malformed_invite_metadata_is_rejected`：未知群格式 `INVALID_ID`；非法群名 / 邀请者非成员 /
+  被邀请者不在成员集合 → `INVALID_INPUT`；全部失败都不留快照。
+
+### 已知限制
+
+1. **邀请元数据由调用方给**：可信度取决于外层已验证的邀请日志/协调者回执；本层只做与 Welcome 的一致性
+   复核，不做独立事实发现。
+2. **`mls_group_id` 必须由邀请携带**：协议层群文本无法反推 MLS 群 ID，因此邀请里同时带两者并做自洽校验。
+2. **只支持“被邀请者即时加入”**：没有邀请过期/撤销/一次性令牌语义（重复接受靠快照存在性拒绝）。
+3. **接受后不自动拉取历史**：入群只落快照与目录，消息/Commit 追赶走既有同步路径。
+
 ## 禁言 / 改名自动准备控制提交（GROUPS-016，2026-10-19，Windows x64）
 
 ### 服务层与 FFI 收口（task-84，2026-10-19）

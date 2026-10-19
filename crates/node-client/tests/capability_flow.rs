@@ -174,4 +174,47 @@ async fn pre_enabled_mode_fetches_before_the_first_chunk() {
         .expect("chunk accepted with a pre-fetched token");
     assert_eq!(client.cached_capability_count(), 1);
 }
+#[tokio::test]
+async fn client_revokes_a_token_and_refetches_a_fresh_one() {
+    let (_node, client, _device, group, source_seq) = setup(required_policy()).await;
+    let descriptor = descriptor(72, &group, source_seq, 8, 4, 2);
+    let session = client
+        .begin_blob_upload(&operation_text(222), &descriptor)
+        .await
+        .expect("upload begins");
+    // 先在强制模式下拿到并缓存一个上传令牌。
+    client
+        .put_blob_chunk(&session.upload_id, 0, b"head")
+        .await
+        .expect("first chunk fetches and caches a token");
+    assert_eq!(client.cached_capability_count(), 1);
+    let token = client
+        .issue_capability(&session.upload_id, "blob:upload", Some(120))
+        .await
+        .expect("token");
+    let token_id = chat_node_services::capability::capability_token_id(&token).expect("token id");
+
+    // 撤销：客户端立即丢掉缓存里的同一令牌。
+    client
+        .revoke_capability(&token_id, Some("operator_request"))
+        .await
+        .expect("node confirms the revocation");
+    assert_eq!(
+        client.cached_capability_count(),
+        0,
+        "the revoked token must leave the cache"
+    );
+
+    // 继续上传：客户端重新申请令牌并成功（撤销不会把客户端卡死）。
+    client
+        .put_blob_chunk(&session.upload_id, 1, b"tail")
+        .await
+        .expect("client refetches a token and the upload continues");
+    assert_eq!(client.cached_capability_count(), 1, "a fresh token is cached");
+
+    // 撤销接口的入参边界：非 hex 的 token id 在本地就被拒绝。
+    let invalid = client.revoke_capability("not-a-token-id", None).await;
+    assert!(invalid.is_err(), "a malformed token id is rejected locally");
+}
+
 

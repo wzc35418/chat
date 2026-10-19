@@ -52,6 +52,8 @@ data class PreviewStoreState(
     val exportTarget: String = "",
     /** 每条消息的附件卡片（来自 AttachmentFfi.records，不含正文）。 */
     val messageCards: Map<String, List<chat.presentation.display.AttachmentCard>> = emptyMap(),
+    /** 消息正文预览（只取前若干字符，用于把附件卡片与消息对应起来）。 */
+    val messagePreviews: Map<String, String> = emptyMap(),
 )
 
 fun PreviewStoreState.opened(databasePath: String, notice: String): PreviewStoreState = copy(
@@ -214,3 +216,11 @@ fun PreviewStoreState.withMessageCards(
     )
 }
 fun PreviewStoreState.updateExportTarget(value: String): PreviewStoreState = copy(exportTarget = value)
+
+/** 记录一条消息的正文预览（截断到 40 字符，不含换行）。 */
+fun PreviewStoreState.withMessagePreview(messageId: String, body: String): PreviewStoreState {
+    val preview = body.replace("\n", " ").take(40)
+    val merged = LinkedHashMap(messagePreviews)
+    merged[messageId] = preview
+    return copy(messagePreviews = merged)
+}

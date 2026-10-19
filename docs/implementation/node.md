@@ -845,3 +845,49 @@ expire_node_data(now: Time, budget: GcBudget) -> Result<CleanupReport>
 
 已知限制：强制模式只覆盖附件块 `PUT/GET`；`--require-capability` 不能“只对某群/某设备”生效；运行时不能热切换
 （要改只能重启进程）。
+## 能力令牌撤销（CAP-REV，2026-10-18，Windows x64）
+
+背景：API-004 的能力令牌是无状态签名令牌，撤销前**只能等过期**。本轮加撤销名单与全端点强制。
+
+### 迁移 0007（crates/node-services/migrations/0007_capability_revocations.sql）
+
+~~~sql
+-- 注意：0001 里的 capability_revocations 是**注册能力版本**撤销表，与此无关。
+CREATE TABLE capability_token_revocations (
+    token_id TEXT PRIMARY KEY NOT NULL,
+    revoked_at_ms INTEGER NOT NULL CHECK (revoked_at_ms >= 0),
+    reason TEXT NOT NULL
+);
+CREATE INDEX capability_token_revocations_revoked_at ON capability_token_revocations(revoked_at_ms);
+~~~
+
+### 公开面
+
+~~~text
+issue_capability_with_id(object, device, scope, ttl, now) -> IssuedCapability { token, token_id }
+capability_token_id(token) -> String        // 由令牌文本确定性派生（sha256 域分隔），64 hex
+revoke_capability(token_id, reason, now_ms) -> bool   // 幂等（重复撤销返回 false）
+capability_revoked(token_id) -> bool
+purge_expired_revocations(now_ms) -> u64    // 保留期 REVOCATION_RETENTION_SECONDS = 7 天
+~~~
+
+- `verify_capability` 在绑定/过期校验之后**独立**查撤销名单：命中 → `CAPABILITY_REVOKED`（新冻结码）；
+- `issue_capability` 保持旧签名（只返回令牌文本），新增 `issue_capability_with_id` 返回 token_id；
+- 令牌本身仍**不落库**：撤销表只存派生标识，因此"可撤销"与"无状态"同时成立。
+
+### 证据
+
+- `capability::revocation_takes_effect_immediately_and_is_idempotent`：签发→验签通过→撤销→
+  立刻 `CAPABILITY_REVOKED`；重复撤销返回 false；其它令牌不受影响。
+- `capability::legacy_cap1_tokens_still_verify_after_the_revocation_feature_lands`：cap1 老令牌照旧可验证。
+- `capability::expired_revocations_are_purged_but_recent_ones_survive`：超过保留期的撤销被清理，
+  期内的保留。
+- 复现：`cargo test --offline -p chat-node-services` → 93 passed（既有 90 继续通过）。
+
+### 已知限制
+
+1. **令牌是确定性的**：同一 (对象, 设备, 用途, 签发秒, 期限) 会得到**逐字节相同**的令牌，
+   因此撤销其中一条会同时撤销"同一秒内为同一对象签发的同一条令牌"；需要区分时用不同 TTL 或等下一秒。
+2. **撤销表不复制到其它节点**：多节点部署时撤销只在当前节点生效（跨节点撤销名单同步未做）。
+3. **不校验撤销发起者的"是否该管这个令牌"**：只要求设备鉴权；谁能撤销谁的令牌由上层授权策略决定（当前未限制）。
+

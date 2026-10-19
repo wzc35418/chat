@@ -114,3 +114,19 @@ P0-03 局部实验已通过客户端单连接事务及独立节点接受事务�
 每项报告字段：date、commit、OS/设备、toolchain、dependencyVersions、command/scenario、expected、observed、evidencePath、result、remainingRisk。状态只有 NOT_RUN/PASS/FAIL/BLOCKED；结构检查 PASS 不等于密码学/跨端 PASS。
 
 失败时缩小原型并修复，或在 ADR 提供明确替代决策和重验范围。不估算尚无依据的工期，不把接口编写量当成技术验证进度。
+
+## 第二批 32 轮后的局部实验补充（2026-10-18）
+
+> 口径不变：以下都是**单机/本机可复现的局部实验**，不等于正式 P0 验收（跨机、经中继、真机密钥库仍未覆盖）。
+
+- [x] **附件跨设备解密（本地实验）**：`AttachmentMessageBody` 走受 MLS 加密的协议字段 57（v2 尾部追加 display_name），描述符用 **MLS exporter** 派生包装密钥；B 在**全新库**仅凭消息体即可 adopt 并独立下载解密，导出内容与 A 明文逐字节一致；篡改摘要/描述符/换密钥全部拒绝且零写入。证据：`cargo test -p chat-core`（attachment_descriptor / attachment_descriptor_protocol / attachment_display_name / attachment_metadata_compat）。
+- [x] **附件元数据版本兼容（本地实验）**：字段 57 v1 前缀逐字节不变、v2 尾部追加名字；v1 视角可读 v2 字节并回退占位名；未登记版本显式拒绝。限制：**未升级的旧客户端仍需过渡版本**才能读新消息。
+- [x] **身份恢复文件（本地实验）**：argon2id + XChaCha20-Poly1305，KCV 区分错口令与篡改，目标库非空拒绝；导出→空库导入→重开拿到同一设备指纹（FFI 层 3 用例）。
+- [x] **插件宿主（本地实验）**：清单校验/安装/启停/派发计划/私有存储隔离/配额/**落库持久化**（迁移 0010）+ Kotlin 桥 + `pluginSmoke` 全链路 PASS。限制：**不加载也不执行插件代码**（无 JVM 插件运行时、无信任确认）。
+- [x] **自移除与角色同步（本地实验）**：MLS 禁止自移除提交 → 走 Remove 提案 + 对端打包提交；策略角色/禁言/群名随控制提交同步（先授权再合并，失败零写入）。
+- [x] **拉取条目应用（本地实验）**：同步 worker 现在把拉到的条目真正 apply 进 MLS 并落成本机消息（游标只在 apply 后前进、重放幂等、失败分类），作者账户经**凭据目录**映射（未知作者显式计数 `unknown_authors`）。
+- [x] **平台密钥槽（本机实验）**：Windows DPAPI（当前用户作用域）封装/解封/删除通过；非 Windows 回退口令派生槽。限制：跨用户/跨机器失败无法单机自动验证。
+- [x] **系统通知（本机实验）**：有托盘时尝试投递；**无托盘显式不可用**并回退应用内提示（测试断言"诚实失败"而非弹窗）。
+- [ ] **经中继实跑**：仍未验证（需要可用 relay 或第二台设备）。
+- [ ] **跨网段/对称 NAT 直连**：未验证。
+- [ ] **OS 凭据库（Credential Manager/keychain）**：未接，当前是 DPAPI 文件封装。

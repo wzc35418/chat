@@ -2164,6 +2164,133 @@ pub fn group_join_from_welcome(
     sync_credential_directory(store, &record)?;
     Ok(project(&record, joined.epoch, None, saved))
 }
+/// 入群邀请元数据（由**已验证**的邀请/控制日志给出；本层只做一致性与权限校验）。
+///
+/// 字段与 Welcome 的真实内容必须一致：`mls_group_id` + `epoch` + `members` 直接进 `WelcomeAcceptance`，
+/// 由 crypto 逐项复核；`group_id` 必须等于由 `mls_group_id` 推导出的协议群文本（本地可算，因此可在
+/// 加入之前就拒绝自相矛盾的邀请）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupInviteMeta {
+    /// 协议群文本（`grp:1:<64 hex>`）。
+    pub group_id: String,
+    /// MLS 群 ID（小写十六进制；Welcome 里认证的群标识）。
+    pub mls_group_id: String,
+    /// 群名（邀请里携带的规范名）。
+    pub name: String,
+    /// 邀请者凭据（必须在成员集合里）。
+    pub inviter_credential: String,
+    /// 群主凭据（必须在成员集合里）。
+    pub owner_credential: String,
+    /// 被邀请者凭据（本机要加入的身份；不能是群主）。
+    pub invitee_credential: String,
+    /// 预期成员凭据集合（顺序无关；必须包含被邀请者与群主）。
+    pub members: Vec<String>,
+    /// 预期 epoch（Welcome 必须停在这个 epoch）。
+    pub epoch: u64,
+}
+
+/// GROUPS-017：接受入群邀请（用 Welcome 加入，并校验邀请元数据与 Welcome 实际一致）。
+///
+/// 顺序（**任何不一致都在写入之前被拒**）：
+/// 1. 邀请元数据自校验：群文本 / 群名 / 凭据 / 成员集合 / epoch / 被邀请者不能是群主；
+/// 2. `group_id` 必须等于由 `mls_group_id` 推导的协议群文本（否则 `STATE_CORRUPTED`）；
+/// 3. 本机已在该群 → `INVALID_STATE_TRANSITION`（重复接受不再进入 Welcome 路径）；
+/// 4. 走 `group_join_from_welcome`（同一份 acceptance 交给 crypto 逐项复核；Welcome 与元数据不符 →
+///    `STATE_CORRUPTED`，crypto 会删掉刚写入 provider 的群状态，**正式库零写入**）；
+/// 5. 成功后凭据目录由 `group_join_from_welcome` 写入（本机 + 已知成员），返回 `role = member` 的快照。
+pub fn accept_group_invite(
+    device: &mut MlsDevice,
+    store: &mut Store,
+    welcome: &[u8],
+    invite: &GroupInviteMeta,
+) -> GroupResult<GroupView> {
+    parse_group_id(&invite.group_id)?;
+    validate_name(&invite.name)?;
+    validate_credential(&invite.inviter_credential)?;
+    validate_credential(&invite.owner_credential)?;
+    validate_credential(&invite.invitee_credential)?;
+    if invite.members.is_empty() {
+        return Err(GroupError::invalid_input(
+            "the invite must name at least one member",
+        ));
+    }
+    for member in &invite.members {
+        validate_credential(member)?;
+    }
+    if invite.epoch == 0 {
+        return Err(GroupError::invalid_input("the invite epoch must be >= 1"));
+    }
+    let has_member = |credential: &str| invite.members.iter().any(|member| member == credential);
+    if !has_member(&invite.invitee_credential) {
+        return Err(GroupError::invalid_input(
+            "the invite must include the invited credential in its members",
+        ));
+    }
+    if !has_member(&invite.owner_credential) {
+        return Err(GroupError::invalid_input(
+            "the invite must include the owner credential in its members",
+        ));
+    }
+    if !has_member(&invite.inviter_credential) {
+        return Err(GroupError::invalid_input(
+            "the inviter must be a member of the invited group",
+        ));
+    }
+    if invite.invitee_credential == invite.owner_credential {
+        return Err(GroupError::invalid_input(
+            "the invited credential cannot be the group owner",
+        ));
+    }
+    if invite.inviter_credential == invite.invitee_credential {
+        return Err(GroupError::invalid_input(
+            "the inviter cannot invite itself",
+        ));
+    }
+    // 协议群文本必须与 MLS 群 ID 自洽（本地可算，无需先加入）。
+    let derived_group_id = protocol_group_id_for(&invite.mls_group_id)
+        .map_err(|_| GroupError::corrupted("the invite MLS group id is malformed"))?;
+    if derived_group_id != invite.group_id {
+        return Err(GroupError::corrupted(
+            "the invite group id does not match its MLS group id",
+        ));
+    }
+    if load_record(store, &invite.group_id).is_ok() {
+        return Err(GroupError::new(
+            "INVALID_STATE_TRANSITION",
+            "this device already joined the group",
+        ));
+    }
+    let acceptance = WelcomeAcceptance {
+        group_id: invite.mls_group_id.clone(),
+        expected_epoch: invite.epoch,
+        members: invite.members.clone(),
+    };
+    let view = group_join_from_welcome(
+        device,
+        store,
+        &invite.name,
+        welcome,
+        &acceptance,
+        &invite.invitee_credential,
+        &invite.owner_credential,
+    )
+    .map_err(|error| {
+        if error.code() == "WELCOME_NOT_AUTHORIZED" {
+            GroupError::corrupted(
+                "the invite metadata does not match the welcome",
+            )
+        } else {
+            error
+        }
+    })?;
+    if view.role != MemberRole::Member {
+        return Err(GroupError::corrupted(
+            "an accepted invite must join as an ordinary member",
+        ));
+    }
+    Ok(view)
+}
+
 /// GROUPS-010：转让群主（仅现群主；目标是确认成员且不是自己）。
 ///
 /// 顺序（**非法操作在任何写入之前被拒**）：

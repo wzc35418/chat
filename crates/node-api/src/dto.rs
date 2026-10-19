@@ -524,6 +524,8 @@ pub struct CapabilityResponseDto {
 #[derive(Clone, Debug, Serialize)]
 pub struct CapabilityDto {
     pub token: String,
+    /// CAP-REV：令牌标识（撤销接口用它；由令牌文本确定性派生，不是秘密）。
+    pub token_id: String,
     pub object_id: String,
     pub device_id: String,
     pub scope: &'static str,
@@ -531,13 +533,61 @@ pub struct CapabilityDto {
     pub expires_at: u64,
 }
 
+/// POST /v1/capabilities/{token_id}/revoke 请求体（可空：默认原因 `operator_request`）。
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeCapabilityRequestDto {
+    /// 请求 schema 版本（缺省 1，显式传其它值会被拒绝）。
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u16,
+    pub reason: Option<String>,
+}
+
+impl RevokeCapabilityRequestDto {
+    /// 取出有界原因（缺省 `operator_request`）。
+    pub fn into_reason(self) -> Result<String, ApiError> {
+        if self.schema_version != DTO_SCHEMA_VERSION {
+            return Err(ApiError::invalid_request("unsupported request schema version"));
+        }
+        let reason = self.reason.unwrap_or_else(|| "operator_request".to_owned());
+        if reason.is_empty()
+            || reason.len() > chat_node_services::capability::MAX_REVOCATION_REASON_BYTES
+            || reason.chars().any(char::is_control)
+        {
+            return Err(ApiError::invalid_request("revocation reason is out of range"));
+        }
+        Ok(reason)
+    }
+}
+
+/// POST /v1/capabilities/{token_id}/revoke 响应。
+#[derive(Clone, Debug, Serialize)]
+pub struct RevokeCapabilityResponseDto {
+    pub schema_version: u16,
+    pub token_id: String,
+    /// 本次是否真的写入了新的撤销记录（重复撤销幂等返回 false）。
+    pub revoked: bool,
+}
+
+impl RevokeCapabilityResponseDto {
+    /// 包装撤销结果。
+    pub fn new(token_id: String, revoked: bool) -> Self {
+        Self {
+            schema_version: DTO_SCHEMA_VERSION,
+            token_id,
+            revoked,
+        }
+    }
+}
+
 impl CapabilityResponseDto {
-    /// 包装已签发的令牌。
-    pub fn new(token: String, grant: CapabilityGrant) -> Self {
+    /// 包装已签发的令牌（token_id 由服务层派生后传入）。
+    pub fn new(token: String, token_id: String, grant: CapabilityGrant) -> Self {
         Self {
             schema_version: DTO_SCHEMA_VERSION,
             capability: CapabilityDto {
                 token,
+                token_id,
                 object_id: grant.object_id,
                 device_id: grant.device_id,
                 scope: grant.scope.as_str(),

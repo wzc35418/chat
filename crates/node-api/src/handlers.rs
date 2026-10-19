@@ -26,7 +26,8 @@ use crate::dto::{
     CompleteBlobUploadRequestDto, DeviceRegistrationResponseDto, GroupHeadResponseDto,
     GroupLogResponseDto, GroupRegistrationResponseDto, MailboxPageResponseDto,
     MailboxReceiptResponseDto, RegisterDeviceRequestDto, RegisterGroupRequestDto,
-    CapabilityResponseDto, HealthResponseDto, IssueCapabilityRequestDto, SignedAuthHeaders,
+    CapabilityResponseDto, HealthResponseDto, IssueCapabilityRequestDto,
+    RevokeCapabilityRequestDto, RevokeCapabilityResponseDto, SignedAuthHeaders,
     StoreMailboxItemRequestDto, UploadSessionResponseDto, parse_chunk_index,
 };
 use crate::error::ApiError;
@@ -55,6 +56,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/mailbox", get(read_mailbox_page))
         .route("/v1/mailbox/ack", post(ack_mailbox_items))
         .route("/v1/capabilities", post(issue_capability))
+        // CAP-REV：撤销能力令牌（设备鉴权；撤销立即生效）。
+        .route("/v1/capabilities/{token_id}/revoke", post(revoke_capability))
         .route("/v1/blobs", post(begin_blob_upload))
         // 同一个 URL 形状承载两个动作：PUT = 写入上传会话的一块，GET = 读取已发布 blob 的一块。
         // 路由参数因此只能有一个名字（axum 不允许同名形状的两种参数命名）。
@@ -270,6 +273,8 @@ pub async fn fetch_group_log(
     ensure_no_unknown_query(&query)?;
     let now = state.now();
     let actor = authenticate(&state, &headers, &uri, "GET", b"", now)?;
+    // CAP-REV：强制模式下日志读端点也要带未撤销的能力令牌（默认关闭）。
+    enforce_read_capability(&state, &headers, &actor.device_id, now)?;
     let page = state.with_service(|service| service.fetch_group_log(&group_id, after, limit, &actor))?;
     Ok(Json(GroupLogResponseDto::new(page)).into_response())
 }
@@ -318,6 +323,8 @@ pub async fn read_mailbox_page(
     ensure_no_unknown_query(&query)?;
     let now = state.now();
     let actor = authenticate(&state, &headers, &uri, "GET", b"", now)?;
+    // CAP-REV：强制模式下信箱读端点也要带未撤销的能力令牌（默认关闭）。
+    enforce_read_capability(&state, &headers, &actor.device_id, now)?;
     let page = state.with_service(|service| {
         service.read_mailbox_page(&actor, cursor.as_deref(), limit, now)
     })?;
@@ -372,7 +379,7 @@ pub async fn issue_capability(
     let now = state.now();
     let actor = authenticate(&state, &headers, &uri, "POST", &body, now)?;
     let device_id = actor.device_id.clone();
-    let (token, grant) = state.with_service(|service| {
+    let (issued, grant) = state.with_service(|service| {
         match scope {
             CapabilityScope::BlobUpload => {
                 service.authorize_blob_upload(&object_id, &actor, now)?;
@@ -381,11 +388,99 @@ pub async fn issue_capability(
                 service.authorize_blob_read(&object_id, &actor, now)?;
             }
         }
-        let token = service.issue_capability(&object_id, &device_id, scope, ttl_seconds, now)?;
-        let grant = service.verify_capability(&token, &object_id, &device_id, scope, now)?;
-        Ok((token, grant))
+        let issued =
+            service.issue_capability_with_id(&object_id, &device_id, scope, ttl_seconds, now)?;
+        let grant = service.verify_capability(
+            &issued.token,
+            &object_id,
+            &device_id,
+            scope,
+            now,
+        )?;
+        Ok((issued, grant))
     })?;
-    Ok(Json(CapabilityResponseDto::new(token, grant)).into_response())
+    Ok(
+        Json(CapabilityResponseDto::new(
+            issued.token,
+            issued.token_id,
+            grant,
+        ))
+        .into_response(),
+    )
+}
+
+
+/// POST /v1/capabilities/{token_id}/revoke：撤销一个能力令牌（CAP-REV）。
+///
+/// 需要**设备鉴权**（与其它端点同一套签名挑战），撤销立即生效：之后任何带该令牌的
+/// 请求都会被判 `CAPABILITY_REVOKED`。幂等：重复撤销返回 `revoked=false`。
+pub async fn revoke_capability(
+    State(state): State<AppState>,
+    UrlPath(token_id): UrlPath<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    ensure_body_bounded(&state, body.len())?;
+    let request: RevokeCapabilityRequestDto = if body.is_empty() {
+        RevokeCapabilityRequestDto::default()
+    } else {
+        parse_body(&body)?
+    };
+    let reason = request.into_reason()?;
+    let now = state.now();
+    let _actor = authenticate(&state, &headers, &uri, "POST", &body, now)?;
+    let now_ms = u64::try_from(now)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000))
+        .ok_or_else(|| ApiError::invalid_request("node clock is out of range"))?;
+    let revoked = state.with_service(|service| {
+        service.revoke_capability(&token_id, &reason, now_ms)
+    })?;
+    Ok(Json(RevokeCapabilityResponseDto::new(token_id, revoked)).into_response())
+}
+
+/// CAP-REV：强制模式下的**读端点**能力门（信箱/日志）。
+///
+/// 语义（与 blob 端点一致，但读端点没有对象级绑定）：
+/// - 关闭强制时完全不介入（旧客户端行为不变，默认关闭）；
+/// - 强制时请求必须带 `x-chat-capability`，令牌必须验签通过、绑定到**本设备**、
+///   未过期且**未被撤销**；否则 `AUTH_REQUIRED` / `CAPABILITY_REVOKED`。
+fn enforce_read_capability(
+    state: &AppState,
+    headers: &HeaderMap,
+    device_id: &str,
+    now: u64,
+) -> Result<(), ApiError> {
+    if !state.capability_required() {
+        return Ok(());
+    }
+    let declared = capability_token(&headers)?;
+    let Some(token) = declared else {
+        return Err(ApiError::from_node(
+            chat_node_services::error::NodeError::AuthRequired,
+        ));
+    };
+    let grant = state.with_service(|service| service.parse_capability(&token))?;
+    if grant.device_id != device_id {
+        return Err(ApiError::from_node(
+            chat_node_services::error::NodeError::InvalidCapability,
+        ));
+    }
+    if now >= grant.expires_at {
+        return Err(ApiError::from_node(
+            chat_node_services::error::NodeError::AuthExpired,
+        ));
+    }
+    let token_id = chat_node_services::capability::capability_token_id(&token)
+        .map_err(ApiError::from_node)?;
+    let revoked = state.with_service(|service| service.capability_revoked(&token_id))?;
+    if revoked {
+        return Err(ApiError::from_node(
+            chat_node_services::error::NodeError::CapabilityRevoked,
+        ));
+    }
+    Ok(())
 }
 
 /// POST /v1/blobs：创建密文附件上传会话（NODE-012）。

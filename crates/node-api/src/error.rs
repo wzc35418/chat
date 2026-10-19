@@ -101,6 +101,8 @@ impl ApiError {
             | NodeError::InvalidCredential => StatusCode::UNAUTHORIZED,
             NodeError::DeviceRevoked
             | NodeError::InvalidCapability
+            // CAP-REV：撤销后的令牌立即失效（403，与其它凭据类拒绝一致）。
+            | NodeError::CapabilityRevoked
             | NodeError::PermissionDenied
             | NodeError::HistoryNotAuthorized => StatusCode::FORBIDDEN,
             NodeError::GroupNotFound

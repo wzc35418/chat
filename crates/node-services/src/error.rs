@@ -33,6 +33,8 @@ pub enum NodeError {
     DeviceLimitExceeded,
     /// 注册能力无效：范围、期限、签名或撤销版本。
     InvalidCapability,
+    /// 能力令牌已被撤销（CAP-REV：撤销立即生效，不等过期）。
+    CapabilityRevoked,
     /// 请求证明与请求目标不匹配（跨设备/跨账户）。
     PermissionDenied,
     /// 未消费挑战数量达到全局容量上限。
@@ -113,6 +115,7 @@ impl NodeError {
             Self::DeviceRevoked => "DEVICE_REVOKED",
             Self::DeviceLimitExceeded => "DEVICE_LIMIT_EXCEEDED",
             Self::InvalidCapability => "INVALID_CAPABILITY",
+            Self::CapabilityRevoked => "CAPABILITY_REVOKED",
             Self::PermissionDenied => "PERMISSION_DENIED",
             Self::ChallengeCapacityExceeded => "CHALLENGE_CAPACITY_EXCEEDED",
             Self::RateLimited { .. } => "RATE_LIMITED",
@@ -160,6 +163,7 @@ impl NodeError {
             Self::DeviceRevoked => "device is revoked",
             Self::DeviceLimitExceeded => "account device limit reached",
             Self::InvalidCapability => "registration capability is not valid",
+            Self::CapabilityRevoked => "capability token has been revoked",
             Self::PermissionDenied => "request is not authorized for this target",
             Self::ChallengeCapacityExceeded => "node challenge capacity is exhausted",
             Self::RateLimited { .. } => "rate limited",

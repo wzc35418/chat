@@ -34,6 +34,8 @@ const INITIAL_CONTROL_HEAD: [u8; 32] = [0x11; 32];
 struct Node {
     address: String,
     clock: Arc<FixedClock>,
+    /// CAP-REV：测试用来切换「强制带上能力令牌」（默认关闭）。
+    state: AppState,
     supervisor: SigningKey,
     account_id: String,
     node_id: String,
@@ -61,10 +63,11 @@ async fn start_node(policy: NodeAuthPolicy) -> Node {
     let node_public_key = service.node_public_key();
     let clock = Arc::new(FixedClock::new(START));
     let state = AppState::new(service, clock.clone());
-    let address = spawn(build_router(state)).await;
+    let address = spawn(build_router(state.clone())).await;
     Node {
         address,
         clock,
+        state,
         supervisor: SigningKey::from_bytes(&[11_u8; 32]),
         account_id: "acct-http".into(),
         node_id: "node-http-group".into(),
@@ -1804,3 +1807,132 @@ async fn disabled_capability_mode_keeps_legacy_clients_working() {
     assert_eq!(read.status, 200);
     assert_eq!(read.body, chunk);
 }
+// ---------------------------------------------------------------- CAP-REV 撤销
+
+/// 撤销一个令牌（设备鉴权；撤销立即生效）。
+async fn revoke_token(node: &Node, seed: u8, token_id: &str) -> HttpResponse {
+    let path = format!("/v1/capabilities/{token_id}/revoke");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "reason": "operator_request",
+    }))
+    .expect("revoke json");
+    let headers = request_headers(node, seed, "POST", &path, "", &body).await;
+    http(&node.address, "POST", &path, &headers, &body).await
+}
+
+#[tokio::test]
+async fn capability_revocation_takes_effect_immediately_over_http() {
+    let (node, group) = setup(NodeAuthPolicy::default()).await;
+    let source_seq = append_attachment_entry(&node, &group, 21).await;
+    let blob = object_text(146);
+    let begin = begin_blob(&node, 21, &group, &operation_text(246), &blob, source_seq, 4, 4, 1).await;
+    assert_eq!(begin.status, 200);
+    let upload_id = begin.json()["session"]["upload_id"]
+        .as_str()
+        .expect("upload id")
+        .to_owned();
+
+    // 签发响应里现在**带 token_id**（撤销接口用它）。
+    let issued = issue_capability(&node, 21, &upload_id, "blob:upload", Some(120)).await;
+    assert_eq!(issued.status, 200);
+    let token = issued.json()["capability"]["token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    let token_id = issued.json()["capability"]["token_id"]
+        .as_str()
+        .expect("token id")
+        .to_owned();
+    assert_eq!(token_id.len(), 64);
+
+    let before = put_chunk_with_capability(&node, 21, &upload_id, 0, b"head", &token).await;
+    assert_eq!(
+        before.status,
+        200,
+        "chunk accepted before revocation: {:?}",
+        String::from_utf8_lossy(&before.body)
+    );
+
+    let revoked = revoke_token(&node, 21, &token_id).await;
+    assert_eq!(revoked.status, 200, "{:?}", String::from_utf8_lossy(&revoked.body));
+    assert_eq!(revoked.json()["revoked"], true);
+    let again = revoke_token(&node, 21, &token_id).await;
+    assert_eq!(again.status, 200);
+    assert_eq!(again.json()["revoked"], false, "revocation is idempotent");
+
+    let after = put_chunk_with_capability(&node, 21, &upload_id, 0, b"head", &token).await;
+    assert_eq!(after.status, 403);
+    assert_eq!(after.error_code(), "CAPABILITY_REVOKED");
+}
+
+#[tokio::test]
+async fn enforced_mode_requires_a_live_token_for_mailbox_reads() {
+    let (node, group) = setup(NodeAuthPolicy::default()).await;
+    // 信箱条目必须引用一条**已接受**的日志条目（由群主 21 追加；对象级授权要求作者本人，
+    // 因此下面的 blob 上传与令牌签发也都用 21）。
+    let source_seq = append_attachment_entry(&node, &group, 21).await;
+    let item = serde_json::json!({
+        "schema_version": 1,
+        "item": {
+            "item_id": "caprev-item-1",
+            "group_id": group,
+            "target_device_id": device_text(22),
+            "source_seq": source_seq,
+            "expires_at": START + 3_600,
+            "ciphertext_envelope": hex_encode(b"cipher text"),
+        },
+    });
+    let body = serde_json::to_vec(&item).expect("item json");
+    let headers = request_headers(&node, 21, "POST", "/v1/mailbox/items", "", &body).await;
+    let stored = http(&node.address, "POST", "/v1/mailbox/items", &headers, &body).await;
+    assert_eq!(stored.status, 200);
+
+    // 默认关闭：不带令牌也能读（旧行为不变）。
+    let open = get_request(&node, 21, "/v1/mailbox", "limit=10").await;
+    assert_eq!(open.status, 200);
+
+    // 打开强制：不带令牌 → 401 AUTH_REQUIRED。
+    node.state.set_capability_required(true);
+    let missing = get_request(&node, 21, "/v1/mailbox", "limit=10").await;
+    assert_eq!(missing.status, 401);
+    assert_eq!(missing.error_code(), "AUTH_REQUIRED");
+
+    // 需要一个绑定到**本设备**的令牌：先建上传会话（本设备发起），再签发。
+    let blob = object_text(147);
+    let begin = begin_blob(&node, 21, &group, &operation_text(247), &blob, source_seq, 4, 4, 1).await;
+    assert_eq!(begin.status, 200);
+    let upload_id = begin.json()["session"]["upload_id"]
+        .as_str()
+        .expect("upload id")
+        .to_owned();
+    let issued = issue_capability(&node, 21, &upload_id, "blob:upload", Some(120)).await;
+    assert_eq!(issued.status, 200);
+    let token = issued.json()["capability"]["token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    let token_id = issued.json()["capability"]["token_id"]
+        .as_str()
+        .expect("token id")
+        .to_owned();
+
+    let mut read_headers = request_headers(&node, 21, "GET", "/v1/mailbox", "limit=10", b"").await;
+    read_headers.push(("x-chat-capability".to_owned(), token.clone()));
+    let allowed = http(&node.address, "GET", "/v1/mailbox?limit=10", &read_headers, b"").await;
+    assert_eq!(
+        allowed.status,
+        200,
+        "mailbox read with a live token: {:?}",
+        String::from_utf8_lossy(&allowed.body)
+    );
+
+    let revoked = revoke_token(&node, 21, &token_id).await;
+    assert_eq!(revoked.status, 200);
+    let mut after_headers = request_headers(&node, 21, "GET", "/v1/mailbox", "limit=10", b"").await;
+    after_headers.push(("x-chat-capability".to_owned(), token));
+    let denied = http(&node.address, "GET", "/v1/mailbox?limit=10", &after_headers, b"").await;
+    assert_eq!(denied.status, 403);
+    assert_eq!(denied.error_code(), "CAPABILITY_REVOKED");
+}
+

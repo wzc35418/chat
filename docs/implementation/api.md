@@ -626,4 +626,28 @@ run_node(config: NodeConfig, shutdown: ShutdownSignal) -> Result<NodeExit>
 - “append 返回后重启不丢日志”有**跨进程**证据：`crates/node-client/tests/cross_process.rs::node_process_and_client_survive_a_hard_restart` 用真实二进制跑完整链路后 `child.kill()`（强杀、不走优雅关闭），再用同一 data-dir + 同一 seed 重启，断言 head 的 seq/log_hash 不变、日志条目还在、未 ACK 的信箱条目还在、已发布 blob 仍可读，并验证重启后新 append 的 `seq = 旧 head + 1`、`previous_hash = 旧 log_hash`（详见“跨进程端到端（真 chat-node 进程 + NodeClient）”）。服务层另有 `crates/node-services` 的崩溃/重开用例（`tests/group_log.rs` 与 `p0_accept`）证明持久层语义。
 
 已知限制：没有后台 GC worker（NODE-016）、没有 TLS 终止（默认只允许回环监听，公开部署需要前置 TLS 反向代理并显式 `--allow-public-bind`）、没有管理接口/指标、没有多实例协调与租约；`SHUTDOWN_TIMEOUT` 没有实现（优雅关闭没有超时上限，靠 axum 的在途请求自然结束）；进程崩溃后没有“staged 物恢复”步骤（附件块与日志都在 SQLite，单库单事务，因此不需要文件系统恢复）。通过本函数用例不自动代表整个模块完成。
+## 能力令牌撤销接口与读端点强制（CAP-REV，2026-10-18，Windows x64）
+
+~~~text
+POST /v1/capabilities/{token_id}/revoke      （设备鉴权；body 可选 {"schema_version":1,"reason":"..."}）
+  -> { schema_version, token_id, revoked: bool }     // 幂等：重复撤销 revoked=false
+POST /v1/capabilities                          // 响应新增 capability.token_id（撤销用）
+GET  /v1/mailbox、GET /v1/groups/{id}/log      // 强制模式下也要带未撤销的令牌（默认关闭）
+~~~
+
+- **读端点强制**（`AppState::capability_required()`，默认关闭、可由策略或环境变量打开）：
+  请求必须带 `x-chat-capability`；令牌必须验签通过、**绑定到本设备**、未过期且**未被撤销**；
+  缺失 → 401 `AUTH_REQUIRED`，被撤销 → 403 `CAPABILITY_REVOKED`，绑定不符 → 403 `INVALID_CAPABILITY`。
+  关闭时完全放行（旧客户端行为不变）。
+- 撤销立即生效：同一个令牌在撤销后的下一个请求就被拒（无需等过期）。
+- 错误映射：`CAPABILITY_REVOKED` → 403（与其它凭据类拒绝一致）。
+
+### 证据
+
+- `group_mailbox_http::capability_revocation_takes_effect_immediately_over_http`：签发（响应带 token_id）
+  → 带令牌写块 200 → 撤销（第一次 revoked=true，第二次 false）→ 同令牌写块 **403 CAPABILITY_REVOKED**。
+- `group_mailbox_http::enforced_mode_requires_a_live_token_for_mailbox_reads`：默认关闭时信箱读取无令牌 200；
+  打开强制后无令牌 401 `AUTH_REQUIRED`；带未撤销令牌 200；撤销后 403 `CAPABILITY_REVOKED`。
+- 复现：`cargo test --offline -p chat-node-api` → 24 passed（既有 22 继续通过）。
+
 

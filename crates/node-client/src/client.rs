@@ -81,11 +81,29 @@ struct CapabilityEnvelope {
 #[derive(Deserialize)]
 struct CapabilityView {
     token: String,
+    /// CAP-REV：令牌标识（节点派生；撤销时用它）。
+    #[serde(default)]
+    token_id: String,
     object_id: String,
     device_id: String,
     scope: String,
     issued_at: u64,
     expires_at: u64,
+}
+
+/// CAP-REV：撤销请求体（原因可空，空 = 节点默认原因）。
+#[derive(Serialize)]
+struct RevokeCapabilityBody {
+    schema_version: u16,
+    reason: Option<String>,
+}
+
+/// CAP-REV：撤销响应（节点确认 + 令牌标识回显）。
+#[derive(Deserialize)]
+struct RevokeCapabilityEnvelope {
+    schema_version: u16,
+    token_id: String,
+    revoked: bool,
 }
 
 /// 鉴权头（与节点 API-003 的传输字段一致）。
@@ -343,6 +361,7 @@ versioned!(
     ChunkReceiptEnvelope,
     BlobReceiptEnvelope,
     CapabilityEnvelope,
+    RevokeCapabilityEnvelope,
 );
 /// 节点客户端：固定端点 + 固定设备身份 + Ed25519 签名钥。
 pub struct NodeClient {
@@ -364,6 +383,8 @@ pub struct NodeClient {
 /// 是唯一不受时钟偏差影响的判据。
 struct CachedCapability {
     token: String,
+    /// CAP-REV：令牌标识（撤销时用于定位缓存项）。
+    token_id: String,
     deadline: std::time::Instant,
 }
 
@@ -1225,7 +1246,14 @@ impl NodeClient {
                 "capability token has an invalid validity window",
             ));
         }
-        self.store_capability(object_id, scope, &view.token, view.issued_at, view.expires_at);
+        self.store_capability(
+            object_id,
+            scope,
+            &view.token,
+            &view.token_id,
+            view.issued_at,
+            view.expires_at,
+        );
         Ok(view.token)
     }
 
@@ -1245,6 +1273,70 @@ impl NodeClient {
         self.issue_capability(object_id, scope, None).await.map(Some)
     }
 
+    /// CAP-REV：撤销一个令牌标识；命中缓存的令牌即刻失效（下次请求重新申请）。
+    ///
+    /// 返回是否真的从缓存里移除了条目。
+    pub fn invalidate_capability(&self, token_id: &str) -> bool {
+        let Ok(mut cache) = self.capabilities.lock() else {
+            return false;
+        };
+        let before = cache.len();
+        cache.retain(|_, cached| cached.token_id != token_id);
+        cache.len() != before
+    }
+
+    /// CAP-REV：清空全部能力令牌缓存（节点侧撤销/策略变更后的保守做法）。
+    pub fn clear_capability_cache(&self) {
+        if let Ok(mut cache) = self.capabilities.lock() {
+            cache.clear();
+        }
+    }
+
+    /// CAP-REV：请求节点撤销一个能力令牌（需要设备鉴权；撤销立即生效）。
+    ///
+    /// 成功后本地缓存里的同一令牌会被移除，因此下一次请求会重新申请。
+    pub async fn revoke_capability(
+        &self,
+        token_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), NodeClientError> {
+        if token_id.len() != 64 || !token_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(NodeClientError::local_invalid("token id is not a hex digest"));
+        }
+        let path = format!("/v1/capabilities/{token_id}/revoke");
+        let body = match reason {
+            Some(reason) => serde_json::to_vec(&RevokeCapabilityBody {
+                schema_version: CLIENT_SCHEMA_VERSION,
+                reason: Some(reason.to_owned()),
+            })
+            .map_err(|_| NodeClientError::local_invalid("revocation body could not be encoded"))?,
+            None => serde_json::to_vec(&RevokeCapabilityBody {
+                schema_version: CLIENT_SCHEMA_VERSION,
+                reason: None,
+            })
+            .map_err(|_| NodeClientError::local_invalid("revocation body could not be encoded"))?,
+        };
+        let response = self
+            .send_authenticated_with_capability(
+                "POST",
+                &path,
+                "",
+                &body,
+                JSON_CONTENT_TYPE,
+                self.limits.max_request_bytes,
+                None,
+            )
+            .await?;
+        let envelope: RevokeCapabilityEnvelope = self.decode(&response)?;
+        if envelope.token_id != token_id || !envelope.revoked {
+            return Err(NodeClientError::local_invalid(
+                "node did not confirm the revocation",
+            ));
+        }
+        self.invalidate_capability(token_id);
+        Ok(())
+    }
+
     fn cached_capability(&self, object_id: &str, scope: &str) -> Option<String> {
         let key = format!("{scope}|{object_id}");
         let now = std::time::Instant::now();
@@ -1262,6 +1354,7 @@ impl NodeClient {
         object_id: &str,
         scope: &str,
         token: &str,
+        token_id: &str,
         issued_at: u64,
         expires_at: u64,
     ) {
@@ -1277,6 +1370,7 @@ impl NodeClient {
                 key,
                 CachedCapability {
                     token: token.to_owned(),
+                    token_id: token_id.to_owned(),
                     deadline,
                 },
             );
@@ -1328,14 +1422,16 @@ impl NodeClient {
                 )
                 .await?
             }
-            // 令牌被判过期/无效：丢掉缓存再取一次（只重试一次，不做无限循环）。
+            // 令牌被判过期/无效/**撤销**：清缓存再取一次（只重试一次，不做无限循环）。
             Err(error)
                 if matches!(
                     error.node_code(),
-                    Some("AUTH_EXPIRED" | "INVALID_CAPABILITY")
+                    Some("AUTH_EXPIRED" | "INVALID_CAPABILITY" | "CAPABILITY_REVOKED")
                 ) =>
             {
                 self.set_capability_mode(true);
+                // CAP-REV：撤销立即生效，缓存里的旧令牌必须彻底丢掉才能重取。
+                self.clear_capability_cache();
                 let capability = self.issue_capability(upload_id, SCOPE_BLOB_UPLOAD, None).await?;
                 self.send_authenticated_with_capability(
                     "PUT",
@@ -1434,11 +1530,18 @@ impl NodeClient {
             Err(error)
                 if matches!(
                     error.node_code(),
-                    Some("AUTH_REQUIRED" | "AUTH_EXPIRED" | "INVALID_CAPABILITY")
+                    Some(
+                        "AUTH_REQUIRED"
+                            | "AUTH_EXPIRED"
+                            | "INVALID_CAPABILITY"
+                            | "CAPABILITY_REVOKED"
+                    )
                 ) =>
             {
-                // 强制模式自适应 + 过期令牌刷新，只重试一次。
+                // 强制模式自适应 + 过期/被撤销令牌刷新，只重试一次。
                 self.set_capability_mode(true);
+                // CAP-REV：撤销立即生效，先丢掉缓存里的旧令牌。
+                self.clear_capability_cache();
                 let capability = self
                     .issue_capability(blob_id, SCOPE_BLOB_DOWNLOAD, None)
                     .await?;

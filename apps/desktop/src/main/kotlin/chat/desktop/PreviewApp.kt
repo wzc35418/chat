@@ -48,6 +48,7 @@ import chat.presentation.preview.updateSendNodePublicKey
 import chat.presentation.preview.updateSendNodeUrl
 import chat.presentation.preview.withSendStep
 import chat.presentation.preview.withMessageCards
+import chat.presentation.preview.withMessagePreview
 import chat.presentation.preview.withSyncStatus
 import chat.presentation.display.toCard
 import chat.presentation.preview.withCancel
@@ -679,6 +680,7 @@ fun main() = application {
                     val page = local.listMessages(conversationId, null, 20)
                     var updated = storeState
                     for (message in page.items) {
+                        updated = updated.withMessagePreview(message.messageId, message.body)
                         val ids = runCatching { local.messageAttachmentIds(message.messageId) }.getOrDefault(emptyList())
                         val cards = if (ids.isEmpty()) emptyList() else {
                             runCatching { attachmentService.records(ids).map { it.toCard() } }.getOrDefault(emptyList())

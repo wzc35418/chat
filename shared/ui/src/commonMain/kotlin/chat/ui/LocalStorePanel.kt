@@ -346,8 +346,13 @@ fun LocalStorePanel(
                 } else {
                     state.messageCards.entries.take(6).forEach { (messageId, cards) ->
                         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            val preview = state.messagePreviews[messageId]
                             Text(
-                                "消息 " + messageId.take(14) + "…",
+                                if (preview.isNullOrBlank()) {
+                                    "消息 " + messageId.take(14) + "…"
+                                } else {
+                                    "消息「" + preview + "」"
+                                },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = Color(0xFF5F6B63),
                             )
