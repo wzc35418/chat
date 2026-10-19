@@ -645,10 +645,15 @@ dependencies = [
 name = "chat-identity"
 version = "0.1.0"
 dependencies = [
+ "argon2",
+ "chacha20poly1305 0.11.0",
  "chat-protocol",
  "chat-storage",
  "ed25519-dalek 3.0.0",
  "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
  "zeroize",
 ]
 

@@ -27,7 +27,7 @@ use chat_crypto::attachment::{
     encrypt_attachment_chunk,
 };
 use chat_crypto::secret_descriptor::{
-    SecretDescriptor, open_secret_descriptor, seal_secret_descriptor,
+    MAX_SECRET_DESCRIPTOR_BYTES, SecretDescriptor, open_secret_descriptor, seal_secret_descriptor,
 };
 use chat_storage::formal::{
     AppliedEntry, AttachmentProgress as StoredTransferProgress,
@@ -141,6 +141,13 @@ pub enum AttachmentError {
     KeyUnavailable(&'static str),
     /// 附件层入参非法（例如负数宽限期），显式拒绝而不是静默纠正。
     InvalidInput(&'static str),
+    /// MLS exporter 派生失败：原样保留 crypto 的稳定码（未持久化/pending/epoch 不一致等）。
+    Exporter {
+        /// crypto 的稳定错误码（例如 EXPORTER_NOT_PERSISTED）。
+        code: &'static str,
+        /// 脱敏原因。
+        detail: String,
+    },
     /// 块传输端口失败（节点不可用/配额/会话过期/块缺失等）：保留冻结码，调用方可重试。
     Transport {
         /// 稳定错误码（实现方给冻结码，例如 NODE_UNAVAILABLE）。
@@ -184,6 +191,7 @@ impl AttachmentError {
             Self::InvalidChunkContext(_) => "INVALID_CHUNK_CONTEXT",
             Self::CryptoFailure(_) => "CRYPTO_FAILURE",
             Self::InternalFailure(_) => "INTERNAL_FAILURE",
+            Self::Exporter { code, .. } => code,
             Self::Storage { code, .. } => code,
             Self::KeyUnavailable(_) => "ATTACHMENT_KEY_UNAVAILABLE",
             Self::InvalidInput(_) => "INVALID_INPUT",
@@ -214,6 +222,9 @@ impl fmt::Display for AttachmentError {
             }
             Self::InvalidInput(detail) => {
                 write!(formatter, "invalid attachment input: {detail}")
+            }
+            Self::Exporter { code, detail } => {
+                write!(formatter, "attachment exporter failure {code}: {detail}")
             }
             Self::Transport { code, detail } => {
                 write!(formatter, "attachment transport failure {code}: {detail}")
@@ -1284,6 +1295,8 @@ impl PersistedAttachmentStore {
                 "restored attachment cache record is missing",
             ));
         };
+        // 重启/重开后进程内缓存可能为空：先用 0007 的 FileKey 恢复缓存记录再读清单。
+        self.ensure_cache_record(&record)?;
         let manifest = self.cache.attachment_manifest(attachment_id)?;
         let matches = cached.plain_size == record.plain_size
             && cached.chunk_size == record.chunk_size
@@ -4721,5 +4734,255 @@ impl PersistedAttachmentStore {
             return Err(error);
         }
         Ok(body.attachment_id.clone())
+    }
+}
+
+// ============================================================================
+// EXPD：exporter 包装密钥 + 协议 57 字段（attachment_metadata）
+// ============================================================================
+
+/// 附件元数据的紧凑编码版本（写进 PROTOCOL-009 字段 57，≤512 字节）。
+pub const ATTACHMENT_METADATA_VERSION: u8 = 1;
+/// 附件元数据上限（与协议字段上限一致）。
+pub const MAX_ATTACHMENT_METADATA_BYTES: usize = 512;
+
+/// 用 **MLS exporter** 派生附件包装密钥（当前写入路径）。
+///
+/// label 与 context 由 crypto 冻结（@@EXPORTER_LABEL_ATTACHMENT_FILE_KEY@@ /
+/// @@attachment_wrapping_context@@）；任何前置不满足（未持久化、有 pending、epoch 不一致、
+/// 已被移出群）都按 crypto 的稳定码原样透出，绝不伪造成功。
+pub fn attachment_exporter_wrapping_key(
+    device: &chat_crypto::engine::MlsDevice,
+    store: &FormalStore,
+    attachment_id: &str,
+    conversation_id: &str,
+    mls_epoch: u64,
+) -> AttachmentResult<[u8; 32]> {
+    let context = chat_crypto::exporter::attachment_wrapping_context(
+        attachment_id,
+        conversation_id,
+        mls_epoch,
+    );
+    let key = device
+        .export_key(
+            store,
+            chat_crypto::exporter::EXPORTER_LABEL_ATTACHMENT_FILE_KEY,
+            &context,
+            32,
+        )
+        .map_err(|error| AttachmentError::Exporter {
+            code: error.code(),
+            detail: format!("{error}"),
+        })?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(key.as_slice());
+    Ok(out)
+}
+
+/// legacy（v1）包装密钥：P0 占位派生，只用于打开老记录（不再产生新 v1）。
+pub fn attachment_legacy_wrapping_key(conversation_id: &str, mls_epoch: u64) -> [u8; 32] {
+    attachment_message_wrapping_key(conversation_id, mls_epoch)
+}
+
+/// 把附件消息体编码成字段 57 的紧凑字节（不含 JSON 开销）。
+///
+/// 布局：version(1) ‖ file_id(16) ‖ plain_size(8) ‖ ciphertext_bytes(8) ‖ chunk_bytes(4)
+/// ‖ chunk_count(4) ‖ content_digest(32) ‖ ciphertext_digest(32) ‖ descriptor_len(2)
+/// ‖ descriptor ‖ binding(32)。attachment_id 由 file_id 确定性派生（@@att-<hex>@@）。
+pub fn encode_attachment_metadata(body: &AttachmentMessageBody) -> AttachmentResult<Vec<u8>> {
+    let file_id = decode_hex_field(&body.file_id, "attachment metadata file id")?;
+    if file_id.len() != 16 {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "attachment metadata file id must be 16 bytes",
+        ));
+    }
+    let content_digest = decode_hex_field(&body.content_digest, "attachment metadata content digest")?;
+    let ciphertext_digest = decode_hex_field(&body.ciphertext_digest, "attachment metadata ciphertext digest")?;
+    if content_digest.len() != 32 || ciphertext_digest.len() != 32 {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "attachment metadata digests must be 32 bytes",
+        ));
+    }
+    let descriptor = decode_hex_field(&body.secret_descriptor, "attachment metadata descriptor")?;
+    if descriptor.is_empty() || descriptor.len() > MAX_SECRET_DESCRIPTOR_BYTES {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "attachment metadata descriptor has an invalid length",
+        ));
+    }
+    let binding = decode_hex_field(&body.binding, "attachment metadata binding")?;
+    if binding.len() != 32 {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "attachment metadata binding must be 32 bytes",
+        ));
+    }
+    let mut out = Vec::with_capacity(128 + descriptor.len());
+    out.push(ATTACHMENT_METADATA_VERSION);
+    out.extend_from_slice(&file_id);
+    out.extend_from_slice(&body.plain_size.to_be_bytes());
+    out.extend_from_slice(&body.ciphertext_bytes.to_be_bytes());
+    out.extend_from_slice(&body.chunk_bytes.to_be_bytes());
+    out.extend_from_slice(&body.chunk_count.to_be_bytes());
+    out.extend_from_slice(&content_digest);
+    out.extend_from_slice(&ciphertext_digest);
+    out.extend_from_slice(&(descriptor.len() as u16).to_be_bytes());
+    out.extend_from_slice(&descriptor);
+    out.extend_from_slice(&binding);
+    if out.len() > MAX_ATTACHMENT_METADATA_BYTES {
+        return Err(AttachmentError::ContentTooLarge);
+    }
+    Ok(out)
+}
+
+/// 解析字段 57 的紧凑字节（attachment_id 由 file_id 派生）。
+pub fn parse_attachment_metadata(metadata: &[u8]) -> AttachmentResult<AttachmentMessageBody> {
+    const HEADER: usize = 1 + 16 + 8 + 8 + 4 + 4 + 32 + 32 + 2;
+    if metadata.len() < HEADER + 1 + 32 || metadata.len() > MAX_ATTACHMENT_METADATA_BYTES {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "attachment metadata has an invalid length",
+        ));
+    }
+    if metadata[0] != ATTACHMENT_METADATA_VERSION {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "attachment metadata has an unsupported version",
+        ));
+    }
+    let mut cursor = 1;
+    let file_id = &metadata[cursor..cursor + 16];
+    cursor += 16;
+    let mut plain_size = [0u8; 8];
+    plain_size.copy_from_slice(&metadata[cursor..cursor + 8]);
+    cursor += 8;
+    let mut ciphertext_bytes = [0u8; 8];
+    ciphertext_bytes.copy_from_slice(&metadata[cursor..cursor + 8]);
+    cursor += 8;
+    let chunk_bytes = u32::from_be_bytes([
+        metadata[cursor],
+        metadata[cursor + 1],
+        metadata[cursor + 2],
+        metadata[cursor + 3],
+    ]);
+    cursor += 4;
+    let chunk_count = u32::from_be_bytes([
+        metadata[cursor],
+        metadata[cursor + 1],
+        metadata[cursor + 2],
+        metadata[cursor + 3],
+    ]);
+    cursor += 4;
+    let content_digest = &metadata[cursor..cursor + 32];
+    cursor += 32;
+    let ciphertext_digest = &metadata[cursor..cursor + 32];
+    cursor += 32;
+    let descriptor_len = usize::from(u16::from_be_bytes([
+        metadata[cursor],
+        metadata[cursor + 1],
+    ]));
+    cursor += 2;
+    if descriptor_len == 0 || metadata.len() < cursor + descriptor_len + 32 {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "attachment metadata descriptor length is invalid",
+        ));
+    }
+    let descriptor = &metadata[cursor..cursor + descriptor_len];
+    cursor += descriptor_len;
+    let binding = &metadata[cursor..cursor + 32];
+    let attachment_id = format!(
+        "{}{}",
+        ATTACHMENT_ID_PREFIX,
+        file_id.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+    );
+    let mut body = AttachmentMessageBody {
+        kind: ATTACHMENT_MESSAGE_KIND.to_owned(),
+        attachment_id,
+        file_id: hex(file_id),
+        plain_size: u64::from_be_bytes(plain_size),
+        content_digest: hex(content_digest),
+        display_name: String::new(),
+        ciphertext_bytes: u64::from_be_bytes(ciphertext_bytes),
+        chunk_bytes,
+        chunk_count,
+        ciphertext_digest: hex(ciphertext_digest),
+        secret_descriptor: hex(descriptor),
+        binding: hex(binding),
+    };
+    if body.chunk_bytes == 0 || body.chunk_count == 0 || body.ciphertext_bytes == 0 {
+        return Err(AttachmentError::AttachmentCorrupted(
+            "attachment metadata manifest fields must be non-zero",
+        ));
+    }
+    // 展示名不在协议字段里：落库时用固定占位（原始文件名不进公开元数据）。
+    body.display_name = ATTACHMENT_METADATA_DISPLAY_NAME.to_owned();
+    Ok(body)
+}
+
+/// 从 57 字段复原时的展示名占位（原始文件名不随公开元数据走）。
+pub const ATTACHMENT_METADATA_DISPLAY_NAME: &'static str = "attachment";
+
+impl PersistedAttachmentStore {
+    /// 采用**字段 57 元数据**：按描述符的派生来源选钥匙（v2 → exporter，v1 → legacy），
+    /// 然后走与旧正文路径完全相同的采用逻辑（绑定校验 + 0007 落库 + 零半状态）。
+    pub fn adopt_attachment_metadata(
+        &mut self,
+        metadata: &[u8],
+        exporter_key: Option<&[u8; 32]>,
+        legacy_key: Option<&[u8; 32]>,
+    ) -> AttachmentResult<String> {
+        let body = parse_attachment_metadata(metadata)?;
+        let descriptor_bytes =
+            decode_hex_field(&body.secret_descriptor, "attachment metadata descriptor")?;
+        let descriptor = SecretDescriptor::from_bytes(descriptor_bytes).map_err(|_| {
+            AttachmentError::KeyUnavailable("attachment metadata descriptor is not valid")
+        })?;
+        let key = if descriptor.is_legacy() {
+            legacy_key.ok_or(AttachmentError::KeyUnavailable(
+                "legacy descriptor requires the legacy P0 wrapping key",
+            ))?
+        } else {
+            exporter_key.ok_or(AttachmentError::KeyUnavailable(
+                "exporter-derived descriptor requires an exported wrapping key",
+            ))?
+        };
+        self.adopt_attachment_message(&body, key)
+    }
+
+    /// 事件级采用：**优先字段 57**，缺失时回退旧正文路径；两路都没有描述符 →
+    /// @@ATTACHMENT_KEY_UNAVAILABLE@@（绝不落一条“看起来能下载”的记录）。
+    pub fn adopt_attachment_event(
+        &mut self,
+        metadata: Option<&[u8]>,
+        legacy_body: Option<&str>,
+        exporter_key: Option<&[u8; 32]>,
+        legacy_key: Option<&[u8; 32]>,
+    ) -> AttachmentResult<String> {
+        if let Some(metadata) = metadata {
+            return self.adopt_attachment_metadata(metadata, exporter_key, legacy_key);
+        }
+        if let Some(text) = legacy_body {
+            let body = parse_attachment_message_body(text)?
+                .ok_or_else(|| {
+                    AttachmentError::AttachmentCorrupted(
+                        "message body is not an attachment descriptor body",
+                    )
+                })?;
+            // 旧正文路径：v2/v1 都可能出现，按描述符派生来源选钥匙。
+            let descriptor_bytes =
+                decode_hex_field(&body.secret_descriptor, "attachment message descriptor")?;
+            let descriptor = SecretDescriptor::from_bytes(descriptor_bytes).map_err(|_| {
+                AttachmentError::KeyUnavailable("attachment message descriptor is not valid")
+            })?;
+            let key = if descriptor.is_legacy() {
+                legacy_key.ok_or(AttachmentError::KeyUnavailable(
+                    "legacy descriptor requires the legacy P0 wrapping key",
+                ))?
+            } else {
+                exporter_key.ok_or(AttachmentError::KeyUnavailable(
+                    "exporter-derived descriptor requires an exported wrapping key",
+                ))?
+            };
+            return self.adopt_attachment_message(&body, key);
+        }
+        Err(AttachmentError::KeyUnavailable(
+            "attachment message carries no secret descriptor (legacy attachment reference)",
+        ))
     }
 }

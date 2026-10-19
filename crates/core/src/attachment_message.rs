@@ -207,3 +207,77 @@ pub fn apply_attachment_message_event(
         sent_at_ms,
     })
 }
+
+/// 附件消息的**协议字段 57**（attachment_metadata）：新消息把描述符放在这里，正文只留人类可读摘要。
+pub fn attachment_metadata_from_event(event: &AuthenticatedEvent) -> Option<&[u8]> {
+    match &event.event().content {
+        ApplicationContent::Attachment { attachment } => attachment.attachment_metadata.as_deref(),
+        _ => None,
+    }
+}
+
+/// 旧格式（描述符在正文里）的正文；新消息（字段 57）返回 None。
+pub fn attachment_legacy_body_from_event(event: &AuthenticatedEvent) -> Option<&str> {
+    match &event.event().content {
+        ApplicationContent::Text { text } => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+/// SECD/EXPD：把**已由描述符复现**的附件消息落成正式消息（字段 57 与旧正文两种形态都接受）。
+///
+/// 存储是单写者独占：调用方先用
+/// [`crate::attachments::PersistedAttachmentStore::adopt_attachment_event`] 在附件库里完成
+/// “优先 57 / 回退正文”的采用，再用本函数（内核句柄）写消息与引用。
+pub fn apply_attachment_event(
+    core: &mut ConversationCore,
+    event: &AuthenticatedEvent,
+    attachment_id: &str,
+) -> anyhow::Result<AppliedApplicationMessage> {
+    let plain = event.event();
+    let has_metadata = attachment_metadata_from_event(event).is_some();
+    let has_legacy_body = attachment_legacy_body_from_event(event).is_some();
+    if !has_metadata && !has_legacy_body {
+        return Err(anyhow::Error::new(AttachmentError::AttachmentCorrupted(
+            "attachment event carries neither field 57 metadata nor a legacy body",
+        )));
+    }
+    let conversation_id = plain.conversation_id.encode();
+    let author_account = plain.account_id.encode();
+    let author_device = plain.device_id.encode();
+    let sent_at_ms = plain.sent_at_unix_ms;
+    let created_at_ms = i64::try_from(sent_at_ms).map_err(|_| {
+        anyhow::Error::new(chat_sync::SyncError::new(
+            chat_sync::ErrorCode::InvalidTarget,
+            "event timestamp is out of the supported range",
+        ))
+    })?;
+    let mine = match core.load_identity_account() {
+        Ok(Some(identity)) => identity.account_id == author_account,
+        Ok(None) => false,
+        Err(error) => return Err(error),
+    };
+    let message_id = message_id_for_event(event);
+    let input = VerifiedEntryInput {
+        conversation_id: conversation_id.clone(),
+        title: String::new(),
+        message_id: message_id.clone(),
+        author_account: author_account.clone(),
+        author_device: author_device.clone(),
+        // 正文只留人类可读摘要（描述符在字段 57 / 旧正文里，从不进消息正文）。
+        body: ATTACHMENT_ONLY_BODY.to_owned(),
+        mine,
+        created_at_ms,
+    };
+    let row = core.apply_verified_entry_with_attachments(input, vec![attachment_id.to_owned()])?;
+    Ok(AppliedApplicationMessage {
+        message_id: row.message_id,
+        conversation_id: row.conversation_id,
+        body: row.body,
+        attachment_ids: vec![attachment_id.to_owned()],
+        author_account,
+        author_device,
+        mine,
+        sent_at_ms,
+    })
+}

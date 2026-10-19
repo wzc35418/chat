@@ -7,6 +7,12 @@ publish.workspace = true
 [dependencies]
 chat-protocol.workspace = true
 chat-storage.workspace = true
+# IDENTITY-013/014：恢复文件用 argon2id 派生口令密钥 + XChaCha20-Poly1305 加密。
+argon2.workspace = true
+chacha20poly1305.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 zeroize.workspace = true

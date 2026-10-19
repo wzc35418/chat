@@ -11,6 +11,7 @@ import chat.api.StoredPage
 import chat.presentation.display.DraftUiState
 import chat.presentation.display.StoreEventUi
 import chat.presentation.display.presentDraft
+import chat.presentation.display.toCard
 import chat.presentation.display.toDraftEvidence
 import chat.presentation.display.toUi
 
@@ -27,6 +28,20 @@ private inline fun <T> guard(block: () -> T): UseCaseResult<T> = try {
 } catch (error: IllegalArgumentException) {
     UseCaseResult.Failed("INVALID_INPUT", error.message)
 }
+
+/** 群列表用例返回（含跳过计数，不静默丢）。 */
+data class GroupListView(
+    val groups: List<chat.api.GroupSummaryEntry>,
+    val skipped: Int,
+)
+
+/** 消息附件卡片用例返回：每条消息一组卡片（只读投影）。 */
+data class MessageCardsView(
+    val cardsByMessage: Map<String, List<chat.presentation.display.AttachmentCard>>,
+    /** 没有附件或读不到附件 id 的消息数（显式计数，便于界面提示）。 */
+    val emptyMessages: Int,
+    val failedMessages: Int,
+)
 
 /**
  * 应用用例层（PRESENTATION-001~008 的落地骨架）。
@@ -79,6 +94,65 @@ class UseCases(
     /** PRESENTATION-006：取消三态原样返回，界面不得把 cancel_too_late 显示成已撤回。 */
     suspend fun cancelDraft(draftId: String): UseCaseResult<DraftCancelOutcome> = guard {
         store.cancelDraft(draftId)
+    }
+
+    /** PRESENTATION-009：群列表（只读投影，skipped 原样上报）。 */
+    suspend fun loadGroupList(
+        groups: chat.api.GroupService,
+    ): UseCaseResult<GroupListView> = guard {
+        val list = groups.listGroups()
+        GroupListView(groups = list.groups, skipped = list.skipped)
+    }
+
+    /** PRESENTATION-010：按消息批量取附件卡片（不解密正文，缺失跳过并计数）。 */
+    suspend fun loadMessageCards(
+        conversationId: String,
+        attachments: chat.api.AttachmentService,
+        limit: Int = 20,
+    ): UseCaseResult<MessageCardsView> = guard {
+        val page = store.listMessages(conversationId, null, limit)
+        val cards = LinkedHashMap<String, List<chat.presentation.display.AttachmentCard>>()
+        var empty = 0
+        var failed = 0
+        for (message in page.items) {
+            val ids = try {
+                store.messageAttachmentIds(message.messageId)
+            } catch (error: LocalStoreException) {
+                failed += 1
+                continue
+            }
+            if (ids.isEmpty()) {
+                empty += 1
+                cards[message.messageId] = emptyList()
+                continue
+            }
+            val records = try {
+                attachments.records(ids)
+            } catch (error: LocalStoreException) {
+                failed += 1
+                continue
+            }
+            cards[message.messageId] = records.map { it.toCard() }
+        }
+        MessageCardsView(cardsByMessage = cards, emptyMessages = empty, failedMessages = failed)
+    }
+
+    /** PRESENTATION-011：从节点下载附件（返回写入字节数；失败原样透出稳定码）。 */
+    suspend fun downloadAttachment(
+        attachments: chat.api.AttachmentService,
+        attachmentId: String,
+        targetPath: String,
+        endpointUrl: String,
+        nodeId: String,
+        nodePublicKeyHex: String?,
+        groupId: String,
+        sourceSeq: Long,
+    ): UseCaseResult<Long> = guard {
+        require(targetPath.isNotBlank()) { "下载目标路径不能为空" }
+        require(endpointUrl.startsWith("http://") || endpointUrl.startsWith("https://")) {
+            "节点地址必须是 http/https"
+        }
+        attachments.download(attachmentId, targetPath, endpointUrl, nodeId, nodePublicKeyHex, groupId, sourceSeq)
     }
 
     /** PRESENTATION-008：事件转界面提示；溢出必须整体重查（不是“丢几条”）。 */

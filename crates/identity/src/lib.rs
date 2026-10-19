@@ -20,6 +20,7 @@ pub mod device;
 pub mod error;
 pub mod invite;
 pub mod keys;
+pub mod recovery;
 pub mod registry;
 pub mod service;
 
@@ -42,6 +43,12 @@ pub use registry::{
     AuthorizedDevice, DeviceRevocation, DeviceState, DeviceSummary, MAX_ACTIVE_DEVICES,
     MAX_LINK_TTL_MS, MIN_LINK_TTL_MS, PendingDeviceLink, authorize_device, begin_device_link,
     complete_device_link, list_devices, require_active_device, revoke_device,
+};
+pub use recovery::{
+    ALLOWED_ARGON2_PARAMS, Argon2Params, MAX_PASSPHRASE_BYTES, MAX_RECOVERY_BUNDLE_BYTES,
+    MIN_PASSPHRASE_BYTES, RECOVERY_FORMAT_VERSION, RecoveryError, RecoveryIdentityView,
+    RecoveryResult, export_recovery_bundle, export_recovery_bundle_with_params,
+    import_recovery_bundle,
 };
 pub use service::{
     AccountView, ContactRequest, LocalAccount, MAX_DISPLAY_NAME_BYTES, accept_contact_invite,

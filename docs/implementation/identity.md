@@ -673,9 +673,98 @@ import_identity_recovery(source: FileToken, secret: RecoverySecret) -> Result<Re
 
 **完成验收**：
 
-- [ ] 伪造 KDF 极大内存拒绝。
-- [ ] 错误口令无副作用。
-- [ ] 旧历史仍不可恢复。
+- [x] 伪造 KDF 极大内存拒绝。（`ALLOWED_ARGON2_PARAMS` 白名单：m_cost 只接受 19456/47104/65536 KiB，
+  其它值导出与导入都显式 `RECOVERY_UNSUPPORTED`；见 recovery 用例的“头部参数改成白名单外的值”断言）
+- [x] 错误口令无副作用。（KCV 不匹配 → `RECOVERY_BAD_PASSPHRASE`，目标库读写前后都是空）
+- [x] 旧历史仍不可恢复。（恢复文件**不含存储主密钥**，因此旧库的消息/附件无法解开——见下节限制）
 
-**实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
+**实现状态**：已实现（IDENTITY-013/014）。见下文“身份恢复文件实现记录”节的公开面、语义与证据。
+恢复文件里**没有**存储主密钥，所以"换机器拿回身份"≠"拿回旧库历史"。
+
+## 身份恢复文件实现记录（IDENTITY-013/014，2026-10-18，Windows x64）
+
+代码：[crates/identity/src/recovery.rs](../../crates/identity/src/recovery.rs)（新）；测试：
+[crates/identity/tests/recovery.rs](../../crates/identity/tests/recovery.rs)（4 个，真临时加密库）。
+
+### 公开面
+
+~~~text
+pub fn export_recovery_bundle(store: &Store, passphrase: &str) -> RecoveryResult<Vec<u8>>
+pub fn export_recovery_bundle_with_params(store, passphrase, Argon2Params) -> RecoveryResult<Vec<u8>>
+pub fn import_recovery_bundle(store: &mut Store, bundle: &[u8], passphrase: &str)
+    -> RecoveryResult<RecoveryIdentityView>
+
+RecoveryIdentityView { account_id, device_id, account_public_key, device_public_key,
+                       display_name, created_at_ms, devices_digest }
+Argon2Params { m_cost_kib, t_cost, p_cost }        ALLOWED_ARGON2_PARAMS（3 组白名单）
+RecoveryError::code() -> RECOVERY_BAD_PASSPHRASE / RECOVERY_CORRUPTED / RECOVERY_UNSUPPORTED /
+                         RECOVERY_TARGET_NOT_EMPTY / INVALID_INPUT / storage 冻结码
+pub const MAX_RECOVERY_BUNDLE_BYTES = 1 MiB
+~~~
+
+### 文件格式（全大端）
+
+~~~text
+magic(8)="chatreco" | version(1)=1 | m_cost(4) | t_cost(4) | p_cost(4) | salt(16) | kcv(16)
+| nonce(24) | XChaCha20-Poly1305(明文 JSON ‖ tag)
+明文 JSON：format_version, account_id, device_id, display_name, created_at_ms,
+           account_public_key, device_public_key, devices_digest, account_seed, device_seed
+AAD = magic ‖ version ‖ 参数 ‖ salt（头被改就解不开）
+~~~
+
+### 关键语义
+
+1. **KDF**：argon2id（V0x13）派生 32 字节口令密钥；盐每次导出随机 16 字节；
+   参数写成文件头并可版本化；**参数必须在白名单里**（导出与导入都校验）。
+2. **口令错误 vs 文件被篡改**：文件头带 **KCV**（`H("recovery-kcv/v1"‖密钥)` 前 16 字节）。
+   导入先比 KCV：不匹配 → `RECOVERY_BAD_PASSPHRASE`；KCV 匹配但 AEAD 认证失败 →
+   `RECOVERY_CORRUPTED`（正文被改）。这是本轮为“两种错误要给出不同稳定码”而加的唯一设计取舍。
+3. **绝不覆盖**：导入前要求目标库既没有账户投影也没有种子记录，否则 `RECOVERY_TARGET_NOT_EMPTY`。
+4. **自洽校验**：种子必须能派生出载荷里声明的账户/设备 ID 与公钥，设备列表摘要也必须重算一致，
+   否则 `RECOVERY_CORRUPTED`（防止"改 ID 指向别人的账户"）。
+5. **不含主密钥**：恢复文件只有身份材料；旧库的消息/附件/联系人**无法解密**（主密钥不参与导出）。
+
+### 错误码（本层自有码表，不改 PROTOCOL-014）
+
+| 情形 | code |
+|---|---|
+| 口令错（KCV 不匹配） | `RECOVERY_BAD_PASSPHRASE` |
+| 结构损坏/正文被篡改/自洽校验失败 | `RECOVERY_CORRUPTED` |
+| 版本或 argon2 参数不受支持 | `RECOVERY_UNSUPPORTED` |
+| 目标库已有身份 | `RECOVERY_TARGET_NOT_EMPTY` |
+| 口令/文件越界、库里没有身份 | `INVALID_INPUT` |
+| 存储失败 | storage 冻结码（`STORAGE_*`） |
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-identity --test recovery   # 4 passed
+cargo test --offline -p chat-identity -p chat-storage    # 56 + 94 passed（既有 52/94 继续通过）
+~~~
+
+### 证据
+
+- `recovery::export_then_import_restores_the_same_identity`：固定种子建身份 → 导出（文件里**找不到**
+  明文账户种子与主密钥字节）→ 空库导入 → 账户/设备 ID、设备公钥、显示名、创建时间全一致 →
+  库里既有查询（`load_identity_account` / `load_identity_seeds`）能读到，且种子重建出的设备公钥相同。
+- `recovery::four_rejections_leave_the_target_untouched`：错误口令 → `RECOVERY_BAD_PASSPHRASE`；
+  翻转正文一位 → `RECOVERY_CORRUPTED`；版本改 9 → `RECOVERY_UNSUPPORTED`；
+  目标库已有身份 → `RECOVERY_TARGET_NOT_EMPTY`（原身份不变）。前两种都断言目标库仍是空库（零写入）。
+- `recovery::oversized_inputs_and_unknown_kdf_parameters_are_rejected`：文件 1 MiB+1 →
+  `INVALID_INPUT`（解密前拒绝）；口令 5/257 字节 → `INVALID_INPUT`；白名单外参数导出 →
+  `RECOVERY_UNSUPPORTED`；三组白名单参数都能导出并成功导入；把头部参数改成白名单外 → 导入拒绝。
+- `recovery::export_without_an_identity_is_rejected`：库里没有身份 → `INVALID_INPUT`（不产出文件）。
+
+### 已知限制
+
+1. **不含主密钥**：恢复的是身份（账户/设备种子），旧库的消息/附件/联系人仍不可读——这是设计选择，
+   "换机器还能拿回身份"不等于"还能读旧历史"。
+2. **只有本机一台设备**：`devices_digest` 是"账户 + 设备"的摘要；多设备列表与撤销集合的恢复待
+   IDENTITY-011/012 的跨设备同步接上后再扩展。
+3. **KCV 由定长摘要组成**：它让离线口令验证不经过 AEAD，但成本仍由 argon2id 决定（与猜 AEAD 标签等价）；
+   不提供口令强度策略，只做长度/控制字符校验。
+4. **导入是"新建身份"**：不迁移旧数据、不合并、不删除目标库里其它数据（目标库必须没有身份）。
+5. **参数白名单是固定的三组**：升级 argon2 参数需要发版（文件头带版本，旧文件仍可导入）。
+
 
