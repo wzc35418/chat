@@ -49,14 +49,17 @@ cargo test --offline -p chat-crypto --test attachment_chunks   # 9 passed
 [crates/crypto/src/secret_descriptor.rs](../../crates/crypto/src/secret_descriptor.rs)；本地持久化
 （ADR 第 1 步）在 [storage.md](storage.md)。
 
-- 格式（固定 93 字节）：version(1) || nonce(12) || ciphertext(48 = 32 密钥 + 16 标签) || digest(32)。
-  digest = SHA-256(域分隔 || 正文长度 || 正文)，在 AEAD 之前校验，用于快速发现损坏；机密性/完整性
-  仍由 ChaCha20-Poly1305 提供。
-- 包装密钥：调用方提供 32 字节（未来由 MLS application secret 派生；本轮未接线），因此描述符可以
-  随消息传递而不泄露 FileKey。
+- 格式（R-76 起固定 **94 字节** v2）：version(2) || derivation(1 = exporter) || nonce(12) ||
+  ciphertext(48 = 32 密钥 + 16 标签) || digest(32)。digest = SHA-256(域分隔 || 正文长度 || 正文)，
+  在 AEAD 之前校验，用于快速发现损坏；机密性/完整性仍由 ChaCha20-Poly1305 提供。
+  legacy v1（93 字节，无 derivation 字节）**仍可解析与打开**，`derivation()` 标记为 `legacy_p0`。
+- 包装密钥：调用方提供 32 字节；R-76 起必须来自 **MLS exporter**
+  （`MlsDevice::export_key(store, "chat attachment file key", attachment_wrapping_context(...), 32)`），
+  不再使用 P0 占位哈希派生；因此描述符可以随消息传递而不泄露 FileKey，并天然绑定同群同 epoch。
 - AAD：域分隔 + 长度前缀的 attachment_id；把描述符挪到另一个附件上会认证失败。
-- 有界与失败语义：长度不是 93 字节、版本不是 1、长度上限（256 字节）、attachment_id 为空或超长
-  都显式拒绝；解封失败统一 ATTACHMENT_CORRUPTED（不区分错密钥与篡改），不返回任何明文；
+- 有界与失败语义：长度不符合 v2/v1 固定长度、版本/派生标记不可识别、长度上限（256 字节）、
+  attachment_id 为空或超长都显式拒绝；解封失败统一 ATTACHMENT_CORRUPTED（不区分错密钥与篡改），
+  不返回任何明文；
   解出的 FileKey 用 Zeroizing 缓冲（Drop 清零），描述符 Debug 只打印版本与摘要。
 - 密钥外带：新增 `FileKey::copy_bytes()` 返回 Zeroizing 缓冲，只在“写入受保护存储/封装描述符”
   的边界使用；core 侧拿到副本后必须立即交给加密存储并显式清零。
@@ -65,11 +68,12 @@ cargo test --offline -p chat-crypto --test attachment_chunks   # 9 passed
 
 ```powershell
 . .\tools\activate.ps1
-cargo test --offline -p chat-crypto --test secret_descriptor   # 4 passed
+cargo test --offline -p chat-crypto --test secret_descriptor   # 6 passed（v2 往返 + legacy 可读）
 ```
 
-已知限制：包装密钥的派生与生命周期（MLS application secret / 平台密钥槽）未接线，因此跨设备
-“描述符送达即可下载”仍未端到端验证；描述符没有独立的 KDF/版本迁移策略（首个版本固定 93 字节）。
+已知限制：包装密钥的**派生**已由 R-76 的 MLS exporter 接线（`export_key`），但 core 侧仍需把
+`attachment_message_wrapping_key` 的占位派生换成 exporter 调用（crates/core 不在 R-76 写范围）；
+跨设备“描述符送达即可下载”的端到端验证依赖该切换；legacy v1 记录已保证可读。
 
 ## CRYPTO-004/010 MLS 状态持久化切片实现记录（2026-10-18，Windows x64）
 
@@ -166,7 +170,7 @@ cargo test --offline -p chat-storage -p chat-crypto           # 全绿（28 + 65
 ```powershell
 . .\tools\activate.ps1
 cargo test --offline -p chat-crypto --test mls_control   # 22 passed（含自移除与提案式控制流用例）
-cargo test --offline -p chat-crypto                      # 54 passed（既有 49 继续全绿）
+cargo test --offline -p chat-crypto                      # 60 passed（既有 54 继续全绿）
 ```
 
 已知限制：控制操作没有账户/角色授权与 control-head 对账（DOMAIN-004 与日志层未接入）；
@@ -397,6 +401,72 @@ cargo test --offline -p chat-crypto                      # 49 passed（既有 44
 4. 提案在途期间本机不能发应用消息（MLS 规则），调用方（core 的 leave 流程）应把该状态视为
    "退出中"。
 
+
+
+## MLS exporter 密钥派生接线（R-76，2026-10-18，Windows x64）
+
+背景：附件包装密钥此前是 P0 占位派生（SHA-256(域‖会话‖epoch)），SECd 文档标注"exporter 接线后
+必须替换"。本轮在 crypto 侧接线 OpenMLS exporter，并把描述符升级到 v2，同时保留 legacy 可读。
+
+### 落地行为
+
+- `MlsDevice::export_key(store, label, context, len) -> Zeroizing<Vec<u8>>`：
+  - label 白名单（当前只有 `"chat attachment file key"`）；context 上限
+    `MAX_EXPORTER_CONTEXT_BYTES = 256`；长度 1..=32（`MAX_EXPORTER_KEY_BYTES`）；
+  - 导出前核对**已持久化的已提交 epoch** 与内存 epoch 一致：未持久化 → `EXPORTER_NOT_PERSISTED`；
+    不一致 → `STALE_EPOCH`；本机有 pending 控制提交/未跟踪 pending commit →
+    `EXPORTER_PENDING_COMMIT`；本机已被移出 → `USE_AFTER_EVICTION`；
+  - 实际派生调用 OpenMLS `export_secret`：同群同 epoch 的所有成员得到相同字节；
+  - 返回值是 `Zeroizing` 缓冲（Drop 清零），不进入日志/DTO；
+  - 新增稳定错误码：`UNSUPPORTED_EXPORTER_LABEL`、`EXPORTER_CONTEXT_TOO_LONG`、
+    `EXPORTER_KEY_LENGTH_INVALID`、`EXPORTER_PENDING_COMMIT`、`EXPORTER_NOT_PERSISTED`。
+- `attachment_wrapping_context(attachment_id, conversation_id, mls_epoch)`：SHA-256 域分隔绑定串，
+  作为 exporter context（换附件/换会话/换 epoch 都导不出同一密钥）。
+- SecretDescriptor v2（当前写入格式）：
+  `version(2) || derivation(1) || nonce(12) || ciphertext(32) || tag(16) || digest(32)`（94 字节）；
+  `seal_secret_descriptor` 写 v2（`DescriptorKeyDerivation::Exporter`）。
+  legacy v1（`version(1) || nonce || ct || tag || digest`，93 字节）**仍可解析与打开**，
+  `SecretDescriptor::derivation()` / `is_legacy()` 可区分；`seal_secret_descriptor_legacy`
+  只用于迁移/兼容测试，**不再产生新 v1 记录**。摘要覆盖整段正文（含版本/派生标记），
+  改版本或派生标记都会在解析/检索阶段被拒。
+- 删除：crypto 内不再有任何"占位哈希派生包装密钥"的代码路径（P0 占位派生只留在 core 的
+  `attachment_message_wrapping_key`，本轮不动 crates/core；切换是后续任务，legacy 记录已保证可读）。
+
+### 复现命令（全程离线）
+
+~~~powershell
+. .\tools\activate.ps1
+cargo test --offline -p chat-crypto --test exporter           # 4 passed
+cargo test --offline -p chat-crypto --test secret_descriptor  # 6 passed（含 legacy 可读）
+cargo test --offline -p chat-crypto                           # 60 passed（既有 54 继续全绿）
+~~~
+
+### 证据（测试名 → 契约点）
+
+- `exporter::exporter_key_is_identical_across_members_in_the_same_epoch`：同一群同一 epoch 的
+  两个设备导出**相同** 32 字节；换 context 派生不同值。
+- `exporter::exporter_key_changes_with_the_epoch_and_binds_descriptors`：epoch 1 → 2 后导出值变化；
+  双设备在 epoch 2 仍一致；epoch 1 密钥打不开 epoch 2 描述符（反之亦然）。
+- `exporter::exporter_rejects_unlisted_labels_long_contexts_and_bad_lengths`：未登记 label /
+  超长 context / len 0 / len 33 都显式拒绝（稳定码），上限 32 可用。
+- `exporter::exporter_requires_a_persisted_epoch_and_no_pending_commit`：未持久化 →
+  `EXPORTER_NOT_PERSISTED`；持久化后可导出；有 pending 控制提交 → `EXPORTER_PENDING_COMMIT`。
+- `secret_descriptor::secret_descriptor_roundtrip_opens_the_same_file_key`：新写入是 v2 /
+  Exporter 派生，往返还原同一 FileKey。
+- `secret_descriptor::legacy_descriptors_stay_readable_with_their_original_derivation`：v1 legacy
+  记录仍可解析/打开且 `is_legacy()` 为真（老数据不会因切换失效）。
+- `secret_descriptor::exporter_wrapped_descriptor_is_epoch_bound`：不同 epoch 的包装密钥不能互开。
+
+### 已知限制
+
+1. core 仍用 P0 占位派生生成包装密钥（crates/core 不在本轮写范围）：切换后应改成
+   `export_key(store, EXPORTER_LABEL_ATTACHMENT_FILE_KEY, attachment_wrapping_context(...), 32)`，
+   并让新消息体里的描述符是 v2；legacy v1 已保证可读。
+2. 导出要求"当前 epoch 已持久化"：刚合并、尚未 export_to_store 的设备需要先落库再导出（设计如此，
+   避免拿未落库分支的密钥封装）。
+3. exporter 只用于包装密钥；FileKey/分块 AEAD（CRYPTO-011/012）与 MLS 应用消息密钥互不影响。
+4. 未做密钥轮换历史/多版本共存：同一 epoch 内导出稳定，epoch 变化后旧描述符需要旧的包装密钥
+   （legacy 记录用 legacy 派生；v2 记录用写入时 epoch 的 exporter 值）。
 
 ## 提案式控制流（R-61，2026-10-18，Windows x64）
 

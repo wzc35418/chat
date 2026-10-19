@@ -122,6 +122,8 @@ pub mod field {
     // P1 补充（字段号只增不改）：控制候选的可选领域操作声明。
     pub const CONTROL_DOMAIN_OPERATION: u16 = 55;
     pub const CONTROL_DOMAIN_TARGET_DIGEST: u16 = 56;
+    // 附件引用可选 metadata（密钥描述符等，≤512 字节）。
+    pub const CONTENT_ATTACHMENT_METADATA: u16 = 57;
 }
 
 /// 已知安全字段号表。编码/解码都拒绝表外字段号。
@@ -182,6 +184,7 @@ pub const KNOWN_FIELD_IDS: &[u16] = &[
     field::SESSION_MAX_CIPHERTEXT_BYTES,
     field::CONTROL_DOMAIN_OPERATION,
     field::CONTROL_DOMAIN_TARGET_DIGEST,
+    field::CONTENT_ATTACHMENT_METADATA,
 ];
 
 /// 判断字段号是否属于冻结安全字段集合。

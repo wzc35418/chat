@@ -14,6 +14,7 @@ import chat.api.IdentityException
 import chat.api.LocalStoreException
 import chat.bridge.createAttachmentService
 import chat.bridge.createGroupService
+import chat.bridge.createPluginService
 import chat.bridge.createSyncService
 import chat.bridge.createIdentityService
 import chat.bridge.createLocalStore
@@ -62,6 +63,14 @@ import chat.presentation.preview.withPreview
 import chat.ui.AttachmentHandlers
 import chat.ui.GroupHandlers
 import chat.ui.IdentityHandlers
+import chat.presentation.preview.updateManifest
+import chat.presentation.preview.withError
+import chat.presentation.preview.withInstalled
+import chat.presentation.preview.withPlan
+import chat.presentation.preview.withPlugins
+import chat.presentation.preview.withStateNotice
+import chat.presentation.preview.withStorageValue
+import chat.ui.PluginHandlers
 import chat.ui.PreviewChatScreen
 import chat.ui.StoreHandlers
 import kotlinx.coroutines.launch
@@ -276,6 +285,74 @@ fun main() = application {
                         refreshContacts()
                     }
             }
+        }
+    }
+
+    var pluginState by remember { mutableStateOf(chat.presentation.preview.PreviewPluginState.Empty) }
+    val pluginService = remember { runCatching { createPluginService() }.getOrNull() }
+
+    val pluginHandlers = object {
+        fun refresh() = scope.launch {
+            val service = pluginService ?: return@launch
+            pluginState = pluginState.beginBusy()
+            runCatching { service.listPlugins() }
+                .onSuccess { pluginState = pluginState.withPlugins(it) }
+                .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+        }
+
+        fun install() = scope.launch {
+            val service = pluginService ?: return@launch
+            pluginState = pluginState.beginBusy()
+            runCatching {
+                val manifest = service.validateManifest(pluginState.manifestJson)
+                service.install(pluginState.manifestJson)
+                manifest.id
+            }.onSuccess { pluginState = pluginState.withInstalled(it) }
+                .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+            runCatching { service.listPlugins() }.onSuccess { pluginState = pluginState.withPlugins(it) }
+        }
+
+        fun start(id: String) = scope.launch {
+            val service = pluginService ?: return@launch
+            pluginState = pluginState.beginBusy()
+            runCatching { service.start(id) }
+                .onSuccess { pluginState = pluginState.withStateNotice("插件 " + id + " 已启动（宿主内状态）") }
+                .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+            runCatching { service.listPlugins() }.onSuccess { pluginState = pluginState.withPlugins(it) }
+        }
+
+        fun stop(id: String) = scope.launch {
+            val service = pluginService ?: return@launch
+            pluginState = pluginState.beginBusy()
+            runCatching { service.stop(id) }
+                .onSuccess { pluginState = pluginState.withStateNotice("插件 " + id + " 已停止") }
+                .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+            runCatching { service.listPlugins() }.onSuccess { pluginState = pluginState.withPlugins(it) }
+        }
+
+        fun uninstall(id: String) = scope.launch {
+            val service = pluginService ?: return@launch
+            pluginState = pluginState.beginBusy()
+            runCatching { service.uninstall(id, false) }
+                .onSuccess { pluginState = pluginState.withStateNotice("插件 " + id + " 已卸载（保留私有存储）") }
+                .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+            runCatching { service.listPlugins() }.onSuccess { pluginState = pluginState.withPlugins(it) }
+        }
+
+        fun dispatch(id: String) = scope.launch {
+            val service = pluginService ?: return@launch
+            pluginState = pluginState.beginBusy()
+            runCatching { service.dispatch(id, "composer.command", "ping") }
+                .onSuccess { pluginState = pluginState.withPlan(it) }
+                .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+        }
+
+        fun storage(pluginId: String) = scope.launch {
+            val service = pluginService ?: return@launch
+            pluginState = pluginState.beginBusy()
+            runCatching { service.storageGet(pluginId, "probe") }
+                .onSuccess { pluginState = pluginState.withStorageValue(it) }
+                .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
         }
     }
 
@@ -858,9 +935,30 @@ fun main() = application {
             attachmentHandlers = attachmentHandlers,
             groupState = groupState,
             groupHandlers = groupHandlers,
+            pluginState = pluginState,
+            pluginHandlers = PluginHandlers(
+                updateManifest = { pluginState = pluginState.updateManifest(it) },
+                chooseManifestFile = {
+                    val picker = filePicker ?: return@PluginHandlers
+                    runCatching {
+                        val chosen = picker.chooseImportFile("选择插件清单 JSON")
+                        pluginState = pluginState.updateManifest(File(chosen.path).readText())
+                    }.onFailure { pluginState = pluginState.withError("INVALID_INPUT", it.message) }
+                },
+                loadList = { pluginHandlers.refresh() },
+                install = { pluginHandlers.install() },
+                start = { pluginHandlers.start(it) },
+                stop = { pluginHandlers.stop(it) },
+                uninstall = { pluginHandlers.uninstall(it) },
+                dispatch = { pluginHandlers.dispatch(it) },
+                storageGet = { pluginHandlers.storage(it) },
+            ),
         )
     }
 }
+
+/** 附件卡片/插件面板共用的稳定错误码提取。 */
+private fun codeOf(error: Throwable): String = (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT"
 
 /** 演示口令：正式产品必须改为用户输入或操作系统密钥链（PLATFORM-001 未接线部分）。 */
 private const val DEMO_KEY_PASSPHRASE = "chat-preview-demo-passphrase"

@@ -27,6 +27,8 @@ pub const MAX_APPLICATION_EVENT_BYTES: usize = 64 * 1024;
 pub const MAX_EVENT_TEXT_BYTES: usize = 8 * 1024;
 /// 事件摘要用途域（可信去重键）。
 pub const EVENT_DIGEST_DOMAIN: &[u8] = b"chat/p1/application-event/v1";
+/// 附件引用可选 metadata 的字节上限（密钥描述符等）。
+pub const MAX_ATTACHMENT_METADATA_BYTES: usize = 512;
 
 const SCHEMA_VERSION: u64 = 1;
 const EVENT_FIELD_COUNT: usize = 16;
@@ -61,10 +63,28 @@ impl MessageOrigin {
 }
 
 /// 附件引用（已完成加密上传的文件描述 ID）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentRef {
     /// 文件对象 ID。
     pub file_id: ObjectId,
+    /// 可选的附件 metadata（例如密钥描述符；1–512 字节，旧事件缺省为 `None`）。
+    pub attachment_metadata: Option<Vec<u8>>,
+}
+
+impl AttachmentRef {
+    /// 仅文件 ID 的附件引用（兼容旧调用点）。
+    pub const fn new(file_id: ObjectId) -> Self {
+        Self {
+            file_id,
+            attachment_metadata: None,
+        }
+    }
+
+    /// 附带 metadata 的附件引用。
+    pub fn with_metadata(mut self, attachment_metadata: Vec<u8>) -> Self {
+        self.attachment_metadata = Some(attachment_metadata);
+        self
+    }
 }
 
 /// 回复目标。必须与事件同一会话。
@@ -282,6 +302,12 @@ impl PlainApplicationEvent {
                 if is_zero_bytes(attachment.file_id.as_bytes()) {
                     return Err(ProtocolError::InvalidEventBinding);
                 }
+                if let Some(metadata) = &attachment.attachment_metadata {
+                    // 非本形态（空 metadata）与超长都显式拒绝。
+                    if metadata.is_empty() || metadata.len() > MAX_ATTACHMENT_METADATA_BYTES {
+                        return Err(ProtocolError::InvalidCandidate);
+                    }
+                }
             }
             ApplicationContent::Extension { extension } => {
                 // 重新走 PROTOCOL-010：扩展内容必须仍然结构性合法。
@@ -362,7 +388,7 @@ fn event_body(event: &PlainApplicationEvent) -> WireValue {
             extension = WireValue::optional(Some(extension_value(content)));
         }
     }
-    WireValue::structure([
+    let mut body_fields = vec![
         WireField::new(field::SCHEMA_VERSION, WireValue::U64(SCHEMA_VERSION)),
         WireField::new(
             field::PROTOCOL_MAJOR,
@@ -416,7 +442,17 @@ fn event_body(event: &PlainApplicationEvent) -> WireValue {
         ),
         WireField::new(field::MESSAGE_ORIGIN, WireValue::U64(event.origin.as_u64())),
         WireField::new(field::EVENT_SENT_AT, WireValue::U64(event.sent_at_unix_ms)),
-    ])
+    ];
+    // 旧事件（无 metadata）不写新字段，既有固定向量逐字节不变。
+    if let ApplicationContent::Attachment { attachment } = &event.content
+        && let Some(metadata) = &attachment.attachment_metadata
+    {
+        body_fields.push(WireField::new(
+            field::CONTENT_ATTACHMENT_METADATA,
+            WireValue::Bytes(metadata.clone()),
+        ));
+    }
+    WireValue::Struct(body_fields)
 }
 
 fn canonical_event_bytes(event: &PlainApplicationEvent) -> Result<Vec<u8>> {
@@ -553,7 +589,7 @@ pub fn decode_application_event(
     let WireValue::Struct(fields) = frame.into_value() else {
         return Err(ProtocolError::InvalidEventBinding);
     };
-    if fields.len() != EVENT_FIELD_COUNT {
+    if !(fields.len() == EVENT_FIELD_COUNT || fields.len() == EVENT_FIELD_COUNT + 1) {
         return Err(ProtocolError::InvalidEventBinding);
     }
     let mut map: BTreeMap<u16, WireValue> = BTreeMap::new();
@@ -591,6 +627,17 @@ pub fn decode_application_event(
         Some(value) => Some(parse_extension(value)?),
         None => None,
     };
+    // 新字段可缺席（旧字节 → None）；出现时必须是 1–512 字节的 bytes。
+    let attachment_metadata = match map.remove(&field::CONTENT_ATTACHMENT_METADATA) {
+        None => None,
+        Some(WireValue::Bytes(bytes)) => {
+            if bytes.is_empty() || bytes.len() > MAX_ATTACHMENT_METADATA_BYTES {
+                return Err(ProtocolError::InvalidCandidate);
+            }
+            Some(bytes)
+        }
+        Some(_) => return Err(ProtocolError::InvalidCandidate),
+    };
     let reply_conversation = take_optional_id::<32>(&mut map, field::REPLY_CONVERSATION_ID)?;
     let reply_message = take_optional_id::<32>(&mut map, field::REPLY_MESSAGE_ID)?;
     let origin = MessageOrigin::from_u64(take_u64(&mut map, field::MESSAGE_ORIGIN)?)
@@ -605,6 +652,9 @@ pub fn decode_application_event(
             let (Some(text), None, None) = (text, attachment, extension) else {
                 return Err(ProtocolError::InvalidEventBinding);
             };
+            if attachment_metadata.is_some() {
+                return Err(ProtocolError::InvalidCandidate);
+            }
             ApplicationContent::Text { text }
         }
         CONTENT_KIND_ATTACHMENT => {
@@ -614,6 +664,7 @@ pub fn decode_application_event(
             ApplicationContent::Attachment {
                 attachment: AttachmentRef {
                     file_id: ObjectId::from_bytes(file_id),
+                    attachment_metadata,
                 },
             }
         }
@@ -621,6 +672,9 @@ pub fn decode_application_event(
             let (None, None, Some(extension)) = (text, attachment, extension) else {
                 return Err(ProtocolError::InvalidEventBinding);
             };
+            if attachment_metadata.is_some() {
+                return Err(ProtocolError::InvalidCandidate);
+            }
             ApplicationContent::Extension { extension }
         }
         _ => return Err(ProtocolError::InvalidEventBinding),
@@ -704,6 +758,7 @@ pub fn verify_inner_event(
 mod tests {
     use super::*;
     use crate::error::ErrorCode;
+    use crate::verify::SignedCandidate;
     use crate::verify::test_support::{
         DEVICE_SEED, context, credential, sign_with, unsigned_candidate, verified_application,
         verified_control,
@@ -775,6 +830,7 @@ mod tests {
         event.content = ApplicationContent::Attachment {
             attachment: AttachmentRef {
                 file_id: ObjectId::from_bytes([3; 32]),
+                attachment_metadata: None,
             },
         };
         let bytes = encode_application_event(event.clone()).unwrap();
@@ -974,5 +1030,180 @@ mod tests {
             .unwrap_err(),
             ProtocolError::InvalidEventBinding
         );
+    }
+
+    fn attachment_event(metadata: Option<Vec<u8>>) -> PlainApplicationEvent {
+        let mut event = text_event();
+        event.content = ApplicationContent::Attachment {
+            attachment: AttachmentRef {
+                file_id: ObjectId::from_bytes([3; 32]),
+                attachment_metadata: metadata,
+            },
+        };
+        event
+    }
+
+    #[test]
+    fn attachment_metadata_round_trips_old_and_new_bytes() {
+        // 旧事件：无 metadata，编码/解码往返且不带新字段。
+        let old_event = attachment_event(None);
+        let old_bytes = encode_application_event(old_event.clone()).unwrap();
+        assert_eq!(
+            decode_application_event(old_bytes.as_bytes(), DecodeLimits::DEFAULT).unwrap(),
+            old_event
+        );
+        let WireValue::Struct(old_fields) = event_body(&old_event) else {
+            panic!("event body must be a struct");
+        };
+        assert!(
+            old_fields
+                .iter()
+                .all(|field| field.id != field::CONTENT_ATTACHMENT_METADATA)
+        );
+        // 新事件：带 metadata，往返一致且字节不同。
+        let new_event = attachment_event(Some(vec![0xaa; 8]));
+        let new_bytes = encode_application_event(new_event.clone()).unwrap();
+        assert_ne!(old_bytes.as_bytes(), new_bytes.as_bytes());
+        assert_eq!(
+            decode_application_event(new_bytes.as_bytes(), DecodeLimits::DEFAULT).unwrap(),
+            new_event
+        );
+        // 恰好 512 字节可接受；空与超长显式拒绝。
+        let max_event = attachment_event(Some(vec![7; MAX_ATTACHMENT_METADATA_BYTES]));
+        let max_bytes = encode_application_event(max_event.clone()).unwrap();
+        assert_eq!(
+            decode_application_event(max_bytes.as_bytes(), DecodeLimits::DEFAULT).unwrap(),
+            max_event
+        );
+        assert_eq!(
+            encode_application_event(attachment_event(Some(Vec::new())))
+                .unwrap_err()
+                .code(),
+            crate::error::ErrorCode::InvalidCandidate
+        );
+        assert_eq!(
+            encode_application_event(attachment_event(Some(vec![
+                7;
+                MAX_ATTACHMENT_METADATA_BYTES
+                    + 1
+            ])))
+            .unwrap_err()
+            .code(),
+            crate::error::ErrorCode::InvalidCandidate
+        );
+    }
+
+    #[test]
+    fn attachment_metadata_shape_is_validated_on_decode() {
+        // 字段值类型不对（不是 bytes）→ INVALID_CANDIDATE。
+        let mut body = event_body(&attachment_event(Some(vec![1; 4])));
+        if let WireValue::Struct(fields) = &mut body {
+            for field in fields.iter_mut() {
+                if field.id == field::CONTENT_ATTACHMENT_METADATA {
+                    field.value = WireValue::U64(1);
+                }
+            }
+        }
+        let bytes = encode_canonical(&body, ProtocolVersion::V1).unwrap();
+        assert_eq!(
+            decode_application_event(bytes.as_bytes(), DecodeLimits::DEFAULT)
+                .unwrap_err()
+                .code(),
+            crate::error::ErrorCode::InvalidCandidate
+        );
+        // 空 metadata 字段 → INVALID_CANDIDATE。
+        let mut body = event_body(&attachment_event(Some(vec![1; 4])));
+        if let WireValue::Struct(fields) = &mut body {
+            for field in fields.iter_mut() {
+                if field.id == field::CONTENT_ATTACHMENT_METADATA {
+                    field.value = WireValue::Bytes(Vec::new());
+                }
+            }
+        }
+        let bytes = encode_canonical(&body, ProtocolVersion::V1).unwrap();
+        assert_eq!(
+            decode_application_event(bytes.as_bytes(), DecodeLimits::DEFAULT)
+                .unwrap_err()
+                .code(),
+            crate::error::ErrorCode::InvalidCandidate
+        );
+        // 无附件内容里出现 metadata → INVALID_CANDIDATE。
+        let mut body = event_body(&text_event());
+        if let WireValue::Struct(fields) = &mut body {
+            fields.push(WireField::new(
+                field::CONTENT_ATTACHMENT_METADATA,
+                WireValue::Bytes(vec![1; 4]),
+            ));
+            fields.sort_by_key(|field| field.id);
+        }
+        let bytes = encode_canonical(&body, ProtocolVersion::V1).unwrap();
+        assert_eq!(
+            decode_application_event(bytes.as_bytes(), DecodeLimits::DEFAULT)
+                .unwrap_err()
+                .code(),
+            crate::error::ErrorCode::InvalidCandidate
+        );
+        // 字段数超过 16/17 → INVALID_EVENT_BINDING。
+        let mut body = event_body(&text_event());
+        if let WireValue::Struct(fields) = &mut body {
+            fields.push(WireField::new(
+                field::CONTROL_HEAD,
+                WireValue::Bytes(vec![0; 32]),
+            ));
+            fields.push(WireField::new(
+                field::SUBMISSION_ID,
+                WireValue::Bytes(vec![0; 32]),
+            ));
+            fields.sort_by_key(|field| field.id);
+        }
+        let bytes = encode_canonical(&body, ProtocolVersion::V1).unwrap();
+        assert_eq!(
+            decode_application_event(bytes.as_bytes(), DecodeLimits::DEFAULT).unwrap_err(),
+            ProtocolError::InvalidEventBinding
+        );
+    }
+
+    #[test]
+    fn attachment_metadata_tampering_breaks_candidate_signature() {
+        // metadata 在 MLS 密文内；外层候选签名覆盖密文摘要，因此换 metadata 会让原签名失效。
+        let original_event = attachment_event(Some(vec![0xaa; 8]));
+        let original_bytes = encode_application_event(original_event).unwrap();
+        let mut unsigned = unsigned_candidate();
+        unsigned.encrypted_payload = original_bytes.as_bytes().to_vec();
+        let signed = sign_with(&unsigned, &DEVICE_SEED);
+        let verified = verify_candidate(signed.clone(), credential(&DEVICE_SEED), context())
+            .expect("original candidate must verify");
+        assert_eq!(verified.kind(), CandidateKind::Application);
+
+        let tampered_event = attachment_event(Some(vec![0xab; 8]));
+        let tampered_bytes = encode_application_event(tampered_event).unwrap();
+        let mut tampered = unsigned.clone();
+        tampered.encrypted_payload = tampered_bytes.as_bytes().to_vec();
+        assert_eq!(
+            verify_candidate(
+                SignedCandidate {
+                    unsigned: tampered,
+                    author_signature: signed.author_signature,
+                },
+                credential(&DEVICE_SEED),
+                context(),
+            )
+            .unwrap_err(),
+            ProtocolError::InvalidSignature
+        );
+        // 内层去重键也随 metadata 改变。
+        let first = verify_inner_event(
+            &DecryptedEvent::from_bytes(original_bytes.as_bytes().to_vec()),
+            sender(),
+            &verified_application(),
+        )
+        .unwrap();
+        let second = verify_inner_event(
+            &DecryptedEvent::from_bytes(tampered_bytes.as_bytes().to_vec()),
+            sender(),
+            &verified_application(),
+        )
+        .unwrap();
+        assert_ne!(first.digest(), second.digest());
     }
 }

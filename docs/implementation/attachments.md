@@ -486,10 +486,15 @@ cargo test --offline -p chat-core                                # 76 passed（�
 
 ### 已知限制
 
-1. **包装密钥仍是 P0 派生**：MLS exporter 未接线（crypto 无导出 application secret 的入口），
-   `attachment_message_wrapping_key(conversation_id, mls_epoch)` 用域分隔 SHA-256 派生。描述符只经 MLS 密文传输，
-   机密性来自 MLS；该密钥提供“同会话同 epoch 绑定 + 换会话/epoch 打不开”的纵深防御。exporter 接线后必须替换，
-   且**必须**同步换掉测试里的派生期望。
+1. **包装密钥仍是 P0 派生（crypto 侧已备好 exporter，core 待切换）**：crypto 本轮已提供
+   `MlsDevice::export_key(store, "chat attachment file key", context, len)`（OpenMLS
+   `export_secret`，见 [crypto.md 的 R-76 记录](crypto.md)）与
+   `attachment_wrapping_context(attachment_id, conversation_id, mls_epoch)`；**core 的**
+   `attachment_message_wrapping_key(conversation_id, mls_epoch)` 仍是域分隔 SHA-256 占位派生
+   （crates/core 不在 R-76 写范围）。切换时：core 用会话的 `MlsDevice` 调 `export_key` 得到包装密钥，
+   并把描述符升级为 v2（exporter 派生）；**老 v1 legacy 描述符仍可读**（crypto 的
+   `SecretDescriptor::derivation()` 可区分），因此历史消息不会因切换而不可解。描述符只经 MLS 密文
+   传输，机密性来自 MLS；该密钥提供“同会话同 epoch 绑定 + 换会话/epoch 打不开”的纵深防御。
 2. 明文摘要（`content_digest`）与明文大小进入消息体（按 TYPES.md 允许进入 E2EE 内层与本地记录），
    因此接收方在下载前就知道明文大小/摘要；它们不是秘密，但也不得进入节点公开清单。
 3. 单附件：协议内层事件目前只允许一个附件引用；消息体也按单附件建模。

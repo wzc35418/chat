@@ -366,7 +366,7 @@ fn legacy_attachment_reference_without_descriptor_cannot_be_downloaded() {
         0,
         4,
         ApplicationContent::Attachment {
-            attachment: AttachmentRef { file_id },
+            attachment: AttachmentRef::new(file_id),
         },
     );
     // 发送方本机：旧路径（带解析端口）照旧落库。

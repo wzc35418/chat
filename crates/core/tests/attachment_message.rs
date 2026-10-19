@@ -253,7 +253,7 @@ fn attachment_event_persists_the_message_and_the_reference() {
         before.epoch,
         0xe1,
         ApplicationContent::Attachment {
-            attachment: AttachmentRef { file_id },
+            attachment: AttachmentRef::new(file_id),
         },
         1_700_000_000_000,
     );
@@ -321,7 +321,7 @@ fn unknown_attachment_rejects_the_whole_message() {
         before.epoch,
         0xe2,
         ApplicationContent::Attachment {
-            attachment: AttachmentRef { file_id },
+            attachment: AttachmentRef::new(file_id),
         },
         1_700_000_100_000,
     );

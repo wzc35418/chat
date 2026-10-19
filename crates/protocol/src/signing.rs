@@ -458,7 +458,9 @@ pub fn decode_proposal_kind(body: &WireValue) -> Result<Option<ProposalKind>> {
     let WireValue::Struct(fields) = body else {
         return Err(ProtocolError::InvalidCandidate);
     };
-    let Some(candidate) = fields.iter().find(|candidate| candidate.id == field::CONTROL_OPERATION)
+    let Some(candidate) = fields
+        .iter()
+        .find(|candidate| candidate.id == field::CONTROL_OPERATION)
     else {
         return Ok(None);
     };
@@ -949,10 +951,26 @@ mod tests {
     #[test]
     fn proposal_values_round_trip_and_carry_a_stable_audit_label() {
         let cases = [
-            (9_u64, ControlOperation::ProposeMembership, ProposalKind::Membership),
-            (10, ControlOperation::ProposeRolePolicy, ProposalKind::RolePolicy),
-            (11, ControlOperation::ProposeSettings, ProposalKind::Settings),
-            (12, ControlOperation::ProposeKeyRotation, ProposalKind::KeyRotation),
+            (
+                9_u64,
+                ControlOperation::ProposeMembership,
+                ProposalKind::Membership,
+            ),
+            (
+                10,
+                ControlOperation::ProposeRolePolicy,
+                ProposalKind::RolePolicy,
+            ),
+            (
+                11,
+                ControlOperation::ProposeSettings,
+                ProposalKind::Settings,
+            ),
+            (
+                12,
+                ControlOperation::ProposeKeyRotation,
+                ProposalKind::KeyRotation,
+            ),
             (13, ControlOperation::ProposeCustom, ProposalKind::Custom),
         ];
         for (raw, operation, kind) in cases {
@@ -962,7 +980,10 @@ mod tests {
             assert_eq!(operation.proposal_kind(), Some(kind));
             assert_eq!(kind.as_u64(), (raw - 8));
             assert_eq!(ProposalKind::from_u64(kind.as_u64()), Some(kind));
-            assert!(operation.audit_label().starts_with("proposal:"), "audit label is a proposal");
+            assert!(
+                operation.audit_label().starts_with("proposal:"),
+                "audit label is a proposal"
+            );
             assert_eq!(kind.as_str(), &operation.audit_label()["proposal:".len()..]);
         }
         // 具体操作（1..=8）不因为新增提案值而改变数值，也不是提案。
@@ -1004,7 +1025,8 @@ mod tests {
         application.kind = CandidateKind::Application;
         application.control_metadata = None;
         assert_eq!(
-            decode_proposal_kind(&candidate_body_fields(&application)).expect("application decodes"),
+            decode_proposal_kind(&candidate_body_fields(&application))
+                .expect("application decodes"),
             None
         );
         // 未知操作值、畸形字段 → 显式失败。
@@ -1060,6 +1082,10 @@ mod tests {
             Digest::from_bytes([0x55; 32]),
         ));
         let other_bytes = candidate_signing_bytes(&other).expect("other proposal encodes");
-        assert_ne!(bytes.as_bytes(), other_bytes.as_bytes(), "提案值参与签名原文");
+        assert_ne!(
+            bytes.as_bytes(),
+            other_bytes.as_bytes(),
+            "提案值参与签名原文"
+        );
     }
 }

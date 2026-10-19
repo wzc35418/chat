@@ -436,3 +436,53 @@ fn domain_declaration_round_trips_and_old_bytes_stay_none() {
     assert!(is_known_field(field::CONTROL_DOMAIN_OPERATION));
     assert!(is_known_field(field::CONTROL_DOMAIN_TARGET_DIGEST));
 }
+/// 带 metadata 的附件事件（其余字段取自 u_package_event）。
+fn attachment_metadata_event() -> PlainApplicationEvent {
+    let mut event = u_package_event();
+    event.content = ApplicationContent::Attachment {
+        attachment: AttachmentRef {
+            file_id: ObjectId::from_bytes([3; 32]),
+            attachment_metadata: Some(vec![0xa5; 48]),
+        },
+    };
+    event
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(char::from(HEX[(byte >> 4) as usize]));
+        text.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    text
+}
+
+const ATTACHMENT_METADATA_EVENT_VECTOR: &str = "435043010007001100010100000000000000010002010000000000000001000301000000000000000000050200000020777777777777777777777777777777777777777777777777777777777777777700060200000020b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b200230200000020e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e100240200000020a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1002501000000000000000200260400270400280502000000200303030303030303030303030303030303030303030303030303030303030303002904002a04002b010000000000000001002c0200000020c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1002d010000018bcfe5680000390200000030a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5";
+const ATTACHMENT_METADATA_DIGEST_VECTOR: &str =
+    "64d9113ad3f6e854cc5027bc676645be88e49b6df5e1995c81f2dc899cc35a85";
+
+#[test]
+fn attachment_metadata_event_matches_frozen_vector() {
+    let event = attachment_metadata_event();
+    let bytes = encode_application_event(event.clone()).expect("encode");
+    assert_eq!(
+        hex_encode(bytes.as_bytes()),
+        ATTACHMENT_METADATA_EVENT_VECTOR
+    );
+    // 内层去重键（事件摘要）也冻结：metadata 改变必然改变该摘要。
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(EVENT_DIGEST_DOMAIN);
+    preimage.extend_from_slice(bytes.as_bytes());
+    assert_eq!(
+        Digest::sha256(&preimage).to_hex(),
+        ATTACHMENT_METADATA_DIGEST_VECTOR
+    );
+    assert_eq!(
+        decode_application_event(bytes.as_bytes(), DecodeLimits::DEFAULT).unwrap(),
+        event
+    );
+    // 新事件比旧事件多一个 57 字段；旧事件编码走既有冻结向量测试。
+    let old = encode_application_event(u_package_event()).expect("old event");
+    assert!(bytes.as_bytes().len() > old.as_bytes().len());
+}
