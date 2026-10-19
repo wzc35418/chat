@@ -459,6 +459,7 @@ pub(crate) mod test_support {
             domain_operation: None,
             added_credentials: Vec::new(),
             removed_credentials: Vec::new(),
+            revoked_devices: Vec::new(),
         });
         unsigned
     }
@@ -641,6 +642,7 @@ mod tests {
             domain_operation: None,
             added_credentials: Vec::new(),
             removed_credentials: Vec::new(),
+            revoked_devices: Vec::new(),
         });
         // 候选本身已不合法：规范编码阶段就拒绝，签名永远不会被检查。
         let candidate = SignedCandidate {

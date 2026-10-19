@@ -367,6 +367,29 @@ impl MlsDevice {
         })
     }
 
+    /// CTRLREV：生成一版**可投递的** SelfUpdate 提交字节并暂存 pending。
+    ///
+    /// 与 [`Self::advance_epoch_with_self_update`] 的区别：**不合并、不推进 epoch**，
+    /// 只把 Commit 暂存为 pending 并把序列化字节返回给调用方投递；对方处理该提交后
+    /// 本机仍需走正常的接受/合并路径（T2 语义：pending 与正式状态分开）。
+    ///
+    /// 已有 pending 时显式拒绝（不覆盖、不叠加）。
+    pub fn stage_self_update_commit(&mut self) -> Result<Vec<u8>> {
+        let (provider, signer, group) = self.control_parts_mut()?;
+        ensure!(
+            group.pending_commit().is_none(),
+            "a pending commit already exists"
+        );
+        let bundle = group
+            .self_update(provider, signer, LeafNodeParameters::default())
+            .context("stage MLS self update commit")?;
+        let bytes = bundle
+            .commit()
+            .tls_serialize_detached()
+            .context("serialize self update commit")?;
+        Ok(bytes)
+    }
+
     /// 推进 epoch 的最小操作：本地自更新 commit 并立即合并。
     ///
     /// 只用于本地状态推进/密钥轮换切片；对端处理该 commit（CRYPTO-007）与正式群

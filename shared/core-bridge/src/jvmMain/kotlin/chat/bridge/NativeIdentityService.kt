@@ -116,6 +116,52 @@ class NativeIdentityService : IdentityService {
         }
     }
 
+    override suspend fun listDevices(includeRevoked: Boolean): List<chat.api.IdentityDevice> = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            val identity = native ?: throw IdentityException("CORE_CLOSED", "identity is not open")
+            guard { identity.listDevices(includeRevoked) }.map { view ->
+                chat.api.IdentityDevice(
+                    deviceId = view.deviceId,
+                    accountId = view.accountId,
+                    label = view.label,
+                    devicePublicKeyHex = view.devicePublicKeyHex,
+                    addedAtMillis = view.addedAtMs.toLong(),
+                    revokedAtMillis = view.revokedAtMs?.toLong(),
+                    revokedReason = view.revokedReason,
+                    isLocal = view.isLocal,
+                )
+            }
+        }
+    }
+
+    override suspend fun registerDevice(
+        deviceId: String,
+        devicePublicKeyHex: String,
+        label: String,
+    ): chat.api.IdentityDevice = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            val identity = native ?: throw IdentityException("CORE_CLOSED", "identity is not open")
+            val view = guard { identity.registerDevice(deviceId, devicePublicKeyHex, label) }
+            chat.api.IdentityDevice(
+                deviceId = view.deviceId,
+                accountId = view.accountId,
+                label = view.label,
+                devicePublicKeyHex = view.devicePublicKeyHex,
+                addedAtMillis = view.addedAtMs.toLong(),
+                revokedAtMillis = view.revokedAtMs?.toLong(),
+                revokedReason = view.revokedReason,
+                isLocal = view.isLocal,
+            )
+        }
+    }
+
+    override suspend fun revokeDevice(deviceId: String, reason: String): Boolean = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            val identity = native ?: throw IdentityException("CORE_CLOSED", "identity is not open")
+            guard { identity.revokeDevice(deviceId, reason) }
+        }
+    }
+
     override suspend fun close(): Unit = withContext(NonCancellable) {
         mutex.withLock {
             withContext(Dispatchers.IO) {

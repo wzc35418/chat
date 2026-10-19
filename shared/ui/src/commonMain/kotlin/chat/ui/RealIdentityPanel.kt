@@ -45,6 +45,8 @@ data class IdentityHandlers(
     val updateRecoveryPassphrase: (String) -> Unit = {},
     val exportRecovery: () -> Unit = {},
     val importRecovery: () -> Unit = {},
+    val loadDevices: () -> Unit = {},
+    val revokeDevice: (String) -> Unit = {},
 ) {
     companion object {
         val None = IdentityHandlers()
@@ -139,6 +141,39 @@ fun RealIdentityPanel(
                     style = MaterialTheme.typography.labelSmall,
                     color = Color(0xFFB3261E),
                 )
+
+                HorizontalDivider(color = Color(0xFFE1E6E1))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("已登记设备（IDENTITY-011/012）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                    TextButton(
+                        onClick = handlers.loadDevices,
+                        enabled = !state.busy,
+                        modifier = Modifier.semantics { contentDescription = "加载已登记设备" },
+                    ) { Text("加载设备", style = MaterialTheme.typography.labelMedium) }
+                }
+                if (state.devices.isEmpty()) {
+                    Text("还没有加载设备列表。", style = MaterialTheme.typography.bodySmall)
+                } else {
+                    state.devices.forEach { device ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                (device.label.ifBlank { device.deviceId.take(12) + "…" }) +
+                                    (if (device.isLocal) "（本机）" else "") +
+                                    (device.revokedAtMillis?.let { " · 已撤销" } ?: " · 有效"),
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            if (!device.isLocal && device.revokedAtMillis == null) {
+                                TextButton(
+                                    onClick = { handlers.revokeDevice(device.deviceId) },
+                                    enabled = !state.busy,
+                                    modifier = Modifier.semantics {
+                                        contentDescription = "撤销设备 " + device.deviceId
+                                    },
+                                ) { Text("撤销", style = MaterialTheme.typography.labelSmall) }
+                            }
+                        }
+                    }
+                }
 
                 HorizontalDivider(color = Color(0xFFE1E6E1))
                 Text("身份恢复（IDENTITY-013）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)

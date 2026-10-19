@@ -27,6 +27,8 @@ data class PreviewIdentityState(
     val recoveryPassphrase: String = "",
     /** 最近一次恢复导出结果提示。 */
     val recoveryNotice: String? = null,
+    /** IDENTITY-011/012：本账户已登记设备（含已撤销）。 */
+    val devices: List<chat.api.IdentityDevice> = emptyList(),
 )
 
 /** 打开真实身份：显示脱敏账户信息。 */
@@ -91,5 +93,18 @@ fun PreviewIdentityState.updateRecoveryPassphrase(value: String): PreviewIdentit
 fun PreviewIdentityState.withRecoveryExported(bytes: Int, target: String): PreviewIdentityState = copy(
     busy = false,
     recoveryNotice = "已导出恢复文件 " + bytes + " 字节到 " + target + "（不含主密钥，旧库数据仍不可读）",
+    lastErrorCode = null,
+)
+
+fun PreviewIdentityState.withDevices(list: List<chat.api.IdentityDevice>): PreviewIdentityState = copy(
+    devices = list,
+    busy = false,
+    notice = if (list.isEmpty()) "还没有登记设备" else "已登记 " + list.size + " 台设备",
+    lastErrorCode = null,
+)
+
+fun PreviewIdentityState.withDeviceRevoked(deviceId: String, revoked: Boolean): PreviewIdentityState = copy(
+    busy = false,
+    notice = if (revoked) "已撤销设备 " + deviceId else "该设备之前已撤销（幂等）",
     lastErrorCode = null,
 )

@@ -83,6 +83,8 @@ fn metadata_of(operation: &GroupOperation) -> ControlMetadata {
         domain_operation: None,
         added_credentials: Vec::new(),
         removed_credentials: Vec::new(),
+        // PROTOCOL-004 字段 61：设备撤销列表（本测试不涉及）。
+        revoked_devices: Vec::new(),
     }
 }
 

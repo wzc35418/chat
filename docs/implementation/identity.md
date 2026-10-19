@@ -859,6 +859,28 @@ DeviceViewFfi { device_id, account_id, label, device_public_key_hex, added_at_ms
 
 复现：`cargo test --offline -p chat-ffi --test identity_devices_ffi` → 5 passed；
 `cargo test --offline -p chat-ffi` → **76 passed**（既有 71 继续通过）。
+### 设备登记入口（IdentityFfi.register_device，2026-10-18）
+
+~~~text
+IdentityFfi.register_device(device_id, device_public_key_hex, label) -> DeviceViewFfi
+~~~
+
+- 需要持久化身份（纯内存 → `INVALID_STATE_TRANSITION`；关闭后 → `CORE_CLOSED`）；
+- `device_id` 必须是 **PROTOCOL-001 设备文本**（`dev:1:<64 hex>`），否则 `INVALID_INPUT`；
+- `device_public_key_hex` 必须**正好 64 个 hex 字符**（32 字节），否则 `INVALID_INPUT`；
+- **幂等**：重复登记只刷新公钥/label，`added_at_ms` 保留首次值，不新增行；
+- **归属保护**：同一 `device_id` 已属于其它账户 → `INVALID_INPUT`（不偷偷改归属）；
+- **撤销不可逆**：已撤销设备重新登记**不复活**，返回视图仍带 `revoked_at_ms/revoked_reason`；
+- 返回 `is_local` 依据当前设备 ID（登记本机即 true）。
+
+测试：[crates/ffi/tests/identity_device_register.rs](../../crates/ffi/tests/identity_device_register.rs)（6 个，真库）：
+登记第二台 → 两条 → 撤销 → 默认一条 → 再登记仍撤销（原因保留、label 刷新）；重复登记 `added_at_ms` 不变且不新增行；
+显式登记本机 → `is_local = true`；公钥 63/65 hex 与非 hex、`device_id` 为空/非设备文本/账户文本 → `INVALID_INPUT`
+且集合无半写入；关闭后 `CORE_CLOSED`；纯内存对象 `INVALID_STATE_TRANSITION`。
+
+复现：`cargo test --offline -p chat-ffi --test identity_device_register` → 6 passed；
+`cargo test --offline -p chat-ffi` → **82 passed**（既有 76 继续通过）。
+
 
 
 

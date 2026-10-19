@@ -515,3 +515,30 @@ map_error(error: InternalError, operation: Option<OperationId>) -> PublicError
 
 **实现状态**：已实现（`error.rs`）。证据：`error::tests::every_code_is_unique_and_non_empty`（41 码唯一）、`error::tests::unknown_error_maps_to_internal_failure_without_leaking_detail`（内部 detail 含伪密钥/正文也不出现在 `PublicError` 的 Display/Debug）、`error::tests::retry_after_is_clamped_and_operation_id_is_kept`（限幅 300000/默认 1000/最小 1）、`error::tests::storage_corruption_is_not_a_network_retry`（`STORAGE_FAILURE`/`STATE_CORRUPTED` 不可重试，`STORAGE_LOCKED` 可重试）、`error::tests::network_error_is_retryable`。领域错误经 `InternalError::Classified` 保留具体码。
 
+## CTRLREV · 字段 61 CONTROL_REVOKED_DEVICES 与操作值 RevokeDevice（2026-10-19）
+
+撤销设备需要一个**公开、可审计**的载体：提交里要能声明“撤销了哪些设备”，但正文仍然不进公开层。
+
+### 协议面（已交付）
+
+    field::CONTROL_REVOKED_DEVICES = 61   (WireValue::List of Text)
+      - 单个设备 ID：1..=128 字节、无控制字符；
+      - 总数 ≤ 64；列表内去重；
+      - 只在 ControlOperation::RevokeDevice(=14) 时允许出现，且必须非空；
+      - 其它操作携带 61、或 RevokeDevice 不带 61、或同时带成员凭据 → INVALID_CANDIDATE。
+    ControlOperation::RevokeDevice = 14（末尾追加，1..=13 的冻结数值一个都没动）
+      - is_proposal() = false，proposal_kind() = None，audit_label() = "revoke_device"；
+      - 旧字节（无 61 字段）的规范编码/签名原文逐字节不变，既有固定向量全部通过。
+
+解码：`decode_control_revoked_devices(body) -> Result<Vec<String>>`（旧字节返回空列表，畸形显式失败）。
+
+### 证据（`cargo test --offline -p chat-protocol`：88 passed）
+
+- 冻结值回归：既有提案/具体操作数值与审计文本不变；`from_u64(14) = RevokeDevice`、`from_u64(15) = None`；
+- 既有固定向量与签名原文向量全部通过（本轮只对既有测试里“14 是未知值”的两处断言做了必要更新，替换为 15 并显式断言 14 的新语义）；
+- 新增校验路径：数量/单条/控制字符/去重/操作配对五类拒绝。
+
+### 尚未完成（同任务的 core 侧）
+
+- `crates/core`：`PeerEntryInput.revoked_devices`、`GroupView.revoked_devices`（本机视角）、应用路径把撤销集合落到群快照、双设备端到端用例，**本轮未做**（详见 task-110 报告）。
+

@@ -90,5 +90,14 @@ interface IdentityService {
      */
     suspend fun importRecoveryBundle(passphrase: String, bundle: ByteArray): RecoveryImportView
 
+    /** IDENTITY-011：本账户已登记设备（includeRevoked 为真时含已撤销）。 */
+    suspend fun listDevices(includeRevoked: Boolean = false): List<IdentityDevice>
+
+    /** 登记第二台设备（幂等；撤销不可逆，已撤销设备重新登记不复活）。 */
+    suspend fun registerDevice(deviceId: String, devicePublicKeyHex: String, label: String): IdentityDevice
+
+    /** IDENTITY-012：撤销某台设备（不能撤销本机；撤销不可逆）。 */
+    suspend fun revokeDevice(deviceId: String, reason: String): Boolean
+
     suspend fun close()
 }

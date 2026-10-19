@@ -1432,7 +1432,32 @@ cargo test --offline -p chat-core                            # 180 passed（既�
    且群主不能禁言自己），因此测试只能验证 1 人被禁言的计数；计数逻辑本身按确认成员全量统计。
 2. `pending_proposal` 只统计"作者不是本机"的提案：本机自己发起的（自移除）走 `pending` 的 leaving 线索。
 
+## CTRLREV · 撤销设备随控制提交传播（2026-10-19）
 
+### 已交付（代码）
 
+- `GroupRecord` / `GroupView` 新增 `revoked_devices: Vec<String>`（本机视角；`#[serde(default)]` 兼容旧快照）；
+- `PeerEntryInput` 新增 `revoked_devices: Vec<String>`（默认空，`PeerEntryInput::new` 保持兼容）；
+- `group_process_peer_entry`：**合并前**先 `validate_revoked_devices(input)`，Commit 分支在 `persist_snapshot` 之前 `merge_revoked_devices(...)`（并集 + 去重 + 升序，重复提交幂等），撤销集合随快照一起落库；
+- 校验规则：非空列表只允许出现在**纯撤销提交**（无成员增删、无角色/禁言/改名声明，否则 `INVALID_INPUT`）；单条 1..=128B、无控制字符、总数 ≤64、列表内去重；未知设备 ID **显式允许**（本层没有设备登记表，登记校验由节点负责）。
 
+### 测试（已交付，真双设备）
+
+`crates/core/tests/revoked_devices.rs`（4 例）+ `crates/crypto/tests/stage_self_update.rs`（3 例）：
+
+- **正例**：A 用 `MlsDevice::stage_self_update_commit` 生成**可投递的纯撤销提交**（暂存 pending、不合并、不推进 epoch）→ 投递 → B `group_process_peer_entry` 应用后 epoch 1→2、`view.revoked_devices == ["dev:1:bob-device"]`，重开库后快照仍保留；
+- **幂等**：重复投递同一条目 → `STALE_EPOCH`，快照逐字节不变（集合语义，不重复计入）；
+- **反例**：Application 条目携带撤销 → `INVALID_INPUT`；撤销与成员新增混用 → `INVALID_INPUT`；超 64 条 / 重复 / 超 128B / 空串 / 控制字符 → `INVALID_INPUT`，且每次失败后快照逐字节不变。
+
+crypto 侧新增（与 `advance_epoch_with_self_update` 并存、未改其行为）：
+
+    MlsDevice::stage_self_update_commit(&mut self) -> CryptoResult<Vec<u8>>
+      - 生成 SelfUpdate 提交字节并暂存 pending；**不 merge、不推进 epoch**；
+      - 已有 pending 时显式拒绝；未建群时 `GroupNotInitialized`；
+      - 对端用 `process_verified_entry` 应用后 epoch +1（测试实证）。
+
+### 证据
+
+- `cargo test --offline -p chat-crypto -p chat-protocol -p chat-core` → **EXIT=0，392 passed，0 警告**（既有 60/88/236 继续通过；本轮新增 crypto 3 + core 4 例）。
+- `cargo check --offline -p chat-core --all-targets` = EXIT=0（**只有 `crates/core/src/group_node.rs` 一处 `GroupView` 字面量需要补字段；`crates/core/tests/` 里的 7 处 `GroupView {` 命中都是函数返回类型，不是字面量，无需机械补字段** —— 修正了我此前向主控汇报的估计）。
 

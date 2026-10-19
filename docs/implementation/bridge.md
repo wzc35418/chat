@@ -967,6 +967,18 @@ DeviceViewFfi { device_id, account_id, label, device_public_key_hex, added_at_ms
 - `revoke_device`：本机 → `DEVICE_SELF_REVOKE`；未登记/跨账户 → `INVALID_INPUT`；幂等（重复撤销 false）；
 - 撤销后默认列表隐藏，`include_revoked` 可见撤销时间与原因（行永不删除）；
 - 测试：[crates/ffi/tests/identity_devices_ffi.rs](../../crates/ffi/tests/identity_devices_ffi.rs)（5 个，真库）。
+## 设备登记（IdentityFfi.register_device，2026-10-18）
+
+~~~text
+IdentityFfi.register_device(device_id, device_public_key_hex, label) -> DeviceViewFfi
+~~~
+
+- 需 `open_persisted`（纯内存 → `INVALID_STATE_TRANSITION`；关闭 → `CORE_CLOSED`）；
+- `device_id` 必须是 `dev:1:<64 hex>`；公钥必须正好 64 hex → 否则 `INVALID_INPUT`；
+- 幂等（`added_at_ms` 不变、不新增行）；已属其它账户 → `INVALID_INPUT`；
+- 已撤销设备重新登记**不复活**（返回视图仍带撤销时间与原因）；返回 `is_local`；
+- 测试：[crates/ffi/tests/identity_device_register.rs](../../crates/ffi/tests/identity_device_register.rs)（6 个，真库）。
+
 
 
 

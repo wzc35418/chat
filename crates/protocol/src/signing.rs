@@ -31,6 +31,10 @@ pub const SCHEMA_VERSION: u64 = 1;
 pub const MAX_CONTROL_CREDENTIAL_BYTES: usize = 128;
 /// 控制提交携带的成员凭据总数上限（added + removed）。
 pub const MAX_CONTROL_CREDENTIALS: usize = 64;
+/// 单条撤销设备 ID 的字节上限。
+pub const MAX_REVOKED_DEVICE_BYTES: usize = 128;
+/// 单次撤销的设备数量上限。
+pub const MAX_REVOKED_DEVICES: usize = 64;
 
 /// 候选类别。外层签名必须绑定类别，避免应用事件与控制元数据互换。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +95,8 @@ pub enum ControlOperation {
     ProposeKeyRotation = 12,
     /// 其它提案（具体语义在密文正文里，公开层只留摘要）。
     ProposeCustom = 13,
+    /// 撤销设备（CTRLREV：唯一允许携带字段 61 的操作）。
+    RevokeDevice = 14,
 }
 
 /// 通用提案类型（NODECAP）：把 `ControlOperation::Propose*` 的数值空间映射成稳定的审计分类。
@@ -162,6 +168,7 @@ impl ControlOperation {
             11 => Some(ControlOperation::ProposeSettings),
             12 => Some(ControlOperation::ProposeKeyRotation),
             13 => Some(ControlOperation::ProposeCustom),
+            14 => Some(ControlOperation::RevokeDevice),
             _ => None,
         }
     }
@@ -206,6 +213,7 @@ impl ControlOperation {
             Self::ProposeSettings => "proposal:settings",
             Self::ProposeKeyRotation => "proposal:key_rotation",
             Self::ProposeCustom => "proposal:custom",
+            Self::RevokeDevice => "revoke_device",
         }
     }
 }
@@ -264,6 +272,8 @@ pub struct ControlMetadata {
     pub added_credentials: Vec<String>,
     /// 提交携带的移除成员凭据（仅 `remove` 候选；UTF-8，单个 ≤128B、总数 ≤64）。
     pub removed_credentials: Vec<String>,
+    /// 提交携带的撤销设备 ID（仅 `RevokeDevice` 候选；UTF-8，单个 ≤128B、总数 ≤64，去重）。
+    pub revoked_devices: Vec<String>,
 }
 
 impl ControlMetadata {
@@ -275,6 +285,7 @@ impl ControlMetadata {
             domain_operation: None,
             added_credentials: Vec::new(),
             removed_credentials: Vec::new(),
+            revoked_devices: Vec::new(),
         }
     }
 
@@ -282,6 +293,12 @@ impl ControlMetadata {
     pub fn with_credentials(mut self, added: Vec<String>, removed: Vec<String>) -> Self {
         self.added_credentials = added;
         self.removed_credentials = removed;
+        self
+    }
+
+    /// 附带撤销设备列表（仅 `RevokeDevice` 可用，校验在候选验证里）。
+    pub fn with_revoked_devices(mut self, devices: Vec<String>) -> Self {
+        self.revoked_devices = devices;
         self
     }
 
@@ -324,8 +341,43 @@ fn validate_credential_lists(added: &[String], removed: &[String]) -> Result<()>
     Ok(())
 }
 
+/// CTRLREV：撤销设备列表的校验（数量/单条/控制字符/去重）。
+fn validate_revoked_devices(devices: &[String]) -> Result<()> {
+    if devices.len() > MAX_REVOKED_DEVICES {
+        return Err(ProtocolError::InvalidCandidate);
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(devices.len());
+    for device in devices {
+        if device.is_empty() || device.len() > MAX_REVOKED_DEVICE_BYTES {
+            return Err(ProtocolError::InvalidCandidate);
+        }
+        if device.chars().any(char::is_control) {
+            return Err(ProtocolError::InvalidCandidate);
+        }
+        if seen.contains(&device.as_str()) {
+            return Err(ProtocolError::InvalidCandidate);
+        }
+        seen.push(device);
+    }
+    Ok(())
+}
+
 fn validate_control_credentials(metadata: &ControlMetadata) -> Result<()> {
     validate_credential_lists(&metadata.added_credentials, &metadata.removed_credentials)?;
+    // CTRLREV：只有 RevokeDevice 能带撤销列表，且必须非空（空撤销没有语义）。
+    validate_revoked_devices(&metadata.revoked_devices)?;
+    if !metadata.revoked_devices.is_empty() && metadata.operation != ControlOperation::RevokeDevice {
+        return Err(ProtocolError::InvalidCandidate);
+    }
+    if metadata.operation == ControlOperation::RevokeDevice && metadata.revoked_devices.is_empty() {
+        return Err(ProtocolError::InvalidCandidate);
+    }
+    // 撤销提交不得携带成员凭据（凭据只属于 invite/remove）。
+    if metadata.operation == ControlOperation::RevokeDevice
+        && (!metadata.added_credentials.is_empty() || !metadata.removed_credentials.is_empty())
+    {
+        return Err(ProtocolError::InvalidCandidate);
+    }
     // 仅 invite 可带新增、remove 可带移除。
     if !metadata.added_credentials.is_empty() && metadata.operation != ControlOperation::Invite {
         return Err(ProtocolError::InvalidCandidate);
@@ -510,6 +562,18 @@ fn candidate_body(candidate: &UnsignedCandidate) -> WireValue {
                 ),
             ));
         }
+        if !metadata.revoked_devices.is_empty() {
+            body_fields.push(WireField::new(
+                field::CONTROL_REVOKED_DEVICES,
+                WireValue::List(
+                    metadata
+                        .revoked_devices
+                        .iter()
+                        .map(|device| WireValue::Text(device.clone()))
+                        .collect(),
+                ),
+            ));
+        }
         if let Some(declaration) = metadata.domain_operation {
             body_fields.push(WireField::new(
                 field::CONTROL_DOMAIN_OPERATION,
@@ -589,6 +653,34 @@ pub fn decode_control_credentials(body: &WireValue) -> Result<(Vec<String>, Vec<
     // 与编码前校验同一套规则（数量/单条/重复）；操作配对由候选校验负责。
     validate_credential_lists(&added, &removed)?;
     Ok((added, removed))
+}
+
+/// CTRLREV：从候选规范结构解码撤销设备列表。
+///
+/// 旧字节没有字段 61 → 返回空列表；类型不对、单条为空/超 128B、总数超 64、
+/// 重复都显式失败（`INVALID_CANDIDATE`）；是否允许出现由候选校验负责。
+pub fn decode_control_revoked_devices(body: &WireValue) -> Result<Vec<String>> {
+    let WireValue::Struct(fields) = body else {
+        return Err(ProtocolError::InvalidCandidate);
+    };
+    let Some(field) = fields
+        .iter()
+        .find(|candidate| candidate.id == field::CONTROL_REVOKED_DEVICES)
+    else {
+        return Ok(Vec::new());
+    };
+    let WireValue::List(items) = &field.value else {
+        return Err(ProtocolError::InvalidCandidate);
+    };
+    let devices: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            WireValue::Text(text) => Ok(text.clone()),
+            _ => Err(ProtocolError::InvalidCandidate),
+        })
+        .collect::<Result<Vec<String>>>()?;
+    validate_revoked_devices(&devices)?;
+    Ok(devices)
 }
 
 /// 从候选规范结构解码可选领域操作声明。
@@ -702,6 +794,7 @@ mod tests {
                 domain_operation: None,
                 added_credentials: Vec::new(),
                 removed_credentials: Vec::new(),
+                revoked_devices: Vec::new(),
             }),
         }
     }
@@ -748,6 +841,7 @@ mod tests {
                     domain_operation: None,
                     added_credentials: Vec::new(),
                     removed_credentials: Vec::new(),
+                    revoked_devices: Vec::new(),
                 })
             }),
             Box::new(|c| {
@@ -757,6 +851,7 @@ mod tests {
                     domain_operation: None,
                     added_credentials: Vec::new(),
                     removed_credentials: Vec::new(),
+                    revoked_devices: Vec::new(),
                 })
             }),
         ];
@@ -1122,7 +1217,15 @@ mod tests {
             assert_eq!(operation.audit_label(), label);
         }
         // 未登记值显式失败（不是“尽力解析”）。
-        assert_eq!(ControlOperation::from_u64(14), None);
+        // CTRLREV：14 现在是 RevokeDevice（末尾追加、旧值不动），所以用 15 验证未知值。
+        assert_eq!(
+            ControlOperation::from_u64(14),
+            Some(ControlOperation::RevokeDevice)
+        );
+        assert!(!ControlOperation::RevokeDevice.is_proposal());
+        assert_eq!(ControlOperation::RevokeDevice.proposal_kind(), None);
+        assert_eq!(ControlOperation::RevokeDevice.audit_label(), "revoke_device");
+        assert_eq!(ControlOperation::from_u64(15), None);
         assert_eq!(ControlOperation::from_u64(0), None);
         assert_eq!(ProposalKind::from_u64(6), None);
     }
@@ -1152,11 +1255,11 @@ mod tests {
                 .expect("application decodes"),
             None
         );
-        // 未知操作值、畸形字段 → 显式失败。
+        // 未知操作值、畸形字段 → 显式失败（15 仍是未知值；14 已被 RevokeDevice 占用）。
         assert_eq!(
             decode_proposal_kind(&WireValue::Struct(vec![WireField::new(
                 field::CONTROL_OPERATION,
-                WireValue::Some(Box::new(WireValue::U64(14))),
+                WireValue::Some(Box::new(WireValue::U64(15))),
             )]))
             .unwrap_err(),
             ProtocolError::InvalidCandidate

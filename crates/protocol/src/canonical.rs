@@ -127,6 +127,8 @@ pub mod field {
     // 控制提交携带的成员凭据（UTF-8 列表，单个 ≤128B、总数 ≤64）。
     pub const CONTROL_ADDED_CREDENTIALS: u16 = 59;
     pub const CONTROL_REMOVED_CREDENTIALS: u16 = 60;
+    // 控制提交携带的撤销设备 ID 列表（UTF-8，单个 ≤128B、总数 ≤64，仅 RevokeDevice）。
+    pub const CONTROL_REVOKED_DEVICES: u16 = 61;
 }
 
 /// 已知安全字段号表。编码/解码都拒绝表外字段号。
@@ -190,6 +192,7 @@ pub const KNOWN_FIELD_IDS: &[u16] = &[
     field::CONTENT_ATTACHMENT_METADATA,
     field::CONTROL_ADDED_CREDENTIALS,
     field::CONTROL_REMOVED_CREDENTIALS,
+    field::CONTROL_REVOKED_DEVICES,
 ];
 
 /// 判断字段号是否属于冻结安全字段集合。

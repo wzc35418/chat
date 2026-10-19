@@ -281,6 +281,8 @@ pub struct GroupView {
     ///
     /// 提案被对端打包成 Commit 并合并后才真正离群（那时 `self_removed` 为真）。
     pub leaving_at_ms: Option<i64>,
+    /// CTRLREV：本机视角的已撤销设备 ID 列表（升序去重；不含任何密钥）。
+    pub revoked_devices: Vec<String>,
 }
 
 /// 被丢弃控制提交的投影（只含公开绑定信息与稳定原因码）。
@@ -338,6 +340,9 @@ struct GroupRecord {
     /// 待提交的独立提案（本机发起或对端收下；打包成 Commit 后清空）。
     #[serde(default)]
     pending_proposal: Option<RecordProposal>,
+    /// CTRLREV：已撤销的设备 ID（本机视角的并集；旧快照缺省为空）。
+    #[serde(default)]
+    revoked_devices: Vec<String>,
 }
 
 /// 待提交独立提案（公开绑定 + 可转发字节）。
@@ -707,6 +712,72 @@ fn actor_of(record: &GroupRecord, index: usize) -> Actor {
 }
 
 /// 把持久记录与真实 MLS 状态合成对外投影。
+/// 单条撤销设备 ID 的字节上限（与协议 CTRLREV 一致）。
+const MAX_REVOKED_DEVICE_BYTES: usize = 128;
+/// 单次撤销的设备数量上限（与协议 CTRLREV 一致）。
+const MAX_REVOKED_DEVICES: usize = 64;
+
+/// CTRLREV：校验外层声明的撤销设备列表。
+///
+/// 规则：非空列表必须只出现在**纯撤销提交**里（无成员增删、无角色/禁言/改名声明），
+/// 单条 1..=128 字节、无控制字符、总数 ≤64、列表内去重。
+/// 未知设备 ID **显式允许**：本层没有设备登记表，登记校验由节点负责。
+fn validate_revoked_devices(input: &PeerEntryInput) -> GroupResult<()> {
+    let devices = &input.revoked_devices;
+    if devices.is_empty() {
+        return Ok(());
+    }
+    if !input.added_members.is_empty()
+        || !input.removed_members.is_empty()
+        || input.policy_intent.is_some()
+        || input.policy_sync.is_some()
+    {
+        return Err(GroupError::new(
+            "INVALID_INPUT",
+            "a revocation entry must not carry member or policy changes",
+        ));
+    }
+    if devices.len() > MAX_REVOKED_DEVICES {
+        return Err(GroupError::new(
+            "INVALID_INPUT",
+            "too many revoked devices in one entry",
+        ));
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(devices.len());
+    for device in devices {
+        if device.is_empty() || device.len() > MAX_REVOKED_DEVICE_BYTES {
+            return Err(GroupError::new(
+                "INVALID_INPUT",
+                "revoked device id length is out of bounds",
+            ));
+        }
+        if device.chars().any(char::is_control) {
+            return Err(GroupError::new(
+                "INVALID_INPUT",
+                "revoked device id contains control characters",
+            ));
+        }
+        if seen.contains(&device.as_str()) {
+            return Err(GroupError::new(
+                "INVALID_INPUT",
+                "a revoked device is listed twice in one entry",
+            ));
+        }
+        seen.push(device);
+    }
+    Ok(())
+}
+
+/// CTRLREV：把本次声明的撤销设备并入快照集合（并集 + 去重 + 升序；重复提交幂等）。
+fn merge_revoked_devices(existing: &mut Vec<String>, incoming: &[String]) {
+    for device in incoming {
+        if !existing.iter().any(|value| value == device) {
+            existing.push(device.clone());
+        }
+    }
+    existing.sort();
+}
+
 fn project(
     record: &GroupRecord,
     epoch: u64,
@@ -769,6 +840,7 @@ fn project(
         dissolved_at_ms: (record.dissolved_at_ms > 0).then_some(record.dissolved_at_ms),
         left_at_ms: (record.left_at_ms > 0).then_some(record.left_at_ms),
         leaving_at_ms: (record.leaving_at_ms > 0).then_some(record.leaving_at_ms),
+        revoked_devices: record.revoked_devices.clone(),
         last_control_cleared: record
             .last_control_cleared
             .as_ref()
@@ -1009,6 +1081,7 @@ pub fn create_group_with_welcome(
         left_at_ms: 0,
         leaving_at_ms: 0,
         pending_proposal: None,
+        revoked_devices: Vec::new(),
     };
     record.validate()?;
     // 建群时先自检策略快照不变量（全零头 + 唯一群主）。
@@ -1635,6 +1708,8 @@ pub struct PeerEntryInput {
     pub policy_role: Option<MemberRole>,
     /// 可选：**非角色策略声明**（禁言 / 改名）。与 `policy_intent` 互斥。
     pub policy_sync: Option<PolicySyncIntent>,
+    /// CTRLREV：外层已验证控制元数据里的**撤销设备 ID 列表**（仅 `RevokeDevice` 提交非空）。
+    pub revoked_devices: Vec<String>,
 }
 
 impl PeerEntryInput {
@@ -1656,6 +1731,7 @@ impl PeerEntryInput {
             policy_intent: None,
             policy_role: None,
             policy_sync: None,
+            revoked_devices: Vec::new(),
         }
     }
 
@@ -1914,6 +1990,8 @@ pub fn group_process_peer_entry(
     for credential in input.added_members.iter().chain(input.removed_members.iter()) {
         validate_credential(credential)?;
     }
+    // CTRLREV：撤销列表先校验（畸形/超限/与成员或策略声明混用都在合并前拒绝）。
+    validate_revoked_devices(&input)?;
     // 角色声明与非角色声明（禁言/改名）互斥：同时出现 → 不猜权威。
     if input.policy_intent.is_some() && input.policy_sync.is_some() {
         return Err(GroupError::new(
@@ -2042,6 +2120,8 @@ pub fn group_process_peer_entry(
                 }
             }
             record.mls_epoch = new_epoch;
+            // CTRLREV：把本次声明的撤销设备并入快照集合（并集 + 去重 + 升序，幂等）。
+            merge_revoked_devices(&mut record.revoked_devices, &input.revoked_devices);
             record.validate()?;
             let saved = persist_snapshot(store, &record, record.mls_epoch)?;
             Ok(PeerEntryOutcome::Commit {
@@ -2058,11 +2138,20 @@ pub fn group_process_peer_entry(
             sender_identity,
             epoch,
             plaintext,
-        } => Ok(PeerEntryOutcome::Application {
-            sender_identity,
-            epoch,
-            plaintext,
-        }),
+        } => {
+            // CTRLREV：撤销只能随控制提交传播，应用消息不得携带撤销声明。
+            if !input.revoked_devices.is_empty() {
+                return Err(GroupError::new(
+                    "INVALID_INPUT",
+                    "an application entry may not carry revoked devices",
+                ));
+            }
+            Ok(PeerEntryOutcome::Application {
+                sender_identity,
+                epoch,
+                plaintext,
+            })
+        }
         ProcessedEntry::Proposal {
             sender_identity,
             epoch,
@@ -2156,6 +2245,7 @@ pub fn group_join_from_welcome(
         left_at_ms: 0,
         leaving_at_ms: 0,
         pending_proposal: None,
+        revoked_devices: Vec::new(),
     };
     record.validate()?;
     let _ = domain_snapshot(&record)?;

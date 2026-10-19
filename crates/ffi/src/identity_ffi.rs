@@ -292,6 +292,17 @@ fn open_formal_store(
     })
 }
 
+/// 设备签名公钥：必须正好 64 个 hex 字符（32 字节）。
+fn decode_device_public_key(text: &str) -> Result<[u8; 32], FfiError> {
+    if text.len() != 64 {
+        return Err(state_error(
+            "INVALID_INPUT",
+            "device public key must be exactly 64 hexadecimal characters",
+        ));
+    }
+    decode_master_key_hex(text)
+}
+
 fn decode_master_key_hex(text: &str) -> Result<[u8; 32], FfiError> {
     if text.len() != 64 {
         return Err(state_error(
@@ -886,6 +897,57 @@ impl IdentityFfi {
         Ok(Arc::new(Self {
             state: Mutex::new(state),
         }))
+    }
+
+    /// IDENTITY-011：登记一台设备（幂等；公钥必须是 32 字节 hex）。
+    ///
+    /// - 需要持久化身份（否则 `INVALID_STATE_TRANSITION`）；
+    /// - `device_id` 必须是 PROTOCOL-001 设备文本、公钥必须是 64 hex 字符，否则 `INVALID_INPUT`；
+    /// - 已登记到**其它账户**的设备拒绝覆盖（`INVALID_INPUT`，不偷偷改归属）；
+    /// - 已撤销设备重新登记**不会复活**：返回的视图仍带 `revoked_at_ms/revoked_reason`。
+    pub fn register_device(
+        &self,
+        device_id: String,
+        device_public_key_hex: String,
+        label: String,
+    ) -> Result<DeviceViewFfi, FfiError> {
+        let parsed = DeviceId::parse(&device_id).map_err(|_| {
+            state_error(
+                "INVALID_INPUT",
+                "device id must be a PROTOCOL-001 device identifier",
+            )
+        })?;
+        let device_id = parsed.encode();
+        let device_public_key = decode_device_public_key(&device_public_key_hex)?;
+        self.with_store(|store, local| {
+            // 归属保护：同 ID 已属于别的账户时拒绝（storage 的 upsert 会覆盖 account_id）。
+            if let Some(existing) = store.load_identity_device(&device_id).map_err(storage_failure)? {
+                if existing.account_id != local.account_id {
+                    return Err(state_error(
+                        "INVALID_INPUT",
+                        "the device is already registered to another account",
+                    ));
+                }
+            }
+            let entry = chat_identity::devices::register_device(
+                store,
+                &device_id,
+                &local.account_id,
+                device_public_key,
+                &label,
+            )
+            .map_err(device_failure)?;
+            Ok(DeviceViewFfi {
+                is_local: entry.device_id == local.device_id,
+                device_id: entry.device_id,
+                account_id: entry.account_id,
+                label: entry.label,
+                device_public_key_hex: entry.device_public_key,
+                added_at_ms: entry.added_at_ms,
+                revoked_at_ms: entry.revoked_at_ms,
+                revoked_reason: entry.revoked_reason,
+            })
+        })
     }
 
     /// IDENTITY-011：设备列表（默认隐藏已撤销设备）。

@@ -893,6 +893,7 @@ mod tests {
             dissolved_at_ms: None,
             left_at_ms: None,
             leaving_at_ms: None,
+            revoked_devices: Vec::new(),
         }
     }
 

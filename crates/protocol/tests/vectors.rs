@@ -24,6 +24,7 @@ fn candidate() -> UnsignedCandidate {
             domain_operation: None,
             added_credentials: Vec::new(),
             removed_credentials: Vec::new(),
+            revoked_devices: Vec::new(),
         }),
     }
 }

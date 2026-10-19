@@ -811,3 +811,23 @@ decrypt_attachment_chunk(key: FileKey, ctx: ChunkContext, chunk: CipherChunk) ->
 
 **实现状态**：已实现（Windows x64 实测）。解密先按上下文核算期望密文长度（1+12+plain_length+16），再认证解密；失败一律返回 ATTACHMENT_CORRUPTED 或 INVALID_CHUNK_CONTEXT，绝不返回未认证字节，明文用 Zeroizing 缓冲返回。层内不解总数覆盖与完整摘要：这两项由 [ATTACHMENTS-006 export_attachment](attachments.md#attachments-006) 逐块认证 + 全文件摘要复核完成（`attachments::tests` 覆盖）。
 
+## CTRLREV · stage_self_update_commit（2026-10-19）
+
+撤销设备需要一个**可投递的、只推进 epoch 不带成员变化**的提交。原先只有
+`advance_epoch_with_self_update`（本地立即合并、不返回字节），无法把提交投递给对端。
+
+新增（与既有方法并存，未改其行为）：
+
+    MlsDevice::stage_self_update_commit(&mut self) -> Result<Vec<u8>>
+      - 生成 MLS SelfUpdate 提交字节并暂存 pending；**不 merge、不推进 epoch**；
+      - 已有 pending → 显式拒绝（不覆盖、不叠加）；未建群 → GroupNotInitialized；
+      - 返回字节可直接投递，对端用 process_verified_entry 应用后 epoch +1。
+
+证据（`cargo test --offline -p chat-crypto`，新增 3 例）：
+
+- `stage_self_update::staging_a_self_update_leaves_the_epoch_unchanged_and_keeps_pending`：staging 后 epoch 仍为 1、返回非空字节、二次 staging 被拒（错误信息含 `pending commit`）；
+- `stage_self_update::the_staged_bytes_advance_a_peer_epoch_once`：B 应用后 epoch 1→2、added=0/removed=0，A 仍停在 epoch 1（T2 语义：pending 与正式状态分开）；
+- `stage_self_update::staging_requires_an_initialized_group`：无群设备调用被显式拒绝。
+
+限制：本方法只暂存一次提交；合并/丢弃仍需走既有 T2 路径（`merge_accepted_pending` / `discard`）。
+

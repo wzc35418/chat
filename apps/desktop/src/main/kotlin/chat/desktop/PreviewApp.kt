@@ -66,6 +66,8 @@ import chat.ui.GroupHandlers
 import chat.ui.IdentityHandlers
 import chat.presentation.preview.updateManifest
 import chat.presentation.preview.updateRecoveryPassphrase
+import chat.presentation.preview.withDeviceRevoked
+import chat.presentation.preview.withDevices
 import chat.presentation.preview.withRecoveryExported
 import chat.presentation.preview.withError
 import chat.presentation.preview.withInstalled
@@ -269,6 +271,40 @@ fun main() = application {
         },
         refreshContacts = { scope.launch { refreshContacts() } },
         updateRecoveryPassphrase = { value -> identityState = identityState.updateRecoveryPassphrase(value) },
+        loadDevices = {
+            scope.launch {
+                val service = identity ?: return@launch
+                identityState = identityState.copy(busy = true, lastErrorCode = null)
+                runCatching { service.listDevices(includeRevoked = true) }
+                    .onSuccess { identityState = identityState.withDevices(it) }
+                    .onFailure { error ->
+                        identityState = identityState.copy(
+                            busy = false,
+                            notice = error.message ?: "加载设备失败",
+                            lastErrorCode = (error as? IdentityException)?.code ?: "UNKNOWN_RESULT",
+                        )
+                    }
+            }
+        },
+        revokeDevice = { deviceId ->
+            scope.launch {
+                val service = identity ?: return@launch
+                identityState = identityState.copy(busy = true, lastErrorCode = null)
+                runCatching { service.revokeDevice(deviceId, "user requested") }
+                    .onSuccess { revoked ->
+                        identityState = identityState.withDeviceRevoked(deviceId, revoked)
+                        runCatching { service.listDevices(includeRevoked = true) }
+                            .onSuccess { identityState = identityState.withDevices(it) }
+                    }
+                    .onFailure { error ->
+                        identityState = identityState.copy(
+                            busy = false,
+                            notice = error.message ?: "撤销失败",
+                            lastErrorCode = (error as? IdentityException)?.code ?: "UNKNOWN_RESULT",
+                        )
+                    }
+            }
+        },
         importRecovery = {
             scope.launch {
                 val service = identity ?: return@launch
