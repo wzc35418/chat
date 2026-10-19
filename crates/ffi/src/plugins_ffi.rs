@@ -119,6 +119,27 @@ pub struct DispatchPlanViewFfi {
     pub timeout_ms: u64,
 }
 
+/// 插件包结构校验结果（PLUGINS：不执行任何插件代码）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct PackageViewFfi {
+    /// 清单插件 ID。
+    pub plugin_id: String,
+    /// 清单版本（MAJOR.MINOR.PATCH）。
+    pub plugin_version: String,
+    /// 入口类名。
+    pub entry_class: String,
+    /// 入口类的 .class 条目路径。
+    pub entry_file: String,
+    /// SPI 描述符路径（META-INF/services/&lt;entryClass&gt;）。
+    pub spi_file: String,
+    /// 条目总数。
+    pub entry_count: u32,
+    /// 压缩字节合计。
+    pub compressed_bytes: u64,
+    /// 解压字节合计。
+    pub uncompressed_bytes: u64,
+}
+
 /// 已安装插件（纯数据）。
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct PluginInfoFfi {
@@ -327,6 +348,31 @@ impl PluginsFfi {
             return Err(core_closed());
         }
         Ok(inner.skipped_on_load)
+    }
+
+    /// PLUGINS：校验插件包（ZIP/JAR）结构 —— **不执行任何插件代码**。
+    ///
+    /// 校验：ZIP 结构（central directory）、条目名（无穿越/无重名）、规模上限
+    /// （包 8 MiB / 解压 64 MiB / 条目 4096）、`manifest.json` 能过清单校验、
+    /// 入口类的 `.class` 存在、SPI 描述符存在且实现名与 entryClass 一致。
+    ///
+    /// 清单与 SPI 必须是 **stored（method 0）** 条目：本层不做 inflate（见 plugins.md 限制）。
+    pub fn inspect_package(&self, bytes: Vec<u8>) -> Result<PackageViewFfi, FfiError> {
+        let inner = self.lock()?;
+        if inner.closed {
+            return Err(core_closed());
+        }
+        let view = chat_plugins::inspect_plugin_package(&bytes, &inner.limits).map_err(failure)?;
+        Ok(PackageViewFfi {
+            plugin_id: view.plugin_id,
+            plugin_version: view.plugin_version,
+            entry_class: view.entry_class,
+            entry_file: view.entry_file,
+            spi_file: view.spi_file,
+            entry_count: view.entry_count,
+            compressed_bytes: view.compressed_bytes,
+            uncompressed_bytes: view.uncompressed_bytes,
+        })
     }
 
     /// 校验清单 JSON（不安装、不执行）。

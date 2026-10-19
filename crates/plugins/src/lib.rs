@@ -19,6 +19,7 @@ pub mod error;
 pub mod host;
 pub mod limits;
 pub mod manifest;
+pub mod package;
 pub mod registry;
 pub mod storage;
 
@@ -29,6 +30,11 @@ pub use manifest::{
     CURRENT_MANIFEST_SCHEMA, CURRENT_SDK_VERSION, ExtensionPoint, MAX_ENTRY_CLASS_BYTES,
     MAX_PERMISSIONS, MAX_PLUGIN_ID_BYTES, PluginCapability, PluginId, PluginManifest,
     PluginPermission, PluginPlatform, PluginVersion, parse_manifest,
+};
+pub use package::{
+    MANIFEST_FILE, MAX_ENTRY_COUNT, MAX_ENTRY_NAME_BYTES, MAX_PACKAGE_BYTES,
+    MAX_UNCOMPRESSED_BYTES, SPI_DIRECTORY, PackageEntryView, PackageInspection,
+    inspect_plugin_package, list_package_entries,
 };
 pub use registry::{ExtensionPointRegistry, RegistrationOutcome};
 pub use storage::{PluginStorage, StorageUsage};

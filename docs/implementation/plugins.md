@@ -647,3 +647,62 @@ skipped_on_load() -> u32                                              // 打开�
 持久化模式的已知限制：① 运行状态不恢复（要靠上层重新 start）；② `delete_data=false` 会留下
 `uninstalled` 行（KV 占配额直到 true 卸载或重装后清理）；③ 配额是 storage 侧的硬边界，
 与纯内存模式宿主自己的配额数值可能不同；④ 一次最多 256 行插件（`MAX_PLUGIN_ROWS`）。
+## 插件包结构校验（PLUGINS-PKG，2026-10-18）
+
+真加载插件前先做**不执行代码**的结构校验：新增 [crates/plugins/src/package.rs](../../crates/plugins/src/package.rs)。
+
+### 公开面
+
+~~~text
+inspect_plugin_package(bytes, limits) -> PackageInspection
+list_package_entries(bytes) -> Vec<PackageEntryView>     // 只读 central directory，不读内容
+PackageInspection { plugin_id, plugin_version, entry_class, entry_file, spi_file,
+                    entry_count, compressed_bytes, uncompressed_bytes }
+const MAX_PACKAGE_BYTES = 8 MiB;  MAX_UNCOMPRESSED_BYTES = 64 MiB;  MAX_ENTRY_COUNT = 4096
+const MANIFEST_FILE = "manifest.json";  SPI_DIRECTORY = "META-INF/services/"
+~~~
+
+### 校验规则（全部无第三方依赖、纯字节解析）
+
+1. **ZIP 结构**：从尾部找 EOCD（允许 ≤64KiB comment，且 comment 长度必须正好收尾），
+   再逐条读 central directory（签名/偏移/长度越界都显式拒绝）；
+2. **条目名**：非空、≤512 字节、非绝对路径、无反斜杠、无控制字符、无 `..` 段、无 `:`，且**无重名**；
+3. **规模**：包 ≤8 MiB、解压总量 ≤64 MiB、条目 ≤4096（解压总量按 central directory 的**声明值**累计）；
+4. **清单**：`manifest.json` 必须存在、是 UTF-8、且能通过 [`parse_manifest`] 的完整清单校验；
+5. **入口类**：清单 `entryClass` 必须有对应 `com/example/Plugin.class` 条目；
+6. **SPI**：`META-INF/services/<entryClass>` 必须存在，去注释/空行后**每一行都必须等于 entryClass**。
+
+### 稳定码
+
+| 情形 | code |
+|---|---|
+| ZIP 结构损坏/截断/假 EOCD | `PLUGIN_PACKAGE_CORRUPTED` |
+| 包/解压总量/条目数超限 | `PLUGIN_PACKAGE_TOO_LARGE` |
+| 没有 `manifest.json` | `PLUGIN_PACKAGE_MISSING_MANIFEST` |
+| 入口类缺 `.class` | `PLUGIN_PACKAGE_MISSING_ENTRY` |
+| SPI 缺失或实现名不符 | `PLUGIN_PACKAGE_SPI_MISMATCH` |
+| 路径穿越/非法条目名 | `PLUGIN_PACKAGE_UNSAFE_PATH` |
+| 条目重名 | `PLUGIN_PACKAGE_DUPLICATE_ENTRY` |
+| 清单/SPI 用了非 stored 压缩 | `PLUGIN_PACKAGE_UNSUPPORTED_COMPRESSION` |
+| 清单/SPI 不是 UTF-8 | `PLUGIN_PACKAGE_NOT_TEXT` |
+| 清单内容不合法 | `INVALID_PLUGIN_PACKAGE`（复用清单层码） |
+
+### 证据
+
+[crates/plugins/tests/package.rs](../../crates/plugins/tests/package.rs)（10 个，测试内构造最小 ZIP）：
+合法包通过并报告字段；缺清单 / 缺入口类 / SPI 不符 / 缺 SPI / 路径穿越（`../`、绝对路径、`C:/`）/
+重名 / 输入 >8 MiB / 条目 >4096 / 声明解压 >64 MiB / 非 stored 清单 / 非 ZIP / 截断 EOCD /
+清单非法 / 清单非 UTF-8 / 超长条目名 —— 各自断言对应稳定码。
+
+复现：`cargo test --offline -p chat-plugins --test package` → 10 passed；
+`cargo test --offline -p chat-plugins` → 46 passed（既有 36 继续通过）。
+
+### 已知限制
+
+1. **不做 inflate**：只读 stored（method 0）条目的内容，因此清单与 SPI 必须是 stored；
+   其它条目可以是 deflate（我们只看尺寸声明，不读内容）。真正的 inflate 与代码加载属于后续阶段。
+2. **不校验 CRC**：不读内容的条目无法验 CRC（清单/SPI 读了内容但也未验 CRC）——CRC 只用于传输完整性，
+   安全边界是"结构 + 清单 + SPI 一致"，不是加密校验。
+3. **不做签名校验**：包签名/信任链不在本轮（P4 的信任确认另行设计）。
+4. **ZIP64/多卷/加密 ZIP 未支持**：相关标记会落成 `PLUGIN_PACKAGE_CORRUPTED` / `TOO_LARGE`。
+

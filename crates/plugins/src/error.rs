@@ -59,6 +59,24 @@ pub enum PluginError {
     StorageQuotaExceeded { detail: &'static str },
     /// 宿主限额配置非法（0 或超过硬上限）。
     InvalidLimits { detail: &'static str },
+    /// 插件包（ZIP）结构损坏：签名/偏移/长度不自洽。
+    PackageCorrupted { detail: &'static str },
+    /// 插件包体积/解压总量/条目数超过上限。
+    PackageTooLarge { detail: &'static str },
+    /// 插件包里没有 `manifest.json`。
+    PackageMissingManifest,
+    /// 清单声明的入口类没有对应的 `.class` 条目。
+    PackageMissingEntry,
+    /// SPI 文件缺失，或声明的实现名与 `entryClass` 不一致。
+    PackageSpiMismatch { detail: &'static str },
+    /// 条目路径不安全（绝对路径/`..`/反斜杠/控制字符）。
+    PackageUnsafePath { detail: &'static str },
+    /// 同名条目重复。
+    PackageDuplicateEntry { detail: &'static str },
+    /// 需要读取内容的条目用了不支持的压缩方法（当前只支持 stored）。
+    PackageUnsupportedCompression { detail: &'static str },
+    /// 包内文件不是合法 UTF-8（清单/SPI 必须是文本）。
+    PackageNotText { detail: &'static str },
 }
 
 impl PluginError {
@@ -85,6 +103,17 @@ impl PluginError {
             PluginError::InvalidStorageKey { .. } => "INVALID_STORAGE_KEY",
             PluginError::StorageQuotaExceeded { .. } => "PLUGIN_STORAGE_QUOTA_EXCEEDED",
             PluginError::InvalidLimits { .. } => "INVALID_PLUGIN_LIMITS",
+            PluginError::PackageCorrupted { .. } => "PLUGIN_PACKAGE_CORRUPTED",
+            PluginError::PackageTooLarge { .. } => "PLUGIN_PACKAGE_TOO_LARGE",
+            PluginError::PackageMissingManifest => "PLUGIN_PACKAGE_MISSING_MANIFEST",
+            PluginError::PackageMissingEntry => "PLUGIN_PACKAGE_MISSING_ENTRY",
+            PluginError::PackageSpiMismatch { .. } => "PLUGIN_PACKAGE_SPI_MISMATCH",
+            PluginError::PackageUnsafePath { .. } => "PLUGIN_PACKAGE_UNSAFE_PATH",
+            PluginError::PackageDuplicateEntry { .. } => "PLUGIN_PACKAGE_DUPLICATE_ENTRY",
+            PluginError::PackageUnsupportedCompression { .. } => {
+                "PLUGIN_PACKAGE_UNSUPPORTED_COMPRESSION"
+            }
+            PluginError::PackageNotText { .. } => "PLUGIN_PACKAGE_NOT_TEXT",
         }
     }
 
@@ -148,6 +177,33 @@ impl fmt::Display for PluginError {
             PluginError::InvalidLimits { detail } => {
                 write!(formatter, "invalid plugin host limits: {detail}")
             }
+            PluginError::PackageCorrupted { detail } => {
+                write!(formatter, "plugin package is corrupted: {detail}")
+            }
+            PluginError::PackageTooLarge { detail } => {
+                write!(formatter, "plugin package exceeds its limits: {detail}")
+            }
+            PluginError::PackageMissingManifest => {
+                formatter.write_str("plugin package has no manifest.json")
+            }
+            PluginError::PackageMissingEntry => {
+                formatter.write_str("plugin package has no class for the declared entry class")
+            }
+            PluginError::PackageSpiMismatch { detail } => {
+                write!(formatter, "plugin service descriptor is invalid: {detail}")
+            }
+            PluginError::PackageUnsafePath { detail } => {
+                write!(formatter, "plugin package entry path is unsafe: {detail}")
+            }
+            PluginError::PackageDuplicateEntry { detail } => {
+                write!(formatter, "plugin package has a duplicate entry: {detail}")
+            }
+            PluginError::PackageUnsupportedCompression { detail } => {
+                write!(formatter, "plugin package compression is unsupported: {detail}")
+            }
+            PluginError::PackageNotText { detail } => {
+                write!(formatter, "plugin package entry is not valid UTF-8: {detail}")
+            }
         }
     }
 }
@@ -158,7 +214,7 @@ impl std::error::Error for PluginError {}
 pub type Result<T> = core::result::Result<T, PluginError>;
 
 /// 插件层稳定码全量，供唯一性测试与文档码表使用。
-pub const CODE_TABLE: [&str; 20] = [
+pub const CODE_TABLE: [&str; 29] = [
     "INVALID_PLUGIN_PACKAGE",
     "PLUGIN_ID_CONFLICT",
     "SDK_INCOMPATIBLE",
@@ -179,6 +235,15 @@ pub const CODE_TABLE: [&str; 20] = [
     "INVALID_STORAGE_KEY",
     "PLUGIN_STORAGE_QUOTA_EXCEEDED",
     "INVALID_PLUGIN_LIMITS",
+    "PLUGIN_PACKAGE_CORRUPTED",
+    "PLUGIN_PACKAGE_TOO_LARGE",
+    "PLUGIN_PACKAGE_MISSING_MANIFEST",
+    "PLUGIN_PACKAGE_MISSING_ENTRY",
+    "PLUGIN_PACKAGE_SPI_MISMATCH",
+    "PLUGIN_PACKAGE_UNSAFE_PATH",
+    "PLUGIN_PACKAGE_DUPLICATE_ENTRY",
+    "PLUGIN_PACKAGE_UNSUPPORTED_COMPRESSION",
+    "PLUGIN_PACKAGE_NOT_TEXT",
 ];
 
 #[cfg(test)]

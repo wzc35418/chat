@@ -923,4 +923,21 @@ GroupSummaryFfi { group_id, name, epoch, role, policy_version, dissolved, left, 
 - `pending` 仍是"待收口线索"（自己发起自移除 **或** 有待打包提案）；
 - `pending_proposal` 只表示"**收下的对端**提案等本机打包"（自己发起的提案不算）；
 - `group_list` 依旧只读快照、不导入 MLS 设备、损坏条目计入 `skipped`。
+## 插件包结构校验（PluginsFfi.inspect_package，2026-10-18）
+
+~~~text
+PluginsFfi.inspect_package(bytes) -> PackageViewFfi      // 不执行任何插件代码
+PackageViewFfi { plugin_id, plugin_version, entry_class, entry_file, spi_file,
+                 entry_count, compressed_bytes, uncompressed_bytes }
+~~~
+
+- 复用 `chat_plugins::inspect_plugin_package`（纯字节解析，无第三方依赖）；
+- 稳定码原样透出：`PLUGIN_PACKAGE_CORRUPTED` / `PLUGIN_PACKAGE_TOO_LARGE` /
+  `PLUGIN_PACKAGE_MISSING_MANIFEST` / `PLUGIN_PACKAGE_MISSING_ENTRY` /
+  `PLUGIN_PACKAGE_SPI_MISMATCH` / `PLUGIN_PACKAGE_UNSAFE_PATH` /
+  `PLUGIN_PACKAGE_DUPLICATE_ENTRY` / `PLUGIN_PACKAGE_UNSUPPORTED_COMPRESSION` /
+  `PLUGIN_PACKAGE_NOT_TEXT` / `INVALID_PLUGIN_PACKAGE`；关闭后 `CORE_CLOSED`；
+- 限制：清单与 SPI 必须是 stored（method 0）条目（本层不做 inflate），也不校验 CRC/包签名。
+- 测试：[crates/ffi/tests/plugins_package.rs](../../crates/ffi/tests/plugins_package.rs)（1 个，测试内构造最小 ZIP）。
+
 

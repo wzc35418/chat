@@ -12,6 +12,8 @@ dependencies {
     implementation(project(":shared:platform-api"))
     implementation(project(":desktop:platform"))
     implementation(project(":desktop:plugin-host"))
+    // P4 起步：JVM 插件宿主需要 SDK 的 DesktopPlugin/PluginContext 接口
+    implementation(project(":desktop:plugin-sdk"))
     implementation(compose.desktop.currentOs)
     implementation(compose.material3)
     implementation(libs.coroutines.core)
@@ -147,6 +149,16 @@ tasks.register<JavaExec>("dpapiSmoke") {
     dependsOn("classes")
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("chat.desktop.DpapiSmokeKt")
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+}
+
+tasks.register<JavaExec>("pluginJvmSmoke") {
+    group = "verification"
+    description = "PLUGINS P4：真实加载并执行本地插件 JAR（无沙箱，需显式信任）。"
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.PluginJvmSmokeKt")
     systemProperty("file.encoding", "UTF-8")
     systemProperty("stdout.encoding", "UTF-8")
 }
