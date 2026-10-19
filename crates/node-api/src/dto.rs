@@ -601,7 +601,7 @@ impl CapabilityResponseDto {
 // ---------------------------------------------------------------- NODE-018 审计只读端点
 
 /// 允许查询的审计种类白名单。
-pub const AUDIT_KIND_WHITELIST: [&str; 7] = [
+pub const AUDIT_KIND_WHITELIST: [&str; 8] = [
     "http",
     "append",
     "control",
@@ -609,6 +609,8 @@ pub const AUDIT_KIND_WHITELIST: [&str; 7] = [
     "capability_revoke",
     "auth",
     "rate_limit",
+    // GROUPS-020：带 invite 标记的群条目（邀请投递）在审计里单列一类。
+    "invite",
 ];
 
 /// 审计查询默认条数。

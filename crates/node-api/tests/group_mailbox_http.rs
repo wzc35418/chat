@@ -99,6 +99,14 @@ impl HttpResponse {
             .to_owned()
     }
 
+    /// 按名字读响应头（大小写不敏感；不存在时为 None）。
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
     /// 响应头取值（不存在时为 None）。
     fn content_type(&self) -> Option<String> {
         self.headers
@@ -2135,4 +2143,125 @@ async fn audit_endpoint_reports_a_disabled_audit_without_faking_events() {
     assert_eq!(body["audit_enabled"], false);
     assert_eq!(body["events"].as_array().expect("events").len(), 0);
     assert_eq!(body["truncated"], false);
+}
+
+// ---------------------------------------------------------------- GROUPS-020 邀请标记审计
+
+/// 构造并提交一条应用候选（可选 invite 标记），返回 HTTP 响应。
+async fn append_application_candidate(
+    node: &Node,
+    group: &str,
+    submission_seed: u8,
+    marker: Option<&str>,
+) -> HttpResponse {
+    let mut candidate = GroupCandidate {
+        protocol_major: 1,
+        protocol_minor: 0,
+        submission_id: submission_text(submission_seed),
+        group_id: group.to_owned(),
+        author_device_id: device_text(21),
+        kind: chat_node_services::group::KIND_APPLICATION.to_owned(),
+        expected_control_head: hex_encode(&INITIAL_CONTROL_HEAD),
+        policy_version: 1,
+        mls_epoch: 0,
+        encrypted_payload: hex_encode(b"sealed invite payload"),
+        control_metadata: marker.map(|operation| CandidateControlMetadata {
+            operation: operation.to_owned(),
+            target_digest: hex_encode(&[0x5a_u8; 32]),
+            added_credentials: Vec::new(),
+            removed_credentials: Vec::new(),
+        }),
+    };
+    if marker.is_none() {
+        candidate.control_metadata = None;
+    }
+    let unsigned = candidate
+        .to_unsigned(chat_protocol::MAX_CIPHERTEXT_BYTES)
+        .expect("application candidate converts");
+    let signing = candidate_signing_bytes(&unsigned).expect("signing bytes");
+    let signature: Signature = device(21).sign(signing.as_bytes());
+    let body = entry_body(&candidate, &hex_encode(&signature.to_bytes()));
+    let path = format!("/v1/groups/{group}/entries");
+    let headers = request_headers(node, 21, "POST", &path, "", &body).await;
+    http(&node.address, "POST", &path, &headers, &body).await
+}
+
+/// invite 标记的 application 候选 → 审计出现 kind=invite（含 group_id 与 request_id）。
+#[tokio::test]
+async fn an_invite_marked_append_is_recorded_as_kind_invite_in_the_audit() {
+    let (node, group) = setup(NodeAuthPolicy::default()).await;
+    let response = append_application_candidate(&node, &group, 201, Some("invite")).await;
+    assert_eq!(
+        response.status,
+        200,
+        "{:?}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let request_id = response
+        .header("x-chat-request-id")
+        .expect("the response carries a request id")
+        .to_owned();
+    let audit = get_request(&node, 21, "/v1/audit", "kind=invite").await;
+    assert_eq!(audit.status, 200, "{:?}", String::from_utf8_lossy(&audit.body));
+    let body = audit.json();
+    let events = body["events"].as_array().expect("events");
+    assert_eq!(events.len(), 1, "exactly one invite audit event: {body}");
+    assert_eq!(events[0]["kind"], "invite");
+    assert_eq!(events[0]["group_id"], group);
+    assert_eq!(events[0]["device_id"], device_text(21));
+    assert_eq!(events[0]["request_id"], request_id);
+    assert_eq!(events[0]["outcome"], "ok");
+}
+
+/// 普通应用条目（旧客户端不带标记）不产生 kind=invite，且提交仍然成功。
+#[tokio::test]
+async fn an_ordinary_append_stays_compatible_and_produces_no_invite_audit() {
+    let (node, group) = setup(NodeAuthPolicy::default()).await;
+    let response = append_application_candidate(&node, &group, 202, None).await;
+    assert_eq!(
+        response.status,
+        200,
+        "legacy clients keep working: {:?}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let audit = get_request(&node, 21, "/v1/audit", "kind=invite").await;
+    assert_eq!(audit.status, 200);
+    assert_eq!(
+        audit.json()["events"].as_array().expect("events").len(),
+        0,
+        "an ordinary append must not be classified as an invite"
+    );
+}
+
+/// 非法操作文本（不在白名单里的 invite 变体）被拒绝，且不产生审计。
+#[tokio::test]
+async fn an_unknown_operation_text_is_rejected_and_never_audited_as_invite() {
+    let (node, group) = setup(NodeAuthPolicy::default()).await;
+    // 白名单校验发生在候选转换阶段（客户端/网关两层都会拒）：未知操作文本直接失败。
+    let candidate = GroupCandidate {
+        protocol_major: 1,
+        protocol_minor: 0,
+        submission_id: submission_text(203),
+        group_id: group.clone(),
+        author_device_id: device_text(21),
+        kind: chat_node_services::group::KIND_APPLICATION.to_owned(),
+        expected_control_head: hex_encode(&INITIAL_CONTROL_HEAD),
+        policy_version: 1,
+        mls_epoch: 0,
+        encrypted_payload: hex_encode(b"sealed"),
+        control_metadata: Some(CandidateControlMetadata {
+            operation: "invite_group".into(),
+            target_digest: hex_encode(&[0x5a_u8; 32]),
+            added_credentials: Vec::new(),
+            removed_credentials: Vec::new(),
+        }),
+    };
+    let error = candidate
+        .to_unsigned(chat_protocol::MAX_CIPHERTEXT_BYTES)
+        .expect_err("unknown operation text must be rejected");
+    assert_eq!(error.code(), "INVALID_REQUEST");
+    // 没有任何提交发生 → 审计里没有 invite 事件。
+    let audit = get_request(&node, 21, "/v1/audit", "kind=invite").await;
+    assert_eq!(audit.status, 200);
+    assert_eq!(audit.json()["events"].as_array().expect("events").len(), 0);
 }

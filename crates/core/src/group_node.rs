@@ -668,7 +668,15 @@ pub fn submit_group_invite(
         policy_version: head.policy_version,
         mls_epoch: head.mls_epoch,
         encrypted_payload: hex_encode(&payload),
-        control_metadata: None,
+        // GROUPS-020：复用既有公开元数据字段做**可区分标记**（不新增协议字段）：
+        // operation = 既有白名单里的 "invite"，target_digest = 本邀请 blob 的摘要。
+        // protocol 只为此一种组合放行（application + Invite + 非零 digest）；取回侧仍按 payload 解码。
+        control_metadata: Some(chat_node_services::group::CandidateControlMetadata {
+            operation: "invite".to_owned(),
+            target_digest: hex_encode(&digest),
+            added_credentials: Vec::new(),
+            removed_credentials: Vec::new(),
+        }),
     };
     let receipt = match append_candidate(client, &candidate)? {
         Ok(receipt) => receipt,

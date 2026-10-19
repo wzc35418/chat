@@ -43,6 +43,24 @@ interface GroupService {
     /** 建群（本机为 owner；引导成员由本进程临时设备承担）。 */
     suspend fun createGroup(name: String): GroupSnapshot
 
+    /** 把邀请（元数据 + Welcome）提交到节点；回执真实、幂等可重投。 */
+    suspend fun submitInvite(
+        groupId: String,
+        meta: GroupInviteMeta,
+        welcomeBytes: ByteArray,
+        endpointUrl: String,
+        nodeId: String,
+        nodePublicKeyHex: String?,
+    ): InviteReceipt
+
+    /** 从节点取回最近一条邀请；没有邀请返回 null（与"出错"区分开）。 */
+    suspend fun fetchInvite(
+        groupId: String,
+        endpointUrl: String,
+        nodeId: String,
+        nodePublicKeyHex: String?,
+    ): GroupInviteBlob?
+
     /** 本机群列表（只读投影；skipped 是解析失败被跳过的条数）。 */
     suspend fun listGroups(): GroupList
 
@@ -86,4 +104,30 @@ data class GroupList(
     val groups: List<GroupSummaryEntry>,
     /** 损坏或不合规而被跳过的条目数（不静默丢）。 */
     val skipped: Int,
+)
+
+/** 邀请元数据（与 core GroupInviteMeta 一致；纯数据）。 */
+data class GroupInviteMeta(
+    val groupId: String,
+    val mlsGroupId: String,
+    val name: String,
+    val inviterCredential: String,
+    val ownerCredential: String,
+    val inviteeCredential: String,
+    val members: List<String>,
+    val epoch: Int,
+)
+
+/** 邀请提交回执（节点真实回执，不伪造）。 */
+data class InviteReceipt(
+    val submissionId: String,
+    val seq: Long,
+    val logHash: String,
+    val nodeId: String,
+)
+
+/** 从节点取回的邀请（Welcome 字节原样）。 */
+data class GroupInviteBlob(
+    val meta: GroupInviteMeta,
+    val welcomeBytes: ByteArray,
 )

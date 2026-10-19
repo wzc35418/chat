@@ -736,3 +736,13 @@ GET  /v1/mailbox、GET /v1/groups/{id}/log      // 强制模式下也要带未�
 3. **缺失鉴权头返回 400 而不是 401**：这是全仓既有约定（`missing_auth_header` → `INVALID_REQUEST`），
    改成 401 会同时影响所有端点与既有用例，因此本端点沿用；401 保留给「有鉴权头但不合法/过期/签名不符」。
 
+## GROUPS-020 · 审计 kind=invite（2026-10-20）
+
+`GET /v1/audit` 的 `kind` 白名单新增 **`invite`**（现为 8 类）。
+
+- 触发条件：`POST /v1/groups/{id}/entries` 的候选带 `control_metadata.operation = "invite"`（邀请投递标记）；
+- 事件字段：`kind=invite`、`group_id`、`device_id`、`request_id`（响应头 `x-chat-request-id` 同值）、`outcome=ok`；
+- 普通应用条目（无标记）不产生该 kind；未知操作文本（如 `invite_group`）在候选转换阶段即被拒（`INVALID_REQUEST`），不会写审计。
+
+证据（`cargo test -p chat-node-api`，39 passed）：`an_invite_marked_append_is_recorded_as_kind_invite_in_the_audit`、`an_ordinary_append_stays_compatible_and_produces_no_invite_audit`、`an_unknown_operation_text_is_rejected_and_never_audited_as_invite`。
+

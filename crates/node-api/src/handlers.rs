@@ -360,6 +360,7 @@ pub async fn register_group(
 pub async fn append_group_entry(
     State(state): State<AppState>,
     UrlPath(group_id): UrlPath<String>,
+    Extension(request_id): Extension<RequestId>,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
@@ -367,6 +368,13 @@ pub async fn append_group_entry(
     ensure_body_bounded(&state, body.len())?;
     let request: AppendGroupEntryRequestDto = parse_body(&body)?;
     let (candidate, domain) = request.into_request()?;
+    // GROUPS-020：邀请条目带 operation=invite 的公开标记 → 审计里单列 kind=invite。
+    let is_invite = candidate
+        .candidate
+        .control_metadata
+        .as_ref()
+        .map(|metadata| metadata.operation == "invite")
+        .unwrap_or(false);
     let now = state.now();
     let actor = authenticate(&state, &headers, &uri, "POST", &body, now)?;
     // 带领域声明走 with_domain 路径（声明参与验签与日志投影）；不带则与旧行为完全一致。
@@ -379,6 +387,17 @@ pub async fn append_group_entry(
             now,
         )
     })?;
+    if is_invite {
+        let event = chat_node_services::audit::AuditEvent::new(
+            "invite",
+            now.saturating_mul(1_000),
+            AuditOutcome::Ok,
+        )
+        .with_group(group_id.clone())
+        .with_device(actor.device_id.clone())
+        .with_request_id(request_id.0.clone());
+        state.record_audit(event);
+    }
     Ok(Json(AppendGroupEntryResponseDto::new(result)).into_response())
 }
 

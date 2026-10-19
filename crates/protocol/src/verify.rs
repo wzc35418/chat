@@ -636,8 +636,9 @@ mod tests {
     #[test]
     fn application_candidate_cannot_smuggle_control_metadata() {
         let mut unsigned = unsigned_candidate();
+        // GROUPS-020：application + Invite 是唯一允许的例外，因此这里改用 set_role 验证拒绝。
         unsigned.control_metadata = Some(crate::signing::ControlMetadata {
-            operation: crate::signing::ControlOperation::Invite,
+            operation: crate::signing::ControlOperation::SetRole,
             target_digest: Digest::from_bytes([1; 32]),
             domain_operation: None,
             added_credentials: Vec::new(),

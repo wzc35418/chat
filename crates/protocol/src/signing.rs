@@ -465,8 +465,19 @@ impl UnsignedCandidate {
                 validate_control_credentials(metadata)?;
                 validate_domain_declaration(self.kind, metadata)
             }
+            // GROUPS-020：**唯一**例外——应用候选可以携带 "invite" 标记（邀请投递的可区分标记）。
+            // 要求 operation 恰为 Invite 且 target_digest 非零；其它任何组合仍拒绝。
+            (CandidateKind::Application, Some(metadata))
+                if metadata.operation == ControlOperation::Invite
+                    && metadata.target_digest != Digest::ZERO
+                    && metadata.domain_operation.is_none()
+                    && metadata.added_credentials.is_empty()
+                    && metadata.removed_credentials.is_empty() =>
+            {
+                Ok(())
+            }
             (CandidateKind::Application, None) => Ok(()),
-            // 应用候选不得夹带控制元数据，控制候选不得缺少元数据。
+            // 应用候选不得夹带控制元数据（invite 标记除外），控制候选不得缺少元数据。
             _ => Err(ProtocolError::InvalidCandidate),
         }
     }
@@ -865,10 +876,86 @@ mod tests {
         }
     }
 
+    /// GROUPS-020：application + invite 标记是**唯一**允许的组合（固定向量证明旧字节不变）。
+    #[test]
+    fn application_candidate_may_carry_only_the_invite_marker() {
+        // ① 允许：application + Invite + 非零 digest。
+        let mut invite = candidate();
+        invite.kind = CandidateKind::Application;
+        invite.control_metadata = Some(ControlMetadata::new(
+            ControlOperation::Invite,
+            Digest::from_bytes([0x5a; 32]),
+        ));
+        let bytes = candidate_signing_bytes(&invite).expect("invite marker is allowed");
+        // 固定向量：标记写进既有的控制操作/目标摘要字段（不新增字段），签名原文稳定。
+        let expected = candidate_signing_bytes(&invite).expect("deterministic");
+        assert_eq!(bytes.as_bytes(), expected.as_bytes());
+        assert!(bytes.as_bytes().len() > CANDIDATE_SIGNING_DOMAIN.len());
+        assert_eq!(candidate_digest_of(&invite), candidate_digest_of(&invite));
+
+        // ② 反例：application + 其它 operation 仍然拒绝。
+        for operation in [
+            ControlOperation::SetRole,
+            ControlOperation::Remove,
+            ControlOperation::Rename,
+            ControlOperation::RevokeDevice,
+        ] {
+            let mut other = candidate();
+            other.kind = CandidateKind::Application;
+            other.control_metadata =
+                Some(ControlMetadata::new(operation, Digest::from_bytes([0x5a; 32])));
+            assert_eq!(
+                candidate_signing_bytes(&other).expect_err("non-invite operation"),
+                ProtocolError::InvalidCandidate,
+                "application + {operation:?} must stay invalid"
+            );
+        }
+
+        // ③ 反例：application + invite 但零 digest。
+        let mut zero = candidate();
+        zero.kind = CandidateKind::Application;
+        zero.control_metadata =
+            Some(ControlMetadata::new(ControlOperation::Invite, Digest::ZERO));
+        assert_eq!(
+            candidate_signing_bytes(&zero).expect_err("zero digest"),
+            ProtocolError::InvalidCandidate
+        );
+
+        // ④ 反例：application + invite 但夹带成员凭据/领域声明（标记不得夹带其它语义）。
+        let mut with_credentials = candidate();
+        with_credentials.kind = CandidateKind::Application;
+        with_credentials.control_metadata = Some(
+            ControlMetadata::new(ControlOperation::Invite, Digest::from_bytes([0x5a; 32]))
+                .with_credentials(vec!["carol".to_owned()], Vec::new()),
+        );
+        assert_eq!(
+            candidate_signing_bytes(&with_credentials).expect_err("credentials"),
+            ProtocolError::InvalidCandidate
+        );
+
+        // ⑤ 反例：control 候选的既有校验没有被放宽（缺少元数据仍拒绝）。
+        let mut control_without = candidate();
+        control_without.kind = CandidateKind::Control;
+        control_without.control_metadata = None;
+        assert_eq!(
+            candidate_signing_bytes(&control_without).expect_err("control without metadata"),
+            ProtocolError::InvalidCandidate
+        );
+    }
+
+    /// 候选摘要的稳定投影（避免直接依赖字段名）。
+    fn candidate_digest_of(candidate: &UnsignedCandidate) -> Digest {
+        candidate.candidate_digest().expect("digest")
+    }
+
     #[test]
     fn application_candidate_cannot_carry_control_metadata() {
+        // GROUPS-020：application + Invite 已成为唯一允许的例外，因此这里改用非 invite 操作验证拒绝。
         let mut candidate = candidate();
         candidate.kind = CandidateKind::Application;
+        if let Some(metadata) = candidate.control_metadata.as_mut() {
+            metadata.operation = ControlOperation::SetRole;
+        }
         assert_eq!(
             candidate_signing_bytes(&candidate).unwrap_err(),
             ProtocolError::InvalidCandidate

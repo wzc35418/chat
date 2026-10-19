@@ -65,6 +65,61 @@ class NativeGroupService(
         }
     }
 
+    override suspend fun submitInvite(
+        groupId: String,
+        meta: chat.api.GroupInviteMeta,
+        welcomeBytes: ByteArray,
+        endpointUrl: String,
+        nodeId: String,
+        nodePublicKeyHex: String?,
+    ): chat.api.InviteReceipt = call {
+        val receipt = it.groupSubmitInvite(
+            groupId,
+            uniffi.chat_ffi.InviteMetaFfi(
+                groupId = meta.groupId,
+                mlsGroupId = meta.mlsGroupId,
+                name = meta.name,
+                inviterCredential = meta.inviterCredential,
+                ownerCredential = meta.ownerCredential,
+                inviteeCredential = meta.inviteeCredential,
+                members = meta.members,
+                epoch = meta.epoch.toULong(),
+            ),
+            welcomeBytes,
+            endpointUrl,
+            nodeId,
+            nodePublicKeyHex,
+        )
+        chat.api.InviteReceipt(
+            submissionId = receipt.submissionId,
+            seq = receipt.seq.toLong(),
+            logHash = receipt.logHash,
+            nodeId = receipt.nodeId,
+        )
+    }
+
+    override suspend fun fetchInvite(
+        groupId: String,
+        endpointUrl: String,
+        nodeId: String,
+        nodePublicKeyHex: String?,
+    ): chat.api.GroupInviteBlob? {
+        val blob = call { it.groupFetchInvite(groupId, endpointUrl, nodeId, nodePublicKeyHex) } ?: return null
+        return chat.api.GroupInviteBlob(
+            meta = chat.api.GroupInviteMeta(
+                groupId = blob.meta.groupId,
+                mlsGroupId = blob.meta.mlsGroupId,
+                name = blob.meta.name,
+                inviterCredential = blob.meta.inviterCredential,
+                ownerCredential = blob.meta.ownerCredential,
+                inviteeCredential = blob.meta.inviteeCredential,
+                members = blob.meta.members,
+                epoch = blob.meta.epoch.toInt(),
+            ),
+            welcomeBytes = blob.welcomeBytes,
+        )
+    }
+
     override suspend fun snapshot(groupId: String): GroupSnapshot = call { it.groupSnapshot(groupId).toSnapshot() }
 
     override suspend fun rename(groupId: String, newName: String): GroupSnapshot =
@@ -100,7 +155,8 @@ class NativeGroupService(
             ?: throw LocalStoreException("INVALID_STATE_TRANSITION", "本机不在该群的确认成员里")
     }
 
-    private suspend fun call(block: (GroupFfi) -> GroupSnapshot): GroupSnapshot = mutex.withLock {
+    // 泛型化：既要返回快照，也要返回邀请回执/blob（返回类型由调用点决定）。
+    private suspend fun <T> call(block: (GroupFfi) -> T): T = mutex.withLock {
         withContext(Dispatchers.IO) {
             try {
                 block(native)

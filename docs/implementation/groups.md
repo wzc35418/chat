@@ -1607,3 +1607,40 @@ let Ok(bytes) = chat_node_services::canonical::decode_hex_bytes(
 1. 测试里节点日志只翻最多 `MAX_RECONCILE_PAGES` 页；邀请很多时需要调用方自己指定游标（当前 API 只取“最近一条”）。
 2. 被邀请者必须在节点上先作为群成员登记（节点读日志有成员鉴权），这属于节点侧既有语义。
 
+## GROUPS-020 · 邀请条目在节点侧可区分（2026-10-20）
+
+邀请此前在节点日志里与普通应用条目**不可区分**（都是 `kind=application`、无公开标记）。本轮给邀请加**可区分标记**，只影响可观测性/审计，取回侧仍按 payload 解码。
+
+### 标记（不新增协议字段）
+
+      kind = application
+      control_metadata.operation   = "invite"（复用既有白名单操作文本）
+      control_metadata.target_digest = sha256(邀请 blob)（非零 32 字节）
+
+`submit_group_invite` 提交时附带该标记；`fetch_group_invite` **不改**解码逻辑（仍按 payload 的 `GroupInviteBlob`）。
+
+### protocol 的唯一放行（严格限定）
+
+`UnsignedCandidate::validate` 原先“application 候选不得带 control_metadata”，现只放行**一种组合**：
+`kind = Application` **且** `operation = Invite` **且** `target_digest != 零` **且** 不带成员凭据/领域声明。
+其它任何组合（application + set_role/remove/rename/revoke_device、零 digest、夹带凭据）仍 `INVALID_CANDIDATE`，control 候选的既有校验**未放宽**。
+
+### 节点侧可观测性
+
+- `GET /v1/audit` 的 `kind` 白名单新增 `invite`；
+- 带 invite 标记的 append 会记一条 `kind=invite` 审计（含 `group_id` / `device_id` / `request_id` / `outcome=ok`）；
+- 普通应用条目（旧客户端，无标记）**不产生**该 kind，提交行为完全不变。
+
+### 证据
+
+- `cargo test --offline -p chat-protocol -p chat-core -p chat-node-services -p chat-node-api` → **EXIT=0，490 passed，0 警告**（既有 88/251/111/36 全过）；
+- protocol：新增 `application_candidate_may_carry_only_the_invite_marker`（放行 + 固定签名原文稳定性 + 4 类反例 + control 候选未被放宽）；
+- node-api：新增 3 例 —— invite 标记提交后 `kind=invite` 审计含 group_id/request_id；普通条目无该 kind 且旧客户端仍可提交；未知操作文本 `invite_group` 被拒且不产生审计；
+- core：邀请投递 4 例继续全绿（标记启用后 `submit_group_invite` 仍然成功、幂等、不可达与非法 Welcome 行为不变）。
+
+### 已知限制
+
+1. 标记只表达“这是邀请”，具体邀请内容仍需读 payload（节点不解析正文）；
+2. `target_digest` 是 blob 摘要，不是群/成员摘要（仅用于区分与去重辅助）；
+3. 标记不参与取回逻辑，未来若改变 blob 编码不影响可观测性。
+
