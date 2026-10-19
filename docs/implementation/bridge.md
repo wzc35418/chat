@@ -978,6 +978,13 @@ IdentityFfi.register_device(device_id, device_public_key_hex, label) -> DeviceVi
 - 幂等（`added_at_ms` 不变、不新增行）；已属其它账户 → `INVALID_INPUT`；
 - 已撤销设备重新登记**不复活**（返回视图仍带撤销时间与原因）；返回 `is_local`；
 - 测试：[crates/ffi/tests/identity_device_register.rs](../../crates/ffi/tests/identity_device_register.rs)（6 个，真库）。
+## 群摘要新增 revoked_devices_count（GroupSummaryFfi，2026-10-18）
+
+`GroupSummaryFfi` 新增 `revoked_devices_count: u32`（与 core 的 `GroupSummaryView` 一一对应，
+来自快照 `revoked_devices` 长度）。`GroupFfi.group_list` 的语义不变：只读快照、不导入 MLS 设备、
+损坏条目计入 `skipped`。测试见 [crates/ffi/tests/groups_list_ffi.rs](../../crates/ffi/tests/groups_list_ffi.rs)
+（默认 0）与 [crates/core/tests/revoked_devices.rs](../../crates/core/tests/revoked_devices.rs)（处理后 1）。
+
 
 
 

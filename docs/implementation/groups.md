@@ -1461,3 +1461,54 @@ crypto 侧新增（与 `advance_epoch_with_self_update` 并存、未改其行为
 - `cargo test --offline -p chat-crypto -p chat-protocol -p chat-core` → **EXIT=0，392 passed，0 警告**（既有 60/88/236 继续通过；本轮新增 crypto 3 + core 4 例）。
 - `cargo check --offline -p chat-core --all-targets` = EXIT=0（**只有 `crates/core/src/group_node.rs` 一处 `GroupView` 字面量需要补字段；`crates/core/tests/` 里的 7 处 `GroupView {` 命中都是函数返回类型，不是字面量，无需机械补字段** —— 修正了我此前向主控汇报的估计）。
 
+## CTRLREV-SEED · 账户撤销集合播种进群快照（2026-10-19）
+
+撤销集合有两个来源：**身份层（账户视角，权威）**与**群快照（本机缓存/投影）**。
+本轮新增单向播种，把账户里已撤销的设备补进本机群快照。
+
+### 接口
+
+    seed_revoked_devices_from_registry(store: &mut Store, group_id: &str) -> GroupResult<usize>
+
+语义：
+
+1. **权威性**：`identity_device_revocations`（身份层，账户视角）是权威来源；群快照里的
+   `revoked_devices` 只是**本机缓存**。本函数只做 **账户 → 群快照** 的单向播种，**不做反向写回**。
+2. **只增不减**：与既有快照取并集（去重、升序），永不删除快照里已有的条目（对端提交带来的撤销不会被身份层覆盖）。
+3. **幂等**：并集没有新增时直接返回 0，**不写盘、不推进 state_version**。
+4. **账户来源（P0 约定）**：成员凭据即账户身份，因此对快照里每个成员凭据（含 pending）尝试读取其撤销集合；
+   读不到对应账户就跳过——不报错、不写。
+5. **错误**：群不存在 → `INVALID_TARGET`（格式非法才是 `INVALID_ID`）；无撤销设备 → 0 且不写。
+
+### 证据（`crates/core/tests/revoked_seed.rs`，4 例，真库）
+
+- `seeding_from_the_registry_adds_revoked_devices_once`：登记并撤销 2 台 → seed 返回 **2**、快照升序 `[dev:1:laptop, dev:1:phone]`；再 seed 返回 **0**（幂等）；新增第 3 台 → seed 返回 **1**；重开库后 3 条仍在；
+- `seeding_without_registered_revocations_writes_nothing`：无撤销时返回 0 且快照逐字段不变（不写盘）；
+- `seeding_an_unknown_group_is_invalid_target`：格式合法但不存在的群 → `INVALID_TARGET`；
+- `a_peer_revocation_entry_and_the_registry_seed_are_merged_not_replaced`：身份层播种与对端撤销条目共用同一集合（只增不减，不互相覆盖）。
+
+### 验收
+
+- `cargo test --offline -p chat-core -p chat-storage` → **EXIT=0，340 passed，0 警告**（既有 236/96 继续通过 + 本轮 4 例，其余为并行任务增量）。
+
+### 已知限制
+
+1. 账户 ID 从群成员凭据推断（P0 约定）；等身份层正式暴露 `local_account` 到群模块后应改为显式账户参数。
+2. 没有自动触发点：播种需要调用方在合适时机（建群后/身份恢复后/撤销事件后）显式调用。
+3. 只播种本机群快照；多设备间的撤销集合一致性仍依赖控制提交传播（CTRLREV）。
+## 撤销集合进群列表摘要（GROUPS-002，2026-10-18）
+
+`GroupSummaryView` 新增 `revoked_devices_count: u32`：来自快照记录的 `revoked_devices` 长度
+（CTRLREV 的本地并集；旧快照缺省为空 → 0）。
+
+- 计算完全在 `summary_from_key` 里做：**仍只读快照、不解密 MLS 状态、不导入设备**；
+- 与 `muted_members` / `pending_proposal` 同一层语义：列表页展示用，精确值请用 `group_snapshot`；
+- 破损条目（快照读不出/不是本模块记录/`validate()` 失败）仍然只计入 `GroupListView.skipped`，绝不影响其它条目。
+
+证据：[crates/core/tests/revoked_devices.rs](../../crates/core/tests/revoked_devices.rs) 在同一条撤销流程里断言
+`group_list` 的计数 0 → 1（处理后）且 `skipped == 0`；
+[crates/core/tests/groups_list.rs](../../crates/core/tests/groups_list.rs) 继续断言损坏条目计入 `skipped`（既有用例）。
+
+复现：`cargo test --offline -p chat-core -p chat-ffi` → 全绿。
+
+

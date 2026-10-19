@@ -768,6 +768,44 @@ fn validate_revoked_devices(input: &PeerEntryInput) -> GroupResult<()> {
     Ok(())
 }
 
+/// CTRLREV-SEED：把**身份层（账户视角）**里已撤销的设备播种进本机群快照。
+///
+/// 权威性说明：**账户撤销集合是权威来源**（`identity_device_revocations`，由身份层维护）；
+/// 群快照里的 `revoked_devices` 只是本机缓存/投影。本函数是**单向**的（账户 → 群快照），
+/// 不做反向写回，也不会删除快照里已有的条目（只增不减）。
+///
+/// 账户来源：P0 约定成员凭据即账户身份，因此对快照里的每个成员凭据尝试读取其撤销集合；
+/// 读不到对应账户（未登记）就跳过——不报错、不写。
+///
+/// 返回新增条数；幂等（再调 0）。未知群 → `INVALID_TARGET`；无撤销设备 → 0 且不写盘。
+pub fn seed_revoked_devices_from_registry(store: &mut Store, group_id: &str) -> GroupResult<usize> {
+    let (mut record, state_version) = load_record(store, group_id)?;
+    let mut incoming: Vec<String> = Vec::new();
+    for member in record.members.iter().chain(record.pending_members.iter()) {
+        let Ok(set) = store.revoked_devices(&member.credential) else {
+            // 未登记账户：跳过（不是错误，也不是“没有撤销”）。
+            continue;
+        };
+        for revocation in set.revoked {
+            incoming.push(revocation.device_id);
+        }
+    }
+    if incoming.is_empty() {
+        return Ok(0);
+    }
+    let before = record.revoked_devices.len();
+    merge_revoked_devices(&mut record.revoked_devices, &incoming);
+    let added = record.revoked_devices.len().saturating_sub(before);
+    if added == 0 {
+        // 幂等：并集没有新增 → 不写盘（也不推进 state_version）。
+        return Ok(0);
+    }
+    record.validate()?;
+    let _ = persist_snapshot(store, &record, record.mls_epoch)?;
+    let _ = state_version;
+    Ok(added)
+}
+
 /// CTRLREV：把本次声明的撤销设备并入快照集合（并集 + 去重 + 升序；重复提交幂等）。
 fn merge_revoked_devices(existing: &mut Vec<String>, incoming: &[String]) {
     for device in incoming {
@@ -3011,6 +3049,8 @@ pub struct GroupSummaryView {
     pub muted_members: u32,
     /// 是否有一条**已收下、等待本机打包**的对端提案（与 `pending` 的"待收口线索"语义分开）。
     pub pending_proposal: bool,
+    /// 快照里记录的已撤销设备数（CTRLREV 的本地并集；只读快照，不导入 MLS 设备）。
+    pub revoked_devices_count: u32,
 }
 
 /// 群列表结果（`skipped` 是被跳过的损坏条目数，绝不静默丢弃）。
@@ -3099,6 +3139,8 @@ fn summary_from_key(
         // 与 pending 分开：只有"已收下待本机打包的**对端**提案"才为 true
         // （本机自己发起的提案走 pending 的 leaving 线索）。
         pending_proposal: received_proposal,
+        // CTRLREV：快照里已撤销设备的条数（旧快照缺省空 → 0）。
+        revoked_devices_count: u32::try_from(record.revoked_devices.len()).unwrap_or(u32::MAX),
     }))
 }
 

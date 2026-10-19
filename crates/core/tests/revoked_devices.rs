@@ -11,7 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chat_core::groups::{
     CreateGroupRequest, GroupBootstrapPeer, GroupView, PeerEntryInput, PeerEntryOutcome,
-    create_group_with_welcome, group_join_from_welcome, group_process_peer_entry, group_snapshot,
+    create_group_with_welcome, group_join_from_welcome, group_list, group_process_peer_entry,
+    group_snapshot,
 };
 use chat_crypto::control::{CommitExpectation, WelcomeAcceptance};
 use chat_crypto::engine::MlsDevice;
@@ -137,6 +138,11 @@ fn a_revocation_commit_reaches_the_peer_snapshot() {
     let mut fixture = Fixture::new();
     assert_eq!(fixture.b_view.epoch, 1);
     assert!(fixture.b_view.revoked_devices.is_empty());
+    // GROUPS-002 列表侧：撤销前群摘要里的已撤销设备数是 0。
+    let before = group_list(&fixture.store_b).expect("group list before revocation");
+    assert_eq!(before.groups.len(), 1);
+    assert_eq!(before.skipped, 0);
+    assert_eq!(before.groups[0].revoked_devices_count, 0);
     let payload = fixture.staged_commit();
     let mut input = fixture.input(payload);
     input.revoked_devices = vec![REVOKED.to_owned()];
@@ -153,6 +159,11 @@ fn a_revocation_commit_reaches_the_peer_snapshot() {
     let snapshot = group_snapshot(&fixture.store_b, &fixture.group_id()).expect("snapshot");
     assert_eq!(snapshot.revoked_devices, vec![REVOKED.to_owned()]);
     assert_eq!(snapshot.epoch, 2);
+    // 处理后群摘要里的已撤销设备数是 1（仍只读快照，不解密 MLS 状态）。
+    let after_list = group_list(&fixture.store_b).expect("group list after revocation");
+    assert_eq!(after_list.skipped, 0);
+    assert_eq!(after_list.groups[0].revoked_devices_count, 1);
+    assert_eq!(after_list.groups[0].group_id, fixture.group_id());
 
     // 重复投递：epoch 已落后 → 显式拒绝，快照不变（不会重复计入）。
     let after = group_snapshot(&fixture.store_b, &fixture.group_id()).expect("snapshot");

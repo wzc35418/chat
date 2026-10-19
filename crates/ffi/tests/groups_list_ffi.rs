@@ -107,11 +107,15 @@ fn group_list_reports_states_and_skips_corrupted_entries() {
         .find(|summary| summary.group_id == second.group_id)
         .expect("group two summary");
     assert_eq!(two.name, "群二（改名）", "renames are reflected immediately");
-    // 新字段：禁言计数与"待打包对端提案"标记都透出（默认 0 / false）。
+    // 新字段：禁言计数、已撤销设备数与"待打包对端提案"标记都透出（默认 0 / false）。
     for summary in &list.groups {
         assert_eq!(summary.muted_members, 0, "no member is muted by default");
         assert!(!summary.pending_proposal, "no received proposal by default");
         assert!(!summary.pending);
+        assert_eq!(
+            summary.revoked_devices_count, 0,
+            "no revoked device before any revocation commit"
+        );
     }
 
     // 禁言一名成员 → FFI 里 muted_members = 1。

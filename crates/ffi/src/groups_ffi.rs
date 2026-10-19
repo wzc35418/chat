@@ -489,6 +489,8 @@ pub struct GroupSummaryFfi {
     pub muted_members: u32,
     /// 是否有已收下、等本机打包的对端提案（与 `pending` 的"待收口线索"语义分开）。
     pub pending_proposal: bool,
+    /// 快照里记录的已撤销设备数（CTRLREV；只读快照，不导入 MLS 设备）。
+    pub revoked_devices_count: u32,
 }
 
 /// 群列表结果：`skipped` 是被跳过的损坏条目数（绝不静默丢弃）。
@@ -512,6 +514,7 @@ fn summary_ffi(view: &chat_core::groups::GroupSummaryView) -> GroupSummaryFfi {
         pending: view.pending,
         muted_members: view.muted_members,
         pending_proposal: view.pending_proposal,
+        revoked_devices_count: view.revoked_devices_count,
     }
 }
 
