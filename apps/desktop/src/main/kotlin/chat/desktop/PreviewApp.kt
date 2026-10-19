@@ -69,6 +69,10 @@ import chat.presentation.preview.updateRecoveryPassphrase
 import chat.presentation.preview.withRecoveryExported
 import chat.presentation.preview.withError
 import chat.presentation.preview.withInstalled
+import chat.presentation.preview.toggleTrusted
+import chat.presentation.preview.updateJarPath
+import chat.presentation.preview.withLoadedPlugins
+import chat.presentation.preview.withPackage
 import chat.presentation.preview.withPlan
 import chat.presentation.preview.withPlugins
 import chat.presentation.preview.withStateNotice
@@ -368,6 +372,7 @@ fun main() = application {
 
     var pluginState by remember { mutableStateOf(chat.presentation.preview.PreviewPluginState.Empty) }
     val pluginService = remember { runCatching { createPluginService() }.getOrNull() }
+    val pluginJvmHost = remember { runCatching { PluginJvmHost() }.getOrNull() }
 
     val pluginHandlers = object {
         fun refresh() = scope.launch {
@@ -1031,6 +1036,55 @@ fun main() = application {
                 uninstall = { pluginHandlers.uninstall(it) },
                 dispatch = { pluginHandlers.dispatch(it) },
                 storageGet = { pluginHandlers.storage(it) },
+                chooseJar = {
+                    runCatching {
+                        val picker = DesktopFilePicker(null)
+                        val chosen = picker.chooseImportFile("选择插件 JAR（.jar）")
+                        pluginState = pluginState.updateJarPath(chosen.path)
+                    }.onFailure { pluginState = pluginState.withError("INVALID_INPUT", it.message) }
+                },
+                inspectPackage = {
+                    scope.launch {
+                        val service = pluginService ?: return@launch
+                        pluginState = pluginState.beginBusy()
+                        runCatching {
+                            val bytes = File(pluginState.jarPath).readBytes()
+                            service.inspectPackage(bytes)
+                        }.onSuccess { pluginState = pluginState.withPackage(it) }
+                            .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+                    }
+                },
+                toggleTrusted = { value -> pluginState = pluginState.toggleTrusted(value) },
+                loadJar = {
+                    scope.launch {
+                        val host = pluginJvmHost ?: return@launch
+                        val view = pluginState.packageView ?: return@launch
+                        pluginState = pluginState.beginBusy()
+                        runCatching {
+                            host.load(pluginState.jarPath, view.pluginId, pluginState.trusted)
+                            host.loadedPluginIds()
+                        }.onSuccess { pluginState = pluginState.withLoadedPlugins(it) }
+                            .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+                    }
+                },
+                runAction = {
+                    scope.launch {
+                        val host = pluginJvmHost ?: return@launch
+                        val id = pluginState.loadedPlugins.firstOrNull() ?: return@launch
+                        pluginState = pluginState.beginBusy()
+                        runCatching { host.runSelectedTextAction(id, "echo", "ping") }
+                            .onSuccess { pluginState = pluginState.withStateNotice("插件输出：" + it) }
+                            .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+                    }
+                },
+                unloadJar = {
+                    scope.launch {
+                        val host = pluginJvmHost ?: return@launch
+                        val id = pluginState.loadedPlugins.firstOrNull() ?: return@launch
+                        runCatching { host.unload(id) }
+                        pluginState = pluginState.withLoadedPlugins(host.loadedPluginIds())
+                    }
+                },
             ),
         )
     }

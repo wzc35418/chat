@@ -34,6 +34,9 @@ data class DispatchPlanView(
  * 诚实语义：dispatch 只返回**执行计划**；本层不加载 JVM 插件包、不执行插件代码。
  */
 interface PluginService {
+    /** P4：不执行代码地校验插件包结构（ZIP 目录/清单/入口类/SPI）。 */
+    suspend fun inspectPackage(bytes: ByteArray): PluginPackageView
+
     suspend fun validateManifest(json: String): PluginManifestView
 
     suspend fun install(json: String)
@@ -56,3 +59,14 @@ interface PluginService {
 
     suspend fun shutdown()
 }
+/** 插件包结构校验结果（来自 Rust 侧纯字节解析）。 */
+data class PluginPackageView(
+    val pluginId: String,
+    val pluginVersion: String,
+    val entryClass: String,
+    val entryFile: String,
+    val spiFile: String,
+    val entryCount: Int,
+    val compressedBytes: Long,
+    val uncompressedBytes: Long,
+)

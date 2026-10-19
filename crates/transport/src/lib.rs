@@ -23,6 +23,7 @@ pub mod error;
 pub mod frame;
 pub mod pull_map;
 pub mod receive;
+pub mod reconnect;
 pub mod retry;
 pub mod send;
 pub mod session;

@@ -35,6 +35,20 @@ class NativePluginService(private val native: PluginsFfi) : PluginService {
 
     private fun nowMillis(): ULong = (System.currentTimeMillis() / 1000L).toULong()
 
+    override suspend fun inspectPackage(bytes: ByteArray): chat.api.PluginPackageView = call {
+        val view = it.inspectPackage(bytes)
+        chat.api.PluginPackageView(
+            pluginId = view.pluginId,
+            pluginVersion = view.pluginVersion,
+            entryClass = view.entryClass,
+            entryFile = view.entryFile,
+            spiFile = view.spiFile,
+            entryCount = view.entryCount.toInt(),
+            compressedBytes = view.compressedBytes.toLong(),
+            uncompressedBytes = view.uncompressedBytes.toLong(),
+        )
+    }
+
     override suspend fun validateManifest(json: String): PluginManifestView =
         call { it.manifestValidate(json) }.toView()
 

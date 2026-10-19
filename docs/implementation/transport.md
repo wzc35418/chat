@@ -571,3 +571,46 @@ shutdown_transport(handle: EndpointHandle, deadline: Duration) -> Result<Shutdow
 
 **实现状态**：未开始。实现时补提交引用、自动化/真机用例位置与实际结果；通过本函数用例不自动代表整个模块完成。
 
+## TRANSPORT-009 · 连接恢复策略（2026-10-19，Windows x64）
+
+连接恢复的纯逻辑策略层：只计算退避与调度，不持有连接、不依赖会话对象、不联网、不 sleep。
+
+代码：[crates/transport/src/reconnect.rs](../../crates/transport/src/reconnect.rs)；
+测试：[crates/transport/tests/reconnect_policy.rs](../../crates/transport/tests/reconnect_policy.rs)（4 个）+ 模块内 2 个单元测试。
+
+### 公开面
+
+    pub struct RetryPolicy { max_attempts: u32, base_delay_ms: u64, max_delay_ms: u64, jitter_permille: u32 }
+        DEFAULT = { 5, 500, 30_000, 200 }
+        validate() / base_delay_for(attempt) / jitter_cap_for(attempt) / jitter_for(attempt) / delay_for(attempt)
+
+    pub struct ReconnectAttempts        // 尝试计数 + 调度状态机（不持有连接）
+        new(policy) / policy() / state() / on_disconnected(code, now_ms) / ready_at(now_ms)
+        next_attempt(now_ms) -> Result<ReconnectSchedule, ReconnectError> / record_success()
+    pub struct ReconnectState { attempts: u32, last_error_code: Option<&'static str>, next_attempt_ms: u64 }
+    pub struct ReconnectSchedule { attempt: u32, delay_ms: u64, next_attempt_ms: u64 }
+    pub enum ReconnectError { InvalidPolicy { detail }, BudgetExhausted { attempts } }
+        code() -> INVALID_RECONNECT_POLICY | RECONNECT_BUDGET_EXHAUSTED
+
+### 语义
+
+1. 指数退避 + 封顶：基础延迟 = min(base × 2^(n-1), max_delay_ms)；max_delay_ms 受 300000ms 硬上限约束，极端 attempt 饱和到封顶。
+2. 确定性抖动：抖动上限 = base × jitter_permille / 1000，实际值 = splitmix64(attempt) 对上限+1 取模；不读系统时间，同策略同 attempt 永远相同；permille = 0 表示无抖动。
+3. 预算显式耗尽：第 max_attempts + 1 次 next_attempt 返回 RECONNECT_BUDGET_EXHAUSTED，状态写入 last_error_code 与 next_attempt_ms；被拒绝的那次不消耗预算。
+4. 断线只排期：on_disconnected(code, now_ms) 不消耗预算，只写错误码与下次尝试时间；ready_at(now_ms) 供宿主判断是否到点。
+5. 成功复位：record_success() 把计数与错误清零，下一次断线重新从第 1 次算。
+
+### 证据（cargo test --offline -p chat-transport，74 passed）
+
+- jitter_is_deterministic_and_stays_within_the_permille_band：每个 attempt 的抖动 ≤ 上限、上限等于 base×permille/1000、反复取值相同（跨新策略实例也相同）、最终延迟落在 [base, base+cap] 且 ≤ 封顶；permille = 0 无抖动，1000 仍合法。
+- backoff_doubles_and_caps_at_max_delay：1000/2000/4000/8000 → 封顶 10000，u32::MAX 不溢出；max_delay_ms 超过 300000 被拒绝。
+- out_of_range_permille_and_attempts_are_rejected：permille = 1001、max_attempts = 0、base = 0、cap < base 全部返回 INVALID_RECONNECT_POLICY。
+- exhaustion_is_explicit_and_success_resets_the_budget：断线不耗预算、ready_at 语义、三次预算内成功（延迟 100/200/400）、第四次显式 RECONNECT_BUDGET_EXHAUSTED 且计数仍为 3、record_success 后复位。
+- 模块内单元测试：策略校验边界、状态机在预算内爬升与耗尽语义。
+
+### 已知限制
+
+1. 只做策略，不做拨号：真实重连（重建 iroh 连接、重放未确认帧、对端去重）仍由宿主/后续任务承担。
+2. 抖动不是安全随机：splitmix64 只用于打散同时重试，不能用于密钥/令牌。
+3. 没有全局重试预算：每个 ReconnectAttempts 实例独立计数，多会话并发时的总预算由宿主聚合。
+

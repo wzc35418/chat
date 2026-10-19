@@ -40,6 +40,12 @@ data class PluginHandlers(
     val uninstall: (String) -> Unit = {},
     val dispatch: (String) -> Unit = {},
     val storageGet: (String) -> Unit = {},
+    val chooseJar: () -> Unit = {},
+    val inspectPackage: () -> Unit = {},
+    val toggleTrusted: (Boolean) -> Unit = {},
+    val loadJar: () -> Unit = {},
+    val runAction: () -> Unit = {},
+    val unloadJar: () -> Unit = {},
 ) {
     companion object {
         val None = PluginHandlers()
@@ -119,6 +125,62 @@ fun PluginPanel(
                 Text("还没有插件；安装后出现在这里。", style = MaterialTheme.typography.bodySmall)
             } else {
                 state.plugins.forEach { plugin -> PluginRow(plugin, state, handlers) }
+            }
+
+            HorizontalDivider(color = Color(0xFFE1E6E1))
+            Text("P4：真正加载插件包（无沙箱）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+            Text(
+                "顺序：选 JAR → Rust 结构校验 → 你确认信任 → 同 JVM 加载执行。超时只能放弃等待，无法强杀线程。",
+                style = MaterialTheme.typography.labelSmall,
+                color = Color(0xFF5F6B63),
+            )
+            Text(
+                if (state.jarPath.isBlank()) "尚未选择插件包" else "已选：" + state.jarPath,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                TextButton(
+                    onClick = handlers.chooseJar,
+                    modifier = Modifier.semantics { contentDescription = "选择插件 JAR" },
+                ) { Text("选择 JAR", style = MaterialTheme.typography.labelMedium) }
+                TextButton(
+                    onClick = handlers.inspectPackage,
+                    enabled = !state.busy && state.jarPath.isNotBlank(),
+                    modifier = Modifier.semantics { contentDescription = "校验插件包结构" },
+                ) { Text("校验结构", style = MaterialTheme.typography.labelMedium) }
+            }
+            state.packageView?.let { view ->
+                Text(
+                    "包：" + view.pluginId + " " + view.pluginVersion + " · " + view.entryCount + " 条目 · " +
+                        view.uncompressedBytes + " 字节（解压）",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(
+                    onClick = { handlers.toggleTrusted(!state.trusted) },
+                    modifier = Modifier.semantics { contentDescription = "确认或取消信任该插件" },
+                ) { Text(if (state.trusted) "已确认信任 ✓" else "确认信任（无沙箱）", style = MaterialTheme.typography.labelMedium) }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                TextButton(
+                    onClick = handlers.loadJar,
+                    enabled = !state.busy && state.packageView != null && state.trusted,
+                    modifier = Modifier.semantics { contentDescription = "加载插件到 JVM" },
+                ) { Text("加载", style = MaterialTheme.typography.labelMedium) }
+                TextButton(
+                    onClick = handlers.runAction,
+                    enabled = !state.busy && state.loadedPlugins.isNotEmpty(),
+                    modifier = Modifier.semantics { contentDescription = "执行插件动作" },
+                ) { Text("执行动作", style = MaterialTheme.typography.labelMedium) }
+                TextButton(
+                    onClick = handlers.unloadJar,
+                    enabled = !state.busy && state.loadedPlugins.isNotEmpty(),
+                    modifier = Modifier.semantics { contentDescription = "卸载已加载插件" },
+                ) { Text("卸载", style = MaterialTheme.typography.labelMedium) }
+            }
+            if (state.loadedPlugins.isNotEmpty()) {
+                Text("已加载：" + state.loadedPlugins.joinToString("、"), style = MaterialTheme.typography.bodySmall)
             }
 
             state.lastPlan?.let { plan ->

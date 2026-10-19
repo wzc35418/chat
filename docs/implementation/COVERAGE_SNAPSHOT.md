@@ -102,3 +102,11 @@
 4. **平台 OS 凭据库 + 后台收消息通知接线**
 5. **多节点撤销同步** 与撤销记录保留期清理
 6. **凭据目录与真实身份账户交叉校验**（当前映射仍是确定性派生）
+
+
+## 2026-10-19 第 51 轮补充（P4 与传输策略层）
+
+- **PLUGINS**：Rust 包结构校验（`inspect_plugin_package`，9 个稳定码）+ FFI + **P4 JVM 宿主真加载执行**（trusted 门、有界执行、unload 清理）+ 面板全链路 + `pluginJvmSmoke`（现场编译插件 JAR 执行）→ PLUGINS 从"只到宿主逻辑"推进到"**能真跑插件代码**（无沙箱，需用户确认）"。
+- **TRANSPORT**：新增 `reconnect.rs` 策略层（RetryPolicy + 确定性抖动 + 状态机），**真实重连仍未接入 Session**；经中继/跨网段仍未验证。
+- **测试**：Rust 994；Gradle 13 个任务（含 p0Smoke/p0Snapshot/previewSnapshot/pluginSmoke/pluginJvmSmoke）。
+- **事故记录**：两次"脚本/整文件写"导致源码截断（`node-services/src/group.rs`、`transport/src/session.rs`），均已 git 恢复；此后所有任务都加了硬性规则（只新增文件 + 单行插入 + 定点 edit）。
