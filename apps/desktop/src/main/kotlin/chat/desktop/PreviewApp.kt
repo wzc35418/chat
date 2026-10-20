@@ -123,6 +123,9 @@ fun main() = application {
     // 节点配置持久化（非机密）：首启读取，未配置则弹引导。
     val uiPrefsStore = remember { UiPreferencesStore(UiPreferencesStore.defaultFile()) }
     var uiPrefs by remember { mutableStateOf(runCatching { uiPrefsStore.load() }.getOrDefault(UiPreferences())) }
+    // 命令面板（插件 palette.commands 槽位）：null = 关闭。
+    var paletteFilter by remember { mutableStateOf("") }
+    var paletteOpen by remember { mutableStateOf(false) }
     val nodeConfigStore = remember { NodeConfigStore(NodeConfigStore.defaultFile()) }
     val initialNodeConfig = remember { runCatching { nodeConfigStore.load() }.getOrDefault(NodeConfig()) }
     var onboardingState by remember {
@@ -1141,6 +1144,7 @@ fun main() = application {
             if (id != null) scope.launch { refreshMessages(id) }
         },
         updateDraftText = { value -> storeDraftText = value.take(8 * 1024) },
+        openPalette = { paletteFilter = ""; paletteOpen = true },
         pluginComposerActions = { pluginJvmHost?.composerActions() ?: emptyList() },
         runPluginComposerAction = { pluginId, name ->
             scope.launch {
@@ -1350,6 +1354,31 @@ PreviewChatScreen(
                     onboardingState = null
                 },
                 close = { onboardingState = null },
+            ),
+            paletteFilter = paletteFilter,
+            paletteEntries = if (paletteOpen) {
+                pluginJvmHost?.paletteCommands()?.map { chat.ui.PaletteEntry(it.first, it.second) } ?: emptyList()
+            } else null,
+            paletteHandlers = chat.ui.CommandPaletteHandlers(
+                updateFilter = { paletteFilter = it },
+                run = { entry ->
+                    scope.launch {
+                        val host = pluginJvmHost ?: return@launch
+                        runCatching { host.runCommand(entry.pluginId, entry.command) }
+                            .onSuccess { text ->
+                                // 命令产物只进草稿（用户确认后才发送）。
+                                val separator = if (storeDraftText.isBlank()) "" else "\n"
+                                storeDraftText = (storeDraftText + separator + text).take(8 * 1024)
+                                storeState = storeState.copy(
+                                    busy = false,
+                                    notice = "已插入命令输出（" + text.length + " 字符），确认后再发送",
+                                )
+                                paletteOpen = false
+                            }
+                            .onFailure { storeState = storeState.withError(codeOf(it), it.message) }
+                    }
+                },
+                close = { paletteOpen = false },
             ),
             uiScale = uiPrefs.scale,
             showPluginEntry = uiPrefs.showPlugins,

@@ -48,6 +48,9 @@ class PluginJvmHost {
     /** 声明式槽位 composer.actions：插件 id -> (动作名 -> 说明)，只存元数据。 */
     private val composerActions = LinkedHashMap<String, MutableMap<String, String>>()
 
+    /** 声明式槽位 palette.commands：插件 id -> (命令名 -> 实现)。 */
+    private val commandImpls = LinkedHashMap<String, MutableMap<String, () -> String>>()
+
     private val composerImpls = LinkedHashMap<String, MutableMap<String, () -> String>>()
 
     /**
@@ -97,7 +100,14 @@ class PluginJvmHost {
         }
 
         val record = Loaded(expectedId, loader, plugin)
-        val context = HostContext(record, commandNames, selectedTextActions, composerActions, composerImpls)
+        val context = HostContext(
+            record,
+            commandNames,
+            selectedTextActions,
+            commandImpls,
+            composerActions,
+            composerImpls,
+        )
         val started = try {
             withDeadline("PLUGIN_START_TIMEOUT") { plugin.start(context) }
             true
@@ -124,6 +134,7 @@ class PluginJvmHost {
         // 槽位注册也要随卸载清掉（同 selectedTextActions 的教训）。
         composerActions.remove(pluginId)
         composerImpls.remove(pluginId)
+        commandImpls.remove(pluginId)
         return true
     }
 
@@ -131,6 +142,25 @@ class PluginJvmHost {
     fun shutdown() {
         loaded.keys.toList().forEach { unload(it) }
         executor.shutdownNow()
+    }
+
+    /** 命令面板条目：插件 id -> 命令名（只给元数据，不含实现）。 */
+    fun paletteCommands(): List<Pair<String, String>> = buildList {
+        for ((pluginId, impls) in commandImpls) {
+            for (name in impls.keys) add(pluginId to name)
+        }
+    }
+
+    /** 运行命令面板里的某条命令；结果同样受大小上限与超时约束。 */
+    fun runCommand(pluginId: String, name: String): String {
+        val action = commandImpls[pluginId]?.get(name)
+            ?: throw PluginLoadException("PLUGIN_OPERATION_UNKNOWN", "未知命令：" + pluginId + "/" + name)
+        val output = withDeadline("PLUGIN_TASK_TIMEOUT") { action() }
+        val bytes = output.toByteArray(Charsets.UTF_8).size
+        if (bytes > MAX_OUTPUT_BYTES) {
+            throw PluginLoadException("CONTENT_TOO_LARGE", "插件输出超过上限（" + bytes + " 字节）")
+        }
+        return output
     }
 
     /** 已注册的 composer.actions（插件 id -> [(名字, 说明)]），供界面渲染按钮。 */
@@ -171,15 +201,18 @@ class PluginJvmHost {
         private val record: Loaded,
         private val commands: MutableMap<String, MutableList<String>>,
         private val actions: MutableMap<String, MutableMap<String, (String) -> String>>,
+        private val impls: MutableMap<String, MutableMap<String, () -> String>>,
         private val composerMeta: MutableMap<String, MutableMap<String, String>>,
         private val composerImpls: MutableMap<String, MutableMap<String, () -> String>>,
     ) : PluginContext {
         override fun registerCommand(name: String, action: () -> String): Registration {
-            // 草案阶段：命令产出只能是草稿；这里只记录名字，不执行 action。
+            // 命令产出只能是草稿文本；实现存起来供命令面板调用。
             commands.getOrPut(record.id) { mutableListOf() }.add(name)
+            impls.getOrPut(record.id) { LinkedHashMap() }[name] = action
             return object : Registration {
                 override fun dispose() {
                     commands[record.id]?.remove(name)
+                    impls[record.id]?.remove(name)
                 }
             }
         }

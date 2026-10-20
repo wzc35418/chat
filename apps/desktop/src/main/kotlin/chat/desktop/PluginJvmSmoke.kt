@@ -65,6 +65,15 @@ fun main() {
         check(inserted.contains("插件填入的草稿")) { "composer 动作输出不符：" + inserted }
         println("      槽位 composer.actions：" + slots[0].second + " -> " + inserted.length + " 字符")
 
+        // 2c) palette.commands 槽位：只列元数据，运行产出草稿文本。
+        val palette = host.paletteCommands()
+        check(palette.any { it.first == "demo.echo" && it.second == "summary" }) {
+            "命令面板应包含 summary，实际：" + palette
+        }
+        val commandOutput = host.runCommand("demo.echo", "summary")
+        check(commandOutput == "命令：摘要输出") { "命令输出不符：" + commandOutput }
+        println("      槽位 palette.commands：" + palette.size + " 条，运行输出 " + commandOutput.length + " 字符")
+
         // 3) 插件 id 不符 → 显式失败（清单与自报必须一致）。
         val mismatch = runCatching { host.load(jar.absolutePath, "other.id", trusted = true) }.exceptionOrNull()
         check(mismatch is PluginLoadException)
@@ -79,6 +88,7 @@ fun main() {
         check(host.unload("demo.echo")) { "卸载应成功" }
         // 卸载后槽位必须清空（否则界面还显示按钮、点了却报未知动作）。
         check(host.composerActions().isEmpty()) { "卸载后 composer 槽位必须清空，实际：" + host.composerActions() }
+        check(host.paletteCommands().isEmpty()) { "卸载后 palette 槽位必须清空，实际：" + host.paletteCommands() }
         val afterUnload = runCatching { host.runComposerAction("demo.echo", "template") }.exceptionOrNull()
         check(afterUnload is PluginLoadException) { "卸载后运行槽位动作应显式失败" }
         check(host.loadedPluginIds().isEmpty())
@@ -112,6 +122,7 @@ private fun buildFixtureJar(work: File): File {
                 this.context = context;
                 context.registerSelectedTextAction("echo", text -> "echo:" + text);
                 context.registerComposerAction("template", "插入问候模板", () -> "你好，这是一条由插件填入的草稿（请自行确认后发送）");
+                context.registerCommand("summary", () -> "命令：摘要输出");
             }
             public void stop() { this.context = null; }
         }

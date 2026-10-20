@@ -145,6 +145,10 @@ fun PreviewChatScreen(
     showPluginEntry: Boolean = true,
     /** 侧栏是否显示「关于」入口。 */
     showAboutEntry: Boolean = true,
+    /** 命令面板（插件 palette.commands）：非空即显示浮层。 */
+    paletteFilter: String = "",
+    paletteEntries: List<PaletteEntry>? = null,
+    paletteHandlers: CommandPaletteHandlers = CommandPaletteHandlers.None,
     onboardingState: chat.presentation.preview.PreviewOnboardingState? = null,
     onboardingHandlers: OnboardingHandlers = OnboardingHandlers.None,
 ) {
@@ -291,6 +295,21 @@ fun PreviewChatScreen(
                     OnboardingPanel(
                         state = onboarding,
                         handlers = onboardingHandlers,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                }
+            }
+            if (paletteEntries != null) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color(0x66000000))
+                        .semantics { contentDescription = "命令面板遮罩" },
+                ) {
+                    CommandPalette(
+                        filter = paletteFilter,
+                        entries = paletteEntries,
+                        handlers = paletteHandlers,
                         modifier = Modifier.padding(16.dp),
                     )
                 }

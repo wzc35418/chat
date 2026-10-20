@@ -52,6 +52,8 @@ data class StoreHandlers(
     val selectConversation: (String) -> Unit = {},
     val refreshMessages: () -> Unit = {},
     val updateDraftText: (String) -> Unit = {},
+    /** 打开命令面板（插件 palette.commands 槽位）。 */
+    val openPalette: () -> Unit = {},
     /** 插件声明的 composer.actions（插件 id / 动作名 / 说明）。 */
     val pluginComposerActions: () -> List<Triple<String, String, String>> = { emptyList() },
     /** 运行某个插件 composer 动作；结果由宿主决定如何进草稿。 */
@@ -223,6 +225,11 @@ fun LocalStorePanel(
                     onFormat = { applyFormat(it) },
                     enabled = state.ready && !state.busy,
                 )
+                TextButton(
+                    onClick = handlers.openPalette,
+                    enabled = state.ready && !state.busy,
+                    modifier = Modifier.semantics { contentDescription = "打开命令面板" },
+                ) { Text("命令面板", style = MaterialTheme.typography.labelMedium) }
                 // 插件槽位 composer.actions：只放按钮，布局仍由宿主决定（插件不接管 UI）。
                 val pluginActions = handlers.pluginComposerActions()
                 if (pluginActions.isNotEmpty()) {
