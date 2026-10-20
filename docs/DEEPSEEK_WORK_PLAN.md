@@ -56,6 +56,8 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 - [x] **R-09（Lead）：Kotlin 本地存储接口与展示投影。** `shared/core-api/.../LocalStore.kt`（StoredDraft/StoredConversation/StoredMessage/StoredPage/VerifiedMessageInput/LocalStore/LocalStoreException）、`shared/presentation/.../display/CoreProjection.kt`（存储事实 → DraftEvidence/ConversationSummaryView/MessageDisplayView，未知状态安全回退、无 unread 保持 null），`DraftEvidence` 增加 `submissionId`（明确“提交 ID 不是节点回执”），`ConversationSummaryView.unreadCount` 改为可空。验证：`presentationChecks` 新增 `checkCoreProjection` 通过（queued/prepared 都不得显示已接受、未知状态回退本地草稿、null unread 不伪造 0、投影分页直接喂 DS-08 合并器后去重与代次校验仍成立）。
 - [x] **R-11：真实身份/口令加好友接界面（第二个竖直切片）。** Rust 侧 `crates/ffi/src/identity_ffi.rs`（`IdentityFfi`：create/account/create_invite/preview_invite/accept_invite/contacts/confirm_identity_change/shutdown，复用既有 `FfiError`，12 个测试）；Kotlin 侧 `shared/core-api/.../Identity.kt`、`shared/core-bridge/.../{IdentityFactory,NativeIdentityService}.kt`、`shared/presentation/.../display/IdentityPresentation.kt`（验签结果/错误码映射/联系人状态/IdentityChanged 强制禁发）、`preview/PreviewIdentityModels.kt`、`shared/ui/.../RealIdentityPanel.kt`（侧栏“真实身份（本机）”入口）。验证：`:apps:desktop:identitySmoke` PASS（两个真实身份互相校验：指纹一致、篡改→INVALID_SIGNATURE、自签→INVALID_TARGET、accept→requested 且禁发、关闭后需密钥调用→CORE_CLOSED）；`presentationChecks` 新增 `checkIdentityPresentation`；`previewSnapshot` 新增两张真实身份面板截图（面板里的账户/指纹/口令/联系人全部是当场真实生成的结果）。
 - [x] **R-12：SYNC 重试/退避与信箱轮询状态机。** `crates/sync/src/{retry,mailbox,send,clock,ids,error}.rs`：指数退避（1s×2 上限 60s、抖动 ±20%、Retry-After 作下界且夹到 5 分钟、预算耗尽终态、只有成功才重置计数）、信箱轮询（游标只前进、同 id 去重且内容不同 `INVALID_CANDIDATE`、乱序暂存 512 条、双预算、ACK 失败保留进度、空页退避）、发送调度（SubmissionId 由 draft/epoch/attempt 确定性派生、unknown 只 QueryExisting 不重发不重加密、租约语义与 storage 一致）。验证：`cargo test -p chat-sync` 33 passed，clippy 0 警告。
+- [x] **R-177（Lead）：首启引导 + 节点配置持久化。** 新增 NodeConfigStore（JVM 侧 JSON，落在 %APPDATA%/Chat/node-config.json；只存地址/节点 ID/公钥这三项公开信息，**不含任何密钥材料**；写失败抛错不假成功）+ 新 OnboardingPanel（三步：数据在哪与加密说明 -> 节点地址/ID/公钥（可跳过）-> 完成提示），首次启动且未配置时弹出，跳过即明确写未配置；保存后同步进本机存储面板的发送配置，重启后自动带回。验证：:apps:desktop:compileKotlin 通过。
+- [x] **R-178：verify-all 接入交付物回归 + GUI 存活检查。** erify-all.ps1 新增 package 阶段（默认开、-SkipPackage 跳过），把 PASS/FAIL 与报告路径并入总表；新增 	ools/check-gui-launch.ps1（先清残留进程 -> 启动 Chat.exe -> 等 8 秒断言存活 -> 强制结束；无交互桌面时输出 SKIP 退出码 3，不误判），并作为 verify-package 第 5 步（-SkipGui）。**实跑证据**：verify-all 表 disk/rust-check/verify-project/package 全 PASS；verify-package 表 build 17.5s / structure / 4 个冒烟 / gui 8.7s 全 PASS，overall PASS EXIT=0。
 - [x] **R-175（Lead）：关于 / 诊断面板。** DiagnosticsService{appInfo(), hostLibraryPath(fileName)} + NativeDiagnosticsService（读 FFI 的 app_info / native_library_path）+ 新 AboutPanel：显示真实版本/构建类型/FFI 契约版本/平台/host 库路径/数据目录，解析失败时把错误与尝试路径原样显示（不静默回退）；侧栏新增「关于」入口。验证：:apps:desktop:compileKotlin 通过；Gradle 11 任务全绿。
 - [x] **R-176：交付物级回归脚本（PKGREG）。** 新 tools/verify-package.ps1：构建 app-image -> 结构断言（Chat.exe / app/app.jar / app/native/chat_ffi.dll / runtime/bin/java.exe）-> 用包内运行时跑 4 个冒烟（Platform/P0/LocalStore/Identity，各自独立临时目录、180s 超时）-> PASS/FAIL 表 + 报告 + 每步日志，失败不中断且退出码非 0，纯 ASCII；参数 -SkipBuild / -Only。实跑证据：build PASS 15.7s / structure PASS / 4 个冒烟全 PASS / overall PASS EXIT=0。过程中修掉一个真缺陷：-Only 原先只看整组名，会导致只跑一个冒烟时整组被跳过、空跑 PASS。
 - [x] **R-173：自包含 app-image（免 JDK，jlink + jpackage）。** 新增 Gradle 任务 `jlinkRuntime`（裁剪运行时，10 个模块、`--strip-debug --compress=2`）、`jpackageAppImage`（`--type app-image --runtime-image`）、`appImageWithNative`（把 host 库塞进 `app/native`）、`appImageZip`。**实测**：① 用包内运行时跑 `chat.desktop.PlatformSmokeKt` → `PASS platform slice`；② 直接启动 `build/dist/app-image/Chat/Chat.exe`，7 秒后进程仍在（GUI 正常起来）。产物 `build/dist/Chat-app-0.1.0.zip`。
@@ -556,4 +558,28 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 1. Gradle 构建阶段当前受并行 Kotlin 改动阻塞（见上），待对方修好后重跑即可全绿；
 2. 冒烟只覆盖 4 个主类（`PlatformSmoke` / `P0Smoke` / `LocalStoreSmoke` / `IdentitySmoke`），未包含 `GroupSmoke`/`AttachmentSmoke`/`PluginSmoke` 等（需要真实节点或额外夹具）；
 3. 未验证 `Chat.exe` 启动（需要 GUI/长时间运行），只验证包内 java + jar 的冒烟链路。
+
+---
+
+## verify-all 接入交付物回归 + GUI 启动存活（2026-10-20，task-124）
+
+**改动**：`tools/verify-all.ps1`（新增 `package` 阶段与 `-SkipPackage`）、`tools/verify-package.ps1`（新增 `gui` 阶段与 `-SkipGui`）、新增 `tools/check-gui-launch.ps1`；`docs/SHIPPING.md` 与本节追加。其它文件未动。
+
+**能力**：总回归现在覆盖到**交付物**——`verify-all` 会在 Rust/结构检查之后跑 `verify-package -SkipBuild`，把它的结果与报告路径并入总表；`verify-package` 的第 5 步用 `check-gui-launch.ps1` 验证 `Chat.exe` 能启动并存活 8 秒。
+
+**GUI 检查的关键语义**：先清残留进程（幂等）→ 启动 exe → 等 8 秒 → 存活即 PASS 并强制结束；**无交互桌面会话输出 SKIP 并说明**（退出码 3），不会把“判不了”当成 PASS/FAIL。
+
+**实跑证据**：
+
+- `verify-all -SkipAndroid -SkipGradle` → `disk PASS / rust-check PASS 13.1s / verify-project PASS 0.9s / gradle SKIP / android SKIP / package PASS 16.1s（detail=verify-package 报告路径）`，**overall PASS、退出码 0**；
+- `verify-package -SkipBuild` → `structure PASS + PlatformSmoke/P0Smoke/LocalStoreSmoke/IdentitySmoke 全 PASS + gui PASS 8.7s`，**overall PASS、退出码 0**；
+- `check-gui-launch.ps1` 单独跑：`started pid=28128` → 8s 后仍存活 → PASS，cleanup 已停止进程。
+
+**对 DeepSeek 任务的影响**：交付前跑 `verify-all`（含 package）即可同时覆盖内核与打包产物；报告分别落在 `build/verify-all-<ts>.md` 与 `build/verify-package-<ts>.md`。
+
+**限制**：
+
+1. GUI 检查只验证“启动后 8 秒内存活”，不验证界面内容/交互；
+2. 无桌面会话（服务/CI）下 gui 阶段为 SKIP，不算 PASS；
+3. `verify-all` 的 package 阶段固定 `-SkipBuild`（构建由 gradle 阶段或人工负责），避免两条构建路径互相争用。
 

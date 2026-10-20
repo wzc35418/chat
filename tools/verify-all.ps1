@@ -166,6 +166,35 @@ if ($SkipAndroid) {
     Invoke-Stage -Name "android" -CommandLine "gradlew.bat :apps:android:assembleDebug --offline --max-workers=1"
 }
 
+# ---------------------------------------------------------------- stage 6: delivery package
+if ($SkipPackage) {
+    Add-SkippedStage -Name "package" -Reason "-SkipPackage"
+} else {
+    Write-Host ""
+    Write-Host "== package =="
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $log = Join-Path $logDir "package.log"
+    $script = Join-Path $root "tools/verify-package.ps1"
+    if (-not (Test-Path $script)) {
+        $sw.Stop()
+        Add-Stage -Name "package" -Status "FAIL" -Seconds ([math]::Round($sw.Elapsed.TotalSeconds, 1)) -Detail "tools/verify-package.ps1 is missing" -Log ""
+    } else {
+        cmd /c ("powershell -NoProfile -ExecutionPolicy Bypass -File `"" + $script + "`" -SkipBuild > `"" + $log + "`" 2>&1") | Out-Null
+        $code = $LASTEXITCODE
+        $sw.Stop()
+        $seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+        $reportLine = (Get-Content -Path $log | Where-Object { $_ -match "^report:" } | Select-Object -Last 1)
+        $detail = ""
+        if ($reportLine) { $detail = ($reportLine -replace "^report:\s*", "").Trim() }
+        if ($code -eq 0) {
+            Add-Stage -Name "package" -Status "PASS" -Seconds $seconds -Detail $detail -Log $log
+        } else {
+            $tail = Get-LogTail -Path $log
+            Add-Stage -Name "package" -Status "FAIL" -Seconds $seconds -Detail ("exit " + $code + "; " + $tail + "; " + $detail) -Log $log
+        }
+    }
+}
+
 # ---------------------------------------------------------------- summary
 $failed = @($script:stages | Where-Object { $_.Status -eq "FAIL" })
 $overall = "PASS"

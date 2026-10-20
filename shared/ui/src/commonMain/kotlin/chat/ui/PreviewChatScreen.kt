@@ -139,6 +139,8 @@ fun PreviewChatScreen(
     aboutState: chat.presentation.preview.PreviewAboutState = chat.presentation.preview.PreviewAboutState(),
     aboutHandlers: AboutHandlers = AboutHandlers.None,
     initialAboutOpen: Boolean = false,
+    onboardingState: chat.presentation.preview.PreviewOnboardingState? = null,
+    onboardingHandlers: OnboardingHandlers = OnboardingHandlers.None,
 ) {
     var state by remember { mutableStateOf(initialState) }
     // 真实身份面板是独立浮层：默认关闭，由侧栏按钮打开；截图入口可指定初始打开。
@@ -264,6 +266,21 @@ fun PreviewChatScreen(
                     PluginPanel(
                         state = pluginState,
                         handlers = pluginHandlers,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                }
+            }
+            val onboarding = onboardingState
+            if (onboarding != null) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color(0x66000000))
+                        .semantics { contentDescription = "首启引导遮罩" },
+                ) {
+                    OnboardingPanel(
+                        state = onboarding,
+                        handlers = onboardingHandlers,
                         modifier = Modifier.padding(16.dp),
                     )
                 }

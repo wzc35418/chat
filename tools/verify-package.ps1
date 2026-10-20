@@ -22,6 +22,7 @@
 [CmdletBinding()]
 param(
     [switch]$SkipBuild,
+    [switch]$SkipGui,
     [string]$Only = ""
 )
 
@@ -205,6 +206,36 @@ if (-not $runSmokes) {
             Add-Stage -Name $name -Status "FAIL" -Seconds $seconds -Detail ("exit " + $exitCode + "; " + (Get-LogTail -Path $log)) -Log $log
         }
         try { Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
+# ---------------------------------------------------------------- stage 4: gui launch aliveness
+if (-not (Should-Run "gui")) {
+    Skip-Stage -Name "gui" -Reason "not selected by -Only"
+} elseif ($SkipGui) {
+    Skip-Stage -Name "gui" -Reason "-SkipGui"
+} else {
+    Write-Host ""
+    Write-Host "== gui =="
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $log = Join-Path $logDir "gui.log"
+    $checker = Join-Path $root "tools/check-gui-launch.ps1"
+    if (-not (Test-Path $checker)) {
+        $sw.Stop()
+        Add-Stage -Name "gui" -Status "FAIL" -Seconds ([math]::Round($sw.Elapsed.TotalSeconds, 1)) -Detail "tools/check-gui-launch.ps1 is missing" -Log ""
+    } else {
+        cmd /c ("powershell -NoProfile -ExecutionPolicy Bypass -File `"" + $checker + "`" > `"" + $log + "`" 2>&1") | Out-Null
+        $code = $LASTEXITCODE
+        $sw.Stop()
+        $seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+        if ($code -eq 0) {
+            Add-Stage -Name "gui" -Status "PASS" -Seconds $seconds -Detail "" -Log $log
+        } elseif ($code -eq 3) {
+            # 无交互桌面：既不判 PASS 也不判 FAIL，明确标 SKIP 并说明原因。
+            Add-Stage -Name "gui" -Status "SKIP" -Seconds $seconds -Detail "no interactive desktop session" -Log $log
+        } else {
+            Add-Stage -Name "gui" -Status "FAIL" -Seconds $seconds -Detail ("exit " + $code + "; " + (Get-LogTail -Path $log)) -Log $log
+        }
     }
 }
 

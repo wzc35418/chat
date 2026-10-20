@@ -48,7 +48,12 @@ import chat.presentation.preview.updateSendNodePublicKey
 import chat.presentation.preview.updateSendNodeUrl
 import chat.presentation.preview.withSendStep
 import chat.presentation.preview.withMessageCards
+import chat.presentation.preview.advance
+import chat.presentation.preview.updateEndpoint
 import chat.presentation.preview.updateInvitee
+import chat.presentation.preview.updateNodeId
+import chat.presentation.preview.updateNodePublicKey
+import chat.presentation.preview.withOnboardingError
 import chat.presentation.preview.updateInviteeKeyPackagePath
 import chat.presentation.preview.withAboutError
 import chat.presentation.preview.withAppInfo
@@ -91,6 +96,7 @@ import chat.presentation.preview.withStorageValue
 import chat.ui.PluginHandlers
 import chat.ui.PreviewChatScreen
 import chat.ui.AboutHandlers
+import chat.ui.OnboardingHandlers
 import chat.ui.StoreHandlers
 import kotlinx.coroutines.launch
 import java.io.File
@@ -109,6 +115,14 @@ fun main() = application {
     var identityState by remember { mutableStateOf(PreviewIdentityState(busy = true)) }
     var storeState by remember { mutableStateOf(PreviewStoreState(busy = true)) }
     var aboutState by remember { mutableStateOf(chat.presentation.preview.PreviewAboutState()) }
+    // 节点配置持久化（非机密）：首启读取，未配置则弹引导。
+    val nodeConfigStore = remember { NodeConfigStore(NodeConfigStore.defaultFile()) }
+    val initialNodeConfig = remember { runCatching { nodeConfigStore.load() }.getOrDefault(NodeConfig()) }
+    var onboardingState by remember {
+        mutableStateOf(
+            if (initialNodeConfig.isConfigured) null else chat.presentation.preview.PreviewOnboardingState(),
+        )
+    }
     var storeDraftText by remember { mutableStateOf("") }
     var selectedConversation by remember { mutableStateOf<String?>(null) }
     val identity = remember { runCatching { createIdentityService() }.getOrNull() }
@@ -1157,6 +1171,44 @@ fun main() = application {
             attachmentHandlers = attachmentHandlers,
             groupState = groupState,
             groupHandlers = groupHandlers,
+            onboardingState = onboardingState,
+            onboardingHandlers = OnboardingHandlers(
+                updateEndpoint = { value -> onboardingState = onboardingState?.updateEndpoint(value) },
+                updateNodeId = { value -> onboardingState = onboardingState?.updateNodeId(value) },
+                updateNodePublicKey = { value -> onboardingState = onboardingState?.updateNodePublicKey(value) },
+                save = {
+                    val current = onboardingState ?: return@OnboardingHandlers
+                    if (current.step < 2) {
+                        onboardingState = current.advance()
+                    } else {
+                        runCatching {
+                            nodeConfigStore.save(
+                                NodeConfig(
+                                    endpointUrl = current.endpointUrl.trim(),
+                                    nodeId = current.nodeId.trim(),
+                                    nodePublicKeyHex = current.nodePublicKeyHex.trim(),
+                                ),
+                            )
+                        }.onSuccess {
+                            storeState = storeState
+                                .updateSendNodeUrl(current.endpointUrl.trim())
+                                .updateSendNodeId(current.nodeId.trim())
+                                .updateSendNodePublicKey(current.nodePublicKeyHex.trim())
+                            onboardingState = null
+                        }.onFailure { error ->
+                            onboardingState = current.withOnboardingError("CONFIG_WRITE_FAILED", error.message)
+                        }
+                    }
+                },
+                skip = {
+                    storeState = storeState
+                        .updateSendNodeUrl(initialNodeConfig.endpointUrl)
+                        .updateSendNodeId(initialNodeConfig.nodeId)
+                        .updateSendNodePublicKey(initialNodeConfig.nodePublicKeyHex)
+                    onboardingState = null
+                },
+                close = { onboardingState = null },
+            ),
             aboutState = aboutState,
             aboutHandlers = AboutHandlers(
                 refresh = {

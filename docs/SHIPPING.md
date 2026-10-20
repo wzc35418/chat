@@ -104,3 +104,29 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 实测（2026-10-20）：`-SkipBuild` → structure PASS + 四个冒烟全 PASS，**overall PASS / 退出码 0**。
 构建阶段当日因并行改动 `shared/ui/.../PreviewChatScreen.kt`（`onOpenAbout` 参数不存在）失败——**脚本如实报告，没有放宽断言**。
 
+## 交付物回归接入总回归 + GUI 启动存活检查（2026-10-20）
+
+### 一条命令覆盖到交付物
+
+`tools/verify-all.ps1` 新增 **package** 阶段（默认开启，`-SkipPackage` 可跳过）：内部调用
+`tools/verify-package.ps1 -SkipBuild`，并把它的 PASS/FAIL 与**报告路径**并入总表（`detail` 列）。
+失败不中断其它阶段；任一步失败整体退出码非 0。
+
+### GUI 启动存活检查
+
+新增 `tools/check-gui-launch.ps1`（`verify-package` 的第 5 步，`-SkipGui` 可跳过）：
+
+1. 先清残留 `Chat` 进程（幂等，避免旧进程假装 PASS）；
+2. 启动 `build/dist/app-image/Chat/Chat.exe`；
+3. **等 8 秒**后断言进程仍在；在则 PASS 并强制结束，退出则 FAIL 并打印退出码；
+4. **无交互桌面会话**（`UserInteractive=false` 或 `SESSIONNAME` 为空/`Services`）→ 输出 **SKIP** 并说明，绝不误判成 PASS/FAIL。
+
+退出码约定：`0` PASS、`1` FAIL（含启动失败与提前退出）、`3` SKIP（无桌面）。
+
+为什么需要它：jar 冒烟只能证明“类能跑”，证明不了**打包后的 exe 能起来并活着**（缺少 DLL/runtime 镜像/错误的 JVM 参数都会在这里暴露）。
+
+### 实测（2026-10-20）
+
+`verify-all -SkipAndroid -SkipGradle` → `disk/rust-check/verify-project` PASS、`package` PASS（detail 给出 verify-package 报告路径）、**overall PASS、退出码 0**；
+`verify-package -SkipBuild` → structure + 四个冒烟 + `gui PASS (8.7s)`、**overall PASS、退出码 0**。
+
