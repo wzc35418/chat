@@ -35,6 +35,17 @@ fingerprint : <64 位小写 hex>
 sudo bash deploy/selfcheck.sh        # 服务/监听/健康/证书/指纹 一次列清，PASS 时直接打印要发给客户端的值
 ```
 
+### 只想快速排查（不跑打包产物）
+
+```powershell
+# 从文件读指纹（把 install-node.sh 打印的三行存成 txt 即可，避免手抄出错）
+powershell -ExecutionPolicy Bypass -File tools\verify-remote.ps1 `
+  -Endpoint https://106.54.223.171:8443 -NodeId node-public `
+  -FingerprintFile .\server.txt -DiagnoseOnly
+```
+
+`-DiagnoseOnly` 只做：TCP 可达 → 服务端证书指纹比对 → `/v1/tls/info`，然后打印 `REMOTE DIAGNOSE: PASS` 退出。
+
 ### 常用排查
 
 ```bash

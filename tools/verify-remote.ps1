@@ -12,6 +12,10 @@ param(
     [Parameter(Mandatory = $true)][string]$Endpoint,
     [Parameter(Mandatory = $true)][string]$NodeId,
     [string]$Fingerprint = '',
+    # 从文件读取指纹（避免手抄出错）：文件里第一处 64 位 hex 即可。
+    [string]$FingerprintFile = '',
+    # 只做连通性/证书诊断，不跑打包产物（快速排查用）。
+    [switch]$DiagnoseOnly,
     [switch]$PlainHttp
 )
 $ErrorActionPreference = 'Stop'
@@ -28,6 +32,11 @@ $tlsMode = ($isHttps -and -not $PlainHttp)
 
 $fp = ''
 if ($tlsMode) {
+    if ($FingerprintFile -and (Test-Path $FingerprintFile)) {
+        $fpText = Get-Content $FingerprintFile -Raw
+        $fpMatch = [regex]::Match($fpText, '([0-9a-fA-F]{64})')
+        if ($fpMatch.Success) { $Fingerprint = $fpMatch.Groups[1].Value }
+    }
     $fp = ($Fingerprint -replace ':', '').Trim().ToLowerInvariant()
     if ($fp -notmatch '^[0-9a-f]{64}$') {
         Write-Host 'FAIL remote check: HTTPS endpoint needs -Fingerprint (64 lowercase hex). Use -PlainHttp only if the node has no TLS.'
@@ -95,6 +104,13 @@ if ($tlsMode) {
     Write-Host ('PASS remote: /v1/tls/info ok (days_remaining=' + $days + ')')
 } else {
     Write-Host 'INFO remote: plain HTTP mode, skipping certificate/fingerprint checks'
+}
+
+if ($DiagnoseOnly) {
+    Write-Host 'INFO remote: -DiagnoseOnly，跳过打包产物（连通性/证书已检查）'
+    Write-Host ('logs: ' + $logDir)
+    Write-Host 'REMOTE DIAGNOSE: PASS'
+    exit 0
 }
 
 # 4. packaged artifact submit + pull
