@@ -169,3 +169,11 @@ RUST_EXIT=0  LOCKED_EXIT=0  VERIFY_EXIT=0  GRADLE_EXIT=0  ANDROID_EXIT=0
 - [x] **双设备互通**：KeyPackage 导出 → 建群 → 节点登记 → 加为节点成员 → 邀请 → 发送 accepted → 对方入群 → 拉取 applied=1。
 - [x] **插件权限门**（最小可行沙箱）：清单声明四权限，宿主过滤，类加载器按声明放行；宿主类永不可见。
 - [ ] 未完成：真实中继/NAT、OS 凭据库、后台通知、PRESENTATION 全面收敛、插件签名信任链、MSI 安装器。
+
+## 2026-10-21 第六批收尾（第 118 轮）
+
+- [x] **证书生命周期**：DER 解析有效期（`cert_validity`）→ 节点启动告警 → `/v1/tls/info` 公开 → 客户端启动自动显示（<30 天显红）。
+- [x] **插件治理**：权限门 + 签名闸门（默认要求签名）+ 信任列表（记住/移除）。
+- [x] **错误可用性**：`Cow` 详情 → 整条错误链 → 分层展示（7 处统一 `ErrorBanner`）→ 统一失败投影（12 处共用）。
+- [x] **验收**：`verify-all` 11 阶段；`docs/FINAL_REPORT.md` + `docs/RETROSPECTIVE_120.md`。
+- [ ] 未完成：跨机器/NAT/中继（需外部节点）、证书自动化续签、`AppFacade` 深层收敛、安装器/后台通知/soak、非 Windows 平台。

@@ -1,4 +1,4 @@
-> 完整的「能做什么 / 不能做什么 / 为什么这样设计」见 [docs/FINAL_REPORT.md](docs/FINAL_REPORT.md)。
+> 完整的「能做什么 / 不能做什么 / 为什么这样设计」见 [docs/FINAL_REPORT.md](docs/FINAL_REPORT.md)；120 轮的过程与教训见 [docs/RETROSPECTIVE_120.md](docs/RETROSPECTIVE_120.md)。
 
 # chat：跨平台加密聊天项目
 
