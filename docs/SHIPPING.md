@@ -138,7 +138,7 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 | 插件无沙箱 | 同 JVM 加载执行；trusted 只是确认，不是安全边界 | 未做 |
 | 传输仅回环/LAN | 无真实中继/NAT 穿透 | 未做 |
 | 无 MSI 安装器 | 只有 app-image（免安装目录） | 离线无法构建 WiX |
-| 双设备互发未打通 | 邀请的节点投递与非建群方拉取日志仍被节点规则拒绝 | 进行中 |
+| 双设备互发（脚本级已通） | 界面缺「加对方为节点成员」按钮，需走脚本/API | 脚本 PASS |
 | KeyPackage 私钥内存态 | 重开身份对象需重新导出 | 未做落库 |
 | 无托盘环境无系统通知 | 已明确提示不可用并回退应用内提示 | 诚实降级 |
 

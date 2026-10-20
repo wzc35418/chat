@@ -21,6 +21,7 @@
 
 [CmdletBinding()]
 param(
+    [switch]$SkipTwoDevice,
     [switch]$SkipAndroid,
     [switch]$SkipGradle,
     [string]$TargetDir = ""
@@ -191,6 +192,32 @@ if ($SkipPackage) {
         } else {
             $tail = Get-LogTail -Path $log
             Add-Stage -Name "package" -Status "FAIL" -Seconds $seconds -Detail ("exit " + $code + "; " + $tail + "; " + $detail) -Log $log
+        }
+    }
+}
+
+# ---------------------------------------------------------------- stage 7: two-device exchange
+if ($SkipTwoDevice) {
+    Add-SkippedStage -Name "two-device" -Reason "-SkipTwoDevice"
+} else {
+    Write-Host ""
+    Write-Host "== two-device =="
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $log = Join-Path $logDir "two-device.log"
+    $script = Join-Path $root "tools/demo-two-devices.ps1"
+    if (-not (Test-Path $script)) {
+        $sw.Stop()
+        Add-Stage -Name "two-device" -Status "FAIL" -Seconds ([math]::Round($sw.Elapsed.TotalSeconds, 1)) -Detail "tools/demo-two-devices.ps1 is missing" -Log ""
+    } else {
+        # app-image 由 package 阶段构建；这里只跑演示本身，避免两条构建路径抢 build 目录。
+        cmd /c ("powershell -NoProfile -ExecutionPolicy Bypass -File `"" + $script + "`" -SkipBuild > `"" + $log + "`" 2>&1") | Out-Null
+        $code = $LASTEXITCODE
+        $sw.Stop()
+        $seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+        if ($code -eq 0) {
+            Add-Stage -Name "two-device" -Status "PASS" -Seconds $seconds -Detail "A/B exchange (send accepted + pull applied)" -Log $log
+        } else {
+            Add-Stage -Name "two-device" -Status "FAIL" -Seconds $seconds -Detail ("exit " + $code + "; " + (Get-LogTail -Path $log)) -Log $log
         }
     }
 }

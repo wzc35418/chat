@@ -152,3 +152,44 @@ curl.exe -i http://127.0.0.1:8080/v1/health
 3. 把这个文件给对方 → 对方在群面板「选 KeyPackage」→「用它建群」→「提交邀请」→ 你再「取回邀请」→ 接受入群。
 
 **已知限制**：被邀请方接受邀请后，双方收发还需要各自「收一轮」或常驻同步；当前界面展示的是计数与游标，消息列表在收一轮后自动刷新。
+
+## 15. 双设备互通（A ↔ B，自动化脚本）
+
+```powershell
+cd D:\AgentProject\chat
+. .\tools\activate.ps1
+powershell -ExecutionPolicy Bypass -File tools\demo-two-devices.ps1
+# 只看结果不看构建：加 -SkipBuild
+```
+
+脚本会做（全部真实：真节点 + 两份独立身份 + 两个独立 ChatCore）：
+
+1. 起本地节点（127.0.0.1:8099，随机种子、独立数据目录）
+2. 建两份身份库（alice / bob）
+3. bob 导出 KeyPackage（.kp）并在节点自注册设备
+4. alice 用 bob 的 .kp 建群 → 登记群到节点 → **把 bob 加为节点成员**
+5. alice 提交邀请（Welcome 经节点投递）→ 创建草稿 → 发送 → 期望 accepted
+6. bob 凭 Welcome 入群 → 收一轮 → 期望 applied >= 1
+
+预期输出（关键行）：
+
+```
+PASS alice added bob as node member: seq=1
+PASS alice submitted invite: seq=2
+PASS alice message accepted by node
+PASS bob joined: grp:1:... epoch=1
+PASS bob applied 1 entries from the node
+two-device demo: PASS
+```
+
+脚本产物：`build/two-device-logs/<时间戳>/`（node.out / alice.log / bob.log）；工作目录 `build/two-device/<时间戳>/`（两份身份库、两个消息库、bob.kp、a2b.txt 握手文件）。
+
+**手工等价路径**（不经脚本）：
+
+1. 两台机器各自启动预览应用，各自建身份；
+2. B：真实身份面板「导出 .kp」→ 把文件发给 A；
+3. A：群面板「选 KeyPackage」→「用它建群」→ 填节点地址 → 「登记到节点」；
+4. A：如需要把 B 加为节点成员（当前界面未提供按钮，需底层 API 或等后续版本）；
+5. A：草稿 → 发送；B：本机存储面板「收一轮」→ 消息出现。
+
+**已知限制**：界面里还没有「把对方加为节点成员」按钮（脚本/API 已有）；KeyPackage 单次使用；两边都要有同一节点的地址与节点 ID。
