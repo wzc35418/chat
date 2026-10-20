@@ -162,3 +162,10 @@ RUST_EXIT=0  LOCKED_EXIT=0  VERIFY_EXIT=0  GRADLE_EXIT=0  ANDROID_EXIT=0
 - [x] **设备登记与撤销**（0013）+ 撤销随控制提交传播（字段 61 / 操作值 14）+ 账户级播种。
 - [x] **可验证性**：`docs/manual-test-guide.md`、`tools/demo.ps1`、`tools/verify-all.ps1`。
 - 未完成（正式 P0 验收前必须补）：插件沙箱/签名、真实中继、OS 凭据库、PRESENTATION 收敛、后台通知。
+
+## 2026-10-20 第三批收尾（第 88 轮）
+
+- [x] **交付物级回归**：verify-package（结构+4 冒烟+GUI 存活）、verify-all 七阶段、双设备演示。
+- [x] **双设备互通**：KeyPackage 导出 → 建群 → 节点登记 → 加为节点成员 → 邀请 → 发送 accepted → 对方入群 → 拉取 applied=1。
+- [x] **插件权限门**（最小可行沙箱）：清单声明四权限，宿主过滤，类加载器按声明放行；宿主类永不可见。
+- [ ] 未完成：真实中继/NAT、OS 凭据库、后台通知、PRESENTATION 全面收敛、插件签名信任链、MSI 安装器。

@@ -143,3 +143,13 @@
 - 迁移：storage 0001–0013、node-services 0001–0009。
 - 手工验证入口：`docs/manual-test-guide.md`（13 节）+ `tools/demo.ps1` + `tools/verify-all.ps1`。
 - 距 A 口径剩余：插件沙箱/签名、真实中继、OS 凭据库、PRESENTATION 收敛、后台通知、KeyPackage 跨重启。
+
+## 2026-10-20 第三批基线（第 88 轮）
+
+- Rust：**1141 passed / 0 failed**（chat-ffi 122、chat-plugins 59）。
+- Gradle 11 任务（含 pluginSmoke / pluginJvmSmoke 沙箱断言）+ Android APK。
+- 一键回归：`tools/verify-all.ps1` **7 阶段**（disk / rust-check / verify-project / gradle / android / package / two-device）。
+- 交付物：自包含 app-image（`Chat.exe` + jlink 运行时，免 JDK）+ `Chat-app-0.1.0.zip`。
+- 双设备：`tools/demo-two-devices.ps1` 全绿（A/B 建群→登记→加成员→提交邀请→发送 accepted→对方入群→拉取 applied=1）。
+- 插件：权限门最小可行版（清单四权限 → FFI → 宿主 → 类加载器），**不是安全边界**。
+- 距 A 口径剩余：真实中继/NAT、OS 凭据库 + 后台通知、PRESENTATION 全面收敛、插件签名信任链。

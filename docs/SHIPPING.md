@@ -149,3 +149,33 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
   1. 邀请候选（application + control_metadata）被节点判 INVALID_CANDIDATE；
   2. 非建群方读群日志仍 PERMISSION_DENIED。
 - 因此目前不建议对外宣称 两台设备可直接互发；可行的手工路径是用 .kp 文件加节点投递（邀请体可离线传递），或等上述两条规则修好。
+
+## 0.1.0 发布基线（2026-10-20 冻结）
+
+| 项 | 值 |
+| --- | --- |
+| commit | `78d079a` |
+| Rust 测试 | **1141 passed / 0 failed** |
+| Gradle | 11 桌面任务 + Android `assembleDebug` 全 PASS |
+| 一键回归 | `tools/verify-all.ps1` **7 阶段全 PASS**（disk / rust-check / verify-project / gradle / android 115.1s / package 16.9s / two-device 6s） |
+| 回归报告 | `build/verify-all-20261020-213824.md` |
+| 交付包 | `build/dist/Chat-app-0.1.0.zip`（81.79 MB，SHA256 `996E799E…23C7`） |
+| 免 JDK 启动器 | `build/dist/app-image/Chat/Chat.exe`（SHA256 `644E1672…5BD36`） |
+| 便携包（需 JDK 21） | `build/dist/Chat-0.1.0.zip`（49.17 MB） |
+
+### 这一基线证明了什么
+
+1. **能构建**：Rust 全量测试、11 个桌面冒烟、Android APK、自包含 app-image；
+2. **能跑**：包内运行时跑 4 个冒烟、`Chat.exe` 启动 8 秒存活；
+3. **能发**：打包产物向真实节点提交并被 `accepted`；
+4. **能收**：`syncOnce` 拉回条目并落库（`fetched=2 applied=1`）；
+5. **能对话**：双设备 A/B 全链路（建群→登记→加成员→邀请→发送→入群→拉取）；
+6. **有闸门**：任何一项退化都会让 `verify-all` 变红。
+
+### 这一基线**没有**证明什么
+
+- 跨机器/跨网段/NAT 可用（只有回环与同机双进程）；
+- 插件安全（权限门只是门槛，不是隔离；无签名）；
+- OS 级凭据保护（当前 DPAPI 文件封装 + 演示口令）；
+- 长期运行稳定性（没有 soak 测试）；
+- 非 Windows 平台。

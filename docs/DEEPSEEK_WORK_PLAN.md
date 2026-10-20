@@ -58,6 +58,7 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 - [x] **R-12：SYNC 重试/退避与信箱轮询状态机。** `crates/sync/src/{retry,mailbox,send,clock,ids,error}.rs`：指数退避（1s×2 上限 60s、抖动 ±20%、Retry-After 作下界且夹到 5 分钟、预算耗尽终态、只有成功才重置计数）、信箱轮询（游标只前进、同 id 去重且内容不同 `INVALID_CANDIDATE`、乱序暂存 512 条、双预算、ACK 失败保留进度、空页退避）、发送调度（SubmissionId 由 draft/epoch/attempt 确定性派生、unknown 只 QueryExisting 不重发不重加密、租约语义与 storage 一致）。验证：`cargo test -p chat-sync` 33 passed，clippy 0 警告。
 - [x] **R-185：修掉一个真实 flaky 测试（identity invite 篡改）。** `crates/identity/src/invite.rs::tampered_body_is_rejected` 原先用 `replace_body_byte(..., 0x5a)` 固定写入；**当随机 nonce 那一位本来就是 0x5a 时"篡改"其实没改**，签名仍有效 → 全量跑到 532 个用例时随机失败（本轮实测命中）。改为新增 `flip_body_byte`（写入值与原字节相同则再 +1，保证必然不同），并从该用例改用它。重跑 `cargo test --workspace` → **1111 passed / 0 failed**。这类修复的价值在于：**它让"全绿"变得可信**——否则每次失败都要人去猜是不是环境问题。
 - [x] **R-191（Lead）：收一轮后自动重载会话消息。** syncOnce 成功后若已选中会话，顺手走 PRESENTATION 门面 `openConversation` 重载消息并更新提示（`收一轮：拉取 N / 落库 N；当前会话共 N 条`）；失败时显式错误码。`docs/manual-test-guide.md` 新增第 14 节（收一轮与导出 KeyPackage 的操作步骤、单次使用语义、限制）。验证：compileKotlin 通过；Gradle 11 任务 BUILD SUCCESSFUL；verify-project PASS。
+- [x] **R-205（Lead）：0.1.0 发布基线冻结（全量回归 7 阶段全 PASS）。** `tools/verify-all.ps1` 全量实跑（含 Android）：**disk / rust-check 14.4s / verify-project / gradle 30.3s / android 115.1s / package 16.9s / two-device 6s -> overall PASS EXIT=0**（报告 `build/verify-all-20261020-213824.md`）。基线写入 `docs/SHIPPING.md`：commit `78d079a`、Rust 1141 passed、`Chat-app-0.1.0.zip` 81.79 MB（SHA256 `996E799E…`）、`Chat.exe` SHA256 `644E1672…`；并**显式列出「这一基线证明了什么 / 没有证明什么」**六条与五条。第三批（R-172…R-205，24 轮）批次总结写入计划书与 `COVERAGE_SNAPSHOT.md`（含本批最值钱的 8 条真实缺陷与我自己的 3 条失误）、`P0_CHECKLIST.md` 收尾勾选。
 - [x] **R-204：清单权限接到沙箱执行（声明即授权）。** Rust 侧把既有 `permissions` 字段**扩充**（未另起第二套口径）：新增沙箱权限 `network`/`filesystem`/`process`/`host-ui`（`PluginPermission::SANDBOX` 恰为这四个），`MAX_PERMISSIONS` 4→8，大小写敏感、去重、未知值拒；`RawManifest.permissions` 加 `#[serde(default)]`（旧清单不写该字段 = 空集合 = 无敏感权限）；`PackageInspection.permissions` / `PackageViewFfi.permissions` 原样带出。**码表口径冻结并写进 plugins.md**：清单非法统一 `INVALID_PLUGIN_PACKAGE`，不新增 `INVALID_MANIFEST`，`UNKNOWN_PERMISSION` 为历史码不再用于权限声明（两条路径同码由测试钉住）。JVM 侧：`PluginPackageView.permissions` + 桥接映射；`PreviewApp.loadJar` 取 `view.permissions` **过滤出四个沙箱值**再传给 `host.load(..., permissions)` —— 声明什么才给什么。验证：`cargo test -p chat-plugins` → **59 passed**、`-p chat-ffi` → **122 passed**；`pluginJvmSmoke` → **PASS plugin sandbox slice**；Gradle 11 任务 `BUILD SUCCESSFUL`；`verify-project.cjs` PASS。
 - [x] **R-203（Lead）：插件沙箱最小可行版（类加载隔离 + 权限门）。** 新增 `PluginSandboxClassLoader`：① **宿主实现类永不可见**（`chat.desktop.*` / `chat.bridge.*` / `chat.presentation.*` / `chat.ui.*` 一律拒绝，SDK 所在的 `chat.plugin.*` 始终允许）；② **按清单权限拦截敏感包**——`network` → `java.net.*`/`javax.net.*`/`sun.net.*`，`filesystem` → `java.nio.file.*`/`java.io.File*`，`process` → `java.lang.Runtime`/`java.lang.Process*`；无权限即抛 `PLUGIN_PERMISSION_DENIED`（不静默放行）；③ 未知权限值在**任何文件访问之前**拒绝。`PluginJvmHost.load` 新增 `permissions` 参数并改用它。**冒烟扩展**：`pluginJvmSmoke` 现在额外断言「宿主类被拒 / 无 network 时 `java.net.Socket` 被拒 / 声明 network 后可加载 / 未知权限被拒」→ 输出 `PASS plugin sandbox slice`。验证：`pluginJvmSmoke` EXPORT 0；Gradle 11 任务 `BUILD SUCCESSFUL`（16s）；`tools/verify-project.cjs` PASS。**明确边界（已写注释）**：这是门槛不是安全边界——JVM 内仍可被反射/Unsafe/本地库绕过，超时无法强杀线程。
 - [x] **R-202（Lead）：界面补「加为节点成员」——双设备流程纯 GUI 可完成。** `GroupService.submitNodeMemberAdd(groupId, deviceId, endpoint, nodeId, nodeKey)` + `NodeMemberAddReceipt{submissionId, seq, nodeId}`（桥接 `GroupFfi.submitMemberAdd`）；群面板新增「对方设备 ID」输入 + 「加为节点成员」按钮（未填/未打开群时禁用），成功显示 `seq` 与提交 ID，失败显示稳定错误码。`docs/manual-test-guide.md` 第 15 节的手工路径更新（不再写「界面未提供按钮」），限制改为「对方设备必须先在节点注册」。验证：`:apps:desktop:compileKotlin` 通过；Gradle 11 任务 `BUILD SUCCESSFUL`（15s）；`tools/verify-project.cjs` PASS。
@@ -609,3 +610,57 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 2. 无桌面会话（服务/CI）下 gui 阶段为 SKIP，不算 PASS；
 3. `verify-all` 的 package 阶段固定 `-SkipBuild`（构建由 gradle 阶段或人工负责），避免两条构建路径互相争用。
 
+
+## 第三批（第 65–88 轮）批次总结（2026-10-20）
+
+### 一句话
+
+这一批把项目从「打包能跑」推到「**两台设备能真实对话**」，并把插件从「无沙箱」推到「**有权限门的最小可行沙箱**」，同时补齐了一键回归（7 阶段）。
+
+### 交付规模
+
+- 轮次：**24 轮**（R-172 … R-204），全部推送 `main`。
+- Rust 测试：1093 → **1141**（+48）；crate 数 14，含 `chat-ffi` 122、`chat-plugins` 59。
+- Gradle：11 个桌面冒烟 + Android APK；新增 `pluginJvmSmoke` 沙箱断言。
+- 新增工具：`tools/verify-package.ps1`（交付物回归）、`tools/check-gui-launch.ps1`、`tools/demo-two-devices.ps1`（双设备）、`verify-all` 七阶段。
+- 新增产物：自包含 app-image（`Chat.exe` + jlink 运行时，免 JDK）、`Chat-app-0.1.0.zip`。
+
+### 本批真正打通的能力
+
+1. **免 JDK 交付**：jlink 裁剪运行时 + jpackage app-image；包内运行时冒烟通过、`Chat.exe` 启动存活。
+2. **交付物级回归**：结构断言 + 包内四个冒烟 + GUI 存活检查；`verify-all` 单命令跑全套。
+3. **单句柄共享核心 `ChatCoreFfi`**：群/消息/同步/入群同句柄，彻底消除「开-关-再开」绕锁。
+4. **双设备真实互通**：KeyPackage 导出 → 建群 → 节点登记 → **加为节点成员** → 提交邀请 → 发消息 accepted → 对方入群 → **拉取 applied=1**。
+5. **插件权限门**：清单声明四个沙箱权限 → FFI 带出 → 宿主过滤 → 类加载器按声明放行/拒绝（宿主类永不可见）。
+6. **可观测性**：节点错误带 `node code + http status + body 前 512B`，把「UNKNOWN_RESULT」变成可定位信息。
+
+### 期间修掉的真实缺陷（本批最值钱的 8 条）
+
+1. 邀请取回用**定长解码**解变长 blob → 恒返回 `None`（端到端测试才暴露）。
+2. `GroupView` 新增字段后测试夹具字面量漏字段 → 全量编译失败（机械补字段修复）。
+3. `identity` 的篡改用例固定写入 `0x5a`，当原字节恰为 `0x5a` 时**没真的改** → flaky（改 `flip_body_byte` 保证不同）。
+4. `close` 与 UniFFI `Disposable.close()` **conflicting overloads** → 改名 `shutdown`。
+5. KeyPackage 凭据口径是**设备 ID** 而非账户 ID → 建群 `INVALID_CANDIDATE`（新增 `key_package_credential()` 把口径变成事实）。
+6. 节点成员行把 `account_id` 写成作者账户 → 跨账户成员被 `PERMISSION_DENIED`（改为记录设备自己的账户，不放宽安全规则）。
+7. `submitInvite` 的 `INVALID_CANDIDATE` 实为**打包节点二进制过期**（重建即通）。
+8. `-Only` 参数只看整组名 → 单冒烟验证会**整组跳过却报 PASS**（假绿）。
+
+### 我自己犯过并记录的错
+
+- 改完顺序却**以为改了**（日志顺序暴露），回读源码才发现；
+- 把「提交邀请」按钮放在拿不到 Welcome 的面板上（必然失败），后来按诚实原则移除、闭环后再加回；
+- 一度用「问节点要 head 就信」的思路，被自己的注释与队友的测试挡住，改回「用节点签名回执播种游标」。
+
+### A/B 口径对账（本批末）
+
+| 口径 | 完成度 | 剩余 |
+| --- | --- | --- |
+| A：功能完整 | **约 85%** | 真实中继/NAT（2–4 轮）、OS 凭据库+后台通知（2 轮）、PRESENTATION 全面收敛（1–2 轮）、插件签名信任链（1–2 轮） |
+| B：生产就绪 | **约 60%** | 上述全部 + MSI 安装器、自动更新、跨重启可用性（KeyPackage 内存态）、运维巡检 |
+
+### 下一批建议优先级
+
+1. **传输**：中继 + 跨网段（决定「能不能跨机器」，是当前最大空白）；
+2. **凭据与通知**：OS 凭据库 + 后台收消息通知（决定「能不能放心长期用」）；
+3. **PRESENTATION 收敛**：界面全部走 `AppFacade`（决定「维护成本」）；
+4. **插件签名信任链**：权限门已有，签名仍缺（决定「能不能开放第三方插件」）。
