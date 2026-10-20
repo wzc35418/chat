@@ -22,6 +22,7 @@
 [CmdletBinding()]
 param(
     [switch]$SkipTwoDevice,
+    [switch]$SkipLan,
     [switch]$SkipAndroid,
     [switch]$SkipGradle,
     [string]$TargetDir = ""
@@ -220,6 +221,36 @@ if ($SkipTwoDevice) {
             Add-Stage -Name "two-device" -Status "PASS" -Seconds $seconds -Detail "A/B exchange (send accepted + pull applied)" -Log $log
         } else {
             Add-Stage -Name "two-device" -Status "FAIL" -Seconds $seconds -Detail ("exit " + $code + "; " + (Get-LogTail -Path $log)) -Log $log
+        }
+    }
+}
+
+# ---------------------------------------------------------------- stage 8: LAN (non-loopback)
+if ($SkipLan) {
+    Add-SkippedStage -Name "lan" -Reason "-SkipLan"
+} else {
+    Write-Host ""
+    Write-Host "== lan =="
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $log = Join-Path $logDir "lan.log"
+    $script = Join-Path $root "tools/verify-lan.ps1"
+    if (-not (Test-Path $script)) {
+        $sw.Stop()
+        Add-Stage -Name "lan" -Status "FAIL" -Seconds ([math]::Round($sw.Elapsed.TotalSeconds, 1)) -Detail "tools/verify-lan.ps1 is missing" -Log ""
+    } else {
+        cmd /c ("powershell -NoProfile -ExecutionPolicy Bypass -File `"" + $script + "`" > `"" + $log + "`" 2>&1") | Out-Null
+        $code = $LASTEXITCODE
+        $sw.Stop()
+        $seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+        $lanLine = (Get-Content -Path $log | Where-Object { $_ -match "^lan address:" } | Select-Object -Last 1)
+        $detail = ""
+        if ($lanLine) { $detail = ($lanLine -replace "^lan address:\\s*", "").Trim() }
+        if ($code -eq 0) {
+            Add-Stage -Name "lan" -Status "PASS" -Seconds $seconds -Detail ("non-loopback e2e; " + $detail) -Log $log
+        } elseif ($code -eq 3) {
+            Add-Stage -Name "lan" -Status "SKIP" -Seconds $seconds -Detail "no non-loopback IPv4" -Log $log
+        } else {
+            Add-Stage -Name "lan" -Status "FAIL" -Seconds $seconds -Detail ("exit " + $code + "; " + (Get-LogTail -Path $log)) -Log $log
         }
     }
 }

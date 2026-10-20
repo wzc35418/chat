@@ -174,7 +174,7 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 
 ### 这一基线**没有**证明什么
 
-- 跨机器/跨网段/NAT 可用（只有回环与同机双进程）；
+- 跨机器/跨网段/NAT 可用（**已证明不依赖回环接口**：LAN 地址 e2e PASS；但仍是同一台机器，无中继/NAT 穿透/TLS，明文 HTTP 仅限可信网络）；
 - 插件安全（权限门只是门槛，不是隔离；无签名）；
 - OS 级凭据保护（当前 DPAPI 文件封装 + 演示口令）；
 - 长期运行稳定性（没有 soak 测试）；
