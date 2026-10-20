@@ -185,3 +185,12 @@ RUST_EXIT=0  LOCKED_EXIT=0  VERIFY_EXIT=0  GRADLE_EXIT=0  ANDROID_EXIT=0
 - [x] **TLS pinning 生效**：同证书指纹校验通过；换成错误指纹 → 提交被拒（`FAIL NODE_UNAVAILABLE`）。
 - [x] **证书状态端点**：`/v1/tls/info` 返回 `cert_sha256=13be2f93…, days_remaining=3649, expired=false`。
 - [ ] 仍未做：NAT 打洞/中继（当前只支持直连公网 IP）、证书自动续签、非 Windows 平台验证。
+
+## 2026-10-21 批次结论（R-240…R-262）
+
+- [x] Windows Server 部署包生成 + 包内自检（`prepare-node-bundle.ps1` / `verify-bundle.ps1`）。
+- [x] 公网跨机器验证 PASS，并固化进 `verify-all` 第 12 阶段 `remote`。
+- [x] 一步发送（prepare→dispatch）+ 自动恢复（仅冻结可重试码重试、未定结果必对账），**UI 路径在公网节点被证明**。
+- [x] 证书状态：启动自动读 + 运行期每 5 分钟刷新 + <30 天进错误条；SAN 不匹配给可执行指引。
+- [x] 错误码收敛（37 处重复 → `failureCode`）。
+- [ ] 未做：NAT 打洞/中继、证书自动续签/OCSP、MSI 安装器、后台通知、非 Windows 平台、`AppFacade` 完整收敛、soak。
