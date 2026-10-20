@@ -489,6 +489,80 @@ fn the_b_side_joins_through_the_same_shared_handle() {
     a_core.shutdown();
     b_core.shutdown();
 }
+
+#[test]
+fn the_key_package_credential_is_the_device_id_and_account_ids_are_rejected() {
+    // 两份独立身份库 + 两个独立 ChatCore（跨实例口径测试）。
+    let a_identity = FixtureDir::new();
+    enroll_identity_with_seeds(
+        &a_identity.database(),
+        &master_key_hex(),
+        &ACCOUNT_SEED,
+        &DEVICE_SEED,
+    );
+    let b_identity_dir = FixtureDir::new();
+    let b_account_seed = [0x66_u8; 32];
+    let b_device_seed = [0x77_u8; 32];
+    let b_identity = enroll_identity_with_seeds(
+        &b_identity_dir.database(),
+        &master_key_hex(),
+        &b_account_seed,
+        &b_device_seed,
+    );
+
+    let b_dir = FixtureDir::new();
+    let b_core = ChatCoreFfi::open(b_dir.database(), master_key_hex()).expect("open B core");
+    let b_enrolled = b_core
+        .enroll_local_identity(b_identity_dir.database(), master_key_hex())
+        .expect("B enrolls");
+    // 口径 1：KeyPackage 的 leaf credential 就是**设备 ID**（与 enroll 返回值一致）。
+    let credential = b_core.key_package_credential().expect("credential");
+    assert_eq!(credential, b_enrolled.device_id);
+    assert_eq!(credential, b_identity.device_id);
+    assert!(credential.starts_with("dev:1:"), "credential is a device id: {credential}");
+    let key_package = b_core.export_key_package().expect("B exports");
+
+    let a_dir = FixtureDir::new();
+    let a_core = ChatCoreFfi::open(a_dir.database(), master_key_hex()).expect("open A core");
+    a_core
+        .enroll_local_identity(a_identity.database(), master_key_hex())
+        .expect("A enrolls");
+
+    // 口径 2：传**账户 ID** → 在本地就被显式拒绝（不会走到 INVALID_CANDIDATE）。
+    let account_id = b_enrolled.account_id.clone();
+    assert!(account_id.starts_with("acct:1:"));
+    let error = a_core
+        .create_group_with_invitee_key_package(
+            "口径测试".to_owned(),
+            account_id,
+            key_package.clone(),
+            String::new(),
+        )
+        .expect_err("an account id must be rejected");
+    let reason = match error {
+        FfiError::Store { code, reason } => {
+            assert_eq!(code, "INVALID_INPUT");
+            reason
+        }
+    };
+    assert!(reason.contains("device"), "the error explains the 口径: {reason}");
+
+    // 口径 3：传**设备 ID** → 建群成功（跨两个 ChatCore 实例的真实路径）。
+    let created = a_core
+        .create_group_with_invitee_key_package(
+            "口径测试".to_owned(),
+            credential.clone(),
+            key_package,
+            String::new(),
+        )
+        .expect("a device credential builds the group");
+    assert_eq!(created.group.members.len(), 2);
+    assert!(created.group.members.contains(&credential));
+    assert_eq!(created.invite.invitee_credential, credential);
+    assert!(!created.invite.welcome_bytes.is_empty());
+    drop(a_core);
+    drop(b_core);
+}
 #[test]
 fn a_closed_handle_and_a_second_instance_are_explicit() {
     let harness = Harness::new();

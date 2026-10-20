@@ -75,7 +75,8 @@ private fun bobWait(dir: File, endpoint: String, nodeId: String, nodeKey: String
         val kp = core.exportKeyPackage()
         File(dir, "bob.kp").writeBytes(kp)
         // MLS 里用的是**凭据**而不是设备 ID；把凭据一并交给 alice，否则她会用错凭据建不出群。
-        File(dir, "bob-credential.txt").writeText(account.accountId)
+        // MLS 口径：KeyPackage 的 leaf credential 是**设备 ID**（dev:1:...），不是账户 ID。
+        File(dir, "bob-credential.txt").writeText(core.keyPackageCredential())
         log("bob exported key package: " + kp.size + " bytes")
         val handoff = File(dir, "a2b.txt")
         var waited = 0
@@ -139,7 +140,7 @@ private fun alice(dir: File, endpoint: String, nodeId: String, nodeKey: String):
         val bobCredential = File(dir, "bob-credential.txt").takeIf { it.isFile }?.readText()?.trim()
         if (bobCredential.isNullOrBlank()) { log("FAIL bob credential missing"); return 3 }
         log("bob credential: " + bobCredential)
-        val created = core.createGroupWithInviteeKeyPackage("two-device demo", bobCredential, kp, account.accountId)
+        val created = core.createGroupWithInviteeKeyPackage("two-device demo", bobCredential, kp, core.keyPackageCredential())
         log("PASS alice created group: " + created.group.groupId + " epoch=" + created.group.epoch)
         core.configureSendGroup(created.group.mlsGroupKey)
         core.configureSendNode(endpoint, nodeId, nodeKey)

@@ -1194,6 +1194,39 @@ B `sync_once` 不再报缺游标（见下）。
    （建群方自注册），B 还没在节点登记设备/成员。这是独立的"节点成员同步"缺口，不是本地游标问题；
    本地游标已按已验证起点初始化，重复初始化幂等 —— 要真正拉到 B 的日志，还需要把 B 的成员变更
    提交到节点（或让 B 走一次节点设备登记），这一块本轮未做，已在本文件与测试注释里写明。
+### 口径修正：invitee_credential 必须是**设备 ID**（2026-10-18，修双设备建群卡住）
+
+**症状**：A `createGroupWithInviteeKeyPackage(name, bobCredential, kp, alice.accountId)` →
+`INVALID_CANDIDATE: the MLS group could not be bootstrapped with the invitee key package`。
+
+**根因（已定位）**：crypto 的 `create_and_invite_external` 要求 KeyPackage 的 **leaf credential**
+与被邀请者凭据**逐字节相等**；而 `export_key_package` 缓存的那台 MLS 设备的 credential 是
+**设备 ID**（`dev:1:…`，来自 `enroll_local_identity` 返回的 `device_id`），
+不是账户 ID（`acct:1:…`）。传账户 ID 必然对不上。
+
+**结论（口径）**：
+
+| 项 | 值 |
+|---|---|
+| `export_key_package` 设备的 credential | **设备 ID** `dev:1:…`（= `key_package_credential()` = `enroll_local_identity().deviceId`） |
+| `create_group_with_invitee_key_package` 的 `invitee_credential` | 同上，**必须逐字节等于** `key_package_credential()` |
+| 账户 ID `acct:1:…` | **不允许**（本地直接 `INVALID_INPUT`，并说明要传设备 ID） |
+
+**本轮修的三处**：
+1. `key_package_credential() -> String`：把口径变成可读取的事实（不再靠猜）；
+2. `create_group_with_invitee_key_package` 前置守卫 `ensure_device_credential`：传 `acct:…` → 立即
+   `INVALID_INPUT` 且 reason 明确写"要传设备 ID"（不再落到模糊的 `INVALID_CANDIDATE`）；
+3. core 的 `INVALID_CANDIDATE` 一律附口径提示（`invitee_credential` 必须与 KeyPackage leaf credential
+   逐字节相同，用 `dev:1:…`）。
+
+**跨两个 ChatCore 实例的回归测试**（[crates/ffi/tests/shared_core.rs](../../crates/ffi/tests/shared_core.rs)
+`the_key_package_credential_is_the_device_id_and_account_ids_are_rejected`）：
+B `enroll_local_identity` → `key_package_credential()` == `enroll` 返回的 `device_id`（`dev:1:…`）→
+`export_key_package()` → A 传**账户 ID** 被 `INVALID_INPUT` 拒绝（reason 含 device）→
+A 传**设备 ID** 建群**成功**（成员含该设备凭据、Welcome 非空）。
+
+复现：`cargo test --offline -p chat-ffi` → **121 passed**（既有 120 继续通过）。
+
 
 
 

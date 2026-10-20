@@ -255,9 +255,9 @@ fn ensure_device_credential(invitee_credential: &str) -> Result<(), FfiError> {
 }
 
 /// 把 core 的 `INVALID_CANDIDATE` 附上口径提示（口径不一致是最常见的成因）。
-fn invitee_candidate_failure(error: chat_core::groups::GroupError) -> FfiError {
-    let code = error.code();
-    let mut reason = error.to_string();
+fn invitee_candidate_failure(error: &uniffi::deps::anyhow::Error) -> FfiError {
+    let code = chat_core::service::error_code(error);
+    let mut reason = chat_core::service::error_message(error);
     if code == "INVALID_CANDIDATE" {
         reason.push_str(
             " (hint: invitee_credential must be byte-identical to the KeyPackage leaf credential —              use the exporting device id dev:1:…, not an account id acct:1:…)",
@@ -471,7 +471,7 @@ impl ChatCoreFfi {
                 &invitee_credential,
                 &key_package_bytes,
             )
-            .map_err(invitee_candidate_failure)?;
+            .map_err(|error| invitee_candidate_failure(&error))?;
         let invite = invite_view(&view, &local_credential, &invitee_credential, welcome);
         Ok(SharedCreatedGroupFfi {
             group: group_view(&view),
@@ -780,6 +780,23 @@ impl ChatCoreFfi {
             Err(error) => return Err(failure!(error)),
         }
         outcome
+    }
+
+    /// 本机 KeyPackage 的 **leaf credential**（就是 `export_key_package` 里那台设备的 credential）。
+    ///
+    /// 建群方必须把**这个字符串**原样作为 `invitee_credential` 传进去
+    /// （它等于 `enroll_local_identity` 返回的 `device_id`，形如 `dev:1:…`）。
+    pub fn key_package_credential(&self) -> Result<String, FfiError> {
+        let guard = self.core.lock().map_err(|_| core_closed())?;
+        let core = guard.as_ref().ok_or_else(core_closed)?;
+        Ok(core
+            .load_identity_account()
+            .map_err(|error| failure!(error))?
+            .ok_or_else(|| FfiError::Store {
+                code: "INVALID_STATE_TRANSITION".to_owned(),
+                reason: "the local identity is not enrolled in this database".to_owned(),
+            })?
+            .device_id)
     }
 
     /// 导出本机 MLS KeyPackage（交给建群方；**单次使用**、只含公钥材料）。
