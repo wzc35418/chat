@@ -195,3 +195,60 @@ tasks.register<JavaExec>("previewApp") {
     systemProperty("skiko.data.path", previewTemp.get().asFile.absolutePath)
     doFirst { previewTemp.get().asFile.mkdirs() }
 }
+
+
+/**
+ * 可交付便携包（离线可用，不依赖 WiX / jpackage）：
+ *   dist/Chat-<version>/app.jar        —— 所有运行期 classpath（含 shared/desktop 模块）
+ *   dist/Chat-<version>/native/        —— Rust host 动态库（含 chat_ffi.dll）
+ *   dist/Chat-<version>/run.bat        —— 启动脚本（要求本机 JDK 21）
+ *   dist/Chat-<version>.zip           —— 压缩后的交付物
+ */
+// 交付版本号：可用 -PchatVersion=0.1.1 覆盖；默认 0.1.0。
+val appVersion = providers.gradleProperty("chatVersion").getOrElse("0.1.0")
+
+val portableJar = tasks.register<Jar>("portableJar") {
+    group = "distribution"
+    dependsOn(tasks.named("classes"), rootProject.tasks.named("prepareRustHost"))
+    archiveFileName.set("app.jar")
+    destinationDirectory.set(rootProject.layout.buildDirectory.dir("portable"))
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes(
+            "Main-Class" to "chat.desktop.MainKt",
+        )
+    }
+    from(sourceSets["main"].output)
+    from(configurations.runtimeClasspath.get().filter { it.exists() }.map { if (it.isDirectory) it else zipTree(it) })
+}
+
+val portableDist = tasks.register<Sync>("portableDist") {
+    group = "distribution"
+    dependsOn(portableJar)
+    into(rootProject.layout.buildDirectory.dir("dist/Chat-$appVersion"))
+    from(rootProject.layout.buildDirectory.dir("portable/app.jar"))
+    from(rootProject.layout.buildDirectory.dir("native/host")) { into("native") }
+    doLast {
+        val dir = rootProject.layout.buildDirectory.dir("dist/Chat-$appVersion").get().asFile
+        dir.resolve("run.bat").writeText(
+            "@echo off\r\n" +
+                "rem Chat $appVersion portable launcher (JDK 21 required)\r\n" +
+                "set DIR=%~dp0\r\n" +
+                "java -Djna.library.path=%DIR%native -Dfile.encoding=UTF-8 -jar %DIR%app.jar %*\r\n",
+        )
+        dir.resolve("README.txt").writeText(
+            "Chat $appVersion portable build\r\n\r\n" +
+                "1. Requires JDK 21 on PATH (java -version).\r\n" +
+                "2. Double-click run.bat (or: run.bat)\r\n" +
+                "3. Data is stored per-user; see docs/manual-test-guide.md\r\n",
+        )
+    }
+}
+
+tasks.register<Zip>("portableZip") {
+    group = "distribution"
+    dependsOn(portableDist)
+    archiveFileName.set("Chat-$appVersion.zip")
+    destinationDirectory.set(rootProject.layout.buildDirectory.dir("dist"))
+    from(rootProject.layout.buildDirectory.dir("dist/Chat-$appVersion")) { into("Chat-$appVersion") }
+}
