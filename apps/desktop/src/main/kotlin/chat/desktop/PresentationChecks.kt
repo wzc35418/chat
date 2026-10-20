@@ -159,6 +159,7 @@ fun main() = runBlocking {
     checkMarkdown()
     checkRecoveryPresentation()
     checkMessageCardsPresentation()
+    checkMarkdownFormatting()
     println("PASS DS-02/DS-04/DS-05/DS-07/DS-08/DS-09/DS-10/DS-11/DS-12 presentation checks")
 }
 
@@ -1309,4 +1310,37 @@ private fun checkMessageCardsPresentation() {
     check(state.messageCards["msg-1"]?.isEmpty() == true) { "查过但没有附件必须记为空列表" }
     check(!state.busy)
     println("PASS attachment cards presentation: empty result recorded explicitly, busy cleared")
+}
+
+/** 选区格式化（加粗/斜体）：纯函数语义必须在无 UI 的情况下可验证。 */
+private fun checkMarkdownFormatting() {
+    // 选区加粗：把选区包上 **，并保留选区
+    val bold = chat.ui.MarkdownFormatting.toggleBold("hello world", androidx.compose.ui.text.TextRange(0, 5))
+    check(bold.text == "**hello** world") { "加粗应包裹选区，实际：" + bold.text }
+    check(bold.selection == androidx.compose.ui.text.TextRange(2, 7)) { "加粗后选区应仍覆盖原文字" }
+
+    // toggle：已加粗再点一次应去掉
+    val unbold = chat.ui.MarkdownFormatting.toggleBold(bold.text, bold.selection)
+    check(unbold.text == "hello world") { "再次加粗应取消标记，实际：" + unbold.text }
+
+    // 空选区：插入成对标记，光标落在中间
+    val empty = chat.ui.MarkdownFormatting.toggleItalic("ab", androidx.compose.ui.text.TextRange(1, 1))
+    check(empty.text == "a**b") { "空选区应插入成对标记，实际：" + empty.text }
+    check(empty.selection == androidx.compose.ui.text.TextRange(2)) { "光标应落在标记中间" }
+
+    // 首尾空白留在标记外
+    val spaced = chat.ui.MarkdownFormatting.toggleBold("a  b  c", androidx.compose.ui.text.TextRange(1, 6))
+    check(spaced.text == "a  **b**  c") { "空白应留在标记外，实际：" + spaced.text }
+
+    // 跨行：逐行包裹
+    val multi = chat.ui.MarkdownFormatting.toggleBold("one\ntwo", androidx.compose.ui.text.TextRange(0, 7))
+    check(multi.text == "**one**\n**two**") { "跨行应逐行包裹，实际：" + multi.text }
+
+    // 删除线与行内代码用同一套语义
+    val strike = chat.ui.MarkdownFormatting.toggleStrike("x", androidx.compose.ui.text.TextRange(0, 1))
+    check(strike.text == "~~x~~") { "删除线标记错误：" + strike.text }
+    val code = chat.ui.MarkdownFormatting.toggleCode("x", androidx.compose.ui.text.TextRange(0, 1))
+    check(code.text == "`x`") { "行内代码标记错误：" + code.text }
+
+    println("PASS markdown formatting: bold/italic/strike/code toggle with selection preserved, whitespace kept outside markers, multi-line wrapped per line")
 }

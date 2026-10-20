@@ -139,6 +139,12 @@ fun PreviewChatScreen(
     aboutState: chat.presentation.preview.PreviewAboutState = chat.presentation.preview.PreviewAboutState(),
     aboutHandlers: AboutHandlers = AboutHandlers.None,
     initialAboutOpen: Boolean = false,
+    /** 界面缩放（0.85..1.4；由宿主从本机偏好读出）。 */
+    uiScale: Float = 1.0f,
+    /** 侧栏是否显示「插件」入口。 */
+    showPluginEntry: Boolean = true,
+    /** 侧栏是否显示「关于」入口。 */
+    showAboutEntry: Boolean = true,
     onboardingState: chat.presentation.preview.PreviewOnboardingState? = null,
     onboardingHandlers: OnboardingHandlers = OnboardingHandlers.None,
 ) {
@@ -190,6 +196,8 @@ fun PreviewChatScreen(
                                     onOpenGroups = { showGroups = true },
                                     onOpenPlugins = { showPlugins = true },
                             onOpenAbout = { showAbout = true },
+                            showPluginEntry = showPluginEntry,
+                            showAboutEntry = showAboutEntry,
                                 )
                                 Box(Modifier.width(1.dp).fillMaxHeight().background(Color(0xFFE1E6E1)))
                                 ChatPane(
@@ -234,6 +242,8 @@ fun PreviewChatScreen(
                                     onOpenGroups = { showGroups = true },
                                     onOpenPlugins = { showPlugins = true },
                                     onOpenAbout = { showAbout = true },
+                                    showPluginEntry = showPluginEntry,
+                                    showAboutEntry = showAboutEntry,
                                 )
                             }
                         }
@@ -408,6 +418,8 @@ private fun Sidebar(
     onOpenGroups: () -> Unit,
     onOpenPlugins: () -> Unit,
     onOpenAbout: () -> Unit,
+    showPluginEntry: Boolean,
+    showAboutEntry: Boolean,
 ) {
     Surface(modifier, color = Color.White) {
         Column(
@@ -506,7 +518,7 @@ private fun Sidebar(
                 ) {
                     Text("群", style = MaterialTheme.typography.labelMedium)
                 }
-                OutlinedButton(
+                if (showPluginEntry) OutlinedButton(
                     onClick = onOpenPlugins,
                     modifier = Modifier.weight(1f).semantics {
                         contentDescription = "打开插件宿主面板"
@@ -515,7 +527,7 @@ private fun Sidebar(
                 ) {
                     Text("插件", style = MaterialTheme.typography.labelMedium)
                 }
-                OutlinedButton(
+                if (showAboutEntry) OutlinedButton(
                     onClick = onOpenAbout,
                     modifier = Modifier.weight(1f).semantics {
                         contentDescription = "打开关于与诊断面板"

@@ -20,3 +20,6 @@ fun PreviewAboutState.withDataDir(path: String): PreviewAboutState = copy(dataDi
 
 fun PreviewAboutState.withAboutError(code: String, notice: String?): PreviewAboutState =
     copy(lastErrorCode = code, notice = notice)
+
+fun PreviewAboutState.withScaleNotice(factor: Float): PreviewAboutState =
+    copy(notice = "界面缩放已设为 " + factor + "（已保存到本机）", lastErrorCode = null)

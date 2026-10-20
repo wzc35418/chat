@@ -21,6 +21,19 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -191,13 +204,42 @@ fun LocalStorePanel(
                     style = MaterialTheme.typography.labelSmall,
                     color = Color(0xFF5F6B63),
                 )
+                // 选区感知：只有记住 TextFieldValue 才能对"选中文字"施加格式。
+                var draft by remember { mutableStateOf(TextFieldValue(draftText, TextRange(draftText.length))) }
+                // 外部清空（写入草稿成功后）要同步回来。
+                if (draft.text != draftText) {
+                    draft = TextFieldValue(draftText, TextRange(draftText.length))
+                }
+                fun applyFormat(marker: String) {
+                    val edit = applyMarker(draft.text, draft.selection, marker)
+                    draft = TextFieldValue(edit.text, edit.selection)
+                    handlers.updateDraftText(edit.text)
+                }
+                MarkdownFormatBar(
+                    onFormat = { applyFormat(it) },
+                    enabled = state.ready && !state.busy,
+                )
                 OutlinedTextField(
-                    value = draftText,
-                    onValueChange = handlers.updateDraftText,
-                    modifier = Modifier.fillMaxWidth().semantics { contentDescription = "本机草稿正文" },
+                    value = draft,
+                    onValueChange = { value ->
+                        draft = value
+                        handlers.updateDraftText(value.text)
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .semantics { contentDescription = "本机草稿正文" }
+                        .onPreviewKeyEvent { event ->
+                            if (event.type != KeyEventType.KeyDown || !event.isCtrlPressed) {
+                                false
+                            } else when (event.key) {
+                                Key.B -> { applyFormat(MARKER_BOLD); true }
+                                Key.I -> { applyFormat(MARKER_ITALIC); true }
+                                else -> false
+                            }
+                        },
                     minLines = 2,
                     maxLines = 4,
-                    label = { Text("草稿正文（支持 Markdown，最多 8 KiB）") },
+                    label = { Text("草稿正文（支持 Markdown，最多 8 KiB；Ctrl+B 加粗 / Ctrl+I 斜体）") },
                 )
                 Button(
                     onClick = handlers.createDraft,

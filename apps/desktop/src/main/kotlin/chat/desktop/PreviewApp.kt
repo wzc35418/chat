@@ -57,6 +57,7 @@ import chat.presentation.preview.updateNodePublicKey
 import chat.presentation.preview.withOnboardingError
 import chat.presentation.preview.updateInviteeKeyPackagePath
 import chat.presentation.preview.withAboutError
+import chat.presentation.preview.withScaleNotice
 import chat.presentation.preview.withAppInfo
 import chat.presentation.preview.withCreatedGroup
 import chat.presentation.preview.withDataDir
@@ -120,6 +121,8 @@ fun main() = application {
     var storeState by remember { mutableStateOf(PreviewStoreState(busy = true)) }
     var aboutState by remember { mutableStateOf(chat.presentation.preview.PreviewAboutState()) }
     // 节点配置持久化（非机密）：首启读取，未配置则弹引导。
+    val uiPrefsStore = remember { UiPreferencesStore(UiPreferencesStore.defaultFile()) }
+    var uiPrefs by remember { mutableStateOf(runCatching { uiPrefsStore.load() }.getOrDefault(UiPreferences())) }
     val nodeConfigStore = remember { NodeConfigStore(NodeConfigStore.defaultFile()) }
     val initialNodeConfig = remember { runCatching { nodeConfigStore.load() }.getOrDefault(NodeConfig()) }
     var onboardingState by remember {
@@ -1277,7 +1280,14 @@ fun main() = application {
             exitApplication()
         },
     ) {
-        PreviewChatScreen(
+                // 界面缩放：只改显示密度（不影响业务语义）。
+        androidx.compose.runtime.CompositionLocalProvider(
+            androidx.compose.ui.platform.LocalDensity provides androidx.compose.ui.unit.Density(
+                density = androidx.compose.ui.platform.LocalDensity.current.density * uiPrefs.scale.coerceIn(0.85f, 1.4f),
+                fontScale = androidx.compose.ui.platform.LocalDensity.current.fontScale * uiPrefs.scale.coerceIn(0.85f, 1.4f),
+            ),
+        ) {
+PreviewChatScreen(
             identityState = identityState,
             identityHandlers = identityHandlers,
             storeState = storeState,
@@ -1325,8 +1335,17 @@ fun main() = application {
                 },
                 close = { onboardingState = null },
             ),
+            uiScale = uiPrefs.scale,
+            showPluginEntry = uiPrefs.showPlugins,
+            showAboutEntry = uiPrefs.showAbout,
             aboutState = aboutState,
             aboutHandlers = AboutHandlers(
+                setScale = { factor ->
+                    val next = uiPrefs.copy(scale = factor)
+                    runCatching { uiPrefsStore.save(next) }
+                        .onSuccess { uiPrefs = next; aboutState = aboutState.withScaleNotice(factor) }
+                        .onFailure { aboutState = aboutState.withAboutError("CONFIG_WRITE_FAILED", it.message) }
+                },
                 refresh = {
                     aboutState = aboutState.withDataDir(storeDirectory?.absolutePath ?: "（本机存储未初始化）")
                     runCatching {
@@ -1418,6 +1437,7 @@ fun main() = application {
                 },
             ),
         )
+        }
     }
 }
 

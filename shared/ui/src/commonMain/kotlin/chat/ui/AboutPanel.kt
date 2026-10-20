@@ -15,6 +15,8 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import chat.presentation.preview.PreviewAboutState
@@ -22,6 +24,8 @@ import chat.presentation.preview.PreviewAboutState
 /** 诊断回调。 */
 data class AboutHandlers(
     val refresh: () -> Unit = {},
+    /** 界面缩放（0.9 / 1.0 / 1.15 / 1.3）。 */
+    val setScale: (Float) -> Unit = {},
 ) {
     companion object {
         val None = AboutHandlers()
@@ -64,6 +68,21 @@ fun AboutPanel(
             LabeledRow("FFI 契约版本", info.ffiVersion)
             LabeledRow("平台", info.platform)
         } ?: Text("还没有读取版本信息。", style = MaterialTheme.typography.bodySmall)
+        HorizontalDivider(color = Color(0xFFE1E6E1))
+        Text("界面缩放", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf(0.9f to "小", 1.0f to "标准", 1.15f to "大", 1.3f to "特大").forEach { (factor, label) ->
+                TextButton(
+                    onClick = { handlers.setScale(factor) },
+                    modifier = Modifier.semantics { contentDescription = "界面缩放 " + label },
+                ) { Text(label + "（" + factor + "）", style = MaterialTheme.typography.labelSmall) }
+            }
+        }
+        Text(
+            "缩放只影响显示；偏好保存在本机 ui-preferences.json（非机密）。",
+            style = MaterialTheme.typography.labelSmall,
+            color = Color(0xFF5F6B63),
+        )
         HorizontalDivider(color = Color(0xFFE1E6E1))
         LabeledRow("host 库路径", state.hostLibraryPath.ifBlank { "（未解析）" })
         LabeledRow("数据目录", state.dataDir.ifBlank { "（未知）" })
