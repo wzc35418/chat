@@ -500,8 +500,8 @@ impl NodeClient {
         validate_bounded_id("device id", &device_id, MAX_DEVICE_ID_BYTES)
             .map_err(|error| NodeClientError::from_local_node_error(&error))?;
         limits.validate()?;
-        // 默认明文传输（本地/可信网络）；https 必须走 with_limits_and_trust。
-        let trust = TransportSecurity::Plain;
+        // 传输信任来自**进程级默认**（未配置 = 明文，本地/可信网络）；显式信任走 with_limits_and_trust。
+        let trust = crate::transport_security::default_trust();
         trust.validate(endpoint.url().as_str())?;
         let http = build_http_client(limits.timeout, &trust)?;
         Ok(Self {

@@ -242,3 +242,30 @@ impl TransportSecurity {
         }
     }
 }
+
+/// 进程级默认信任（FFI/应用一次性配置；未设置时等价 [TransportSecurity::Plain]）。
+///
+/// 为什么是全局：TLS 固定指纹是**部署级**配置，一个进程连的节点集合通常用同一套信任；
+/// 逐调用点传参会把 `TransportSecurity` 渗透进几十个构造点，反而更容易漏配。
+static DEFAULT_TRUST: std::sync::Mutex<Option<TransportSecurity>> = std::sync::Mutex::new(None);
+
+/// 设置进程默认信任（会覆盖之前的值）。
+pub fn set_default_trust(trust: TransportSecurity) {
+    let mut slot = DEFAULT_TRUST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = Some(trust);
+}
+
+/// 清除进程默认信任（回到明文 HTTP 语义）。
+pub fn clear_default_trust() {
+    let mut slot = DEFAULT_TRUST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = None;
+}
+
+/// 当前进程默认信任。
+pub fn default_trust() -> TransportSecurity {
+    DEFAULT_TRUST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .unwrap_or(TransportSecurity::Plain)
+}

@@ -177,3 +177,44 @@ async fn empty_fingerprint_set_is_rejected() {
     let error = trust.validate("https://127.0.0.1:9").expect_err("must reject");
     assert!(format!("{error:?}").contains("TLS_CERT_INVALID"), "unexpected: {error:?}");
 }
+
+/// 进程级默认信任：配置后所有 NodeClient 构造都按它校验（不必改每个调用点）。
+#[tokio::test]
+async fn global_default_trust_gates_https_endpoints() {
+    let trust = TransportSecurity::pinned_pem(CERT_PEM).expect("pem gives fingerprint");
+
+    // 1) 没配信任时 https 端点被拒（配置期，不发请求）。
+    chat_node_client::transport_security::clear_default_trust();
+    let plain = chat_node_client::NodeClient::new(
+        chat_node_client::NodeEndpoint::new("https://127.0.0.1:9", "node-x").expect("endpoint"),
+        "dev-1",
+        ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]),
+    );
+    assert!(plain.is_err(), "https without trust must be rejected");
+
+    // 2) 配置信任后同一端点可构造（说明走了 pinning 路径）。
+    chat_node_client::transport_security::set_default_trust(trust.clone());
+    let pinned = chat_node_client::NodeClient::new(
+        chat_node_client::NodeEndpoint::new("https://127.0.0.1:9", "node-x").expect("endpoint"),
+        "dev-1",
+        ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]),
+    );
+    assert!(pinned.is_ok(), "https with pinned trust must build: {:?}", pinned.err());
+
+    // 3) 配置了信任却用 http 端点 -> 仍是显式拒绝（假安全一律拒）。
+    let insecure = chat_node_client::NodeClient::new(
+        chat_node_client::NodeEndpoint::new("http://127.0.0.1:9", "node-x").expect("endpoint"),
+        "dev-1",
+        ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]),
+    );
+    assert!(insecure.is_err(), "pinned trust with plain http must be rejected");
+
+    // 4) 清除后回到明文语义。
+    chat_node_client::transport_security::clear_default_trust();
+    let back_to_plain = chat_node_client::NodeClient::new(
+        chat_node_client::NodeEndpoint::new("http://127.0.0.1:9", "node-x").expect("endpoint"),
+        "dev-1",
+        ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]),
+    );
+    assert!(back_to_plain.is_ok(), "plain http must work after clearing trust");
+}

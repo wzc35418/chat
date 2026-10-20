@@ -10,4 +10,5 @@ pub mod native_path;
 pub mod plugins_ffi;
 pub mod shared_core;
 pub mod sync_ffi;
+pub mod transport_ffi;
 uniffi::setup_scaffolding!();

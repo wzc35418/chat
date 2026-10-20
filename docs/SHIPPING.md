@@ -174,7 +174,7 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 
 ### 这一基线**没有**证明什么
 
-- TLS 两端可用（节点 `--tls-cert/--tls-key` 真监听；客户端 **严格 pinning**：只接受 SHA-256 指纹匹配的证书，系统根不参与；仍无证书轮换/OCSP）
+- TLS 两端可用（节点 `--tls-cert/--tls-key` 真监听；客户端**严格 pinning + 指纹集合轮换**，系统根不参与；信任可在 **FFI 进程级**一次性配置；**应用界面尚未接线**）
 - 跨机器/跨网段/NAT 可用（**不同时在线已可送达**：三进程错时投递 PASS）（**已证明不依赖回环接口**：LAN 地址 e2e PASS；但仍是同一台机器，无中继/NAT 穿透/TLS，明文 HTTP 仅限可信网络）；
 - 插件安全（权限门只是门槛，不是隔离；无签名）；
 - OS 级凭据保护（当前 DPAPI 文件封装 + 演示口令）；
