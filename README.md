@@ -1,3 +1,5 @@
+> 完整的「能做什么 / 不能做什么 / 为什么这样设计」见 [docs/FINAL_REPORT.md](docs/FINAL_REPORT.md)。
+
 # chat：跨平台加密聊天项目
 
 Kotlin / Compose Multiplatform 界面、Rust 内核、iroh 与 OpenMLS。已建立正式工程模块，当前提供一个可运行的 P0 双设备加密通信原型。
@@ -107,7 +109,7 @@ powershell -File tools\verify-all.ps1 -TargetDir C:\chat-target  # 把 cargo tar
 
 | 项 | 值 |
 | --- | --- |
-| 版本 / 基线 commit | 0.1.x / `f8907ba`（**11 阶段全绿**） |
+| 版本 / 基线 commit | 0.1.x / `e9b5c7a`（**最终基线，11 阶段全绿**） |
 | Rust 测试 | **1141 passed / 0 failed**（14 个 crate） |
 | 桌面冒烟 | **11 个 Gradle 任务**（含 pluginSmoke / pluginJvmSmoke 沙箱断言） |
 | Android | `assembleDebug` PASS |

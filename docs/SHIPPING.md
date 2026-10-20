@@ -262,3 +262,22 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 - 真正跨机器 / NAT / 中继服务（需外部条件）；
 - 证书到期的**自动刷新/告警横幅**（关于面板已可手动读取并显红）；信任列表管理页 / 吊销；
 - 后台通知、安装器/自动更新、soak。
+
+## 最终基线（2026-10-21 冻结，11 阶段全绿）
+
+| 项 | 值 |
+| --- | --- |
+| commit | `e9b5c7a` |
+| 一键回归 | `tools/verify-all.ps1` **11 阶段全 PASS**（rust-check 22s / gradle 32.8s / android 68.3s / package 16.8s / two-device 6.4s / lan 4.3s / tls 4.8s / offline 4.7s / tls-e2e 5.5s） |
+| 回归报告 | `build/verify-all-20261021-012749.md` |
+| 交付包 | `build/dist/Chat-app-0.1.0.zip`（81.79 MB） |
+| 免 JDK 启动器 | `build/dist/app-image/Chat/Chat.exe` |
+| 对外说明 | `docs/FINAL_REPORT.md`（能做什么 / 不能做什么 / 为什么这样设计） |
+| 手工验收 | `docs/manual-test-guide.md`（20 节）+ `docs/ACCEPTANCE_0.1.0.md` |
+
+### 本基线相比上一基线新增
+
+1. 证书到期**检测**（`cert_validity`，最小 DER 解析）+ 节点启动告警；
+2. 证书状态**公开端点** `/v1/tls/info`（匿名只读，未启用 TLS 返回 404）；
+3. 客户端**读取并展示**剩余天数（<30 天或已过期显红，含轮换提示）；
+4. 插件**签名信任列表**（持久化 + 归一 + 不静默接受新密钥）。
