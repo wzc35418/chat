@@ -50,7 +50,7 @@ fun main() {
         println("      未信任拒绝码：" + untrusted.code)
 
         // 2) 正常加载并执行。
-        val id = host.load(jar.absolutePath, "demo.echo", trusted = true)
+        val id = host.load(jar.absolutePath, "demo.echo", trusted = true, requireSignature = false)
         check(id == "demo.echo")
         check(host.loadedPluginIds() == listOf("demo.echo"))
         val output = host.runSelectedTextAction("demo.echo", "echo", "hello-p4")
@@ -93,7 +93,9 @@ fun main() {
         }
 
         // 3) 插件 id 不符 → 显式失败（清单与自报必须一致）。
-        val mismatch = runCatching { host.load(jar.absolutePath, "other.id", trusted = true) }.exceptionOrNull()
+        val mismatch = runCatching {
+            host.load(jar.absolutePath, "other.id", trusted = true, requireSignature = false)
+        }.exceptionOrNull()
         check(mismatch is PluginLoadException)
         println("      id 不符错误码：" + (mismatch as PluginLoadException).code)
 
@@ -116,6 +118,7 @@ fun main() {
 
         host.shutdown()
         verifySandbox()
+    verifySignatures(work)
 
     println("PASS plugin P4 slice: trusted load, SPI discovery, bounded execution, unload")
     println("PASS plugin sandbox slice: host classes blocked, sensitive packages gated by declared permissions")
@@ -183,4 +186,154 @@ private fun buildFixtureJar(work: File): File {
     }
     check(jarTool != null || true)
     return jar
+}
+
+/**
+ * 签名闸门冒烟：用 JDK 的 keytool/jarsigner **现场生成密钥并签名**一个插件 JAR，然后验证：
+ * 1) 已签名 + 正确指纹 -> 通过（并能读到指纹）；
+ * 2) 已签名 + 错误指纹 -> `PLUGIN_SIGNATURE_MISMATCH`；
+ * 3) 未签名 + 默认策略 -> `PLUGIN_SIGNATURE_MISSING`；
+ * 4) 未签名 + 显式允许 -> 通过；
+ * 5) **被篡改**的已签名 JAR -> `PLUGIN_SIGNATURE_INVALID`。
+ */
+private fun verifySignatures(work: File) {
+    val jdkHome = File(System.getProperty("java.home"))
+    fun jdkTool(name: String): String? {
+        val candidate = File(jdkHome, "bin" + File.separator + name + if (System.getProperty("os.name").lowercase().contains("windows")) ".exe" else "")
+        return if (candidate.isFile) candidate.absolutePath else null
+    }
+    val keytool = jdkTool("keytool")
+    val jarsigner = jdkTool("jarsigner")
+    if (keytool == null || jarsigner == null) {
+        println("SKIP plugin signature smoke: keytool/jarsigner not found")
+        return
+    }
+
+    val sourceJar = buildFixtureJar(File(work, "sig-src").apply { mkdirs() })
+    val keystore = File(work, "plugin-signing.p12")
+    val storePass = "changeit"
+    val alias = "chat-plugin-test"
+    val keytoolRun = ProcessBuilder(
+        keytool, "-genkeypair", "-alias", alias, "-keyalg", "RSA", "-keysize", "2048",
+        "-validity", "3650", "-dname", "CN=chat plugin test", "-storetype", "PKCS12",
+        "-keystore", keystore.absolutePath, "-storepass", storePass, "-keypass", storePass,
+    ).redirectErrorStream(true).start()
+    val keytoolOut = keytoolRun.inputStream.bufferedReader().readText()
+    check(keytoolRun.waitFor() == 0) { "keytool failed: " + keytoolOut }
+
+    val signedJar = File(work, "demo-signed.jar")
+    sourceJar.copyTo(signedJar, overwrite = true)
+    val signRun = ProcessBuilder(
+        jarsigner, "-keystore", keystore.absolutePath, "-storepass", storePass, "-keypass", storePass,
+        signedJar.absolutePath, alias,
+    ).redirectErrorStream(true).start()
+    val signOut = signRun.inputStream.bufferedReader().readText()
+    check(signRun.waitFor() == 0) { "jarsigner failed: " + signOut }
+
+    // 读出签名证书指纹（用与生产同一套 API）。
+    val fingerprint = readSignerFingerprint(signedJar)
+    check(fingerprint != null) { "signed jar must expose a signer certificate" }
+
+    // 1) 正确指纹 -> 通过
+    run {
+        val host = PluginJvmHost()
+        try {
+            host.load(signedJar.absolutePath, "demo.echo", trusted = true, expectedSignerFingerprint = fingerprint)
+            check(host.signerFingerprint("demo.echo") == fingerprint) { "应记录签名指纹" }
+            println("      signed plugin accepted with matching fingerprint: " + fingerprint!!.take(16) + "...")
+        } finally {
+            host.shutdown()
+        }
+    }
+
+    // 2) 错误指纹 -> 不匹配
+    run {
+        val host = PluginJvmHost()
+        try {
+            val error = runCatching {
+                host.load(
+                    signedJar.absolutePath,
+                    "demo.echo",
+                    trusted = true,
+                    expectedSignerFingerprint = "0".repeat(64),
+                )
+            }.exceptionOrNull()
+            check(error is PluginLoadException && error.code == "PLUGIN_SIGNATURE_MISMATCH") {
+                "expected PLUGIN_SIGNATURE_MISMATCH, got " + error
+            }
+            println("      wrong fingerprint rejected: " + (error as PluginLoadException).code)
+        } finally {
+            host.shutdown()
+        }
+    }
+
+    // 3) 未签名 + 默认策略 -> 拒绝
+    run {
+        val host = PluginJvmHost()
+        try {
+            val error = runCatching { host.load(sourceJar.absolutePath, "demo.echo", trusted = true) }.exceptionOrNull()
+            check(error is PluginLoadException && error.code == "PLUGIN_SIGNATURE_MISSING") {
+                "expected PLUGIN_SIGNATURE_MISSING, got " + error
+            }
+            println("      unsigned plugin rejected by default policy")
+        } finally {
+            host.shutdown()
+        }
+    }
+
+    // 4) 未签名 + 显式允许 -> 通过
+    run {
+        val host = PluginJvmHost()
+        try {
+            host.load(sourceJar.absolutePath, "demo.echo", trusted = true, requireSignature = false)
+            println("      unsigned plugin accepted only when explicitly allowed")
+        } finally {
+            host.shutdown()
+        }
+    }
+
+    // 5) 篡改已签名 JAR -> 签名无效
+    run {
+        val tampered = File(work, "demo-tampered.jar")
+        signedJar.copyTo(tampered, overwrite = true)
+        val bytes = tampered.readBytes()
+        // 在 JAR 中段翻一个字节（不动 central directory，保证仍可打开但内容被改）。
+        val at = bytes.size / 2
+        bytes[at] = (bytes[at].toInt() xor 0x5a).toByte()
+        tampered.writeBytes(bytes)
+        val host = PluginJvmHost()
+        try {
+            val error = runCatching {
+                host.load(tampered.absolutePath, "demo.echo", trusted = true, expectedSignerFingerprint = fingerprint)
+            }.exceptionOrNull()
+            check(error is PluginLoadException && error.code == "PLUGIN_SIGNATURE_INVALID") {
+                "tampered jar must be rejected, got " + error
+            }
+            println("      tampered jar rejected: " + (error as PluginLoadException).code)
+        } finally {
+            host.shutdown()
+        }
+    }
+    println("PASS plugin signature slice: signed accepts, wrong fingerprint/unsigned/tampered rejected")
+}
+
+/** 用生产同款 API 读签名指纹（测试辅助）。 */
+private fun readSignerFingerprint(jar: File): String? {
+    val archive = java.util.jar.JarFile(jar, true)
+    return try {
+        val entries = archive.entries()
+        var result: String? = null
+        while (entries.hasMoreElements()) {
+            val entry = entries.nextElement()
+            archive.getInputStream(entry).use { it.readBytes() }
+            val signers = entry.codeSigners ?: continue
+            val certificate = signers.firstOrNull()?.signerCertPath?.certificates?.firstOrNull() ?: continue
+            val digest = java.security.MessageDigest.getInstance("SHA-256").digest(certificate.encoded)
+            result = digest.joinToString("") { b -> String.format("%02x", b.toInt() and 0xff) }
+            break
+        }
+        result
+    } finally {
+        runCatching { archive.close() }
+    }
 }

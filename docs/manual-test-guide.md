@@ -238,3 +238,27 @@ two-device demo: PASS
 6. 「清除（回到明文）」后模式变回 **明文 HTTP**。
 
 配置落在 `%APPDATA%\Chat\node-config.json` 的 `tlsFingerprints` 数组（非机密）。
+
+
+## 19. 插件签名（R-232）
+
+**默认策略：插件必须已签名**（未签名会被拒绝，错误码 `PLUGIN_SIGNATURE_MISSING`）。
+
+签名与验证（测试/自托管场景）：
+
+```powershell
+# 1. 生成密钥（一次性）
+keytool -genkeypair -alias my-plugin -keyalg RSA -keysize 2048 -validity 3650   -dname "CN=my plugin" -storetype PKCS12 -keystore plugin.p12 -storepass changeit -keypass changeit
+
+# 2. 签名插件 JAR（先构建出 jar）
+jarsigner -keystore plugin.p12 -storepass changeit -keypass changeit my-plugin.jar my-plugin
+
+# 3. 看签名证书指纹（SHA-256，用来钉住）
+keytool -list -v -keystore plugin.p12 -storepass changeit | Select-String "SHA256:"
+```
+
+**验收**：
+1. 签名后的 JAR → 加载成功；
+2. **改一个字节**（篡改） → 必须失败 `PLUGIN_SIGNATURE_INVALID`；
+3. 未签名 JAR → 默认失败 `PLUGIN_SIGNATURE_MISSING`；
+4. 给了错误指纹 → `PLUGIN_SIGNATURE_MISMATCH`。

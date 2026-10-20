@@ -236,4 +236,4 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 - 真正跨机器 / NAT / 中继服务；
 - 证书轮换自动化与到期告警；
 - 后台通知、安装器/自动更新、soak；
-- 插件签名信任链（权限门已有）。
+- 插件签名信任链的**吊销/信任列表 UI**（签名校验本身已实现，见 R-232）。

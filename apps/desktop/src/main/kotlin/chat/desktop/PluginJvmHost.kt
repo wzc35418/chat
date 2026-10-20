@@ -31,6 +31,12 @@ class PluginJvmHost {
     )
 
     private val loaded = LinkedHashMap<String, Loaded>()
+
+    /** 已加载插件的签名证书 SHA-256 指纹（未签名/未校验时为空）。 */
+    private val lastSignerFingerprints = LinkedHashMap<String, String>()
+
+    /** 某个插件的签名指纹（诊断用；未签名返回 null）。 */
+    fun signerFingerprint(pluginId: String): String? = lastSignerFingerprints[pluginId]
     private val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "chat-plugin-exec").apply { isDaemon = true }
     }
@@ -65,6 +71,9 @@ class PluginJvmHost {
         expectedId: String,
         trusted: Boolean,
         permissions: Set<String> = emptySet(),
+        // 签名策略：默认**要求签名**（自签亦可），指纹不匹配 / 未签名一律拒绝。
+        requireSignature: Boolean = true,
+        expectedSignerFingerprint: String? = null,
     ): String {
         if (!trusted) {
             throw PluginLoadException("PLUGIN_TRUST_REQUIRED", "插件加载需要用户显式确认信任（无沙箱执行）")
@@ -73,6 +82,12 @@ class PluginJvmHost {
         if (!jar.isFile) throw PluginLoadException("PLUGIN_PACKAGE_INVALID", "插件 JAR 不存在")
         if (jar.length() > 8L * 1024 * 1024) throw PluginLoadException("PLUGIN_PACKAGE_TOO_LARGE", "插件 JAR 超过 8 MiB")
         loaded[expectedId]?.let { throw PluginLoadException("PLUGIN_STATE_CONFLICT", "插件已加载：" + expectedId) }
+
+        // 签名闸门（与权限门并列的第二道闸）：先验完整性，再比指纹。
+        val signer = PluginSignatures.verify(jar, requireSignature, expectedSignerFingerprint)
+        if (signer.fingerprint != null) {
+            lastSignerFingerprints[expectedId] = signer.fingerprint
+        }
 
         // 父加载器只暴露 SDK 接口；并按清单权限拦截敏感包（最小可行沙箱，不是安全边界）。
         val unknown = permissions - PluginSandboxClassLoader.KNOWN
@@ -136,6 +151,7 @@ class PluginJvmHost {
         composerActions.remove(pluginId)
         composerImpls.remove(pluginId)
         commandImpls.remove(pluginId)
+        lastSignerFingerprints.remove(pluginId)
         statusBarItems.remove(pluginId)
         return true
     }
