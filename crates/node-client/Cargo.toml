@@ -13,6 +13,9 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ed25519-dalek.workspace = true
+# 严格 pinning：自定义 rustls verifier 需要 rustls + sha2（证书 SHA-256 指纹）。
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
+sha2.workspace = true
 
 [dev-dependencies]
 # 真 TCP 端到端测试：在本进程内用 axum 起 node-api 路由，需要 tokio 的 net/io-util。

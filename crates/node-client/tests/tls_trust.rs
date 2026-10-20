@@ -1,13 +1,10 @@
-//! 传输安全（https + 固定证书）真握手测试：用**自签证书**起一个本地 TLS 服务端。
+//! 传输安全（https + 证书指纹固定 / 严格 pinning）真握手测试。
 //!
 //! 断言：
-//! 1) 给了对应证书 -> TLS 握手成功、HTTP 请求成功；
-//! 2) https 但没给信任 -> 配置期显式拒绝（`TLS_TRUST_REQUIRED`），**不静默降级**；
-//! 3) http 却给了固定证书 -> 配置期显式拒绝（`INSECURE_TRANSPORT`）；
-//! 4) 给的是**另一张**自签证书 -> 握手失败（客户端不会接受未知证书）。
-//!
-//! 诚实边界：本实现是"加信任锚"，系统根仍启用（reqwest 0.13 该 API 未暴露关闭开关），
-//! 因此**不是严格 pinning**；严格 pinning 需要 rustls 自定义验证器（后续）。
+//! 1) 指纹匹配 -> TLS 握手成功、HTTP 200（生产代码路径 `rustls_client_config`）；
+//! 2) https 但没给信任 -> 配置期显式拒绝（`TLS_TRUST_REQUIRED`）；
+//! 3) http 却给了指纹 -> 配置期显式拒绝（`INSECURE_TRANSPORT`）；
+//! 4) 指纹不匹配（换成另一张证书的指纹）-> 握手失败，**不是**靠系统根放过的。
 
 use std::sync::Arc;
 
@@ -17,7 +14,6 @@ use tokio::net::TcpListener;
 
 const CERT_PEM: &[u8] = include_bytes!("fixtures/tls/test-cert.pem");
 const KEY_PEM: &[u8] = include_bytes!("fixtures/tls/test-key.pem");
-/// 另一张自签证书：用于"客户端不认识这张证书"的负例。
 const OTHER_CERT_PEM: &[u8] = include_bytes!("fixtures/tls/test-other-cert.pem");
 
 fn der_from_pem(pem: &[u8], label: &str) -> Vec<u8> {
@@ -52,9 +48,8 @@ fn base64_decode(input: &str) -> Vec<u8> {
     out
 }
 
-/// 起一个只回一句 HTTP 200 的 TLS 服务端，返回 (地址, 关闭句柄)。
+/// 起一个只回一句 HTTP 200 的 TLS 服务端，返回 (端点, 任务句柄)。
 async fn spawn_tls_server() -> (String, tokio::task::JoinHandle<()>) {
-    // 测试进程里显式装 ring provider（我们的 rustls 依赖同时可能引入多个 provider）。
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certs = vec![rustls::pki_types::CertificateDer::from(der_from_pem(CERT_PEM, "CERTIFICATE"))];
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(der_from_pem(KEY_PEM, "PRIVATE KEY").into());
@@ -87,54 +82,54 @@ async fn spawn_tls_server() -> (String, tokio::task::JoinHandle<()>) {
     (format!("https://{address}"), handle)
 }
 
-fn config_error(result: Result<reqwest::Client, chat_node_client::error::NodeClientError>) -> String {
-    match result {
-        Ok(_) => panic!("expected configuration error"),
-        Err(error) => format!("{error:?}"),
+fn client_for(trust: &TransportSecurity) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Some(config) = trust.rustls_client_config().expect("config builds") {
+        builder = builder.use_preconfigured_tls(config);
     }
+    builder.build().expect("client builds")
 }
 
 #[tokio::test]
-async fn pinned_self_signed_certificate_goes_through() {
+async fn pinned_fingerprint_goes_through() {
     let (endpoint, handle) = spawn_tls_server().await;
-    let trust = TransportSecurity::pinned_pem(CERT_PEM.to_vec());
+    let trust = TransportSecurity::pinned_pem(CERT_PEM).expect("pem gives fingerprint");
     trust.validate(&endpoint).expect("endpoint and trust agree");
-    let client = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(CERT_PEM).expect("pem accepted"))
-        .build()
-        .expect("client builds");
-    let response = client
+    let response = client_for(&trust)
         .get(endpoint + "/v1/health")
         .send()
         .await
-        .expect("TLS handshake must succeed with the pinned certificate");
+        .expect("TLS handshake must succeed with the pinned fingerprint");
     assert_eq!(response.status().as_u16(), 200);
     handle.abort();
 }
 
 #[tokio::test]
 async fn https_without_trust_is_rejected_before_any_request() {
-    let trust = TransportSecurity::Plain;
-    let error = trust.validate("https://127.0.0.1:9").expect_err("must reject");
+    let error = TransportSecurity::Plain
+        .validate("https://127.0.0.1:9")
+        .expect_err("must reject");
     assert!(format!("{error:?}").contains("TLS_TRUST_REQUIRED"), "unexpected: {error:?}");
 }
 
 #[tokio::test]
-async fn pinned_certificate_with_plain_http_is_rejected() {
-    let trust = TransportSecurity::pinned_pem(CERT_PEM.to_vec());
+async fn pinned_fingerprint_with_plain_http_is_rejected() {
+    let trust = TransportSecurity::pinned_pem(CERT_PEM).expect("pem gives fingerprint");
     let error = trust.validate("http://127.0.0.1:9").expect_err("must reject");
     assert!(format!("{error:?}").contains("INSECURE_TRANSPORT"), "unexpected: {error:?}");
 }
 
 #[tokio::test]
-async fn unknown_certificate_fails_the_handshake() {
+async fn mismatched_fingerprint_fails_the_handshake() {
     let (endpoint, handle) = spawn_tls_server().await;
-    // 客户端只信任**另一张**自签证书：与服务端那张不匹配，握手必须失败。
-    let client = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(OTHER_CERT_PEM).expect("pem accepted"))
-        .build()
-        .expect("client builds");
-    let result = client.get(endpoint + "/v1/health").send().await;
-    assert!(result.is_err(), "unknown certificate must not be accepted");
+    // 用**另一张**证书的指纹：握手必须失败（不靠系统根放过）。
+    let trust = TransportSecurity::pinned_pem(OTHER_CERT_PEM).expect("pem gives fingerprint");
+    let result = client_for(&trust).get(endpoint + "/v1/health").send().await;
+    assert!(result.is_err(), "mismatched fingerprint must fail the handshake");
+    let text = format!("{:?}", result.expect_err("must fail"));
+    assert!(
+        text.contains("PIN_MISMATCH") || text.to_lowercase().contains("certificate"),
+        "error should mention the certificate mismatch, got: {text}"
+    );
     handle.abort();
 }

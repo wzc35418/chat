@@ -702,6 +702,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
  "tokio-rustls",
 ]

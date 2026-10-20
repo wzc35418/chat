@@ -441,11 +441,10 @@ fn build_http_client(
         // 不跟随重定向：跳转后的路径与签名原文不再一致，属于协议违规。
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("chat-node-client/1");
-    if let TransportSecurity::PinnedCertificate(pem) = trust {
-        builder = builder.add_root_certificate(
-            reqwest::Certificate::from_pem(pem)
-                .map_err(|_| NodeClientError::config("TLS_CERT_INVALID: 固定证书 PEM 无法解析"))?,
-        );
+    if let TransportSecurity::PinnedFingerprint(fingerprint) = trust {
+        // 严格 pinning：系统根完全不参与，只接受指纹匹配的那张证书。
+        let config = crate::transport_security::pinned_client_config(fingerprint)?;
+        builder = builder.use_preconfigured_tls(config);
     }
     builder
         .build()
