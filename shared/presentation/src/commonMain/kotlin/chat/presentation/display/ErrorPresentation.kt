@@ -388,6 +388,14 @@ private fun safeDiagnosticToken(raw: String?): String? {
 /** 传输/信任类底层标记：出现这些说明是**本机信任配置**的问题，需要明确的排障指引。 */
 private val TRANSPORT_TRUST_MARKERS = listOf("PIN_MISMATCH", "TLS_TRUST_REQUIRED", "INSECURE_TRANSPORT", "TLS_CERT_INVALID")
 
+// 证书与地址不匹配（部署最常见的坑）：证书 SAN 不含正在连接的 IP/域名时，JSSE 报
+// "No subject alternative names matching IP address ..."。
+private val HOSTNAME_MISMATCH_MARKERS = listOf(
+    "No subject alternative names",
+    "certificate_unknown",
+    "PKIX path",
+)
+
 /**
  * 由**原始码 + 原始原因**生成可展示错误（UI 直接用，不必经过 CoreFailure）。
  *
@@ -410,6 +418,20 @@ fun presentRawError(
         ?.trim()
         ?.take(300)
         ?.ifEmpty { null }
+    // 先判「证书与地址不匹配」：这类错误最容易让用户误以为是网络问题。
+    if (HOSTNAME_MISMATCH_MARKERS.any { marker -> safeReason?.contains(marker) == true }) {
+        return UserActionableError(
+            title = "证书与连接地址不匹配",
+            detail = "节点证书里没有你正在连接的地址（SAN 不含该 IP/域名）。换过 IP 或重新生成过证书时：用 -PublicIp <新 IP> 重新生成部署包，或把节点地址改成证书里的地址。",
+            actionLabel = "核对证书 SAN 与节点地址",
+            action = ErrorAction.NONE,
+            retryable = false,
+            diagnosticCode = safeDiagnosticToken(trimmedCode),
+            diagnosticId = null,
+            autoRetryAllowed = false,
+            reason = safeReason,
+        )
+    }
     val marker = TRANSPORT_TRUST_MARKERS.firstOrNull { marker -> safeReason?.contains(marker) == true }
     val base = knownErrors[trimmedCode]
     val transportTitle = marker?.let {

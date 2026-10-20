@@ -1369,6 +1369,15 @@ private fun checkRawErrorPresentation() {
     check(known.title == "本地数据已锁定") { "已知码应使用冻结文案，实际：" + known.title }
     check(known.reason == "another writer holds the store") { "原因应原样保留" }
 
+    // 3b) 证书与地址不匹配 -> 必须给"核对 SAN"的指引（部署最常见坑）
+    val sanMismatch = chat.presentation.display.presentRawError(
+        "TLS_INFO_UNAVAILABLE",
+        "javax.net.ssl.SSLHandshakeException: java.security.cert.CertificateException: No subject alternative names matching IP address 127.0.0.1 found",
+    )
+    check(sanMismatch.title.contains("证书与连接地址")) { "SAN 不匹配应给明确标题，实际：" + sanMismatch.title }
+    check(sanMismatch.detail.contains("SAN")) { "说明里应提到 SAN" }
+    check(!sanMismatch.retryable) { "证书/地址不匹配不应标成可重试" }
+
     // 4) 未知码走回退，不崩
     val unknown = chat.presentation.display.presentRawError("SOME_NEW_CODE", null)
     check(unknown.title == "操作未完成") { "未知码应回退，实际：" + unknown.title }
