@@ -129,7 +129,8 @@ pub fn error_projection(error: &anyhow::Error) -> (&'static str, String) {
 
 /// 脱敏后的错误消息：截断 300 字符并把换行压平，避免把 SQL 或长输入塞进 UI。
 pub fn error_message(error: &anyhow::Error) -> String {
-    let text = error.to_string();
+    // 用格式化链取整条错误链：只取顶层会丢掉 node-client 的真实原因（如 PIN_MISMATCH）。
+    let text = format!("{error:#}");
     let truncated: String = text.chars().take(300).collect();
     truncated.replace('\n', " ")
 }

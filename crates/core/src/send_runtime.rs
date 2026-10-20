@@ -516,11 +516,12 @@ fn prepare_ports(
     if let Some(public_key) = config.node_public_key {
         endpoint = endpoint.with_node_public_key(public_key);
     }
-    let client = NodeClient::new(endpoint, seeds.device_id.clone(), signing_key).map_err(|_| {
+    let client = NodeClient::new(endpoint, seeds.device_id.clone(), signing_key).map_err(|error| {
         anyhow::Error::new(SyncError::new(
             ErrorCode::InvalidTarget,
             "node client could not be created from the persisted device identity",
         ))
+        .context(format!("node-client: {}", error.detail()))
     })?;
     let submitter = NodeClientSubmitter::new(client, group_id.clone()).map_err(anyhow::Error::new)?;
     Ok(PreparedPorts {
