@@ -460,3 +460,30 @@ fun presentRawError(
         reason = safeReason,
     )
 }
+
+/** 证书剩余天数的展示视图（纯函数，便于单测）。 */
+data class TlsCertificateView(
+    /** 人话标签，例："剩余 3649 天" / "已过期 3 天"。 */
+    val label: String,
+    /** 是否应显红（已过期或 < 30 天）。 */
+    val critical: Boolean,
+    /** 是否应在 30 天预警区间。 */
+    val warning: Boolean,
+)
+
+/**
+ * 把 `days_remaining` 变成可展示视图。
+ *
+ * 语义：已过期（<=0）与 <30 天都算 critical（要显红），30..=90 天给 warning，其余正常。
+ * 负数按“已过期 N 天”表达，不显示负号，避免用户误读。
+ */
+fun presentTlsCertificate(daysRemaining: Int): TlsCertificateView {
+    val label = if (daysRemaining <= 0) {
+        "已过期 " + (-daysRemaining) + " 天"
+    } else {
+        "剩余 " + daysRemaining + " 天"
+    }
+    val critical = daysRemaining < 30
+    val warning = daysRemaining in 30..90
+    return TlsCertificateView(label = label, critical = critical, warning = warning)
+}

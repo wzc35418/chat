@@ -41,7 +41,7 @@
     "未验证 MLS/密码学/跨端/网络/部署行为",
     "SQL仅在内存普通SQLite中验证，不证明加密存储可用"
   ],
-  "fileCount": 644,
+  "fileCount": 645,
   "functionCount": 197,
   "markdownLinks": 1700
 }

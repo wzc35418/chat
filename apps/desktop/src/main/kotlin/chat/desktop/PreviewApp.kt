@@ -147,6 +147,8 @@ fun main() = application {
     var keySlotSummary by remember { mutableStateOf("密钥槽未初始化") }
     var transportMode by remember { mutableStateOf("明文 HTTP") }
     var transportFingerprintText by remember { mutableStateOf("") }
+    var tlsCertificateText by remember { mutableStateOf("") }
+    var tlsCertificateCritical by remember { mutableStateOf(false) }
     var keySlotBackend by remember { mutableStateOf(KeySlotBackend.None) }
     var keySlotDetail by remember { mutableStateOf("") }
     var keySlotMigrationPending by remember { mutableStateOf(false) }
@@ -1426,6 +1428,8 @@ PreviewChatScreen(
             showAboutEntry = uiPrefs.showAbout,
             transportMode = transportMode,
             transportFingerprints = transportFingerprintText,
+            tlsCertificate = tlsCertificateText,
+            tlsCertificateCritical = tlsCertificateCritical,
             keySlotBackend = keySlotBackend.label,
             keySlotDetail = keySlotDetail,
             keySlotSummary = keySlotSummary,
@@ -1435,6 +1439,44 @@ PreviewChatScreen(
             aboutState = aboutState,
             aboutHandlers = AboutHandlers(
                 updateTransportFingerprints = { transportFingerprintText = it },
+                refreshTlsCertificate = {
+                    scope.launch {
+                        val saved = runCatching { nodeConfigStore.load() }.getOrNull()
+                        val endpoint = saved?.endpointUrl?.trim().orEmpty()
+                        if (endpoint.isEmpty()) {
+                            tlsCertificateText = "（未配置节点地址）"
+                            tlsCertificateCritical = false
+                            aboutState = aboutState.withAboutError("INVALID_INPUT", "先在首启引导里配置节点地址")
+                            return@launch
+                        }
+                        runCatching {
+                            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                TlsInfoFetcher.fetch(endpoint, saved?.tlsFingerprints ?: emptyList())
+                            }
+                        }.onSuccess { info ->
+                            if (info == null) {
+                                tlsCertificateText = "（该节点未启用 TLS）"
+                                tlsCertificateCritical = false
+                                aboutState = aboutState.copy(notice = "节点未启用 TLS，无证书信息", lastErrorCode = null)
+                            } else {
+                                val view = chat.presentation.display.presentTlsCertificate(info.daysRemaining)
+                                tlsCertificateText = view.label
+                                tlsCertificateCritical = view.critical
+                                aboutState = aboutState.copy(
+                                    notice = "证书状态：" + view.label,
+                                    lastErrorCode = null,
+                                )
+                            }
+                        }.onFailure { error ->
+                            tlsCertificateText = "（读取失败）"
+                            tlsCertificateCritical = false
+                            aboutState = aboutState.withAboutError(
+                                "TLS_INFO_UNAVAILABLE",
+                                error.message ?: error::class.simpleName,
+                            )
+                        }
+                    }
+                },
                 applyTransportTrust = { raw ->
                     val parsed = raw.split(',', ' ', '\n', '\t')
                         .map { it.trim().lowercase() }

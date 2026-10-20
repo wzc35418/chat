@@ -37,6 +37,8 @@ data class AboutHandlers(
     val applyTransportTrust: (String) -> Unit = {},
     /** 更新指纹输入框。 */
     val updateTransportFingerprints: (String) -> Unit = {},
+    /** 重新读取节点证书状态（/v1/tls/info）。 */
+    val refreshTlsCertificate: () -> Unit = {},
 ) {
     companion object {
         val None = AboutHandlers()
@@ -64,6 +66,10 @@ fun AboutPanel(
     transportMode: String = "",
     /** 输入框里的指纹文本。 */
     transportFingerprints: String = "",
+    /** 节点证书剩余天数（人话），空 = 未取到。 */
+    tlsCertificate: String = "",
+    /** 证书是否应显红（过期或 < 30 天）。 */
+    tlsCertificateCritical: Boolean = false,
     /** 是否正在等待"确认迁移"。 */
     keySlotMigrationPending: Boolean = false,
     /** 迁移目标后端是否可用（不可用时按钮禁用并说明）。 */
@@ -96,6 +102,18 @@ fun AboutPanel(
         HorizontalDivider(color = Color(0xFFE1E6E1))
         Text("传输安全（TLS）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
         LabeledRow("当前模式", transportMode.ifBlank { "未配置" })
+        LabeledRow("节点证书", tlsCertificate.ifBlank { "（未读取）" })
+        if (tlsCertificateCritical && tlsCertificate.isNotBlank()) {
+            Text(
+                "证书快过期或已过期：请尽快轮换，并同步更新指纹（否则客户端会连不上）。",
+                style = MaterialTheme.typography.labelSmall,
+                color = Color(0xFFB3261E),
+            )
+        }
+        TextButton(
+            onClick = handlers.refreshTlsCertificate,
+            modifier = Modifier.semantics { contentDescription = "刷新节点证书状态" },
+        ) { Text("刷新证书状态", style = MaterialTheme.typography.labelMedium) }
         Text(
             "指纹 = 节点证书的 SHA-256（64 位小写十六进制）。填了就只接受这些证书的 https；留空 = 明文 HTTP（仅限可信网络）。",
             style = MaterialTheme.typography.labelSmall,

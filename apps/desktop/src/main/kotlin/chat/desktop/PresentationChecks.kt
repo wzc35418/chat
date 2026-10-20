@@ -161,6 +161,7 @@ fun main() = runBlocking {
     checkMessageCardsPresentation()
     checkMarkdownFormatting()
     checkRawErrorPresentation()
+    checkTlsCertificatePresentation()
     println("PASS DS-02/DS-04/DS-05/DS-07/DS-08/DS-09/DS-10/DS-11/DS-12 presentation checks")
 }
 
@@ -1389,4 +1390,26 @@ private fun checkRawErrorPresentation() {
     check(long.reason != null && long.reason!!.length == 300) { "原因应截断到 300 字符" }
 
     println("PASS error presentation: transport-trust guidance, frozen copy, unknown fallback, 300-char reason truncation")
+}
+
+/** 证书剩余天数展示：过期/预警/正常三态，且负数用“已过期 N 天”表达。 */
+private fun checkTlsCertificatePresentation() {
+    val expired = chat.presentation.display.presentTlsCertificate(-3)
+    check(expired.label == "已过期 3 天") { "过期应为无负号的人话，实际：" + expired.label }
+    check(expired.critical) { "过期必须显红" }
+
+    val soon = chat.presentation.display.presentTlsCertificate(12)
+    check(soon.label == "剩余 12 天") { "剩余天数文案不对：" + soon.label }
+    check(soon.critical) { "少于 30 天必须显红" }
+    check(!soon.warning) { "少于 30 天不应只算 warning" }
+
+    val warn = chat.presentation.display.presentTlsCertificate(45)
+    check(warn.warning) { "30..90 天应进入 warning" }
+    check(!warn.critical) { "45 天不该显红" }
+
+    val healthy = chat.presentation.display.presentTlsCertificate(3649)
+    check(healthy.label == "剩余 3649 天") { "正常文案不对：" + healthy.label }
+    check(!healthy.critical && !healthy.warning) { "长期证书不该告警" }
+
+    println("PASS tls certificate presentation: expired/soon/warning/healthy states")
 }
