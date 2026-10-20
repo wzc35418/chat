@@ -46,6 +46,7 @@ class NativePluginService(private val native: PluginsFfi) : PluginService {
             entryCount = view.entryCount.toInt(),
             compressedBytes = view.compressedBytes.toLong(),
             uncompressedBytes = view.uncompressedBytes.toLong(),
+            permissions = view.permissions,
         )
     }
 

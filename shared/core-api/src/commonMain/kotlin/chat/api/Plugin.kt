@@ -69,4 +69,6 @@ data class PluginPackageView(
     val entryCount: Int,
     val compressedBytes: Long,
     val uncompressedBytes: Long,
+    /** 清单声明的权限（原样；沙箱只认 network/filesystem/process/host-ui 四个）。 */
+    val permissions: List<String> = emptyList(),
 )

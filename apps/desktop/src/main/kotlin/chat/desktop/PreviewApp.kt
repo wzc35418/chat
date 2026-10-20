@@ -1387,7 +1387,12 @@ fun main() = application {
                         val view = pluginState.packageView ?: return@launch
                         pluginState = pluginState.beginBusy()
                         runCatching {
-                            host.load(pluginState.jarPath, view.pluginId, pluginState.trusted)
+                            // 清单声明的权限 → 沙箱：只把四个沙箱权限透给类加载器（其余是用户可见权限）。
+                            val sandboxPermissions = view.permissions
+                                .map { it.trim() }
+                                .filter { it in PluginSandboxClassLoader.KNOWN }
+                                .toSet()
+                            host.load(pluginState.jarPath, view.pluginId, pluginState.trusted, sandboxPermissions)
                             host.loadedPluginIds()
                         }.onSuccess { pluginState = pluginState.withLoadedPlugins(it) }
                             .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }

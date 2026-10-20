@@ -91,7 +91,7 @@ MVP 只有声明式配置与用户明确选择可信的 JVM 插件。SDK 权限�
 | `INVALID_PLUGIN_VERSION` | 版本字符串非法 | 否 | 插件新增码 |
 | `UNKNOWN_EXTENSION_POINT` | 清单声明未知扩展点 | 否 | 插件新增码 |
 | `UNKNOWN_CAPABILITY` | 清单声明未知能力 | 否 | 插件新增码 |
-| `UNKNOWN_PERMISSION` | 清单声明未知权限 | 否 | 插件新增码 |
+| `UNKNOWN_PERMISSION` | 清单声明未知权限（**历史码**：TASK-129 起权限声明非法统一走 `INVALID_PLUGIN_PACKAGE`，本码不再用于权限声明，仅保留在码表布局中） | 否 | 插件新增码 |
 | `CAPABILITY_NOT_DECLARED` | 扩展点缺所需能力 / 使用私有存储未声明能力 | 否 | 插件新增码 |
 | `PLUGIN_NOT_INSTALLED` | 未安装即启动/停止 | 否 | 插件新增码 |
 | `PLUGIN_NOT_RUNNING` | 停止后仍用旧句柄调用 | 否 | 插件新增码 |
@@ -842,6 +842,55 @@ Keep 升级后旧键仍可读且重开仍可读；Namespace 迁移后 `v1.0.0/a`
    （安全方向是"只增不删"），重跑会跳过已复制的键；但没有跨键的单一物理事务。
 2. 部分迁移若恰好突破配额，会在预检阶段就拒绝（预检按最坏情况合计），仍不做半迁移。
 3. **清理只认 `uninstalled`**：`installed/stopped/running` 行即使很久没更新也不会被删。
+## 权限声明（清单 `permissions`，TASK-129，2026-10-18）
+
+> **码表口径（冻结）**：清单非法（含权限非法/大小写不符/重复/超限）**统一用 `INVALID_PLUGIN_PACKAGE`**，
+> 本模块**没有**也**不再新增** `INVALID_MANIFEST`；`UNKNOWN_PERMISSION` 是历史码，**不再用于权限声明**
+> （枚举与码表保留只为不破坏既有码表布局）。运行时清单校验与包结构校验**两条路径同码**，
+> 由 [crates/plugins/tests/permissions.rs](../../crates/plugins/tests/permissions.rs) 钉住 —— 以后看到两个码
+> 不要以为是两套规则。
+
+**本轮重要事实：该字段与权限枚举早就存在**（P4 早期就有 `UserSelectedContent` / `ComposeDraft` 两个
+**用户可见权限**，带完整校验）。本轮按沙箱需求扩充，**没有另起一套字段**：
+
+~~~text
+"permissions": ["network", "filesystem", "process", "host-ui"]   // 可选
+~~~
+
+| 值 | 类别 | 含义 |
+|---|---|---|
+| `network` | 沙箱 | 允许发起网络访问 |
+| `filesystem` | 沙箱 | 允许读写插件私有目录之外的文件系统 |
+| `process` | 沙箱 | 允许启动子进程 |
+| `host-ui` | 沙箱 | 允许扩展宿主 UI |
+| `UserSelectedContent` / `ComposeDraft` | 既有（向后兼容） | P4 早期用户可见权限 |
+
+规则（运行时清单校验与**包结构校验同一套**）：
+
+- 字段**可选**：不写 = 无敏感权限（旧清单照常通过，`serde(default)` + 空集合）；
+- **大小写敏感**：`Network` / `HOST-UI` 都不合法；
+- 按清单顺序**去重**（重复 → 拒绝）；
+- 最多 [`MAX_PERMISSIONS`]（本轮 4 → **8**）项，超限拒绝；
+- 未知值 → **清单非法**（本模块冻结码 `INVALID_PLUGIN_PACKAGE`，reason `unknown permission declaration`）；
+  `UNKNOWN_PERMISSION` 这个旧码不再用于权限声明（枚举与码表保留，避免破坏既有码表布局）。
+
+带出路径：
+- `PackageInspection.permissions: Vec<String>`（`inspect_plugin_package` 原样带出，纯数据）；
+- `PluginViewFfi/PluginInfoFfi.manifest.permissions`（既有 `ManifestViewFfi` 已经带）；
+- FFI 包校验结果 `PackageViewFfi.permissions`（本轮新增字段）。
+
+### 证据
+
+[crates/plugins/tests/permissions.rs](../../crates/plugins/tests/permissions.rs)（5 个）：
+不写字段通过（运行时 + 包校验都带空权限）；四个沙箱值各自通过且 `SANDBOX` 白名单恰为这四个；
+未知值/大小写不符在**两条路径上都被拒且码一致**；重复与超限被拒（6 个不同值仍合法）；
+包视图与清单投影逐字段一致，且包内清单原文仍可取（安装事务路径）。
+
+复现：`cargo test --offline -p chat-plugins -p chat-ffi` → **59 + 122 passed**（既有 54/122 继续通过）。
+
+**已知限制**：权限目前只是**声明**（沙箱执行侧按它限制类加载，本轮不在 crates/plugins 内实现拦截）；
+`sanboxPermissions` 之类的独立字段没有引入（避免两套口径）。
+
 
 
 
