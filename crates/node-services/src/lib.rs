@@ -7,6 +7,7 @@ pub mod audit;
 pub mod auth;
 pub mod blob;
 pub mod canonical;
+pub mod cert_validity;
 pub mod config_validation;
 pub mod capability;
 pub mod cleanup;

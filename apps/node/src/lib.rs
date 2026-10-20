@@ -772,6 +772,31 @@ fn load_tls_acceptor(tls: &TlsConfig) -> Result<tokio_rustls::TlsAcceptor, NodeS
         .map_err(|_| NodeStartError::Config("TLS private key file could not be read"))?;
     let certs = parse_pem_certificates(&cert_pem)
         .ok_or(NodeStartError::Config("TLS certificate PEM contains no certificate"))?;
+
+    // 证书有效期：启动就算一次并打出来（到期前 30 天显式告警）。
+    if let Some(first) = certs.first() {
+        match chat_node_services::cert_validity::parse_der(first.as_ref()) {
+            Some(validity) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs() as i64)
+                    .unwrap_or(0);
+                let days = validity.days_remaining(now);
+                if validity.is_expired(now) {
+                    eprintln!(
+                        "chat-node tls certificate EXPIRED {} days ago; clients that pin it will fail",
+                        -days
+                    );
+                } else if days < 30 {
+                    eprintln!("chat-node WARN tls certificate expires in {days} days (rotate soon)");
+                }
+                println!("chat-node tls certificate expires in {days} days");
+            }
+            None => {
+                eprintln!("chat-node WARN tls certificate validity could not be parsed (unknown expiry)");
+            }
+        }
+    }
     let key = parse_pem_private_key(&key_pem)
         .ok_or(NodeStartError::Config("TLS private key PEM is not supported (PKCS#8 or RSA expected)"))?;
     // rustls 需要显式安装 CryptoProvider（本项目统一用 ring）。

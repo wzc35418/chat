@@ -80,6 +80,33 @@ try {
     if ($untrusted -match 'Verify return code: 0') { Write-Host 'FAIL tls check: untrusted client accepted the certificate'; exit 1 }
     Write-Host 'PASS tls node: client without the certificate is rejected'
 
+    # 5. 证书有效期必须在启动时算出并打日志（到期前 30 天会 WARN）。
+    # 节点进程还活着，日志文件被独占：必须用 FileShare.ReadWrite 读，否则拿到空串。
+    $nodeLogText = ''
+    for ($i = 0; $i -lt 20; $i++) {
+        try {
+            $stream = [System.IO.File]::Open($nodeOut, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            try {
+                $reader = New-Object System.IO.StreamReader($stream)
+                $nodeLogText = $reader.ReadToEnd()
+            } finally {
+                $stream.Dispose()
+            }
+        } catch { $nodeLogText = '' }
+        if ($nodeLogText -match 'tls certificate expires in') { break }
+        Start-Sleep -Milliseconds 250
+    }
+    if ($nodeLogText -notmatch 'tls certificate expires in (-?\d+) days') {
+        Write-Host 'FAIL tls check: node did not report the certificate expiry'
+        exit 1
+    }
+    $days = [int]$matches[1]
+    if ($days -le 0) {
+        Write-Host ('FAIL tls check: test certificate is expired (' + $days + ' days)')
+        exit 1
+    }
+    Write-Host ('PASS tls node: certificate expiry reported (' + $days + ' days remaining)')
+
     Write-Host ('logs: ' + $logDir)
     exit 0
 } finally {
