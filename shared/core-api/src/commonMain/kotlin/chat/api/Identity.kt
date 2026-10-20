@@ -90,6 +90,14 @@ interface IdentityService {
      */
     suspend fun importRecoveryBundle(passphrase: String, bundle: ByteArray): RecoveryImportView
 
+    /**
+     * 把本机身份登记进另一个库（通常是消息库）。
+     *
+     * 语义：幂等；目标库已绑定另一账户 → `IDENTITY_ACCOUNT_CONFLICT`（绝不覆盖）；
+     * 目标主密钥错 → 存储层错误码原样透出。**不返回任何种子材料**。
+     */
+    suspend fun enrollIntoStore(targetDatabasePath: String, targetMasterKeyHex: String): IdentityAccount
+
     /** IDENTITY-011：本账户已登记设备（includeRevoked 为真时含已撤销）。 */
     suspend fun listDevices(includeRevoked: Boolean = false): List<IdentityDevice>
 

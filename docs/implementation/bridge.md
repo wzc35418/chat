@@ -1090,6 +1090,21 @@ native_library_path(file_name) -> String            // 命中的库路径；失�
 
 **已知限制**：只解析"文件是否存在"（不 dlopen 校验 ABI）；Android/iOS 的打包路径（assets/ framework）
 需要各端在 `open_persisted` 之前显式设置 `CHAT_HOST_LIBRARY_DIR`，本层不做平台猜测。
+## 身份登记进其它库（FIX-R179，2026-10-18）
+
+~~~text
+IdentityFfi.enroll_into_store(target_database_path, target_master_key_hex) -> AccountView
+AccountView { account_id, device_id, display_name, fingerprint }
+~~~
+
+- 用途：消息库/群库/附件库需要本机身份（`load_identity_seeds`）才能提交，否则
+  `INVALID_STATE_TRANSITION：the local identity is not enrolled`；
+- 幂等（同账户同显示信息不写行、库版本不涨）；目标库绑定别的账户 → `IDENTITY_ACCOUNT_CONFLICT`
+  原样透出、绝不覆盖；主密钥错/库损坏 → 存储层码原样透出；
+- 需持久化且已打开的身份对象（纯内存 → `INVALID_STATE_TRANSITION`；关闭 → `CORE_CLOSED`）；
+- 种子不进日志、不进返回值（返回脱敏 `AccountView`）；
+- 测试：[crates/ffi/tests/identity_enroll.rs](../../crates/ffi/tests/identity_enroll.rs)（5 个，真库）。
+
 
 
 

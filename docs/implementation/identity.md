@@ -926,6 +926,39 @@ GroupJoinedFfi { group_id, epoch, members }
 
 **依赖说明**：crates/ffi 把 `chat-crypto` 从 dev-dependencies 提升为正式依赖（它本来就在根
 `[workspace.dependencies]` 里，没有引入新依赖）——KeyPackage 的私钥材料只存在于设备实例内，FFI 必须直接持有该实例。
+### 把本机身份登记进另一个库（FIX-R179，2026-10-18）
+
+~~~text
+IdentityFfi.enroll_into_store(target_database_path, target_master_key_hex) -> AccountView
+AccountView { account_id, device_id, display_name, fingerprint }   // 脱敏投影，不含种子
+~~~
+
+**背景（R-179 真实缺陷）**：打包产物里 `open store → createDraft → configureSendNode` 都通过，但
+`sendPrepare`（以及 send/group/attachment 的所有提交路径）报
+`INVALID_STATE_TRANSITION：the local identity is not enrolled in this database` —— 因为那些库
+不是身份库，`Store::load_identity_seeds` 读不到本机身份。本接口就是让界面把身份**登记进消息库/群库/附件库**。
+
+- 打开目标真实加密库，用既有 `Store::save_identity_account` 写入本机身份（同一账户、同一套种子，
+  来源是**源库的密封记录**）；
+- **幂等**：同账户同显示信息重复登记不写行、库版本不涨；
+- 目标库已绑定**另一个账户** → `IDENTITY_ACCOUNT_CONFLICT` **原样透出**（绝不覆盖，目标库逐字段不变）；
+- 目标主密钥错/库损坏 → 存储层稳定码原样透出；
+- 本对象未打开/已关闭 → `CORE_CLOSED`；**纯内存身份**（无源库可读种子）→ `INVALID_STATE_TRANSITION`；
+- **种子绝不外泄**：只在内存里搬运（本层副本用完立即清零），不进日志、不进返回值；
+  返回的是脱敏投影（账户/设备 ID + 显示名 + 指纹 hex）。
+
+### 证据
+
+[crates/ffi/tests/identity_enroll.rs](../../crates/ffi/tests/identity_enroll.rs)（5 个，真库）：
+① enroll 到空库后目标库的 `load_identity_seeds` 能读到同一 `account_id/device_id` 且
+`account_seed/device_seed` 与源库**逐字节相同**；② 再 enroll 幂等（schema 版本不变）；
+③ 目标库已绑定另一账户 → `IDENTITY_ACCOUNT_CONFLICT` 且投影逐字段不变；
+④ 纯内存身份 `INVALID_STATE_TRANSITION`、关闭后 `CORE_CLOSED`；
+⑤ 目标库用另一把主密钥创建 → 不是冲突而是显式存储层错误码。
+
+复现：`cargo test --offline -p chat-ffi --test identity_enroll` → 5 passed；
+`cargo test --offline -p chat-ffi` → **110 passed**（既有 105 继续通过）。
+
 
 
 

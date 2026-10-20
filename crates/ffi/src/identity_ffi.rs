@@ -952,6 +952,89 @@ impl IdentityFfi {
         }))
     }
 
+    /// FIX-R179：把**本机身份**登记进另一个真实加密库（消息库/群库/附件库都要有本机身份，
+    /// 否则所有提交路径都会报 `INVALID_STATE_TRANSITION：the local identity is not enrolled`）。
+    ///
+    /// 语义：
+    /// - 打开目标库并用既有 `Store::save_identity_account` 写入本机身份（**同一账户同一套种子**）；
+    /// - **幂等**：同一账户同一显示信息重复登记不写行、不推进库版本；
+    /// - 目标库已绑定**另一个账户** → `IDENTITY_ACCOUNT_CONFLICT` 原样透出（绝不覆盖）；
+    /// - 目标主密钥错/库损坏 → 存储层稳定码原样透出；
+    /// - 本对象未打开 / 已关闭 → `CORE_CLOSED`；纯内存身份（没有源库可读种子）→
+    ///   `INVALID_STATE_TRANSITION`；
+    /// - 种子只在内存里搬运（来源是源库的密封记录），**不进日志、不进返回值**；返回脱敏视图。
+    pub fn enroll_into_store(
+        &self,
+        target_database_path: String,
+        target_master_key_hex: String,
+    ) -> Result<AccountView, FfiError> {
+        // 1) 前置与公开材料（账户/设备公钥、脱敏投影）——不释放写锁就能拿到。
+        let (account_public_key, device_public_key) = {
+            let state = self.lock()?;
+            state.require_open()?;
+            if state.database.is_none() || state.master_key_hex.is_none() {
+                return Err(state_error(
+                    "INVALID_STATE_TRANSITION",
+                    "enrolling the identity requires the persistent identity (open_persisted)",
+                ));
+            }
+            let account = state.account.as_ref().ok_or_else(|| {
+                state_error("CORE_CLOSED", "identity key material has been released")
+            })?;
+            let device = state.device.as_ref().ok_or_else(|| {
+                state_error("CORE_CLOSED", "identity key material has been released")
+            })?;
+            (*account.trust_anchor().account_public_key(), device.public_key())
+        };
+        // 2) 从源库读种子与投影（with_store 会短暂释放并恢复身份句柄）。
+        let (mut account_seed, mut device_seed, projection) =
+            self.with_store(|store, _local| {
+                let seeds = store
+                    .load_identity_seeds()
+                    .map_err(storage_failure)?
+                    .ok_or_else(|| {
+                        state_error(
+                            "INVALID_STATE_TRANSITION",
+                            "the source database holds no identity seeds to enroll",
+                        )
+                    })?;
+                let projection = store
+                    .load_identity_account()
+                    .map_err(storage_failure)?
+                    .ok_or_else(|| {
+                        state_error("STATE_CORRUPTED", "the source identity projection is missing")
+                    })?;
+                Ok((seeds.account_seed.to_vec(), seeds.device_seed.to_vec(), projection))
+            })?;
+        // 3) 写入目标库（同一账户同一套种子；冲突原样透出，绝不覆盖）。
+        let written = (|| -> Result<chat_storage::formal::IdentityAccountRecord, FfiError> {
+            let mut target = open_formal_store(&target_database_path, &target_master_key_hex)?;
+            target
+                .save_identity_account(chat_storage::formal::IdentityAccountInput {
+                    account_id: projection.account_id.clone(),
+                    device_id: projection.device_id.clone(),
+                    account_public_key,
+                    device_public_key,
+                    account_seed: account_seed.clone(),
+                    device_seed: device_seed.clone(),
+                    display_name: projection.display_name.clone(),
+                    fingerprint: projection.fingerprint,
+                    created_at_ms: projection.created_at_ms,
+                })
+                .map_err(storage_failure)
+        })();
+        // 4) 清掉本层的种子副本（无论成败）。
+        account_seed.iter_mut().for_each(|byte| *byte = 0);
+        device_seed.iter_mut().for_each(|byte| *byte = 0);
+        let written = written?;
+        Ok(AccountView {
+            account_id: written.account_id,
+            device_id: written.device_id,
+            display_name: written.display_name,
+            fingerprint: hex_lower(&written.fingerprint),
+        })
+    }
+
     /// GROUPS-004：导出本机 MLS **KeyPackage**（邀请闭环里 B 侧要交给 A 的字节）。
     ///
     /// - 需要**已加载的持久身份**（纯内存对象 → `INVALID_STATE_TRANSITION`；关闭 → `CORE_CLOSED`）；

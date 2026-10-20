@@ -116,6 +116,22 @@ class NativeIdentityService : IdentityService {
         }
     }
 
+    override suspend fun enrollIntoStore(
+        targetDatabasePath: String,
+        targetMasterKeyHex: String,
+    ): chat.api.IdentityAccount = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            val identity = native ?: throw IdentityException("CORE_CLOSED", "identity is not open")
+            val view = guard { identity.enrollIntoStore(targetDatabasePath, targetMasterKeyHex) }
+            chat.api.IdentityAccount(
+                accountId = view.accountId,
+                deviceId = view.deviceId,
+                displayName = view.displayName,
+                fingerprint = view.fingerprint,
+            )
+        }
+    }
+
     override suspend fun listDevices(includeRevoked: Boolean): List<chat.api.IdentityDevice> = mutex.withLock {
         withContext(Dispatchers.IO) {
             val identity = native ?: throw IdentityException("CORE_CLOSED", "identity is not open")

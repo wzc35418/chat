@@ -1,5 +1,6 @@
 package chat.desktop
 
+import chat.bridge.createIdentityService
 import chat.bridge.createLocalStore
 import chat.api.LocalStoreException
 import kotlinx.coroutines.runBlocking
@@ -25,9 +26,19 @@ fun main(args: Array<String>): Unit = runBlocking {
     val tempDir = java.io.File(System.getProperty("java.io.tmpdir"), "chat-pkg-e2e-" + System.nanoTime())
     tempDir.mkdirs()
     val dbPath = java.io.File(tempDir, "pkg-e2e.sqlite").absolutePath
+    val identity = createIdentityService()
     val store = createLocalStore()
     var failures = 0
     try {
+        // 顺序很重要：消息库同一时刻只允许一个写者，必须先登记身份再 open store。
+        val identityDir = java.io.File(tempDir, "identity")
+        identityDir.mkdirs()
+        val identityPath = java.io.File(identityDir, "identity.sqlite").absolutePath
+        val account = identity.openPersisted(identityPath, "1".repeat(64), "node:1:" + "0a".repeat(32))
+        println("PASS identity opened: " + account.deviceId)
+        val enrolled = identity.enrollIntoStore(dbPath, "0".repeat(64))
+        println("PASS identity enrolled into message store: " + enrolled.accountId)
+
         store.open(dbPath, "0".repeat(64))
         println("PASS store opened: " + dbPath)
 
@@ -65,6 +76,7 @@ fun main(args: Array<String>): Unit = runBlocking {
         failures += 1
     } finally {
         runCatching { store.close() }
+        runCatching { identity.close() }
         tempDir.deleteRecursively()
     }
     if (failures == 0) {
