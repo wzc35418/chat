@@ -97,3 +97,34 @@ powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1      # 11 阶段�
 - 脚本里给 `java.exe` 传空字符串参数会被丢弃，用 `-` 占位；
 - PowerShell 5.1 没有 `Invoke-WebRequest -SkipCertificateCheck`，TLS 检查统一用 `openssl s_client`；
 - 冻结码表（`FROZEN_AUTO_RETRY_CODES`）决定“能不能重试”，不要凭记忆判断（`STORAGE_LOCKED` 在表里）。
+
+## 十一、最终状态（第 140 轮，2026-10-21）
+
+| 口径 | 数值 | 依据 |
+| --- | --- | --- |
+| **A：功能闭环** | **100%** | 12 阶段 `verify-all` 全 PASS，其中 `remote` 阶段 7 条断言直连公网节点（证书 pin / 节点身份 / 打包产物 accepted+applied / UI 一步发送 / 错误指纹被拒） |
+| **B：生产就绪** | **≈ 82%** | 缺 NAT 打洞与中继、证书自动续签、MSI 安装器、后台通知、非 Windows 平台、soak 数据 |
+| 可复跑性 | 每条结论都有命令 | `docs/DELIVERY_CHECKLIST.md` 第二节 |
+
+### 这个项目现在能做什么（一句话）
+
+> 在两台机器之间、用自签证书 + SHA-256 指纹固定的 TLS，把消息加密后提交到自建节点并拉回，且客户端不会因为指纹配错而误连。
+
+### 不能说什么（诚实边界）
+
+- ❌ **不能说“生产可用”** —— 没有安装器、没有后台通知、没有 soak、没有非 Windows 验证；
+- ❌ **不能说“穿透 NAT”** —— 只支持直连公网 IP；
+- ❌ **不能说“证书自动轮换”** —— 只有告警，轮换要人工；
+- ❌ **不能说“已经端到端加密到联系人级别”** —— 群消息走 MLS，但多设备/多联系人的完整社交场景未验证。
+
+### 下次接手第一步
+
+```powershell
+cd D:\AgentProject\chat
+. .\tools\activate.ps1
+powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
+  -RemoteEndpoint https://106.54.223.171:8443 -RemoteNodeId node-public `
+  -RemoteFingerprint 13be2f93162bd121cba6a91d4e05c22900dcc06abcd92cf843bd5ed772b8a053
+```
+
+先确认 12 阶段仍然全绿，再动代码；节点若已关停，把 `-RemoteEndpoint` 去掉即可（`remote` 会显式 SKIP，不算通过）。

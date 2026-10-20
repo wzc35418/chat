@@ -359,3 +359,17 @@ powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
   -RemoteEndpoint https://106.54.223.171:8443 -RemoteNodeId node-public `
   -RemoteFingerprint 13be2f93162bd121cba6a91d4e05c22900dcc06abcd92cf843bd5ed772b8a053
 ```
+
+## 终局回归（第 140 轮，2026-10-21，12 阶段含公网 remote）
+
+| 阶段 | 结果 | 用时 |
+| --- | --- | --- |
+| disk / rust-check / verify-project | PASS | 0s / 2.2s / 0.9s |
+| gradle（13 任务） | PASS | 36.3s |
+| android | PASS | 32.4s |
+| package（结构+4 冒烟+GUI） | PASS | 16.7s |
+| two-device | PASS | 6s |
+| lan（192.168.20.1） | PASS | 3.7s |
+| tls / offline / tls-e2e | PASS | 4.8s / 5.3s / 5.4s |
+| **remote（公网 7 断言）** | **PASS** | **68.1s** |
+| **overall** | **PASS（EXIT=0）** | `build/verify-all-20261021-032010.md` |
