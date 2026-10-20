@@ -177,3 +177,11 @@ RUST_EXIT=0  LOCKED_EXIT=0  VERIFY_EXIT=0  GRADLE_EXIT=0  ANDROID_EXIT=0
 - [x] **错误可用性**：`Cow` 详情 → 整条错误链 → 分层展示（7 处统一 `ErrorBanner`）→ 统一失败投影（12 处共用）。
 - [x] **验收**：`verify-all` 11 阶段；`docs/FINAL_REPORT.md` + `docs/RETROSPECTIVE_120.md`。
 - [ ] 未完成：跨机器/NAT/中继（需外部节点）、证书自动化续签、`AppFacade` 深层收敛、安装器/后台通知/soak、非 Windows 平台。
+
+## 2026-10-21 公网跨机器验证
+
+- [x] **公网节点部署**（Windows Server，`106.54.223.171:8443`，自签证书 + TLS，指纹 `13be2f93…`）。
+- [x] **跨机器收发**：打包产物 `sendDispatch accepted` → `syncOnce fetched=2 applied=1 skipped=1 cursor=1 settled=true`。
+- [x] **TLS pinning 生效**：同证书指纹校验通过；换成错误指纹 → 提交被拒（`FAIL NODE_UNAVAILABLE`）。
+- [x] **证书状态端点**：`/v1/tls/info` 返回 `cert_sha256=13be2f93…, days_remaining=3649, expired=false`。
+- [ ] 仍未做：NAT 打洞/中继（当前只支持直连公网 IP）、证书自动续签、非 Windows 平台验证。
