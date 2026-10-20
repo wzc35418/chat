@@ -102,8 +102,35 @@ if ($tlsMode) {
     $days = [int]$daysMatch.Groups[1].Value
     if ($days -le 0) { Write-Host ('FAIL remote check: remote certificate expired (' + $days + ' days)'); exit 1 }
     Write-Host ('PASS remote: /v1/tls/info ok (days_remaining=' + $days + ')')
+    # 节点身份：/v1/health 的 node_id 必须与 -NodeId 一致（防止连错节点）。
+    $healthReq = Join-Path $logDir 'health.request.txt'
+    $healthText = 'GET /v1/health HTTP/1.1' + "`r`n" + 'Host: ' + $hostPart + "`r`n" + 'Connection: close' + "`r`n`r`n"
+    Set-Content -Path $healthReq -Value $healthText -NoNewline -Encoding ascii
+    $healthCmd = 'cmd /c ""' + $openssl + '" s_client -connect ' + $hostPart + ' -CAfile "' + $certOut + '" -verify_return_error -quiet -ign_eof < "' + $healthReq + '" 2>&1"'
+    $healthBody = cmd /c $healthCmd | Out-String
+    Set-Content -Path (Join-Path $logDir 'health.response.txt') -Value $healthBody -Encoding utf8
+    if ($healthBody -match '"(?:node_id|nodeId)"\s*:\s*"([^"]+)"') {
+        $remoteNodeId = $matches[1]
+        if ($remoteNodeId -ne $NodeId) {
+            Write-Host 'FAIL remote check: node identity mismatch'
+            Write-Host ('  expected node_id: ' + $NodeId)
+            Write-Host ('  actual node_id  : ' + $remoteNodeId)
+            exit 1
+        }
+        Write-Host ('PASS remote: node identity matches (' + $remoteNodeId + ')')
+    } else {
+        Write-Host 'FAIL remote check: /v1/health did not expose node_id'
+        exit 1
+    }
 } else {
     Write-Host 'INFO remote: plain HTTP mode, skipping certificate/fingerprint checks'
+    try { $plainHealth = (Invoke-WebRequest -Uri ($Endpoint + '/v1/health') -TimeoutSec 10 -UseBasicParsing).Content } catch { $plainHealth = '' }
+    if ($plainHealth -match '"(?:node_id|nodeId)"\s*:\s*"([^"]+)"' -and $matches[1] -eq $NodeId) {
+        Write-Host ('PASS remote: node identity matches (' + $matches[1] + ')')
+    } else {
+        Write-Host 'FAIL remote check: plain /v1/health node_id missing or mismatched'
+        exit 1
+    }
 }
 
 if ($DiagnoseOnly) {

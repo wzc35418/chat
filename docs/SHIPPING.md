@@ -311,3 +311,12 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 | `tools/verify-remote.ps1` | 本机跨机器验证：证书指纹比对 → `/v1/tls/info` → 打包产物提交+拉取 → 错误指纹必须失败 |
 
 本机已用 `0.0.0.0:8443 --allow-public-bind` 的真节点模拟公网路径跑通（EXIT=0）；**只差真实公网 IP 的最后一跳**。
+
+## Windows Server 部署（R-248）
+
+| 文件 | 用途 |
+| --- | --- |
+| `deploy/prepare-node-bundle.ps1` | 开发机一键生成部署包（release exe + 自签证书 SAN=公网 IP + 种子 + 启动/开机脚本 + 指纹文件） |
+| `deploy/README-WINDOWS.md` | Windows Server 操作步骤（复制/防火墙/安全组/启动/自检/本机验证） |
+
+已用生成的 bundle 实跑：`verify-remote.ps1` 六条断言全 PASS（含**节点身份 node_id 校验**与错误指纹拒绝）。bundle 中的 `seed.hex`/`key.pem` 已确认被 `.gitignore` 忽略。
