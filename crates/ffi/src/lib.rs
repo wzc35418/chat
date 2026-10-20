@@ -8,5 +8,6 @@ pub mod identity_ffi;
 pub mod local_store;
 pub mod native_path;
 pub mod plugins_ffi;
+pub mod shared_core;
 pub mod sync_ffi;
 uniffi::setup_scaffolding!();

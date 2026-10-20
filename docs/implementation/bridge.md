@@ -1113,4 +1113,49 @@ AccountView { account_id, device_id, display_name, fingerprint }
 - 建群后必须调用一次，否则节点不认识该群、后续条目会被拒；
 - 幂等：重复调用返回节点给出的同一结果（已登记时回读 head 取真实序号）；
 - 错误：未登记身份 `INVALID_STATE_TRANSITION`、群不存在 `INVALID_TARGET`、不可达 `NODE_UNAVAILABLE`、节点拒绝原样透出。
+## 单句柄共享核心（ChatCoreFfi / TASK-128，2026-10-18）
+
+新增模块 [crates/ffi/src/shared_core.rs](../../crates/ffi/src/shared_core.rs)：**一个** `Store` 句柄
+（内部 `Mutex<Option<ConversationCore>>`，core 自己持有唯一的库句柄）上同时提供身份之外的全部写路径，
+不再需要"开-关-再开"绕单写者锁。
+
+~~~text
+ChatCoreFfi.open(database_path, master_key_hex) -> ChatCoreFfi
+ChatCoreFfi.close() / is_open()
+群：create_group / create_group_with_invitee_key_package / group_register_on_node
+    / submit_invite / fetch_invite / snapshot / list_groups
+消息：create_draft / configure_send_node / configure_send_group
+      / send_prepare / send_dispatch / send_reconcile / list_messages / draft_status
+同步：sync_once
+~~~
+
+- **全部转发到既有 core 函数**（不新写业务逻辑）：`ConversationCore::{group_create_with_welcome,
+  group_create_with_invitee_key_package, group_register_on_node, group_submit_invite,
+  group_fetch_invite, group_snapshot, group_list, create_draft, configure_send_node,
+  configure_send_group, send_prepare, send_dispatch, send_reconcile, list_messages, draft_status}`；
+  `sync_once` 复用 `chat_core::sync_worker::run_pull_once_reporting_at`；
+- **单写者不变**：同库第二个实例 → `STORAGE_LOCKED`（存储层原样透出）；
+- **关闭后**所有方法 → `CORE_CLOSED`（close 幂等）；
+- `sync_once` 需要裸 `Store` 句柄：临时释放核心 → 打开唯一句柄跑一轮 → **无条件**把核心装回
+  （失败也装回，对象不会停在"无核心"状态）；
+- 建群返回 `SharedCreatedGroupFfi{group, invite}`（invite 含 Welcome 原文），提交邀请直接用它；
+- 群投影含 `mls_group_key`（`configure_send_group` 要的就是它）与 `seeded_revoked_devices`；
+- 单轮同步结果含 `fetched = applied + stale + unsupported`（"取回了几条"与"应用了几条"分开报）。
+
+### 证据
+
+[crates/ffi/tests/shared_core.rs](../../crates/ffi/tests/shared_core.rs)（4 个，真库 + 真 axum 节点 + 真 OpenMLS）：
+① 同一句柄 建群 → `group_register_on_node`（设备自注册 + 节点建群）→ `submit_invite`（真回执 seq≥1、
+log_hash 64 hex）→ `fetch_invite`（按 bob 过滤、Welcome 逐字节回传）→ `snapshot`/`list_groups` 一致；
+② 同句柄 配置节点/群 → `create_draft` → `send_prepare` → `send_dispatch` → **accepted** 且 `settled`、
+`draft_status` 一致、消息可分页；③ `sync_once` 取回 ≥1 条（`fetched>=1`）且对象仍可用；
+④ 同库第二个实例 `STORAGE_LOCKED`、关闭后所有方法 `CORE_CLOSED`（close 幂等）。
+
+复现：`cargo test --offline -p chat-ffi --test shared_core` → 4 passed；
+`cargo test --offline -p chat-ffi` → **119 passed**（既有 115 继续通过）。
+
+**已知限制**：① 这是"门面"而不是新的权限边界（调用方仍拿到同一库的全部能力）；② `sync_once`
+期间会短暂释放句柄（同进程其它持库者若抢到锁，重开会失败并显式返回错误）；③ 未覆盖的方案
+（邀请接受、恢复导入）仍在各自既有对象上，后续可逐步并入本门面。
+
 
