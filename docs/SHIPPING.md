@@ -2,7 +2,25 @@
 
 版本：**0.1.0**（便携包，无需安装器）
 
-## 产物
+## 产物（两种形态）
+
+### A. 自包含 app-image（推荐交付，不需要 JDK）
+
+```
+build/dist/app-image/Chat/Chat.exe     双击即启动（自带裁剪运行时）
+build/dist/app-image/Chat/runtime/      jlink 裁剪的 JDK 运行时（java.base/desktop/logging/... 10 个模块）
+build/dist/app-image/Chat/app/app.jar   应用
+build/dist/app-image/Chat/app/native/   Rust host 动态库
+build/dist/Chat-app-0.1.0.zip           上述整个目录的压缩包
+```
+
+构建：`gradlew :apps:desktop:appImageZip --offline --max-workers=1`
+
+**已验证**：
+- 用包内运行时跑冒烟 → `PASS platform slice`；
+- 直接启动 `Chat.exe`，7 秒后进程仍在（窗口起来了）。
+
+### B. 便携包（需要本机 JDK 21）
 
 ```
 build/dist/Chat-0.1.0.zip          交付压缩包（约 49 MB）
@@ -40,7 +58,7 @@ java -Djna.library.path=<dir>\native -cp <dir>\app.jar chat.desktop.PlatformSmok
 
 GUI 启动：双击 `run.bat`（或在同目录执行）。
 
-## 为什么是便携包而不是 MSI
+## 为什么没有 MSI
 
 Compose 的 `nativeDistributions` 在本机离线环境下会在 `downloadWix` 任务上失败（WiX 需要联网下载），
 因此交付形态选择**免安装目录 + zip**：不依赖 WiX、不写注册表、删目录即卸载。
@@ -54,3 +72,11 @@ Compose 的 `nativeDistributions` 在本机离线环境下会在 `downloadWix` �
 - 插件无沙箱（同 JVM 加载执行），`trusted` 只是确认，不是安全边界。
 - 传输仅回环/LAN 验证过，未做真实中继/NAT 穿透。
 - 系统通知在无托盘环境会明确提示不可用（不是静默失败）。
+
+## 两种形态怎么选
+
+| 场景 | 用哪个 |
+|---|---|
+| 发给非技术用户试用 | **A. app-image（Chat.exe）** |
+| 自己开发调试 / CI 冒烟 | B. 便携包（换 jar 方便） |
+| 需要系统级安装、开始菜单、卸载项 | 都需要 MSI（本机离线不可构建，见下） |

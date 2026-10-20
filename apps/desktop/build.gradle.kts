@@ -252,3 +252,64 @@ tasks.register<Zip>("portableZip") {
     destinationDirectory.set(rootProject.layout.buildDirectory.dir("dist"))
     from(rootProject.layout.buildDirectory.dir("dist/Chat-$appVersion")) { into("Chat-$appVersion") }
 }
+
+/**
+ * 自包含 app-image（jlink 运行时 + jpackage），不依赖 Compose 的 nativeDistributions
+ * （后者在离线环境会在 downloadWix 上失败）。产物：build/dist/Chat-app/Chat.exe
+ */
+val jlinkRuntimeDir = rootProject.layout.buildDirectory.dir("jlink/chat-runtime")
+
+val jlinkRuntime = tasks.register<Exec>("jlinkRuntime") {
+    group = "distribution"
+    val javaHome = System.getProperty("java.home")
+    val outDir = jlinkRuntimeDir.get().asFile
+    inputs.property("javaHome", javaHome)
+    outputs.dir(outDir)
+    commandLine(
+        "$javaHome/bin/jlink.exe",
+        "--add-modules", "java.base,java.desktop,java.logging,java.management,java.naming,java.sql,java.xml,jdk.crypto.ec,jdk.unsupported,jdk.zipfs",
+        "--strip-debug", "--no-man-pages", "--no-header-files", "--compress=2",
+        "--output", outDir.absolutePath,
+    )
+    doFirst { if (outDir.exists()) outDir.deleteRecursively() }
+}
+
+val jpackageAppImage = tasks.register<Exec>("jpackageAppImage") {
+    group = "distribution"
+    dependsOn(portableJar, tasks.named("jlinkRuntime"))
+    val appVersion = providers.gradleProperty("chatVersion").getOrElse("0.1.0")
+    val javaHome = System.getProperty("java.home")
+    val inputDir = rootProject.layout.buildDirectory.dir("portable").get().asFile
+    val destDir = rootProject.layout.buildDirectory.dir("dist/app-image").get().asFile
+    inputs.dir(inputDir)
+    outputs.dir(destDir)
+    commandLine(
+        "$javaHome/bin/jpackage.exe",
+        "--type", "app-image",
+        "--name", "Chat",
+        "--app-version", appVersion,
+        "--input", inputDir.absolutePath,
+        "--main-jar", "app.jar",
+        "--main-class", "chat.desktop.MainKt",
+        "--runtime-image", jlinkRuntimeDir.get().asFile.absolutePath,
+        "--dest", destDir.absolutePath,
+        "--java-options", "-Dfile.encoding=UTF-8",
+    )
+    doFirst { if (destDir.exists()) destDir.deleteRecursively(); destDir.mkdirs() }
+}
+
+// 把 Rust host 库塞进 app-image 的 app/ 目录，供 JNA 相对路径查找。
+val appImageWithNative = tasks.register<Copy>("appImageWithNative") {
+    group = "distribution"
+    dependsOn(jpackageAppImage)
+    from(rootProject.layout.buildDirectory.dir("native/host"))
+    into(rootProject.layout.buildDirectory.dir("dist/app-image/Chat/app/native"))
+}
+
+tasks.register<Zip>("appImageZip") {
+    group = "distribution"
+    dependsOn(appImageWithNative)
+    archiveFileName.set("Chat-app-" + providers.gradleProperty("chatVersion").getOrElse("0.1.0") + ".zip")
+    destinationDirectory.set(rootProject.layout.buildDirectory.dir("dist"))
+    from(rootProject.layout.buildDirectory.dir("dist/app-image/Chat")) { into("Chat") }
+}

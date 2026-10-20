@@ -1056,5 +1056,40 @@ GroupJoinedFfi { group_id, epoch, members }
 - 与 `GroupFfi.group_create_with_invitee_key_package` 配对即构成完整邀请闭环：
   B 导出 KeyPackage → A 建群拿 Welcome → B 接受加入；
 - 测试：[crates/ffi/tests/key_package_export.rs](../../crates/ffi/tests/key_package_export.rs)（3 个，含端到端入群）。
+## 应用信息与本机库解析（TASK-122，2026-10-18）
+
+新增模块 [crates/ffi/src/native_path.rs](../../crates/ffi/src/native_path.rs)。
+
+~~~text
+app_info() -> AppInfoFfi { version, build_profile, ffi_version, platform }
+native_library_path(file_name) -> String            // 命中的库路径；失败 NATIVE_LIBRARY_NOT_FOUND
+~~~
+
+- `app_info`：`version` 取 `env!("CARGO_PKG_VERSION")`；`build_profile` 为 `debug`/`release`
+  （`cfg!(debug_assertions)`）；`ffi_version` 是**桥接契约版本**（`FFI_CONTRACT_VERSION = "1.0"`，
+  记录/方法签名变化时递增，与库版本独立）；`platform` 是 `<OS>/<ARCH>`（`std::env::consts`）；
+  纯编译期常量 + 环境常量，**不联网、不读库、不会失败**；
+- `native_library_path` 候选顺序（**固定**）：可执行文件目录 → 其 `native/` → 其 `lib/` →
+  环境变量 `CHAT_HOST_LIBRARY_DIR`（最后一个，部署方显式覆盖）；同一目录去重；
+- **失败不静默回退**：返回 `NATIVE_LIBRARY_NOT_FOUND`，`reason` 里逐行列出**所有尝试过的路径**
+  （便于定位"安装包里少了 dll"这类问题）；
+- 纯函数拆分（`native_library_directories` / `resolve_in_directories`）便于用真文件系统单测。
+
+### 证据
+
+[crates/ffi/tests/app_info.rs](../../crates/ffi/tests/app_info.rs)（2 个）：字段非空、`version` 形如
+`MAJOR.MINOR.PATCH` 且等于 crate 元数据、`build_profile` ∈ {@debug@, @release@}、`ffi_version` 一致、
+`platform` 恰为 `<OS>/<ARCH>` 两段且与 `std::env::consts` 相符、重复调用稳定；
+[crates/ffi/tests/native_path.rs](../../crates/ffi/tests/native_path.rs)（4 个，真文件系统）：
+按序命中 exe 目录 → native/ → lib/ → 环境变量覆盖；全 miss 时错误列出每个候选路径；
+`native_library_path` 的失败码与原因（含可执行文件目录）；环境变量名稳定。
+模块内另有 3 个纯函数单测（含候选目录去重）。
+
+复现：`cargo test --offline -p chat-ffi --test app_info --test native_path` → 6 passed；
+`cargo test --offline -p chat-ffi` → **105 passed**（既有 96 继续通过）。
+
+**已知限制**：只解析"文件是否存在"（不 dlopen 校验 ABI）；Android/iOS 的打包路径（assets/ framework）
+需要各端在 `open_persisted` 之前显式设置 `CHAT_HOST_LIBRARY_DIR`，本层不做平台猜测。
+
 
 
