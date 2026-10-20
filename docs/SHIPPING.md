@@ -204,6 +204,6 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 ### 仍未证明（下一批目标）
 
 - 真正跨机器/NAT/中继服务（同机 LAN ≠ 公网可达）；
-- 证书轮换与过期告警；
+- 证书轮换：库层已支持指纹集合（新旧同时信任），但 FFI/应用尚未透传指纹；到期告警未做；
 - 后台消息通知、安装器/自动更新、soak 稳定性；
 - 插件签名信任链（权限门已有，签名没有）。

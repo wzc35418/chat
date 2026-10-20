@@ -133,3 +133,47 @@ async fn mismatched_fingerprint_fails_the_handshake() {
     );
     handle.abort();
 }
+
+/// 轮换窗口：客户端同时信任**新旧两张**证书，服务端换成任一张都能连上。
+#[tokio::test]
+async fn rotation_window_accepts_any_pinned_certificate() {
+    let (endpoint, handle) = spawn_tls_server().await;
+    let current = TransportSecurity::pinned_pem(CERT_PEM).expect("pem gives fingerprint");
+    let next = TransportSecurity::pinned_pem(OTHER_CERT_PEM).expect("pem gives fingerprint");
+    let (TransportSecurity::PinnedFingerprints(current_set), TransportSecurity::PinnedFingerprints(next_set)) =
+        (current, next)
+    else {
+        panic!("expected pinned sets")
+    };
+    let mut combined = current_set.clone();
+    combined.extend(next_set);
+    let trust = TransportSecurity::pinned_fingerprints(combined.clone());
+    trust.validate(&endpoint).expect("endpoint and trust agree");
+    let response = client_for(&trust)
+        .get(endpoint + "/v1/health")
+        .send()
+        .await
+        .expect("server certificate only needs to match one pinned fingerprint");
+    assert_eq!(response.status().as_u16(), 200);
+
+    // 集合去重：重复给同一个指纹必须收敛成一个（顺序无关）。
+    let duplicated = TransportSecurity::pinned_fingerprints(vec![
+        combined[0].clone(),
+        combined[0].clone(),
+    ]);
+    match duplicated {
+        TransportSecurity::PinnedFingerprints(values) => {
+            assert_eq!(values.len(), 1, "identical fingerprints must be deduplicated")
+        }
+        _ => panic!("expected pinned set"),
+    }
+    handle.abort();
+}
+
+/// 空集合 = 配置错误（不能既说 https 又不给任何可信任证书）。
+#[tokio::test]
+async fn empty_fingerprint_set_is_rejected() {
+    let trust = TransportSecurity::pinned_fingerprints(Vec::<String>::new());
+    let error = trust.validate("https://127.0.0.1:9").expect_err("must reject");
+    assert!(format!("{error:?}").contains("TLS_CERT_INVALID"), "unexpected: {error:?}");
+}

@@ -2,7 +2,7 @@
 //!
 //! 语义：
 //! - `http://` 端点必须用 [TransportSecurity::Plain]（本地/可信网络）；
-//! - `https://` 端点必须给 [TransportSecurity::PinnedFingerprint]（或由 PEM 推导的指纹）；
+//! - `https://` 端点必须给 [TransportSecurity::PinnedFingerprints]（或由 PEM 推导的指纹集合）；
 //! - **系统根完全不参与**：自定义 verifier 只接受 SHA-256 指纹匹配的那张证书；
 //! - 配了固定指纹却用 `http://`、或用 `https://` 却不给指纹 -> 显式拒绝（绝不静默降级）。
 
@@ -18,8 +18,11 @@ pub enum TransportSecurity {
     /// 明文 HTTP：只允许与 `http://` 端点搭配。
     #[default]
     Plain,
-    /// 证书 SHA-256 指纹（64 位小写十六进制）：**只**接受这张证书。
-    PinnedFingerprint(String),
+    /// 证书 SHA-256 指纹**集合**（每项 64 位小写十六进制）：只接受其中之一。
+    ///
+    /// 用集合而不是单值是为了**证书轮换**：换证书时客户端可同时信任新旧两张，
+    /// 等所有客户端升级完再摘掉旧的，不需要"一次全换否则全断"。
+    PinnedFingerprints(Vec<String>),
 }
 
 impl TransportSecurity {
@@ -27,12 +30,31 @@ impl TransportSecurity {
     pub fn pinned_pem(pem: impl AsRef<[u8]>) -> Result<Self, NodeClientError> {
         let der = first_certificate_der(pem.as_ref())
             .ok_or_else(|| NodeClientError::config("TLS_CERT_INVALID: PEM 里找不到证书"))?;
-        Ok(TransportSecurity::PinnedFingerprint(hex_lower(&Sha256::digest(&der))))
+        Ok(TransportSecurity::PinnedFingerprints(vec![hex_lower(&Sha256::digest(&der))]))
     }
 
     pub fn pinned_fingerprint(hex: impl Into<String>) -> Self {
-        TransportSecurity::PinnedFingerprint(hex.into().trim().to_ascii_lowercase())
+        TransportSecurity::PinnedFingerprints(vec![hex.into().trim().to_ascii_lowercase()])
     }
+
+    /// 一组指纹（用于轮换窗口：新旧证书同时信任）。
+    pub fn pinned_fingerprints<I, S>(values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut list: Vec<String> = values
+            .into_iter()
+            .map(|value| value.into().trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect();
+        // 去重与顺序无关：先排序再 dedup（否则非相邻重复会漏掉）。
+        list.sort_unstable();
+        list.dedup();
+        TransportSecurity::PinnedFingerprints(list)
+    }
+
+    /// 用多张自签证书 PEM 推导集合（顺序无关，已去重）。
 
     pub fn is_plain(&self) -> bool {
         matches!(self, TransportSecurity::Plain)
@@ -45,12 +67,16 @@ impl TransportSecurity {
             (true, TransportSecurity::Plain) => Err(NodeClientError::config(
                 "TLS_TRUST_REQUIRED: https 端点必须提供证书指纹（系统根不参与）",
             )),
-            (false, TransportSecurity::PinnedFingerprint(_)) => Err(NodeClientError::config(
+            (false, TransportSecurity::PinnedFingerprints(_)) => Err(NodeClientError::config(
                 "INSECURE_TRANSPORT: 固定指纹只能配 https 端点，http 会被拒绝",
             )),
-            (true, TransportSecurity::PinnedFingerprint(value)) if !is_hex_sha256(value) => Err(
-                NodeClientError::config("TLS_CERT_INVALID: 指纹必须是 64 位小写十六进制"),
-            ),
+            (true, TransportSecurity::PinnedFingerprints(values))
+                if values.is_empty() || !values.iter().all(|value| is_hex_sha256(value)) =>
+            {
+                Err(NodeClientError::config(
+                    "TLS_CERT_INVALID: 指纹集合不能为空，且每项必须是 64 位小写十六进制",
+                ))
+            }
             _ => Ok(()),
         }
     }
@@ -59,7 +85,7 @@ impl TransportSecurity {
 /// 只接受指纹匹配证书的 rustls verifier（**不查系统根**）。
 #[derive(Debug)]
 struct PinnedVerifier {
-    expected: [u8; 32],
+    expected: Vec<[u8; 32]>,
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
@@ -73,12 +99,13 @@ impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let actual: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
-        if actual == self.expected {
+        if self.expected.iter().any(|candidate| *candidate == actual) {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General(format!(
-                "PIN_MISMATCH: server certificate fingerprint {} does not match the pinned one",
-                hex_lower(&actual)
+                "PIN_MISMATCH: server certificate fingerprint {} does not match any pinned fingerprint ({} pinned)",
+                hex_lower(&actual),
+                self.expected.len()
             )))
         }
     }
@@ -120,8 +147,20 @@ impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
 
 /// 按指纹固定配置构造 rustls 客户端配置（不使用系统根）。
 pub fn pinned_client_config(fingerprint_hex: &str) -> Result<rustls::ClientConfig, NodeClientError> {
-    let expected = decode_hex_sha256(fingerprint_hex)
-        .ok_or_else(|| NodeClientError::config("TLS_CERT_INVALID: 指纹必须是 64 位小写十六进制"))?;
+    pinned_client_config_many(std::slice::from_ref(&fingerprint_hex.to_owned()))
+}
+
+/// 一组指纹的 rustls 配置（轮换窗口用）。
+pub fn pinned_client_config_many(fingerprints: &[String]) -> Result<rustls::ClientConfig, NodeClientError> {
+    if fingerprints.is_empty() {
+        return Err(NodeClientError::config("TLS_CERT_INVALID: 指纹集合不能为空"));
+    }
+    let mut expected = Vec::with_capacity(fingerprints.len());
+    for value in fingerprints {
+        let decoded = decode_hex_sha256(value)
+            .ok_or_else(|| NodeClientError::config("TLS_CERT_INVALID: 指纹必须是 64 位小写十六进制"))?;
+        expected.push(decoded);
+    }
     // rustls 需要进程级 provider：先尝试安装；已安装过则沿用已有的。
     let _ = rustls::crypto::ring::default_provider().install_default();
     let provider = rustls::crypto::CryptoProvider::get_default()
@@ -197,8 +236,8 @@ impl TransportSecurity {
     pub fn rustls_client_config(&self) -> Result<Option<rustls::ClientConfig>, NodeClientError> {
         match self {
             TransportSecurity::Plain => Ok(None),
-            TransportSecurity::PinnedFingerprint(fingerprint) => {
-                Ok(Some(pinned_client_config(fingerprint)?))
+            TransportSecurity::PinnedFingerprints(fingerprints) => {
+                Ok(Some(pinned_client_config_many(fingerprints)?))
             }
         }
     }

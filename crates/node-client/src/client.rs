@@ -441,9 +441,9 @@ fn build_http_client(
         // 不跟随重定向：跳转后的路径与签名原文不再一致，属于协议违规。
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("chat-node-client/1");
-    if let TransportSecurity::PinnedFingerprint(fingerprint) = trust {
-        // 严格 pinning：系统根完全不参与，只接受指纹匹配的那张证书。
-        let config = crate::transport_security::pinned_client_config(fingerprint)?;
+    if let TransportSecurity::PinnedFingerprints(fingerprints) = trust {
+        // 严格 pinning：系统根完全不参与，只接受指纹集合里的任一证书（轮换窗口）。
+        let config = crate::transport_security::pinned_client_config_many(fingerprints)?;
         builder = builder.use_preconfigured_tls(config);
     }
     builder
