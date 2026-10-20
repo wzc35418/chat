@@ -225,3 +225,16 @@ two-device demo: PASS
 3. 重启应用后，「当前后端」应为 **Windows 凭据管理器**。
 
 **怎么算迁移成功**：迁移后再启动，本地库能正常解密（消息/身份都在）即成功；若旧文件已删而新密钥读不到，会显式报 `KEY_INVALIDATED` / `UNAVAILABLE`，**不会静默丢数据**。
+
+## 18. 传输安全（TLS 指纹）（R-225）
+
+前提：节点用证书起 TLS（`chat-node --tls-cert test-cert.pem --tls-key test-key.pem --bind 127.0.0.1:8096`）。
+
+1. 算指纹：`openssl x509 -in test-cert.pem -noout -fingerprint -sha256` -> 去掉冒号、转小写（64 位 hex）；
+2. 应用「关于」面板 -> 「传输安全（TLS）」-> 填指纹 -> 「保存并应用」；
+3. 期望：「当前模式」变为 **pinned 1 张证书**，提示「传输信任已保存」；
+4. 端点改成 `https://127.0.0.1:8096` 后发消息：应 **accepted**；
+5. **负例**：把指纹改成错的值 -> 保存 -> 发消息必须**失败**（不是看起来成功）；
+6. 「清除（回到明文）」后模式变回 **明文 HTTP**。
+
+配置落在 `%APPDATA%\Chat\node-config.json` 的 `tlsFingerprints` 数组（非机密）。

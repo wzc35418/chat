@@ -10,6 +10,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -32,6 +33,10 @@ data class AboutHandlers(
     val confirmKeySlotMigration: () -> Unit = {},
     /** 取消迁移。 */
     val cancelKeySlotMigration: () -> Unit = {},
+    /** 保存并应用传输信任指纹（逗号或空白分隔，可空 = 清除）。 */
+    val applyTransportTrust: (String) -> Unit = {},
+    /** 更新指纹输入框。 */
+    val updateTransportFingerprints: (String) -> Unit = {},
 ) {
     companion object {
         val None = AboutHandlers()
@@ -55,6 +60,10 @@ fun AboutPanel(
     keySlotDetail: String = "",
     /** 密钥槽保护说明。 */
     keySlotSummary: String = "",
+    /** 当前传输模式（明文 / pinned N 张证书）。 */
+    transportMode: String = "",
+    /** 输入框里的指纹文本。 */
+    transportFingerprints: String = "",
     /** 是否正在等待"确认迁移"。 */
     keySlotMigrationPending: Boolean = false,
     /** 迁移目标后端是否可用（不可用时按钮禁用并说明）。 */
@@ -84,6 +93,32 @@ fun AboutPanel(
             LabeledRow("FFI 契约版本", info.ffiVersion)
             LabeledRow("平台", info.platform)
         } ?: Text("还没有读取版本信息。", style = MaterialTheme.typography.bodySmall)
+        HorizontalDivider(color = Color(0xFFE1E6E1))
+        Text("传输安全（TLS）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+        LabeledRow("当前模式", transportMode.ifBlank { "未配置" })
+        Text(
+            "指纹 = 节点证书的 SHA-256（64 位小写十六进制）。填了就只接受这些证书的 https；留空 = 明文 HTTP（仅限可信网络）。",
+            style = MaterialTheme.typography.labelSmall,
+            color = Color(0xFF5F6B63),
+        )
+        OutlinedTextField(
+            value = transportFingerprints,
+            onValueChange = handlers.updateTransportFingerprints,
+            label = { Text("证书指纹（多个用逗号或空格分隔）") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            TextButton(
+                onClick = { handlers.applyTransportTrust(transportFingerprints) },
+                modifier = Modifier.semantics { contentDescription = "应用传输信任指纹" },
+            ) { Text("保存并应用", style = MaterialTheme.typography.labelMedium) }
+            TextButton(
+                onClick = { handlers.applyTransportTrust("") },
+                modifier = Modifier.semantics { contentDescription = "清除传输信任" },
+            ) { Text("清除（回到明文）", style = MaterialTheme.typography.labelMedium) }
+        }
+
         HorizontalDivider(color = Color(0xFFE1E6E1))
         Text("密钥槽（主密钥保护）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
         LabeledRow("当前后端", keySlotBackend.ifBlank { "（未探测）" })

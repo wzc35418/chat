@@ -144,6 +144,8 @@ fun main() = application {
     val identityDatabase = remember { identityDir?.let { File(it, "identity.db").absolutePath } }
     var identityKey by remember { mutableStateOf<String?>(null) }
     var keySlotSummary by remember { mutableStateOf("密钥槽未初始化") }
+    var transportMode by remember { mutableStateOf("明文 HTTP") }
+    var transportFingerprintText by remember { mutableStateOf("") }
     var keySlotBackend by remember { mutableStateOf(KeySlotBackend.None) }
     var keySlotDetail by remember { mutableStateOf("") }
     var keySlotMigrationPending by remember { mutableStateOf(false) }
@@ -192,6 +194,20 @@ fun main() = application {
 
     // PLATFORM-001/002 接线：Windows 用 DPAPI（当前用户作用域），其它平台回退口令派生槽。
     // 磁盘只存密文/blob；启动时 unwrap，首次运行生成并 wrap。
+    // 启动时应用持久化的传输信任（失败必须显式可见，绝不静默降级成明文）。
+    LaunchedEffect(Unit) {
+        runCatching {
+            val saved = nodeConfigStore.load()
+            transportFingerprintText = saved.tlsFingerprints.joinToString(",")
+            if (saved.tlsFingerprints.isNotEmpty()) {
+                uniffi.chat_ffi.configureTransportTrust(saved.tlsFingerprints)
+                transportMode = "pinned " + saved.tlsFingerprints.size + " 张证书"
+            }
+        }.onFailure { error ->
+            transportMode = "配置失败：" + ((error as? Exception)?.message ?: error::class.simpleName)
+        }
+    }
+
     LaunchedEffect(Unit) {
         if (identityDir == null) {
             keySlotSummary = "密钥槽不可用（目录创建失败）"
@@ -1407,6 +1423,8 @@ PreviewChatScreen(
             uiScale = uiPrefs.scale,
             showPluginEntry = uiPrefs.showPlugins,
             showAboutEntry = uiPrefs.showAbout,
+            transportMode = transportMode,
+            transportFingerprints = transportFingerprintText,
             keySlotBackend = keySlotBackend.label,
             keySlotDetail = keySlotDetail,
             keySlotSummary = keySlotSummary,
@@ -1415,6 +1433,32 @@ PreviewChatScreen(
                 System.getProperty("os.name", "").lowercase().contains("windows"),
             aboutState = aboutState,
             aboutHandlers = AboutHandlers(
+                updateTransportFingerprints = { transportFingerprintText = it },
+                applyTransportTrust = { raw ->
+                    val parsed = raw.split(',', ' ', '\n', '\t')
+                        .map { it.trim().lowercase() }
+                        .filter { it.isNotEmpty() }
+                    runCatching {
+                        if (parsed.isEmpty()) {
+                            uniffi.chat_ffi.clearTransportTrust()
+                        } else {
+                            uniffi.chat_ffi.configureTransportTrust(parsed)
+                        }
+                        val saved = nodeConfigStore.load()
+                        nodeConfigStore.save(saved.copy(tlsFingerprints = parsed))
+                    }.onSuccess {
+                        transportMode = if (parsed.isEmpty()) "明文 HTTP" else "pinned " + parsed.size + " 张证书"
+                        aboutState = aboutState.copy(
+                            notice = if (parsed.isEmpty()) "已清除传输信任（回到明文）" else "传输信任已保存（" + parsed.size + " 张证书）",
+                            lastErrorCode = null,
+                        )
+                    }.onFailure { error ->
+                        aboutState = aboutState.withAboutError(
+                            "TRANSPORT_TRUST_INVALID",
+                            error.message ?: error::class.simpleName,
+                        )
+                    }
+                },
                 requestKeySlotMigration = { keySlotMigrationPending = true },
                 cancelKeySlotMigration = { keySlotMigrationPending = false },
                 confirmKeySlotMigration = {

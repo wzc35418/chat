@@ -12,6 +12,8 @@ data class NodeConfig(
     val endpointUrl: String = "",
     val nodeId: String = "",
     val nodePublicKeyHex: String = "",
+    /** 传输信任：证书 SHA-256 指纹集合（空 = 明文 HTTP；非空 = 只接受这些证书的 https）。 */
+    val tlsFingerprints: List<String> = emptyList(),
 ) {
     val isConfigured: Boolean get() = endpointUrl.isNotBlank() && nodeId.isNotBlank()
 }
@@ -58,14 +60,35 @@ class NodeConfigStore(private val file: File) {
                 endpointUrl = field("endpointUrl"),
                 nodeId = field("nodeId"),
                 nodePublicKeyHex = field("nodePublicKeyHex"),
+                tlsFingerprints = parseFingerprintList(text),
             )
+        }
+
+        /** 解析 `tlsFingerprints` 数组（只取 64 位小写十六进制项；其它忽略）。 */
+        fun parseFingerprintList(text: String): List<String> {
+            val at = text.indexOf("\"tlsFingerprints\"")
+            if (at < 0) return emptyList()
+            val open = text.indexOf('[', at)
+            if (open < 0) return emptyList()
+            val close = text.indexOf(']', open)
+            if (close < 0) return emptyList()
+            return text.substring(open + 1, close)
+                .split(',')
+                .map { it.trim().trim('"').trim().lowercase() }
+                .filter { it.length == 64 && it.all { c -> c in "0123456789abcdef" } }
+                .distinct()
         }
 
         fun render(config: NodeConfig): String = buildString {
             appendLine("{")
             appendLine("  \"endpointUrl\": \"" + escape(config.endpointUrl) + "\",")
             appendLine("  \"nodeId\": \"" + escape(config.nodeId) + "\",")
-            appendLine("  \"nodePublicKeyHex\": \"" + escape(config.nodePublicKeyHex) + "\"")
+            appendLine("  \"nodePublicKeyHex\": \"" + escape(config.nodePublicKeyHex) + "\",")
+            val fingerprints = config.tlsFingerprints
+                .map { it.trim().lowercase() }
+                .filter { it.length == 64 && it.all { c -> c in "0123456789abcdef" } }
+                .distinct()
+            appendLine("  \"tlsFingerprints\": [" + fingerprints.joinToString(",") { "\"" + it + "\"" } + "]")
             appendLine("}")
         }
 
