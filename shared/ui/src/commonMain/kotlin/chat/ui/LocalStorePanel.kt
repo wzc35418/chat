@@ -67,6 +67,8 @@ data class StoreHandlers(
     val updateSendNodeId: (String) -> Unit = {},
     val updateSendNodePublicKey: (String) -> Unit = {},
     val configureSendNode: () -> Unit = {},
+    /** 一步完成「准备并加密 + 发送」（推荐）；失败时说明卡在哪一步。 */
+    val sendNow: () -> Unit = {},
     val sendPrepare: () -> Unit = {},
     val sendDispatch: () -> Unit = {},
     val sendRetry: () -> Unit = {},
@@ -376,6 +378,10 @@ fun LocalStorePanel(
                         onClick = handlers.configureSendNode,
                         enabled = state.ready && !state.busy && state.sendNodeUrl.isNotBlank() && state.sendNodeId.isNotBlank(),
                     ) { Text("保存节点配置", style = MaterialTheme.typography.labelMedium) }
+                    TextButton(
+                        onClick = handlers.sendNow,
+                        enabled = state.ready && !state.busy && state.drafts.isNotEmpty(),
+                    ) { Text("发送（一步完成）", style = MaterialTheme.typography.labelMedium) }
                     TextButton(
                         onClick = handlers.sendPrepare,
                         enabled = state.ready && !state.busy && state.drafts.isNotEmpty(),

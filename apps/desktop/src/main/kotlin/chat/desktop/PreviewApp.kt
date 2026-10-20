@@ -993,6 +993,39 @@ fun main() = application {
                     }
             }
         },
+        sendNow = {
+            scope.launch {
+                if (store == null) return@launch
+                val draft = storeState.drafts.lastOrNull() ?: return@launch
+                storeState = storeState.beginBusy()
+                val outcome = sendNow(store, draft.draftId)
+                if (outcome.ok) {
+                    storeState = storeState.copy(
+                        busy = false,
+                        notice = "发送完成：" + outcome.steps.joinToString(" → "),
+                        lastErrorCode = null,
+                    )
+                    // 发送成功后把界面步骤更新为 accepted（两步都过，提交已被节点接受）。
+                    storeState = storeState.withSendStep(
+                        chat.api.SendStep(
+                            draftId = draft.draftId,
+                            status = "accepted",
+                            submissionId = null,
+                            attemptIndex = null,
+                            detail = "已提交并被节点接受",
+                            settled = true,
+                        ),
+                    )
+                } else {
+                    storeState = storeState.withError(
+                        failureCode(outcome.failure ?: IllegalStateException("SEND_FAILED")),
+                        "步骤 " + (outcome.steps.size + 1) + " 失败（已完成：" +
+                            (if (outcome.steps.isEmpty()) "无" else outcome.steps.joinToString(" → ")) + "）：" +
+                            (outcome.failure?.message ?: "未知错误"),
+                    )
+                }
+            }
+        },
         sendPrepare = {
             scope.launch {
                 if (store == null) return@launch
