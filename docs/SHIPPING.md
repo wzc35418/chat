@@ -333,3 +333,29 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 | 部署方式 | `deploy/prepare-node-bundle.ps1` 生成包 → 拷到服务器 → `run-node.ps1` → `New-NetFirewallRule` + 云安全组 8443 |
 
 这一条把「跨机器/NAT」从**已知限制**里划掉了（直连公网 IP，无中继；打洞仍未做）。
+
+## 12 阶段全绿（含公网 remote，2026-10-21）
+
+```
+disk             PASS          0s
+rust-check       PASS          2.1s
+verify-project   PASS          0.9s
+gradle           PASS          35.3s
+android          PASS          4.3s
+package          PASS          16.3s
+two-device       PASS          6s   A/B exchange (send accepted + pull applied)
+lan              PASS          3.7s non-loopback e2e; 192.168.20.1
+tls              PASS          4.9s https health 200; plaintext refused; untrusted refused
+offline          PASS          5.3s sent with receiver offline; delivered on next sync
+tls-e2e          PASS          5.4s https send accepted + sync applied; wrong fingerprint rejected
+remote           PASS          34.7s cross-machine e2e: cert pin + node identity + submit accepted + pull applied; https://106.54.223.171:8443
+overall: PASS
+```
+
+复跑命令：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
+  -RemoteEndpoint https://106.54.223.171:8443 -RemoteNodeId node-public `
+  -RemoteFingerprint 13be2f93162bd121cba6a91d4e05c22900dcc06abcd92cf843bd5ed772b8a053
+```

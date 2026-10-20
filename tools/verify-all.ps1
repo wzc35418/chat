@@ -1,4 +1,4 @@
-# verify-all.ps1 - one-shot full regression (added 2026-10-19).
+﻿# verify-all.ps1 - one-shot full regression (added 2026-10-19).
 #
 # Design notes:
 #   * Pure ASCII output on purpose: Windows PowerShell 5.1 mangles UTF-8
@@ -28,6 +28,13 @@ param(
     [switch]$SkipTlsE2e,
     [switch]$SkipAndroid,
     [switch]$SkipGradle,
+    [switch]$SkipRemote,
+    # Optional remote node: when set, an extra 'remote' stage verifies a public node cross-machine.
+    [string]$RemoteEndpoint = "",
+    [string]$RemoteNodeId = "node-public",
+    [string]$RemoteFingerprint = "",
+    [string]$RemoteFingerprintFile = "",
+    [switch]$RemoteTofu,
     [string]$TargetDir = ""
 )
 
@@ -333,6 +340,38 @@ if ($SkipTlsE2e) {
             Add-Stage -Name "tls-e2e" -Status "SKIP" -Seconds $seconds -Detail "openssl not installed" -Log $log
         } else {
             Add-Stage -Name "tls-e2e" -Status "FAIL" -Seconds $seconds -Detail ("exit " + $code + "; " + (Get-LogTail -Path $log)) -Log $log
+        }
+    }
+}
+
+# ---------------------------------------------------------------- stage 12: remote (public node, optional)
+if ($SkipRemote -or [string]::IsNullOrWhiteSpace($RemoteEndpoint)) {
+    Add-SkippedStage -Name "remote" -Reason "no -RemoteEndpoint (pass it to verify a public node)"
+} else {
+    Write-Host ""
+    Write-Host "== remote =="
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $log = Join-Path $logDir "remote.log"
+    $script = Join-Path $root "tools/verify-remote.ps1"
+    if (-not (Test-Path $script)) {
+        $sw.Stop()
+        Add-Stage -Name "remote" -Status "FAIL" -Seconds ([math]::Round($sw.Elapsed.TotalSeconds, 1)) -Detail "tools/verify-remote.ps1 is missing" -Log ""
+    } else {
+        $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script, '-Endpoint', $RemoteEndpoint, '-NodeId', $RemoteNodeId)
+        if ($RemoteFingerprint -ne "") { $args += @('-Fingerprint', $RemoteFingerprint) }
+        if ($RemoteFingerprintFile -ne "") { $args += @('-FingerprintFile', $RemoteFingerprintFile) }
+        if ($RemoteTofu) { $args += '-TrustServedCertificate' }
+        $quoted = ($args | ForEach-Object { '"' + $_ + '"' }) -join ' '
+        cmd /c ('powershell ' + $quoted + ' > "' + $log + '" 2>&1') | Out-Null
+        $code = $LASTEXITCODE
+        $sw.Stop()
+        $seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+        if ($code -eq 0) {
+            Add-Stage -Name "remote" -Status "PASS" -Seconds $seconds -Detail ("cross-machine e2e: cert pin + node identity + submit accepted + pull applied; " + $RemoteEndpoint) -Log $log
+        } elseif ($code -eq 3) {
+            Add-Stage -Name "remote" -Status "SKIP" -Seconds $seconds -Detail "missing artifact/openssl" -Log $log
+        } else {
+            Add-Stage -Name "remote" -Status "FAIL" -Seconds $seconds -Detail ("exit " + $code + "; " + (Get-LogTail -Path $log)) -Log $log
         }
     }
 }
