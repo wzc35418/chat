@@ -343,3 +343,21 @@ tasks.register<JavaExec>("nodeSelfCheckSmoke") {
     mainClass.set("chat.desktop.NodeSelfCheckSmokeKt")
     systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
 }
+
+
+// 一步发送（界面路径）冒烟：对真实节点跑 sendWithRecovery（参数走环境变量，避免 Gradle --args 引号问题）。
+tasks.register<JavaExec>("sendFlowSmoke") {
+    group = "verification"
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.PackageE2eSmokeKt")
+    systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+    environment("CHAT_SENDFLOW", "1")
+    val env = System.getenv()
+    val endpoint = env["SENDFLOW_ENDPOINT"] ?: ""
+    val nodeId = env["SENDFLOW_NODE_ID"] ?: ""
+    val fingerprint = env["SENDFLOW_FP"] ?: "-"
+    if (endpoint.isNotEmpty() && nodeId.isNotEmpty()) {
+        args = listOf(endpoint, nodeId, "-", fingerprint)
+    }
+}

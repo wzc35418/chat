@@ -149,6 +149,21 @@ if ($goodCode -ne 0 -or $goodText -notmatch 'accepted' -or $goodText -notmatch '
 }
 Write-Host 'PASS remote: packaged artifact submitted (accepted) and pulled entries back'
 
+# 5b. the UI path (one-step send with recovery) must also work against the same node
+$flowLog = Join-Path $logDir 'e2e-sendflow.log'
+$env:CHAT_SENDFLOW = '1'
+& $java ('-Djna.library.path=' + $native) '-cp' $jar 'chat.desktop.PackageE2eSmokeKt' $Endpoint $NodeId '-' $fp *> $flowLog
+$flowCode = $LASTEXITCODE
+Remove-Item Env:CHAT_SENDFLOW -ErrorAction SilentlyContinue
+$flowText = Get-Content $flowLog -Raw -ErrorAction SilentlyContinue
+if ($null -eq $flowText) { $flowText = '' }
+if ($flowCode -ne 0 -or $flowText -notmatch 'PASS send flow accepted') {
+    Write-Host ('FAIL remote check: one-step send (UI path) failed (exit ' + $flowCode + ')')
+    Get-Content $flowLog -Tail 15 | Out-Host
+    exit 1
+}
+Write-Host 'PASS remote: one-step send flow (UI path) accepted by the same node'
+
 if (-not $tlsMode) {
     Write-Host ('logs: ' + $logDir)
     Write-Host 'REMOTE CONNECTIVITY: PASS (plaintext)'

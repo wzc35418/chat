@@ -131,15 +131,30 @@ fun main(args: Array<String>): Unit = runBlocking {
         store.configureSendNode(endpoint, nodeId, nodeKey)
         println("PASS send node configured: " + endpoint)
 
+        // CHAT_SENDFLOW=1 时走界面用的「一步发送 + 自动恢复」路径（sendWithRecovery），
+        // 这样这条冒烟证明的就是**用户点按钮时实际执行的那段代码**。
+        val useSendFlow = System.getenv("CHAT_SENDFLOW") == "1"
+        var dispatched: chat.api.SendStep? = null
+        if (useSendFlow) {
+            val outcome = sendWithRecovery(store, draft.draftId)
+            println("INFO send flow steps: " + outcome.steps.joinToString(" -> "))
+            if (!outcome.ok) {
+                println("FAIL send flow: " + (outcome.failure?.message ?: "unknown"))
+                kotlin.system.exitProcess(1)
+            }
+            println("PASS send flow accepted after " + outcome.steps.size + " step(s)")
+            dispatched = chat.api.SendStep(draft.draftId, "accepted", null, null, "send flow", true)
+        } else {
         val prepared = store.sendPrepare(draft.draftId)
         println("PASS sendPrepare: " + prepared.status)
 
-        val dispatched = store.sendDispatch(draft.draftId)
+        dispatched = store.sendDispatch(draft.draftId)
         println("PASS sendDispatch: " + dispatched.status)
+        }
 
         val draftStatus = store.draftStatusView(draft.draftId)
         println("INFO draft status after dispatch: " + (draftStatus?.status ?: "unknown"))
-        if (dispatched.status == "accepted" && dispatched.settled) {
+        if (dispatched != null && dispatched.status == "accepted" && dispatched.settled) {
             println("PASS node accepted the packaged submit")
 
             // 收消息：关掉 store（单写者）后用同一份库开同步对象，拉一轮。
@@ -158,7 +173,7 @@ fun main(args: Array<String>): Unit = runBlocking {
             }
             runCatching { sync.shutdown() }
         } else {
-            println("FAIL node did not accept (status=" + dispatched.status + ", settled=" + dispatched.settled + ", detail=" + dispatched.detail + ")")
+            println("FAIL node did not accept (status=" + (dispatched?.status ?: "none") + ")")
             failures += 1
         }
     } catch (error: LocalStoreException) {

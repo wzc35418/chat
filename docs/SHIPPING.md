@@ -329,7 +329,7 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 | 节点 | `106.54.223.171:8443`（Windows Server，自签证书，TLS） |
 | 证书指纹（SHA-256） | `13be2f93162bd121cba6a91d4e05c22900dcc06abcd92cf843bd5ed772b8a053` |
 | node_id | `node-public` |
-| 结论 | `CROSS-MACHINE VERIFICATION: PASS`（6 条断言，含打包产物 accepted+applied 与错误指纹被拒） |
+| 结论 | `CROSS-MACHINE VERIFICATION: PASS`（**7 条断言**：TCP / 证书 pin / 节点身份 / tls_info / 打包产物 accepted+applied / **一步发送 UI 路径** / 错误指纹被拒） |
 | 部署方式 | `deploy/prepare-node-bundle.ps1` 生成包 → 拷到服务器 → `run-node.ps1` → `New-NetFirewallRule` + 云安全组 8443 |
 
 这一条把「跨机器/NAT」从**已知限制**里划掉了（直连公网 IP，无中继；打洞仍未做）。
