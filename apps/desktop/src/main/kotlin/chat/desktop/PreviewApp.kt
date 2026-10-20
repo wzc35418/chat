@@ -1483,6 +1483,22 @@ PreviewChatScreen(
                         selfCheckLines = steps.map { step ->
                             (if (step.ok) "PASS " else "FAIL ") + step.name + ": " + step.detail
                         }
+                        // 自检失败要进入统一的错误条（分层展示 + 可执行建议），而不是只留一行等宽文本。
+                        val failed = steps.firstOrNull { !it.ok }
+                        if (failed == null) {
+                            aboutState = aboutState.copy(notice = "节点自检通过（" + steps.size + " 步）", lastErrorCode = null)
+                        } else {
+                            val code = when (failed.name) {
+                                "health" -> "NODE_UNAVAILABLE"
+                                "node_id" -> "INVALID_TARGET"
+                                "tls_pinning" -> "TLS_TRUST_REQUIRED"
+                                "tls_info" -> "INVALID_TARGET"
+                                else -> "UNKNOWN_RESULT"
+                            }
+                            // 把原始原因带上，让 presentRawError 的标记匹配能命中（PIN_MISMATCH / SAN 等）。
+                            val reason = failed.name + ": " + failed.detail
+                            aboutState = aboutState.withAboutError(code, reason)
+                        }
                     }
                 },
                 refreshTlsCertificate = {
