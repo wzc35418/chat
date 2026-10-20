@@ -45,6 +45,7 @@ data class GroupHandlers(
     val removeMember: (String) -> Unit = {},
     val acceptPending: () -> Unit = {},
     val discardPending: () -> Unit = {},
+    val registerOnNode: () -> Unit = {},
     val loadGroupList: () -> Unit = {},
     val selectGroup: (String) -> Unit = {},
     val updateInvitee: (String) -> Unit = {},
@@ -130,6 +131,11 @@ fun GroupPanel(
 
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("本机群列表", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                    TextButton(
+                        onClick = handlers.registerOnNode,
+                        enabled = state.ready && !state.busy && state.snapshot != null,
+                        modifier = Modifier.semantics { contentDescription = "把本群登记到节点" },
+                    ) { Text("登记到节点", style = MaterialTheme.typography.labelMedium) }
                     TextButton(
                         onClick = handlers.loadGroupList,
                         enabled = state.ready && !state.busy,

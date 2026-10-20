@@ -61,6 +61,7 @@ import chat.presentation.preview.withCreatedGroup
 import chat.presentation.preview.withDataDir
 import chat.presentation.preview.withHostLibraryPath
 import chat.presentation.preview.withFetchedInvite
+import chat.presentation.preview.withRegistration
 import chat.presentation.preview.withInviteReceipt
 import chat.presentation.preview.withMessagePreview
 import chat.presentation.preview.withSyncStatus
@@ -557,6 +558,28 @@ fun main() = application {
     }
 
     val groupHandlers = GroupHandlers(
+        registerOnNode = {
+            scope.launch {
+                val snapshot = groupState.snapshot ?: return@launch
+                groupState = groupState.beginBusy()
+                runCatching {
+                    withGroup { service ->
+                        service.registerOnNode(
+                            snapshot.groupId,
+                            storeState.sendNodeUrl.trim(),
+                            storeState.sendNodeId.trim(),
+                            storeState.sendNodePublicKey.trim().ifEmpty { null },
+                        )
+                    }.getOrThrow()
+                }.onSuccess { groupState = groupState.withRegistration(it) }
+                    .onFailure { error ->
+                        groupState = groupState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
         loadGroupList = {
             scope.launch {
                 groupState = groupState.beginBusy()

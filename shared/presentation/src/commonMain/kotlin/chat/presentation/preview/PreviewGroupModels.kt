@@ -30,6 +30,8 @@ data class PreviewGroupState(
     val inviteeKeyPackagePath: String = "",
     /** 最近一次用 KeyPackage 建群的结果（含可用 Welcome）。 */
     val createdGroup: chat.api.CreatedGroup? = null,
+    /** 最近一次节点登记回执。 */
+    val registration: chat.api.GroupRegistration? = null,
     /** 最近一次从节点取回的邀请。 */
     val fetchedInvite: chat.api.GroupInviteBlob? = null,
 )
@@ -145,5 +147,12 @@ fun PreviewGroupState.withCreatedGroup(created: chat.api.CreatedGroup): PreviewG
     busy = false,
     notice = "已用对方 KeyPackage 建群：epoch " + created.snapshot.epoch +
         "，Welcome " + created.welcomeBytes.size + " 字节（可用于提交邀请）",
+    lastErrorCode = null,
+)
+
+fun PreviewGroupState.withRegistration(view: chat.api.GroupRegistration): PreviewGroupState = copy(
+    registration = view,
+    busy = false,
+    notice = "已在节点登记：" + view.groupId + "（seq " + view.registeredSeq + "）",
     lastErrorCode = null,
 )
