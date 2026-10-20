@@ -48,6 +48,8 @@ data class PreviewStoreState(
     val sendStep: chat.api.SendStep? = null,
     /** 常驻同步状态（SyncFfi 快照）。 */
     val syncStatus: chat.api.SyncStatusView? = null,
+    /** 最近一次单轮拉取结果（syncOnce）。 */
+    val syncOnce: chat.api.SyncOnceView? = null,
     /** 附件导出目标路径（附件面板与本面板共用；空表示未设置）。 */
     val exportTarget: String = "",
     /** 每条消息的附件卡片（来自 AttachmentFfi.records，不含正文）。 */
@@ -224,3 +226,10 @@ fun PreviewStoreState.withMessagePreview(messageId: String, body: String): Previ
     merged[messageId] = preview
     return copy(messagePreviews = merged)
 }
+
+fun PreviewStoreState.withSyncOnce(view: chat.api.SyncOnceView): PreviewStoreState = copy(
+    syncOnce = view,
+    busy = false,
+    notice = if (view.fetched == 0L) "节点上没有新条目" else "本轮拉取 " + view.fetched + " 条，落库 " + view.applied + " 条",
+    lastErrorCode = null,
+)

@@ -45,6 +45,7 @@ data class IdentityHandlers(
     val updateRecoveryPassphrase: (String) -> Unit = {},
     val exportRecovery: () -> Unit = {},
     val importRecovery: () -> Unit = {},
+    val exportKeyPackage: () -> Unit = {},
     val loadDevices: () -> Unit = {},
     val revokeDevice: (String) -> Unit = {},
 ) {
@@ -143,6 +144,20 @@ fun RealIdentityPanel(
                 )
 
                 HorizontalDivider(color = Color(0xFFE1E6E1))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("邀请用的 KeyPackage", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                    TextButton(
+                        onClick = handlers.exportKeyPackage,
+                        enabled = !state.busy,
+                        modifier = Modifier.semantics { contentDescription = "导出我的 KeyPackage" },
+                    ) { Text("导出 .kp", style = MaterialTheme.typography.labelMedium) }
+                }
+                Text(
+                    "用于让别人建群并邀请你：每次导出都是新的（单次使用），只含公钥材料。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF5F6B63),
+                )
+
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("已登记设备（IDENTITY-011/012）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
                     TextButton(

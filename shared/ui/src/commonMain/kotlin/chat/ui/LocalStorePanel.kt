@@ -53,6 +53,7 @@ data class StoreHandlers(
     val syncStart: () -> Unit = {},
     val syncStop: () -> Unit = {},
     val syncRefresh: () -> Unit = {},
+    val syncOnce: () -> Unit = {},
     val loadMessageAttachments: () -> Unit = {},
     val exportCard: (String) -> Unit = {},
     val downloadCard: (String) -> Unit = {},
@@ -240,6 +241,11 @@ fun LocalStorePanel(
                         modifier = Modifier.semantics { contentDescription = "停止常驻同步" },
                     ) { Text("停止同步", style = MaterialTheme.typography.labelMedium) }
                     TextButton(
+                        onClick = handlers.syncOnce,
+                        enabled = state.ready && !state.busy,
+                        modifier = Modifier.semantics { contentDescription = "只拉一轮并应用" },
+                    ) { Text("收一轮", style = MaterialTheme.typography.labelMedium) }
+                    TextButton(
                         onClick = handlers.syncRefresh,
                         enabled = state.ready && !state.busy,
                         modifier = Modifier.semantics { contentDescription = "刷新同步状态" },
@@ -249,6 +255,13 @@ fun LocalStorePanel(
                         enabled = state.ready,
                         modifier = Modifier.semantics { contentDescription = "发送一条测试系统通知" },
                     ) { Text("测试通知", style = MaterialTheme.typography.labelMedium) }
+                }
+                state.syncOnce?.let { once ->
+                    Text(
+                        "本轮：拉取 " + once.fetched + " 条 · 落库 " + once.applied + " 条 · 跳过 " + once.skipped +
+                            " 条 · 游标 " + once.nextCursor + (if (once.settled) " · 已追平" else " · 未追平"),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                 }
                 state.syncStatus?.let { status ->
                     Text(

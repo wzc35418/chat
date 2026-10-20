@@ -91,6 +91,13 @@ interface IdentityService {
     suspend fun importRecoveryBundle(passphrase: String, bundle: ByteArray): RecoveryImportView
 
     /**
+     * 导出本机 KeyPackage 字节（只含公钥材料）。**单次使用**：每次导出都是新的。
+     *
+     * 用于把邀请发给对方：对方拿它建群后会得到可用的 Welcome。
+     */
+    suspend fun exportKeyPackage(): ByteArray
+
+    /**
      * 把本机身份登记进另一个库（通常是消息库）。
      *
      * 语义：幂等；目标库已绑定另一账户 → `IDENTITY_ACCOUNT_CONFLICT`（绝不覆盖）；

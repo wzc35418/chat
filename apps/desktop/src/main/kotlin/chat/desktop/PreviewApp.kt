@@ -47,6 +47,7 @@ import chat.presentation.preview.updateSendNodeId
 import chat.presentation.preview.updateSendNodePublicKey
 import chat.presentation.preview.updateSendNodeUrl
 import chat.presentation.preview.withSendStep
+import chat.presentation.preview.withSyncOnce
 import chat.presentation.preview.withMessageCards
 import chat.presentation.preview.advance
 import chat.presentation.preview.updateEndpoint
@@ -297,6 +298,26 @@ fun main() = application {
         },
         refreshContacts = { scope.launch { refreshContacts() } },
         updateRecoveryPassphrase = { value -> identityState = identityState.updateRecoveryPassphrase(value) },
+        exportKeyPackage = {
+            scope.launch {
+                val service = identity ?: return@launch
+                runCatching {
+                    val bytes = service.exportKeyPackage()
+                    val picker = DesktopFilePicker(null)
+                    val target = picker.chooseExportTarget("my-key-package.kp")
+                    java.io.File(target.path).writeBytes(bytes)
+                    bytes.size
+                }.onSuccess { size ->
+                    identityState = identityState.copy(busy = false, notice = "已导出 KeyPackage（" + size + " 字节）")
+                }.onFailure { error ->
+                    identityState = identityState.copy(
+                        busy = false,
+                        notice = error.message ?: "导出失败",
+                        lastErrorCode = (error as? IdentityException)?.code ?: "UNKNOWN_RESULT",
+                    )
+                }
+            }
+        },
         loadDevices = {
             scope.launch {
                 val service = identity ?: return@launch
@@ -1005,6 +1026,24 @@ fun main() = application {
         syncStart = { syncHandlers.start() },
         syncStop = { syncHandlers.stop() },
         syncRefresh = { syncHandlers.refresh() },
+        syncOnce = {
+            scope.launch {
+                val service = syncService
+                if (service == null) {
+                    storeState = storeState.withError("CORE_CLOSED", "同步服务未创建（需要节点配置与已初始化的游标）")
+                    return@launch
+                }
+                storeState = storeState.beginBusy()
+                runCatching { service.syncOnce() }
+                    .onSuccess { storeState = storeState.withSyncOnce(it) }
+                    .onFailure { error ->
+                        storeState = storeState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
         sendReconcile = {
             scope.launch {
                 if (store == null) return@launch

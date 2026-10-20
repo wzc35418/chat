@@ -116,6 +116,13 @@ class NativeIdentityService : IdentityService {
         }
     }
 
+    override suspend fun exportKeyPackage(): ByteArray = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            val identity = native ?: throw IdentityException("CORE_CLOSED", "identity is not open")
+            guard { identity.exportKeyPackage() }
+        }
+    }
+
     override suspend fun enrollIntoStore(
         targetDatabasePath: String,
         targetMasterKeyHex: String,
