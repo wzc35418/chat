@@ -260,5 +260,5 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 ### 仍未证明
 
 - 真正跨机器 / NAT / 中继服务（需外部条件）；
-- 证书到期的**客户端展示**（节点日志已告警；关于面板未显示）；信任列表管理页 / 吊销；
+- 证书到期的**客户端展示**（节点日志与 `/v1/tls/info` 已有数据，关于面板未读取）；信任列表管理页 / 吊销；
 - 后台通知、安装器/自动更新、soak。

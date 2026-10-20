@@ -671,6 +671,7 @@ dependencies = [
  "hyper-util",
  "rand 0.10.3",
  "rustls",
+ "sha2 0.11.1",
  "tokio",
  "tokio-rustls",
  "tower",

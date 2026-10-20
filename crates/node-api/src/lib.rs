@@ -10,5 +10,6 @@ pub mod dto;
 pub mod error;
 pub mod handlers;
 pub mod state;
+pub mod tls_info;
 
 pub use handlers::build_router;

@@ -107,6 +107,28 @@ try {
     }
     Write-Host ('PASS tls node: certificate expiry reported (' + $days + ' days remaining)')
 
+    # 6. 公开状态端点：/v1/tls/info 必须能匿名读到，且字段自洽。
+    $infoRequest = "GET /v1/tls/info HTTP/1.1`r`nHost: 127.0.0.1`r`nConnection: close`r`n`r`n"
+    $infoFile = Join-Path $logDir 'tlsinfo.request.txt'
+    Set-Content -Path $infoFile -Value $infoRequest -NoNewline -Encoding ascii
+    $infoCmd = 'cmd /c ""' + $openssl + '" s_client -connect 127.0.0.1:' + $Port + ' -CAfile "' + $cert + '" -verify_return_error -quiet -ign_eof < "' + $infoFile + '" 2>&1"'
+    $infoResponse = cmd /c $infoCmd | Out-String
+    Set-Content -Path (Join-Path $logDir 'tlsinfo.response.txt') -Value $infoResponse -Encoding utf8
+    if ($infoResponse -notmatch '"days_remaining"\s*:\s*(-?\d+)') {
+        Write-Host 'FAIL tls check: /v1/tls/info did not return days_remaining'
+        exit 1
+    }
+    $endpointDays = [int]$matches[1]
+    if ($endpointDays -le 0) {
+        Write-Host ('FAIL tls check: /v1/tls/info reports expired cert (' + $endpointDays + ' days)')
+        exit 1
+    }
+    if ($infoResponse -notmatch '"cert_sha256"\s*:\s*"([0-9a-f]{64})"') {
+        Write-Host 'FAIL tls check: /v1/tls/info missing cert_sha256'
+        exit 1
+    }
+    Write-Host ('PASS tls node: /v1/tls/info anonymous read (days_remaining=' + $endpointDays + ')')
+
     Write-Host ('logs: ' + $logDir)
     exit 0
 } finally {

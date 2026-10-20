@@ -791,6 +791,14 @@ fn load_tls_acceptor(tls: &TlsConfig) -> Result<tokio_rustls::TlsAcceptor, NodeS
                     eprintln!("chat-node WARN tls certificate expires in {days} days (rotate soon)");
                 }
                 println!("chat-node tls certificate expires in {days} days");
+                // 公开证书状态：客户端可据此提示"证书快过期了"。
+                let sha256 = chat_node_services::canonical::hex_encode(
+                    &<sha2::Sha256 as sha2::Digest>::digest(first.as_ref()),
+                );
+                chat_node_api::tls_info::set_tls_info(chat_node_api::tls_info::TlsInfo {
+                    not_after_unix: validity.not_after_unix,
+                    cert_sha256: sha256,
+                });
             }
             None => {
                 eprintln!("chat-node WARN tls certificate validity could not be parsed (unknown expiry)");

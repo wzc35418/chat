@@ -17,6 +17,8 @@ axum.workspace = true
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal", "time", "macros", "sync"] }
 # 启动时派生节点公钥、校验固定公钥；--init-seed 用安全随机生成种子（均为 workspace 依赖）。
 ed25519-dalek.workspace = true
+# 证书 SHA-256（公开状态端点用）。
+sha2.workspace = true
 rand.workspace = true
 
 # TLS 监听（自签/自带证书）：用 tokio-rustls 直接包 TCP 流，再交给 hyper 的自动协议层。

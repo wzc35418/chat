@@ -52,6 +52,8 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         // 健康检查：匿名、不鉴权、不限流，只返回公开身份（不含任何秘密）。
         .route("/v1/health", get(health))
+        // 公开的 TLS 证书状态（匿名、只读、不含秘密）：客户端可据此提示"证书快过期了"。
+        .route("/v1/tls/info", get(tls_status))
         .route("/v1/auth/challenge", post(issue_challenge))
         .route("/v1/devices", post(register_device))
         .route("/v1/groups", post(register_group))
@@ -758,6 +760,32 @@ pub async fn read_blob_chunk(
     )
         .into_response())
 }
+/// GET /v1/tls/info：公开的证书状态（匿名、只读）。",
+///
+/// 未启用 TLS 时返回 404（**不**伪造一个"没有证书但有到期时间"的响应）。
+pub async fn tls_status() -> Result<Response, ApiError> {
+    let Some(info) = crate::tls_info::tls_info() else {
+        return Err(ApiError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "this node does not serve TLS",
+        ));
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let days = crate::tls_info::days_remaining(info, now);
+    Ok(Json(serde_json::json!({
+        "not_after_unix": info.not_after_unix,
+        "days_remaining": days,
+        "expired": days <= 0,
+        "warning": days < 30,
+        "cert_sha256": info.cert_sha256,
+    }))
+    .into_response())
+}
+
 /// GET /v1/health：最小健康检查（匿名、不鉴权、不限流）。
 ///
 /// 只返回节点公开身份与 API schema 版本；不返回密钥、配置、库路径或任何内部状态。
