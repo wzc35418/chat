@@ -563,6 +563,157 @@ fn the_key_package_credential_is_the_device_id_and_account_ids_are_rejected() {
     drop(a_core);
     drop(b_core);
 }
+
+/// 一个"合法形状"的已验证起点（只用于走到设备检查之前的那一步）。
+fn dummy_anchor() -> chat_ffi::shared_core::SharedPullStateFfi {
+    chat_ffi::shared_core::SharedPullStateFfi {
+        cursor_seq: 0,
+        cursor_log_hash: "00".repeat(32),
+        control_head: "00".repeat(32),
+        policy_version: 1,
+        mls_epoch: 1,
+    }
+}
+
+#[test]
+fn the_key_package_survives_a_process_restart_and_joins() {
+    let a_identity = FixtureDir::new();
+    enroll_identity_with_seeds(
+        &a_identity.database(),
+        &master_key_hex(),
+        &ACCOUNT_SEED,
+        &DEVICE_SEED,
+    );
+    let b_identity_dir = FixtureDir::new();
+    let b_account_seed = [0x88_u8; 32];
+    let b_device_seed = [0x99_u8; 32];
+    enroll_identity_with_seeds(
+        &b_identity_dir.database(),
+        &master_key_hex(),
+        &b_account_seed,
+        &b_device_seed,
+    );
+    let node = start_node();
+
+    // 进程 1（B 侧）：登记身份 + 导出 KeyPackage（设备随之加密落库）。
+    let b_dir = FixtureDir::new();
+    let b_database = b_dir.database();
+    let b_core = ChatCoreFfi::open(b_database.clone(), master_key_hex()).expect("open B core");
+    b_core
+        .enroll_local_identity(b_identity_dir.database(), master_key_hex())
+        .expect("B enrolls");
+    let credential = b_core.key_package_credential().expect("credential");
+    let key_package = b_core.export_key_package().expect("B exports");
+
+    // A 侧建群/登记/取锚点/提交邀请。
+    let a_dir = FixtureDir::new();
+    let a_core = ChatCoreFfi::open(a_dir.database(), master_key_hex()).expect("open A core");
+    a_core
+        .enroll_local_identity(a_identity.database(), master_key_hex())
+        .expect("A enrolls");
+    let created = a_core
+        .create_group_with_invitee_key_package(
+            "跨进程群".to_owned(),
+            credential.clone(),
+            key_package,
+            String::new(),
+        )
+        .expect("A creates the group");
+    a_core
+        .group_register_on_node(
+            created.group.group_id.clone(),
+            node.endpoint_url(),
+            NODE_ID.to_owned(),
+            Some(node.public_key_hex()),
+        )
+        .expect("A registers");
+    let anchor = a_core
+        .pull_state(created.group.group_id.clone())
+        .expect("pull state")
+        .expect("verified anchor");
+    a_core
+        .submit_invite(
+            created.group.group_id.clone(),
+            created.invite.clone(),
+            node.endpoint_url(),
+            NODE_ID.to_owned(),
+            Some(node.public_key_hex()),
+        )
+        .expect("A submits the invite");
+
+    // 模拟进程退出：drop B 的共享核心（内存里的 MLS 设备随之消失）。
+    drop(b_core);
+    // 进程 2：打开**同一个库**，没有内存槽，必须从库里恢复设备后成功入群。
+    let b_core2 = ChatCoreFfi::open(b_database, master_key_hex()).expect("reopen B core");
+    let joined = b_core2
+        .join_group_from_welcome(
+            "跨进程群".to_owned(),
+            created.invite.clone(),
+            Some(anchor),
+        )
+        .expect("cross-process join succeeds");
+    assert_eq!(joined.group_id, created.group.group_id);
+    assert_eq!(joined.epoch, created.group.epoch);
+    assert_eq!(joined.members.len(), 2);
+    // 单次语义保留：重复入群仍显式失败。
+    let duplicate = b_core2
+        .join_group_from_welcome(
+            "跨进程群".to_owned(),
+            created.invite.clone(),
+            Some(dummy_anchor()),
+        )
+        .expect_err("a duplicate join is rejected");
+    assert_eq!(code(duplicate), "INVALID_STATE_TRANSITION");
+    a_core.shutdown();
+    b_core2.shutdown();
+}
+
+#[test]
+fn a_store_without_a_key_package_reports_the_same_error() {
+    let identity_dir = FixtureDir::new();
+    enroll_identity_with_seeds(
+        &identity_dir.database(),
+        &master_key_hex(),
+        &ACCOUNT_SEED,
+        &DEVICE_SEED,
+    );
+    let dir = FixtureDir::new();
+    let core = ChatCoreFfi::open(dir.database(), master_key_hex()).expect("open core");
+    core.enroll_local_identity(identity_dir.database(), master_key_hex())
+        .expect("enroll");
+    // 从没 export 过 KeyPackage → 库里没有设备快照。
+    let error = core
+        .join_group_from_welcome(
+            "没有 KeyPackage 的群".to_owned(),
+            SharedInviteFfi {
+                group_id: format!("grp:1:{}", "11".repeat(32)),
+                mls_group_id: "22".repeat(32),
+                name: "没有 KeyPackage 的群".to_owned(),
+                inviter_credential: "alice".to_owned(),
+                owner_credential: "alice".to_owned(),
+                invitee_credential: "bob".to_owned(),
+                members: vec!["alice".to_owned(), "bob".to_owned()],
+                epoch: 1,
+                welcome_bytes: vec![0xAB; 32],
+            },
+            Some(dummy_anchor()),
+        )
+        .expect_err("no key package anywhere");
+    let (error_code, reason) = match error {
+        FfiError::Store { code, reason } => (code, reason),
+    };
+    assert_eq!(error_code, "INVALID_STATE_TRANSITION");
+    assert!(
+        reason.contains("export a key package before joining a group"),
+        "the canonical message is preserved: {reason}"
+    );
+    // 私钥材料不得出现在错误文本里：不允许出现长串十六进制。
+    let long_hex_run = reason
+        .split(|character: char| !character.is_ascii_hexdigit())
+        .any(|run| run.len() >= 64);
+    assert!(!long_hex_run, "the error text must not leak key material: {reason}");
+    core.shutdown();
+}
 #[test]
 fn a_closed_handle_and_a_second_instance_are_explicit() {
     let harness = Harness::new();

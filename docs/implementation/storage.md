@@ -1127,6 +1127,53 @@ MAX_DEVICE_REGISTRY_ROWS = 512;  DEVICE_PUBLIC_KEY_BYTES = 32
 - schema 版本 12 → **13**（既有测试里的版本断言已同步更新）。
 
 复现：`cargo test --offline -p chat-storage -p chat-identity` → 157 passed（既有 95 / 56 继续通过）。
+## MLSDEV：设备级 MLS provider 记录（迁移 **0014**，2026-10-18）
+
+**背景**：KeyPackage 的 init 私钥只存在于 `OpenMlsRustCrypto` 的内存 provider 里，进程退出即丢失 ——
+于是 `export_key_package` 之后换进程 `join_group_from_welcome` 必然失败（旧限制）。
+
+~~~sql
+CREATE TABLE mls_device_state (
+    device_key TEXT PRIMARY KEY NOT NULL,
+    state_version INTEGER NOT NULL CHECK (state_version >= 1),
+    protected_state BLOB NOT NULL,
+    updated_at INTEGER NOT NULL CHECK (updated_at >= 0)
+);
+CREATE TABLE mls_device_record (
+    device_key TEXT NOT NULL,
+    record_key BLOB NOT NULL,
+    protected_value BLOB NOT NULL,
+    updated_at INTEGER NOT NULL CHECK (updated_at >= 0),
+    PRIMARY KEY (device_key, record_key),
+    FOREIGN KEY (device_key) REFERENCES mls_device_state(device_key) ON DELETE CASCADE
+);
+~~~
+
+~~~text
+save_mls_device_state(&mut self, MlsDeviceStateInput) -> MlsDeviceStateRecord   // 单笔事务、整组替换
+load_mls_device_state(&self, device_key) -> Option<MlsDeviceStateRecord>        // 不存在 → None
+clear_mls_device_state(&mut self, device_key) -> bool                          // 记录级联删除
+MAX_MLS_DEVICE_RECORDS = 512;  MAX_MLS_DEVICE_RECORD_BYTES = 256 KiB
+MAX_MLS_DEVICE_KEY_BYTES = 128;  MAX_MLS_DEVICE_STATE_BYTES = 8 KiB
+~~~
+
+- 头与每条记录都**密封**：头用 `SealPurpose::MlsGroupState`，记录用 `SealPurpose::MlsRecord`；
+  AAD 绑定 `(device_key, state_version, record_key)` —— 跨设备/跨键/跨版本不可互换；
+- `state_version` 每次保存 +1（旧版本的密封值无法在新版本下解封，等价于整组替换）；
+- 有界校验：设备键可打印且 ≤128 字节、头 1..=8 KiB、记录 1..=256 KiB 且不重复，超限显式 `INVALID_INPUT`；
+- 记录值不进日志/错误文本（错误只有稳定码与描述）。
+
+**crypto 增量**（TASK-130 授权的最小面，未改既有签名/行为）：
+`MlsDevice::export_device_records` / `import_device_records`（无群设备；记录键以小写 hex 文本进出，
+provider 内部键是原始字节）+ **脱敏 `Debug`**（只显示凭据名、签名公钥、有无群/pending，绝不打印记录值）。
+
+**FFI 行为**（ChatCoreFfi）：`export_key_package` 成功后把设备快照落库（失败则整个导出失败）；`join_group_from_welcome`
+内存槽为空时**先按 `mlsdev/<device_id>` 从库恢复**，库里没有 → 仍返回同一
+`INVALID_STATE_TRANSITION: export a key package before joining a group`（不伪造空设备）；入群成功后清掉
+持久化快照（KeyPackage **单次使用**语义保留）。
+
+复现：`cargo test --offline -p chat-crypto -p chat-storage -p chat-core -p chat-ffi`（全绿）。
+
 
 
 

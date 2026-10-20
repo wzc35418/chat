@@ -18,6 +18,7 @@ mod directory;
 mod entry;
 mod error;
 mod identity;
+mod mls_device;
 mod mls_state;
 mod migrations;
 mod outbox_lease;
@@ -54,6 +55,10 @@ pub use identity::{
     DeviceCredentialRecord, DeviceRevocationRecord, DeviceRevocationSetRecord, FINGERPRINT_BYTES,
     IdentityAccountInput, IdentityAccountRecord, MAX_CONTACTS, MAX_DEVICE_CREDENTIALS,
     MAX_DEVICE_REVOCATIONS, MAX_IDENTITY_DISPLAY_NAME_BYTES, PUBLIC_KEY_BYTES, contact_id_for,
+};
+pub use mls_device::{
+    MAX_MLS_DEVICE_KEY_BYTES, MAX_MLS_DEVICE_RECORDS, MAX_MLS_DEVICE_RECORD_BYTES,
+    MAX_MLS_DEVICE_STATE_BYTES, MlsDeviceStateInput, MlsDeviceStateRecord,
 };
 pub use mls_state::{
     MAX_GROUP_STATE_LIST, MAX_MLS_GROUP_ID_BYTES, MAX_MLS_GROUP_RECORD_BYTES,

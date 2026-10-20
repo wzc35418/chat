@@ -24,6 +24,7 @@ param(
     [switch]$SkipTwoDevice,
     [switch]$SkipLan,
     [switch]$SkipTls,
+    [switch]$SkipOffline,
     [switch]$SkipAndroid,
     [switch]$SkipGradle,
     [string]$TargetDir = ""
@@ -279,6 +280,31 @@ if ($SkipTls) {
             Add-Stage -Name "tls" -Status "SKIP" -Seconds $seconds -Detail "openssl not installed" -Log $log
         } else {
             Add-Stage -Name "tls" -Status "FAIL" -Seconds $seconds -Detail ("exit " + $code + "; " + (Get-LogTail -Path $log)) -Log $log
+        }
+    }
+}
+
+# ---------------------------------------------------------------- stage 10: offline (store-and-forward)
+if ($SkipOffline) {
+    Add-SkippedStage -Name "offline" -Reason "-SkipOffline"
+} else {
+    Write-Host ""
+    Write-Host "== offline =="
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $log = Join-Path $logDir "offline.log"
+    $script = Join-Path $root "tools/verify-offline-delivery.ps1"
+    if (-not (Test-Path $script)) {
+        $sw.Stop()
+        Add-Stage -Name "offline" -Status "FAIL" -Seconds ([math]::Round($sw.Elapsed.TotalSeconds, 1)) -Detail "tools/verify-offline-delivery.ps1 is missing" -Log ""
+    } else {
+        cmd /c ("powershell -NoProfile -ExecutionPolicy Bypass -File `"" + $script + "`" > `"" + $log + "`" 2>&1") | Out-Null
+        $code = $LASTEXITCODE
+        $sw.Stop()
+        $seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+        if ($code -eq 0) {
+            Add-Stage -Name "offline" -Status "PASS" -Seconds $seconds -Detail "sent with receiver offline; delivered on next sync" -Log $log
+        } else {
+            Add-Stage -Name "offline" -Status "FAIL" -Seconds $seconds -Detail ("exit " + $code + "; " + (Get-LogTail -Path $log)) -Log $log
         }
     }
 }

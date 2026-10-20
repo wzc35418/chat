@@ -31,6 +31,23 @@ pub struct MlsDevice {
     pending: Option<crate::control::PendingControl>,
 }
 
+/// 脱敏 Debug：只暴露「有/没有群、有没有 pending、凭据名、签名公钥」，
+/// **绝不打印 provider 记录值或任何私钥材料**（MLSDEV 要求）。
+impl core::fmt::Debug for MlsDevice {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("MlsDevice")
+            .field(
+                "credential",
+                &String::from_utf8_lossy(self.credential.credential.serialized_content()),
+            )
+            .field("signer_public", &hex_lower(self.signer.public()))
+            .field("has_group", &self.group.is_some())
+            .field("has_pending", &self.pending.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl MlsDevice {
     pub fn new(name: &str) -> Result<Self> {
         let provider = OpenMlsRustCrypto::default();
@@ -57,6 +74,83 @@ impl MlsDevice {
             .build(SUITE, &self.provider, &self.signer, self.credential.clone())
             .context("create MLS KeyPackage")?;
         Ok(bundle.key_package().tls_serialize_detached()?)
+    }
+
+
+    /// MLSDEV：导出**设备级**持久化记录（无群也能用）。
+    ///
+    /// 返回 `(credential 名, 签名公钥, provider 记录集)`：记录集里既有签名私钥，也有本设备
+    /// 最近一次 `key_package()` 落进 provider 的 **KeyPackage init 私钥**，因此另一进程用
+    /// [`Self::import_device_records`] 重建后可以直接 `join` 该 KeyPackage 换来的 Welcome。
+    ///
+    /// 语义边界：
+    /// - **不打印、不记录任何记录值**（本函数没有任何日志输出；错误只给稳定描述）；
+    /// - 记录集按 key 排序（确定性，便于比较与去重）；
+    /// - 设备必须有群或至少生成过 KeyPackage 才有意义，但本函数不强制（空集也照实返回）。
+    pub fn export_device_records(&self) -> Result<(String, Vec<u8>, Vec<(String, Vec<u8>)>)> {
+        let credential = String::from_utf8(self.credential.credential.serialized_content().to_vec())
+            .context("MLS credential is not valid UTF-8")?;
+        let signer_public = self.signer.public().to_vec();
+        let values = self
+            .provider
+            .storage()
+            .values
+            .read()
+            .map_err(|_| anyhow::anyhow!("MLS provider storage lock is poisoned"))?;
+        // 记录键是 provider 的原始字节；对外用**小写 hex 文本**（与 storage 的 String 记录键一致）。
+        let mut records: Vec<(String, Vec<u8>)> = values
+            .iter()
+            .map(|(record_key, value)| (hex_lower(record_key), value.clone()))
+            .collect();
+        records.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok((credential, signer_public, records))
+    }
+
+    /// MLSDEV：从**设备级**记录恢复一台无群设备（签名私钥 + KeyPackage init 私钥随之回来）。
+    ///
+    /// 任何不自洽都显式失败（不伪造空设备）：
+    /// - 记录集里没有可用签名私钥 → 失败；
+    /// - 恢复出的签名公钥与声明不一致 → 失败。
+    pub fn import_device_records(
+        credential: &str,
+        signer_public: &[u8],
+        records: Vec<(String, Vec<u8>)>,
+    ) -> Result<Self> {
+        ensure!(!signer_public.is_empty(), "MLS signer public key is empty");
+        let provider = OpenMlsRustCrypto::default();
+        {
+            let mut values = provider
+                .storage()
+                .values
+                .write()
+                .map_err(|_| anyhow::anyhow!("MLS provider storage lock is poisoned"))?;
+            for (record_key, value) in records {
+                let key = decode_hex_bytes(&record_key)
+                    .context("persisted MLS record key is not lowercase hex")?;
+                values.insert(key, value);
+            }
+        }
+        let signer = SignatureKeyPair::read(
+            provider.storage(),
+            signer_public,
+            SUITE.signature_algorithm(),
+        )
+        .context("persisted MLS signing key is missing")?;
+        ensure!(
+            signer.public() == signer_public,
+            "restored MLS signer does not match its public key"
+        );
+        let credential = CredentialWithKey {
+            credential: BasicCredential::new(credential.as_bytes().to_vec()).into(),
+            signature_key: signer.public().into(),
+        };
+        Ok(Self {
+            provider,
+            signer,
+            credential,
+            group: None,
+            pending: None,
+        })
     }
 
     pub fn create_and_invite(&mut self, key_package: &[u8], peer: &MlsDevice) -> Result<Vec<u8>> {
@@ -626,6 +720,26 @@ fn hex_lower(bytes: &[u8]) -> String {
     text
 }
 
+/// 解码小写/大写十六进制文本为字节（记录键用；非法字符显式报错）。
+fn decode_hex_bytes(text: &str) -> Result<Vec<u8>> {
+    ensure!(
+        text.len() % 2 == 0,
+        "hex text must have an even number of characters"
+    );
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        let high = (pair[0] as char)
+            .to_digit(16)
+            .context("hex text contains a non-hex character")?;
+        let low = (pair[1] as char)
+            .to_digit(16)
+            .context("hex text contains a non-hex character")?;
+        out.push(((high as u8) << 4) | (low as u8));
+    }
+    Ok(out)
+}
+
 /// 把 provider 内存存储整体快照成记录集（按记录键排序，保证确定性）。
 fn snapshot_provider_records(device: &MlsDevice) -> Result<Vec<MlsRecordInput>> {
     let values = device
@@ -689,6 +803,45 @@ mod tests {
         let ciphertext = alice.encrypt("identity check").unwrap();
         assert!(bob.decrypt(&ciphertext, "Mallory").is_err());
     }
+    #[test]
+    fn device_records_round_trip_and_never_leak_private_keys() {
+        let bob = MlsDevice::new("Bob").unwrap();
+        // 先导出 KeyPackage：init 私钥落进 provider，随设备记录一起被导出。
+        let key_package = bob.key_package().unwrap();
+        assert!(!key_package.is_empty());
+        let (credential, signer_public, records) = bob.export_device_records().unwrap();
+        assert_eq!(credential, "Bob");
+        assert_eq!(signer_public.len(), 32, "Ed25519 public key");
+        assert!(!records.is_empty(), "provider holds the signer + key package keys");
+        // 记录按 key 排序（确定性）。
+        let mut sorted = records.clone();
+        sorted.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(records, sorted);
+
+        // 恢复：无群设备，records 集合逐条相等。
+        let restored =
+            MlsDevice::import_device_records(&credential, &signer_public, records.clone()).unwrap();
+        let (credential_again, signer_again, records_again) =
+            restored.export_device_records().unwrap();
+        assert_eq!(credential_again, credential);
+        assert_eq!(signer_again, signer_public);
+        assert_eq!(records_again, records, "the record set round-trips exactly");
+
+        // 私钥材料不出现在 Debug/错误文本里（Debug 是脱敏的：只报记录条数）。
+        let debug = format!("{restored:?}");
+        assert!(debug.contains("MlsDevice"), "debug identifies the type");
+        for (_key, value) in &records {
+            let needle = hex_lower(value);
+            assert!(
+                !debug.contains(&needle),
+                "provider record bytes must not appear in Debug output"
+            );
+        }
+        // 缺签名私钥 → 显式失败（不伪造设备）。
+        let broken = MlsDevice::import_device_records(&credential, &signer_public, Vec::new());
+        assert!(broken.is_err(), "records without the signer must fail");
+    }
+
     #[test]
     fn key_package_binding_and_single_use_welcome() {
         let mut alice = MlsDevice::new("Alice").unwrap();

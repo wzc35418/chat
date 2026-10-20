@@ -858,36 +858,41 @@ impl ChatCoreFfi {
     }
 
     /// 导出本机 MLS KeyPackage（交给建群方；**单次使用**、只含公钥材料）。
+    ///
+    /// MLSDEV：导出成功后会把这台设备的 provider 记录（签名私钥 + 该 KeyPackage 的 init 私钥）
+    /// **加密落库**，因此另一进程打开同一个库可以直接 `join_group_from_welcome`。
+    /// 落库失败会让整个调用显式失败（不会返回一个"新进程用不了"的 KeyPackage）。
     pub fn export_key_package(&self) -> Result<Vec<u8>, FfiError> {
-        let device_id = {
-            let guard = self.core.lock().map_err(|_| core_closed())?;
-            let core = guard.as_ref().ok_or_else(core_closed)?;
-            core.load_identity_account()
-                .map_err(|error| failure!(error))?
-                .ok_or_else(|| FfiError::Store {
-                    code: "INVALID_STATE_TRANSITION".to_owned(),
-                    reason: "the local identity is not enrolled in this database".to_owned(),
-                })?
-                .device_id
-        };
-        let mut slot = self.mls_device.lock().map_err(|_| core_closed())?;
-        if slot.is_none() {
-            *slot = Some(
-                chat_crypto::engine::MlsDevice::new(&device_id).map_err(|error| FfiError::Store {
+        let device_id = self.local_device_id()?;
+        let (key_package, credential, signer_public, records) = {
+            let mut slot = self.mls_device.lock().map_err(|_| core_closed())?;
+            if slot.is_none() {
+                *slot = Some(chat_crypto::engine::MlsDevice::new(&device_id).map_err(|error| {
+                    FfiError::Store {
+                        code: "STATE_CORRUPTED".to_owned(),
+                        reason: format!("MLS device failed: {error}"),
+                    }
+                })?);
+            }
+            let device = slot.as_ref().ok_or_else(|| FfiError::Store {
+                code: "STATE_CORRUPTED".to_owned(),
+                reason: "the MLS device is unavailable".to_owned(),
+            })?;
+            let key_package = device.key_package().map_err(|error| FfiError::Store {
+                code: "STATE_CORRUPTED".to_owned(),
+                reason: format!("MLS key package failed: {error}"),
+            })?;
+            let (credential, signer_public, records) =
+                device.export_device_records().map_err(|error| FfiError::Store {
                     code: "STATE_CORRUPTED".to_owned(),
-                    reason: format!("MLS device failed: {error}"),
-                })?,
-            );
-        }
-        let device = slot.as_ref().ok_or_else(|| FfiError::Store {
-            code: "STATE_CORRUPTED".to_owned(),
-            reason: "the MLS device is unavailable".to_owned(),
-        })?;
-        device.key_package().map_err(|error| FfiError::Store {
-            code: "STATE_CORRUPTED".to_owned(),
-            reason: format!("MLS key package failed: {error}"),
-        })
+                    reason: format!("MLS device records failed: {error}"),
+                })?;
+            (key_package, credential, signer_public, records)
+        };
+        self.persist_device_snapshot(&device_id, &credential, &signer_public, &records)?;
+        Ok(key_package)
     }
+
 
     /// 读取某个群的**已验证**拉取起点（来自节点签名回执落库后的持久状态）。
     ///
@@ -946,12 +951,20 @@ impl ChatCoreFfi {
             });
         };
         let mut slot = self.mls_device.lock().map_err(|_| core_closed())?;
-        let Some(mut device) = slot.take() else {
-            return Err(FfiError::Store {
-                code: "INVALID_STATE_TRANSITION".to_owned(),
-                reason: "export a key package before joining a group".to_owned(),
-            });
+        // MLSDEV：槽为空 → 先从库里恢复设备（跨进程场景）。库里也没有 → 同一个稳定错误码。
+        let device = match slot.take() {
+            Some(device) => device,
+            None => match self.restore_device_snapshot()? {
+                Some(device) => device,
+                None => {
+                    return Err(FfiError::Store {
+                        code: "INVALID_STATE_TRANSITION".to_owned(),
+                        reason: "export a key package before joining a group".to_owned(),
+                    });
+                }
+            },
         };
+        let mut device = device;
         let acceptance = chat_crypto::control::WelcomeAcceptance {
             group_id: invite.mls_group_id.clone(),
             expected_epoch: invite.epoch,
@@ -1013,6 +1026,10 @@ impl ChatCoreFfi {
                 code: error.code().as_str().to_owned(),
                 reason: error.to_string(),
             })?;
+            // MLSDEV：入群成功 → 清掉持久化的设备快照（KeyPackage 私钥**单次使用**）。
+            if let Ok(Some(identity)) = store.load_identity_account() {
+                let _ = store.clear_mls_device_state(&device_key_for(&identity.device_id));
+            }
             Ok(group)
         })();
         match ConversationCore::open(&self.database_path, &self.master_key_hex) {
@@ -1089,6 +1106,74 @@ impl ChatCoreFfi {
         outcome
     }
 }
+/// MLSDEV：设备快照在库里的稳定键（与设备 ID 绑定）。
+fn device_key_for(device_id: &str) -> String {
+    format!("mlsdev/{device_id}")
+}
+
+/// 设备头编码：`mlsdev-v1\n<credential>\n<signer_public hex>`（不含私钥；头本身也会被密封）。
+fn encode_device_header(credential: &str, signer_public: &[u8]) -> Vec<u8> {
+    format!("mlsdev-v1
+{credential}
+{}", hex_lower_bytes(signer_public)).into_bytes()
+}
+
+/// 设备头解码（格式不符 → 显式 STATE_CORRUPTED，不回退到空设备）。
+fn decode_device_header(state: &[u8]) -> Result<(String, Vec<u8>), FfiError> {
+    let text = std::str::from_utf8(state).map_err(|_| FfiError::Store {
+        code: "STATE_CORRUPTED".to_owned(),
+        reason: "the persisted MLS device header is not UTF-8".to_owned(),
+    })?;
+    let mut lines = text.lines();
+    let version = lines.next().unwrap_or_default();
+    let credential = lines.next().unwrap_or_default();
+    let signer_hex = lines.next().unwrap_or_default();
+    if version != "mlsdev-v1" || credential.is_empty() || lines.next().is_some() {
+        return Err(FfiError::Store {
+            code: "STATE_CORRUPTED".to_owned(),
+            reason: "the persisted MLS device header is malformed".to_owned(),
+        });
+    }
+    let signer_public = decode_hex_bytes(signer_hex)?;
+    if signer_public.len() != 32 {
+        return Err(FfiError::Store {
+            code: "STATE_CORRUPTED".to_owned(),
+            reason: "the persisted MLS device signer key has an invalid length".to_owned(),
+        });
+    }
+    Ok((credential.to_owned(), signer_public))
+}
+
+/// 小写十六进制编码（记录键用）。
+fn hex_lower_bytes(bytes: &[u8]) -> String {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(char::from(HEX[usize::from(byte >> 4)]));
+        text.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    text
+}
+
+/// 十六进制解码（记录键用；非法 → INVALID_INPUT，不回显内容）。
+fn decode_hex_bytes(text: &str) -> Result<Vec<u8>, FfiError> {
+    if text.len() % 2 != 0 {
+        return Err(invalid_input("MLS record key must be an even-length hex text"));
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        let high = (pair[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| invalid_input("MLS record key must be hexadecimal"))?;
+        let low = (pair[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| invalid_input("MLS record key must be hexadecimal"))?;
+        out.push(((high as u8) << 4) | (low as u8));
+    }
+    Ok(out)
+}
+
 /// 打开裸正式库（sync_once 释放核心后用唯一句柄跑一轮）。
 fn open_formal_store(
     database_path: &str,
@@ -1103,6 +1188,98 @@ fn open_formal_store(
 }
 
 impl ChatCoreFfi {
+    /// 本机身份的设备 ID（未入库身份 → `INVALID_STATE_TRANSITION`）。
+    fn local_device_id(&self) -> Result<String, FfiError> {
+        let guard = self.core.lock().map_err(|_| core_closed())?;
+        let core = guard.as_ref().ok_or_else(core_closed)?;
+        Ok(core
+            .load_identity_account()
+            .map_err(|error| failure!(error))?
+            .ok_or_else(|| FfiError::Store {
+                code: "INVALID_STATE_TRANSITION".to_owned(),
+                reason: "the local identity is not enrolled in this database".to_owned(),
+            })?
+            .device_id)
+    }
+
+    /// 把设备快照加密落库（释放唯一核心 → 写一笔事务 → 无条件重开核心）。
+    fn persist_device_snapshot(
+        &self,
+        device_id: &str,
+        credential: &str,
+        signer_public: &[u8],
+        records: &[(String, Vec<u8>)],
+    ) -> Result<(), FfiError> {
+        let mut guard = self.lock()?;
+        let Some(core) = guard.take() else {
+            return Err(core_closed());
+        };
+        core.close();
+        let outcome = (|| -> Result<(), FfiError> {
+            let mut store = open_formal_store(&self.database_path, &self.master_key_hex)?;
+            let mut inputs = Vec::with_capacity(records.len());
+            for (hex_key, value) in records {
+                inputs.push(chat_storage::formal::MlsRecordInput {
+                    record_key: decode_hex_bytes(hex_key)?,
+                    value: value.clone(),
+                });
+            }
+            store
+                .save_mls_device_state(chat_storage::formal::MlsDeviceStateInput {
+                    device_key: device_key_for(device_id),
+                    state: encode_device_header(credential, signer_public),
+                    records: inputs,
+                })
+                .map_err(storage_failure)?;
+            Ok(())
+        })();
+        match ConversationCore::open(&self.database_path, &self.master_key_hex) {
+            Ok(core) => *guard = Some(core),
+            Err(error) => return Err(failure!(error)),
+        }
+        outcome
+    }
+
+    /// 从库里恢复设备（没有记录 → `Ok(None)`；记录损坏 → 显式失败，绝不伪造空设备）。
+    fn restore_device_snapshot(&self) -> Result<Option<chat_crypto::engine::MlsDevice>, FfiError> {
+        let device_id = self.local_device_id()?;
+        let mut guard = self.lock()?;
+        let Some(core) = guard.take() else {
+            return Err(core_closed());
+        };
+        core.close();
+        let outcome = (|| -> Result<Option<chat_crypto::engine::MlsDevice>, FfiError> {
+            let store = open_formal_store(&self.database_path, &self.master_key_hex)?;
+            let Some(state) = store
+                .load_mls_device_state(&device_key_for(&device_id))
+                .map_err(storage_failure)?
+            else {
+                return Ok(None);
+            };
+            let (credential, signer_public) = decode_device_header(&state.state)?;
+            let records: Vec<(String, Vec<u8>)> = state
+                .records
+                .into_iter()
+                .map(|record| (hex_lower_bytes(&record.record_key), record.value))
+                .collect();
+            let device = chat_crypto::engine::MlsDevice::import_device_records(
+                &credential,
+                &signer_public,
+                records,
+            )
+            .map_err(|_| FfiError::Store {
+                code: "STATE_CORRUPTED".to_owned(),
+                reason: "the persisted MLS device could not be restored".to_owned(),
+            })?;
+            Ok(Some(device))
+        })();
+        match ConversationCore::open(&self.database_path, &self.master_key_hex) {
+            Ok(core) => *guard = Some(core),
+            Err(error) => return Err(failure!(error)),
+        }
+        outcome
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, Option<ConversationCore>>, FfiError> {
         self.core.lock().map_err(|_| FfiError::Store {
             code: "CORE_CLOSED".to_owned(),
