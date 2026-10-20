@@ -282,3 +282,22 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 2. 证书状态**公开端点** `/v1/tls/info`（匿名只读，未启用 TLS 返回 404）；
 3. 客户端**读取并展示**剩余天数（<30 天或已过期显红，含轮换提示）；
 4. 插件**签名信任列表**（持久化 + 归一 + 不静默接受新密钥）。
+
+## 终局回归（2026-10-21，commit `4f0c88c`，11 阶段全 PASS）
+
+| 阶段 | 结果 | 用时 |
+| --- | --- | --- |
+| disk | PASS | 0s |
+| rust-check | PASS | 2.5s |
+| verify-project | PASS | 0.9s |
+| gradle（13 任务） | PASS | 33.3s |
+| android（assembleDebug） | PASS | 32.6s |
+| package（结构+4 冒烟+GUI） | PASS | 16s |
+| two-device（A/B 互通） | PASS | 5.8s |
+| lan（192.168.20.1 非回环） | PASS | 4s |
+| tls（https/明文拒绝/无证书拒绝/到期/`tls/info`） | PASS | 4.8s |
+| offline（发送时离线，上线后 applied=1） | PASS | 5.2s |
+| tls-e2e（正确指纹 accepted；错误指纹被拒） | PASS | 5.8s |
+| **overall** | **PASS（EXIT=0）** | 报告 `build/verify-all-20261021-013849.md` |
+
+说明：这是 120 轮结束前的最后一次全量回归，与 `RETROSPECTIVE_120.md` 记录的数字一致（11 阶段、13 个 Gradle 任务、Android 通过）。
