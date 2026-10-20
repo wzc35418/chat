@@ -1141,6 +1141,22 @@ fun main() = application {
             if (id != null) scope.launch { refreshMessages(id) }
         },
         updateDraftText = { value -> storeDraftText = value.take(8 * 1024) },
+        pluginComposerActions = { pluginJvmHost?.composerActions() ?: emptyList() },
+        runPluginComposerAction = { pluginId, name ->
+            scope.launch {
+                val host = pluginJvmHost ?: return@launch
+                runCatching { host.runComposerAction(pluginId, name) }
+                    .onSuccess { text ->
+                        // 插件产物只进草稿，由用户确认后再发送。
+                        val separator = if (storeDraftText.isBlank()) "" else "\n"
+                        storeDraftText = (storeDraftText + separator + text).take(8 * 1024)
+                        storeState = storeState.copy(busy = false, notice = "已插入插件内容（" + text.length + " 字符），确认后再发送")
+                    }
+                    .onFailure { error ->
+                        storeState = storeState.withError(codeOf(error), error.message)
+                    }
+            }
+        },
         createDraft = {
             scope.launch {
                 if (store == null) return@launch

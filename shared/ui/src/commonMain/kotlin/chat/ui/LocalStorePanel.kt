@@ -52,6 +52,10 @@ data class StoreHandlers(
     val selectConversation: (String) -> Unit = {},
     val refreshMessages: () -> Unit = {},
     val updateDraftText: (String) -> Unit = {},
+    /** 插件声明的 composer.actions（插件 id / 动作名 / 说明）。 */
+    val pluginComposerActions: () -> List<Triple<String, String, String>> = { emptyList() },
+    /** 运行某个插件 composer 动作；结果由宿主决定如何进草稿。 */
+    val runPluginComposerAction: (String, String) -> Unit = { _, _ -> },
     val createDraft: () -> Unit = {},
     val cancelLatestDraft: () -> Unit = {},
     val pollEvents: () -> Unit = {},
@@ -219,6 +223,19 @@ fun LocalStorePanel(
                     onFormat = { applyFormat(it) },
                     enabled = state.ready && !state.busy,
                 )
+                // 插件槽位 composer.actions：只放按钮，布局仍由宿主决定（插件不接管 UI）。
+                val pluginActions = handlers.pluginComposerActions()
+                if (pluginActions.isNotEmpty()) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        pluginActions.forEach { (pluginId, name, description) ->
+                            TextButton(
+                                onClick = { handlers.runPluginComposerAction(pluginId, name) },
+                                enabled = state.ready && !state.busy,
+                                modifier = Modifier.semantics { contentDescription = "插件动作：" + description },
+                            ) { Text("插件：" + description, style = MaterialTheme.typography.labelSmall) }
+                        }
+                    }
+                }
                 OutlinedTextField(
                     value = draft,
                     onValueChange = { value ->
