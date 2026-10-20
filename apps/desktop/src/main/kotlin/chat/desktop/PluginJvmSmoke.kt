@@ -11,6 +11,32 @@ import javax.tools.ToolProvider
  * 本冒烟在临时目录里编译一个最小插件，然后验证：
  * 加载 → 注册动作 → 执行动作（输出受限）→ 未信任拒绝 → 卸载。
  */
+/**
+ * 最小可行沙箱的自检（**不是安全边界**，只是门槛）：
+ * 1) 宿主实现类永远不可见；
+ * 2) 没有 network 权限时加载 java.net.Socket 被拒；
+ * 3) 声明 network 后可以加载（说明拦截是按声明生效，不是"什么都拦"）。
+ */
+private fun verifySandbox() {
+    val parent = PluginSandboxClassLoader::class.java.classLoader
+    val strict = PluginSandboxClassLoader(arrayOf(), emptySet(), parent)
+    val hostBlocked = runCatching { strict.loadClass("chat.desktop.PluginJvmHost") }.exceptionOrNull()
+    check(hostBlocked is PluginLoadException) { "host classes must be blocked, got " + hostBlocked }
+    check(hostBlocked.code == "PLUGIN_PERMISSION_DENIED") { "expected PLUGIN_PERMISSION_DENIED, got " + hostBlocked.code }
+
+    val networkBlocked = runCatching { strict.loadClass("java.net.Socket") }.exceptionOrNull()
+    check(networkBlocked is PluginLoadException) { "java.net.Socket must be blocked without network permission" }
+
+    val filesystemBlocked = runCatching { strict.loadClass("java.nio.file.Files") }.exceptionOrNull()
+    check(filesystemBlocked is PluginLoadException) { "java.nio.file.Files must be blocked without filesystem permission" }
+
+    val permitted = PluginSandboxClassLoader(arrayOf(), setOf("network"), parent)
+    check(permitted.loadClass("java.net.Socket") != null) { "java.net.Socket must load with network permission" }
+
+    val unknown = runCatching { PluginJvmHost().load("/nonexistent.jar", "x", true, setOf("root")) }
+    check(unknown.isFailure) { "unknown permission must be rejected before any file access" }
+}
+
 fun main() {
     val work = Files.createTempDirectory("chat-plugin-jvm-").toFile()
     try {
@@ -47,7 +73,10 @@ fun main() {
         check(gone is PluginLoadException)
 
         host.shutdown()
-        println("PASS plugin P4 slice: trusted load, SPI discovery, bounded execution, unload")
+        verifySandbox()
+
+    println("PASS plugin P4 slice: trusted load, SPI discovery, bounded execution, unload")
+    println("PASS plugin sandbox slice: host classes blocked, sensitive packages gated by declared permissions")
     } finally {
         work.deleteRecursively()
     }

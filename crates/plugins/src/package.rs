@@ -72,6 +72,8 @@ pub struct PackageInspection {
     pub compressed_bytes: u64,
     /// 全部条目的解压字节数合计。
     pub uncompressed_bytes: u64,
+    /// 清单声明的权限（原样带出；与运行时校验同一套规则，空 = 无敏感权限）。
+    pub permissions: Vec<String>,
 }
 
 /// 解析出来的一条 central-directory 记录（内部形态）。
@@ -372,6 +374,11 @@ pub fn inspect_plugin_package(bytes: &[u8], limits: &PluginLimits) -> Result<Pac
         entry_count: u32::try_from(entries.len()).unwrap_or(u32::MAX),
         compressed_bytes,
         uncompressed_bytes,
+        permissions: manifest
+            .permissions
+            .iter()
+            .map(|permission| permission.as_str().to_owned())
+            .collect(),
     })
 }
 

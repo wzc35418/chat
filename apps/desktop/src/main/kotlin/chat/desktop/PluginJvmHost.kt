@@ -25,7 +25,7 @@ class PluginJvmHost {
 
     private data class Loaded(
         val id: String,
-        val loader: URLClassLoader,
+        val loader: ClassLoader,
         val plugin: DesktopPlugin,
         val registrations: MutableList<Registration> = mutableListOf(),
     )
@@ -52,7 +52,12 @@ class PluginJvmHost {
      * @param expectedId 清单里的插件 id（必须与插件自报 id 一致）
      * @param trusted 用户是否已确认信任该插件；false 直接拒绝
      */
-    fun load(jarPath: String, expectedId: String, trusted: Boolean): String {
+    fun load(
+        jarPath: String,
+        expectedId: String,
+        trusted: Boolean,
+        permissions: Set<String> = emptySet(),
+    ): String {
         if (!trusted) {
             throw PluginLoadException("PLUGIN_TRUST_REQUIRED", "插件加载需要用户显式确认信任（无沙箱执行）")
         }
@@ -61,8 +66,16 @@ class PluginJvmHost {
         if (jar.length() > 8L * 1024 * 1024) throw PluginLoadException("PLUGIN_PACKAGE_TOO_LARGE", "插件 JAR 超过 8 MiB")
         loaded[expectedId]?.let { throw PluginLoadException("PLUGIN_STATE_CONFLICT", "插件已加载：" + expectedId) }
 
-        // 父加载器只暴露 SDK 接口，避免插件直接看到宿主实现类。
-        val loader = URLClassLoader(arrayOf(jar.toURI().toURL()), DesktopPlugin::class.java.classLoader)
+        // 父加载器只暴露 SDK 接口；并按清单权限拦截敏感包（最小可行沙箱，不是安全边界）。
+        val unknown = permissions - PluginSandboxClassLoader.KNOWN
+        if (unknown.isNotEmpty()) {
+            throw PluginLoadException("PLUGIN_PERMISSION_DENIED", "未知权限声明：" + unknown.joinToString(","))
+        }
+        val loader = PluginSandboxClassLoader(
+            arrayOf(jar.toURI().toURL()),
+            permissions,
+            DesktopPlugin::class.java.classLoader,
+        )
         val plugin = try {
             ServiceLoader.load(DesktopPlugin::class.java, loader).firstOrNull()
                 ?: throw PluginLoadException("PLUGIN_SPI_MISMATCH", "JAR 中找不到 DesktopPlugin 实现")
@@ -99,7 +112,7 @@ class PluginJvmHost {
         val record = loaded.remove(pluginId) ?: return false
         runCatching { record.registrations.forEach { it.dispose() } }
         runCatching { record.plugin.stop() }
-        runCatching { record.loader.close() }
+        runCatching { (record.loader as? java.io.Closeable)?.close() }
         commandNames.remove(pluginId)
         // 真 bug 修复（冒烟抓到）：卸载必须同时清掉动作表，否则卸载后仍能执行插件动作。
         selectedTextActions.remove(pluginId)

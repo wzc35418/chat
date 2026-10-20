@@ -37,7 +37,7 @@ pub const MAX_PLUGIN_ID_BYTES: usize = 64;
 /// 入口类名字节上限。
 pub const MAX_ENTRY_CLASS_BYTES: usize = 256;
 /// 单清单权限声明数量上限。
-pub const MAX_PERMISSIONS: usize = 4;
+pub const MAX_PERMISSIONS: usize = 8;
 
 /// 规范插件 ID（小写点分，例如 `notes.v1`）。
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -249,27 +249,69 @@ impl PluginCapability {
     }
 }
 
-/// 用户可见权限声明（正常插件约定，不是沙箱）。
+/// 插件权限声明（清单 `permissions` 字段）。
+///
+/// 两类值共存：
+/// - **沙箱权限**（JVM 侧按这些限制类加载/系统调用）：`network` / `filesystem` / `process` /
+///   `host-ui`；
+/// - **既有用户可见权限**（P4 早期就有，保持向后兼容）：`UserSelectedContent` / `ComposeDraft`。
+///
+/// 解析**大小写敏感**、按清单顺序去重、最多 [`MAX_PERMISSIONS`] 项；未知值 → 显式错误（绝不忽略）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PluginPermission {
     /// 读取用户显式选择的内容。
     UserSelectedContent,
     /// 向编辑区提出草稿建议。
     ComposeDraft,
+    /// 沙箱：允许发起网络访问。
+    Network,
+    /// 沙箱：允许读写插件私有目录之外的文件系统。
+    Filesystem,
+    /// 沙箱：允许启动子进程。
+    Process,
+    /// 沙箱：允许扩展宿主 UI（面板/命令之外的界面元素）。
+    HostUi,
 }
 
 impl PluginPermission {
     /// 全量权限。
-    pub const ALL: [PluginPermission; 2] = [
+    pub const ALL: [PluginPermission; 6] = [
         PluginPermission::UserSelectedContent,
         PluginPermission::ComposeDraft,
+        PluginPermission::Network,
+        PluginPermission::Filesystem,
+        PluginPermission::Process,
+        PluginPermission::HostUi,
     ];
 
-    /// 从清单字符串解析。
+    /// 四个**沙箱**权限（JVM 侧沙箱最小可行版只认这四个）。
+    pub const SANDBOX: [PluginPermission; 4] = [
+        PluginPermission::Network,
+        PluginPermission::Filesystem,
+        PluginPermission::Process,
+        PluginPermission::HostUi,
+    ];
+
+    /// 是否属于沙箱权限。
+    pub const fn is_sandbox(self) -> bool {
+        matches!(
+            self,
+            PluginPermission::Network
+                | PluginPermission::Filesystem
+                | PluginPermission::Process
+                | PluginPermission::HostUi
+        )
+    }
+
+    /// 从清单字符串解析（**大小写敏感**）。
     pub fn parse(input: &str) -> Option<Self> {
         match input {
             "UserSelectedContent" => Some(PluginPermission::UserSelectedContent),
             "ComposeDraft" => Some(PluginPermission::ComposeDraft),
+            "network" => Some(PluginPermission::Network),
+            "filesystem" => Some(PluginPermission::Filesystem),
+            "process" => Some(PluginPermission::Process),
+            "host-ui" => Some(PluginPermission::HostUi),
             _ => None,
         }
     }
@@ -279,6 +321,10 @@ impl PluginPermission {
         match self {
             PluginPermission::UserSelectedContent => "UserSelectedContent",
             PluginPermission::ComposeDraft => "ComposeDraft",
+            PluginPermission::Network => "network",
+            PluginPermission::Filesystem => "filesystem",
+            PluginPermission::Process => "process",
+            PluginPermission::HostUi => "host-ui",
         }
     }
 }
@@ -406,6 +452,8 @@ struct RawManifest {
     sdk_version: u16,
     platform: String,
     capabilities: Vec<String>,
+    /// 可选：不写 = 无敏感权限（旧清单照常通过）。
+    #[serde(default)]
     permissions: Vec<String>,
     extension_points: Vec<String>,
     entry_class: String,
@@ -465,7 +513,12 @@ pub fn parse_manifest(json: &str, limits: &PluginLimits) -> Result<PluginManifes
     }
     let mut permissions = BTreeSet::new();
     for permission in &raw.permissions {
-        let parsed = PluginPermission::parse(permission).ok_or(PluginError::UnknownPermission)?;
+        // 未知/大小写不符的值一律按**清单非法**拒绝（绝不忽略）。
+        let Some(parsed) = PluginPermission::parse(permission) else {
+            return Err(PluginError::InvalidManifest {
+                detail: "unknown permission declaration",
+            });
+        };
         if !permissions.insert(parsed) {
             return Err(PluginError::InvalidManifest {
                 detail: "duplicate permission declaration",
@@ -654,11 +707,12 @@ mod tests {
             r#"["UserSelectedContent"]"#,
             r#"["UserSelectedContent","Filesystem"]"#,
         );
+        // TASK-129：未知/大小写不符的权限值按**清单非法**拒绝（本模块冻结码 INVALID_PLUGIN_PACKAGE）。
         assert_eq!(
             parse_manifest(&unknown_permission, &PluginLimits::DEFAULT)
                 .unwrap_err()
                 .code(),
-            "UNKNOWN_PERMISSION"
+            "INVALID_PLUGIN_PACKAGE"
         );
         let unknown_point = manifest_json(r#"["Command"]"#, r#"["Command","NetworkHook"]"#);
         assert_eq!(
@@ -725,7 +779,9 @@ mod tests {
             PluginCapability::SettingsPanel
         );
         assert_eq!(PluginCapability::ALL.len(), 4);
-        assert_eq!(PluginPermission::ALL.len(), 2);
+        // 权限白名单：2 个既有用户可见权限 + 4 个沙箱权限（TASK-129）。
+        assert_eq!(PluginPermission::ALL.len(), 6);
+        assert_eq!(PluginPermission::SANDBOX.len(), 4);
         assert_eq!(ExtensionPoint::ALL.len(), 3);
     }
 }

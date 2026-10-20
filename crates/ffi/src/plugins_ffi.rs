@@ -149,6 +149,8 @@ pub struct PackageViewFfi {
     pub compressed_bytes: u64,
     /// 解压字节合计。
     pub uncompressed_bytes: u64,
+    /// 清单声明的权限（纯数据；空 = 无敏感权限）。
+    pub permissions: Vec<String>,
 }
 
 /// 已安装插件（纯数据）。
@@ -406,6 +408,7 @@ impl PluginsFfi {
             entry_count: view.entry_count,
             compressed_bytes: view.compressed_bytes,
             uncompressed_bytes: view.uncompressed_bytes,
+            permissions: view.permissions,
         })
     }
 
