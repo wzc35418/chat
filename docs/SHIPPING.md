@@ -301,3 +301,13 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 | **overall** | **PASS（EXIT=0）** | 报告 `build/verify-all-20261021-013849.md` |
 
 说明：这是 120 轮结束前的最后一次全量回归，与 `RETROSPECTIVE_120.md` 记录的数字一致（11 阶段、13 个 Gradle 任务、Android 通过）。
+
+## 跨机器（公网）验证套件（R-245）
+
+| 文件 | 用途 |
+| --- | --- |
+| `deploy/install-node.sh` | 服务器一键部署：编译 release 节点 + 自签证书 + 种子 + systemd + 自检，最后打印 **endpoint / node_id / 证书指纹** |
+| `deploy/README.md` | 部署步骤、端口放行、排查命令、诚实说明 |
+| `tools/verify-remote.ps1` | 本机跨机器验证：证书指纹比对 → `/v1/tls/info` → 打包产物提交+拉取 → 错误指纹必须失败 |
+
+本机已用 `0.0.0.0:8443 --allow-public-bind` 的真节点模拟公网路径跑通（EXIT=0）；**只差真实公网 IP 的最后一跳**。

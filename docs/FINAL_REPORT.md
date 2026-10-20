@@ -84,7 +84,7 @@ powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1      # 11 阶段�
 
 ## 九、下次接手从哪开始（5 步）
 
-1. **跨机器联调**（唯一外部依赖）：拿到可公网/VPN 可达的节点，把 `tools/verify-lan.ps1` 与 `tools/verify-tls-e2e.ps1` 里的 endpoint 换成该地址即可复用全部断言；同时确认节点 `--bind` 与防火墙。
+1. **跨机器联调**（唯一外部依赖）：`deploy/install-node.sh`（服务器一键部署 + 打印指纹）与 `tools/verify-remote.ps1`（本机一键验证）已备好，拿到公网 endpoint/node_id/指纹后直接跑。历史方案：把 `tools/verify-lan.ps1` 与 `tools/verify-tls-e2e.ps1` 里的 endpoint 换成该地址即可复用全部断言；同时确认节点 `--bind` 与防火墙。
 2. **证书生命周期自动化**：把「启动读一次」升级为定时刷新 + 到期弹窗；补自动续签与信任列表导入/导出/吊销。
 3. **`AppFacade` 深层收敛**：目前只收敛了失败投影与错误展示；面板仍各自调 service（40+ 处理器），收敛后迭代速度会明显提升。
 4. **生产化**：安装器（MSI 需联网取 WiX）、后台通知、soak 测试、指标/告警。

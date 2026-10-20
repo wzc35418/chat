@@ -1,9 +1,74 @@
-# 自托管部署路线
+# 公网节点部署与跨机器验证
 
-当前为配置草案，不是可运行服务。P5-01需先实现节点、构建固定镜像并核实目标平台。compose.yaml强制要求 CHAT_NODE_IMAGE，防止启动一个不存在的示例镜像。节点默认配置为容器内0.0.0.0:8080，compose仅映射宿主127.0.0.1:8080，真实公开HTTPS/WSS应配置受控TLS入口。
+目标：把 `chat-node` 部署到公网服务器（**106.54.223.171**），然后从本机验证
+「**两台真机器**之间能发消息 + 拉取 + TLS 指纹校验」。
 
-持久数据：/data/node.db、/data/blobs、节点身份签名钥的独立受保护位置。node.example.toml 的 .invalid 域名必须替换。权限/配额/管理入口/TLS/备份恢复步骤在实际部署前验证；客户端自己的密钥不交节点。应用节点备份不等于用户身份恢复文件，也不恢复用户明文聊天历史。
+## 一、服务器上做什么（一次性，约 5–10 分钟）
 
-relay 为独立进程，见 [relay说明](relay/README.md)。P0先选择与客户端匹配版本；关闭公共发现和公共中继验收后再填可复现启动步骤。
+前提：Ubuntu/Debian 22.04+，有 root/sudo，能访问 crates.io（编译需要联网）。
 
-节点恢复测试：append成功→杀进程→重启→同SubmissionId原回执；离线信箱未过期内容可拉；半上传对象不可下载；控制日志不能按信箱30天TTL清理。完整路线见 [节点函数计划](../docs/implementation/node.md)。
+```bash
+# 1. 把仓库弄上去（任选一种：git clone / scp 整个目录）
+sudo -i
+cd /opt && git clone <你的仓库地址> chat-src && cd chat-src
+
+# 2. 一键部署（编译 + 证书 + 种子 + systemd + 自检）
+bash deploy/install-node.sh
+```
+
+脚本结束时会打印三个值，**请把这三行发回给我**：
+
+```
+endpoint    : https://106.54.223.171:8443
+node_id     : node-public
+fingerprint : <64 位小写 hex>
+```
+
+### 放行端口（必须）
+
+1. **云厂商安全组**：入站放行 TCP **8443**（腾讯云控制台 → 安全组）；
+2. **本机防火墙**：`ufw allow 8443/tcp`（或 `firewall-cmd --add-port=8443/tcp --permanent && firewall-cmd --reload`）。
+
+### 常用排查
+
+```bash
+systemctl status chat-node            # 是否 active
+journalctl -u chat-node -n 80         # 启动日志（含证书到期天数）
+ss -ltnp | grep 8443                  # 是否在监听
+curl --cacert /etc/chat-node/cert.pem https://106.54.223.171:8443/v1/health
+curl --cacert /etc/chat-node/cert.pem https://106.54.223.171:8443/v1/tls/info
+```
+
+## 二、本机做什么（我这边跑，你把三个值给我后自动完成）
+
+```powershell
+cd D:\AgentProject\chat
+. .\tools\activate.ps1
+powershell -ExecutionPolicy Bypass -File tools\verify-remote.ps1 `
+  -Endpoint https://106.54.223.171:8443 `
+  -NodeId node-public `
+  -Fingerprint <64 位 hex>
+```
+
+这条脚本会依次验证：
+
+1. **匿名健康检查**（带证书校验）能拿到 `node_public_key`；
+2. `/v1/tls/info` 能读到 `days_remaining` 与 `cert_sha256`；
+3. **打包产物**（`app.jar` + FFI）配置指纹后，向公网节点提交消息 → 期望 `accepted`；
+4. 从公网节点**拉取** → 期望 `applied ≥ 1`；
+5. **错误指纹必须失败**（证明 pinning 真在生效）。
+
+## 三、注意事项（诚实说明）
+
+- 这是**自签证书**：客户端靠 SHA-256 指纹固定，不依赖 CA；因此**指纹必须人工核对**（脚本会打印，别从不可信渠道拿）。
+- 节点是**明文之外的唯一防线**：请只开放 8443，不要额外暴露其它端口。
+- 数据目录 `/var/lib/chat-node` 里是 SQLite 库与签名种子：**要备份，别外泄**（`seed.hex` 等于节点身份）。
+- 证书 10 年有效，节点启动会打印剩余天数；到期前需要换证书并把新指纹同步给客户端。
+- 目前**没有**中继/NAT 打洞：客户端必须能直连这个公网 IP:端口。
+
+## 四、如果服务器没有外网编译环境
+
+两个替代方案：
+
+1. **在本地交叉编译**（需要 Linux 目标工具链，未在项目里验证过，不推荐）；
+2. **把本地 `target/debug/chat-node.exe` 换成 Linux 版**：需要在一台 Linux 上 `cargo build --release -p chat-node` 后把二进制拷到服务器（脚本会自己编，通常不需要）。
