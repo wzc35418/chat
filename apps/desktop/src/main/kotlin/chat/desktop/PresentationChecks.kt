@@ -162,6 +162,7 @@ fun main() = runBlocking {
     checkMarkdownFormatting()
     checkRawErrorPresentation()
     checkTlsCertificatePresentation()
+    checkFailureProjection()
     println("PASS DS-02/DS-04/DS-05/DS-07/DS-08/DS-09/DS-10/DS-11/DS-12 presentation checks")
 }
 
@@ -1412,4 +1413,26 @@ private fun checkTlsCertificatePresentation() {
     check(!healthy.critical && !healthy.warning) { "长期证书不该告警" }
 
     println("PASS tls certificate presentation: expired/soon/warning/healthy states")
+}
+
+/** 失败投影：带 code 的异常用自己的码；其它归 UNKNOWN_RESULT，且 reason 不为空。 */
+private fun checkFailureProjection() {
+    class CodedError : RuntimeException("storage is locked") {
+        @Suppress("unused")
+        fun getCode(): String = "STORAGE_LOCKED"
+    }
+    val coded = chat.presentation.preview.projectFailure(CodedError())
+    check(coded.code == "STORAGE_LOCKED") { "带码异常应保留自己的码，实际：" + coded.code }
+    check(coded.reason == "storage is locked") { "说明应取异常消息" }
+
+    val plain = chat.presentation.preview.projectFailure(IllegalStateException("boom"))
+    check(plain.code == "UNKNOWN_RESULT") { "普通异常应归 UNKNOWN_RESULT，实际：" + plain.code }
+    check(plain.reason == "boom")
+
+    // 没有消息的异常：reason 退回类名，不能是空串（否则界面空白）。
+    val silent = chat.presentation.preview.projectFailure(IllegalStateException())
+    check(silent.reason.isNotBlank()) { "无消息异常必须有兜底说明" }
+    check(silent.code == "UNKNOWN_RESULT")
+
+    println("PASS failure projection: coded errors keep their code, others become UNKNOWN_RESULT with a reason")
 }

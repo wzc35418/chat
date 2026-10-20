@@ -1662,8 +1662,13 @@ PreviewChatScreen(
     }
 }
 
-/** 附件卡片/插件面板共用的稳定错误码提取。 */
-private fun codeOf(error: Throwable): String = (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT"
+/**
+ * 稳定错误码提取：统一走 presentation 的投影（带 code 的异常用它自己的码，其它归 UNKNOWN_RESULT）。
+ *
+ * 收敛点：以前这里是 `(error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT"`，
+ * 只认得一种异常；现在任何“带稳定码”的异常都能正确投影。
+ */
+private fun codeOf(error: Throwable): String = chat.presentation.preview.projectFailure(error).code
 
 /** 演示口令：正式产品必须改为用户输入或操作系统密钥链（PLATFORM-001 未接线部分）。 */
 private const val DEMO_KEY_PASSPHRASE = "chat-preview-demo-passphrase"

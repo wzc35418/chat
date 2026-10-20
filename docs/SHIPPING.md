@@ -192,6 +192,7 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 | 一键回归 | `tools/verify-all.ps1` **10 阶段全 PASS**（disk / rust-check / verify-project / gradle 32.7s / android 98.4s / package 16.9s / two-device 6.3s / lan 4.7s / tls 3.7s / offline 5.4s） |
 | 回归报告 | `build/verify-all-20261020-235645.md` |
 | TLS 端到端 | 打包产物经 FFI 指纹连 https：正确指纹 accepted+applied；错误指纹被拒 |
+| 失败投影 | 统一 `projectFailure`（带码异常保留码，其它 `UNKNOWN_RESULT`），12 处错误处理共用 |
 | 错误分层展示 | 统一 `ErrorBanner`（4 个面板已收敛）；TLS 类给可执行指引；可重试性取自冻结码表 |
 | 错误可诊断 | `NodeClientError.detail` 已改 `Cow`，TLS 失败能看到 `PIN_MISMATCH`/`TLS_TRUST_REQUIRED` 等真实原因；**发送链路也通过错误链带出**（顶层短语不变） |
 | 交付包 | `build/dist/Chat-app-0.1.0.zip`（81.79 MB，SHA256 `996E799E…23C7`） |
