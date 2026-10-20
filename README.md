@@ -102,3 +102,21 @@ powershell -File tools\verify-all.ps1 -TargetDir C:\chat-target  # 把 cargo tar
 - 输出**纯 ASCII**：Windows PowerShell 5.1 在中文代码页下会破坏 UTF-8 控制台文本，因此脚本刻意不输出非 ASCII 字符。
 - 脚本会先 dot-source `tools/activate.ps1`（cargo/JDK/Android SDK/MSVC 环境），因此不依赖调用方 shell 已激活。
 
+
+## 当前状态（2026-10-20，0.1.0 基线）
+
+| 项 | 值 |
+| --- | --- |
+| 版本 / 基线 commit | 0.1.0 / `78d079a` |
+| Rust 测试 | **1141 passed / 0 failed**（14 个 crate） |
+| 桌面冒烟 | **11 个 Gradle 任务**（含 pluginSmoke / pluginJvmSmoke 沙箱断言） |
+| Android | `assembleDebug` PASS |
+| 一键回归 | `tools/verify-all.ps1` **7 阶段全 PASS**（disk / rust-check / verify-project / gradle / android / package / two-device） |
+| 交付物 | `build/dist/Chat-app-0.1.0.zip`（免 JDK，双击 `Chat.exe`） |
+| 双设备互通 | `tools/demo-two-devices.ps1` 全 PASS（发消息 accepted + 对方拉取 applied=1） |
+
+**能做什么**：建身份、加密存储、群治理、附件、插件（带权限门）、发消息到真实节点、从节点拉回消息、两台设备互通。
+
+**还不能做什么**：跨机器/跨网段（无中继）、插件安全隔离（权限门不是沙箱）、OS 凭据库、后台通知、安装器/自动更新。
+
+细节见 [SHIPPING.md](docs/SHIPPING.md)（基线与限制）、[manual-test-guide.md](docs/manual-test-guide.md)（15 节手工测试）、[COVERAGE_SNAPSHOT.md](docs/implementation/COVERAGE_SNAPSHOT.md)（模块覆盖与缺口）。
