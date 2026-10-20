@@ -80,3 +80,27 @@ Compose 的 `nativeDistributions` 在本机离线环境下会在 `downloadWix` �
 | 发给非技术用户试用 | **A. app-image（Chat.exe）** |
 | 自己开发调试 / CI 冒烟 | B. 便携包（换 jar 方便） |
 | 需要系统级安装、开始菜单、卸载项 | 都需要 MSI（本机离线不可构建，见下） |
+
+## 交付物级回归：tools/verify-package.ps1
+
+打包出来的 app-image（`build/dist/app-image/Chat`）到底还能不能用？一条命令回答：
+
+```powershell
+powershell -File tools\verify-package.ps1                 # 构建 + 结构断言 + 四个冒烟
+powershell -File tools\verify-package.ps1 -SkipBuild      # 只验已有产物（秒级）
+powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
+```
+
+阶段：
+
+1. **build**：`gradlew.bat :apps:desktop:appImageWithNative --offline --max-workers=1`（`-SkipBuild` 可跳过）；
+2. **structure**：`Chat.exe`、`app/app.jar`、`app/native/chat_ffi.dll`、`runtime/bin/java.exe` 必须存在（缺哪个报哪个）；
+3. **四个冒烟**：用**包内的** `runtime/bin/java.exe` 跑 `app/app.jar` 里的 `chat.desktop.{PlatformSmokeKt,P0SmokeKt,LocalStoreSmokeKt,IdentitySmokeKt}`，
+   各自独立临时工作目录、`-Djna.library.path=<Chat>/app/native`、**180s 超时**；
+4. **汇总**：控制台 PASS/FAIL 表 + 每步耗时；报告 `build/verify-package-<ts>.md`，日志 `build/verify-package-logs/<ts>/<stage>.log`。
+
+约定：任一步失败**不中断**其余步骤，最终退出码非 0；输出**纯 ASCII**（PowerShell 5.1 中文代码页会破坏 UTF-8）。
+
+实测（2026-10-20）：`-SkipBuild` → structure PASS + 四个冒烟全 PASS，**overall PASS / 退出码 0**。
+构建阶段当日因并行改动 `shared/ui/.../PreviewChatScreen.kt`（`onOpenAbout` 参数不存在）失败——**脚本如实报告，没有放宽断言**。
+

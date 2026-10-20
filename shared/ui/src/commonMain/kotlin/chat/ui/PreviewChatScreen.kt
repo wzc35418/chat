@@ -136,6 +136,9 @@ fun PreviewChatScreen(
     pluginState: chat.presentation.preview.PreviewPluginState = chat.presentation.preview.PreviewPluginState.Empty,
     pluginHandlers: PluginHandlers = PluginHandlers.None,
     initialPluginOpen: Boolean = false,
+    aboutState: chat.presentation.preview.PreviewAboutState = chat.presentation.preview.PreviewAboutState(),
+    aboutHandlers: AboutHandlers = AboutHandlers.None,
+    initialAboutOpen: Boolean = false,
 ) {
     var state by remember { mutableStateOf(initialState) }
     // 真实身份面板是独立浮层：默认关闭，由侧栏按钮打开；截图入口可指定初始打开。
@@ -144,6 +147,7 @@ fun PreviewChatScreen(
     var showAttachments by remember { mutableStateOf(initialAttachmentOpen) }
     var showGroups by remember { mutableStateOf(initialGroupOpen) }
     var showPlugins by remember { mutableStateOf(initialPluginOpen) }
+    var showAbout by remember { mutableStateOf(initialAboutOpen) }
 
     MaterialTheme(
         colorScheme = lightColorScheme(
@@ -183,6 +187,7 @@ fun PreviewChatScreen(
                                     onOpenAttachments = { showAttachments = true },
                                     onOpenGroups = { showGroups = true },
                                     onOpenPlugins = { showPlugins = true },
+                            onOpenAbout = { showAbout = true },
                                 )
                                 Box(Modifier.width(1.dp).fillMaxHeight().background(Color(0xFFE1E6E1)))
                                 ChatPane(
@@ -226,6 +231,7 @@ fun PreviewChatScreen(
                                     onOpenAttachments = { showAttachments = true },
                                     onOpenGroups = { showGroups = true },
                                     onOpenPlugins = { showPlugins = true },
+                                    onOpenAbout = { showAbout = true },
                                 )
                             }
                         }
@@ -258,6 +264,21 @@ fun PreviewChatScreen(
                     PluginPanel(
                         state = pluginState,
                         handlers = pluginHandlers,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                }
+            }
+            if (showAbout) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color(0x66000000))
+                        .pointerInput(Unit) { detectTapGestures(onTap = { showAbout = false }) }
+                        .semantics { contentDescription = "关于面板遮罩" },
+                ) {
+                    AboutPanel(
+                        state = aboutState,
+                        handlers = aboutHandlers,
                         modifier = Modifier.padding(16.dp),
                     )
                 }
@@ -369,6 +390,7 @@ private fun Sidebar(
     onOpenAttachments: () -> Unit,
     onOpenGroups: () -> Unit,
     onOpenPlugins: () -> Unit,
+    onOpenAbout: () -> Unit,
 ) {
     Surface(modifier, color = Color.White) {
         Column(
@@ -475,6 +497,15 @@ private fun Sidebar(
                     contentPadding = PaddingValues(vertical = 8.dp, horizontal = 6.dp),
                 ) {
                     Text("插件", style = MaterialTheme.typography.labelMedium)
+                }
+                OutlinedButton(
+                    onClick = onOpenAbout,
+                    modifier = Modifier.weight(1f).semantics {
+                        contentDescription = "打开关于与诊断面板"
+                    },
+                    contentPadding = PaddingValues(vertical = 8.dp, horizontal = 6.dp),
+                ) {
+                    Text("关于", style = MaterialTheme.typography.labelMedium)
                 }
             }
             Surface(color = PreviewCanvas, shape = RoundedCornerShape(10.dp)) {

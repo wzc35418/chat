@@ -50,7 +50,11 @@ import chat.presentation.preview.withSendStep
 import chat.presentation.preview.withMessageCards
 import chat.presentation.preview.updateInvitee
 import chat.presentation.preview.updateInviteeKeyPackagePath
+import chat.presentation.preview.withAboutError
+import chat.presentation.preview.withAppInfo
 import chat.presentation.preview.withCreatedGroup
+import chat.presentation.preview.withDataDir
+import chat.presentation.preview.withHostLibraryPath
 import chat.presentation.preview.withFetchedInvite
 import chat.presentation.preview.withInviteReceipt
 import chat.presentation.preview.withMessagePreview
@@ -86,6 +90,7 @@ import chat.presentation.preview.withStateNotice
 import chat.presentation.preview.withStorageValue
 import chat.ui.PluginHandlers
 import chat.ui.PreviewChatScreen
+import chat.ui.AboutHandlers
 import chat.ui.StoreHandlers
 import kotlinx.coroutines.launch
 import java.io.File
@@ -103,6 +108,7 @@ import kotlin.random.Random
 fun main() = application {
     var identityState by remember { mutableStateOf(PreviewIdentityState(busy = true)) }
     var storeState by remember { mutableStateOf(PreviewStoreState(busy = true)) }
+    var aboutState by remember { mutableStateOf(chat.presentation.preview.PreviewAboutState()) }
     var storeDraftText by remember { mutableStateOf("") }
     var selectedConversation by remember { mutableStateOf<String?>(null) }
     val identity = remember { runCatching { createIdentityService() }.getOrNull() }
@@ -1151,6 +1157,26 @@ fun main() = application {
             attachmentHandlers = attachmentHandlers,
             groupState = groupState,
             groupHandlers = groupHandlers,
+            aboutState = aboutState,
+            aboutHandlers = AboutHandlers(
+                refresh = {
+                    aboutState = aboutState.withDataDir(storeDirectory?.absolutePath ?: "（本机存储未初始化）")
+                    runCatching {
+                        val diagnostics = chat.bridge.NativeDiagnosticsService()
+                        aboutState = aboutState
+                            .withAppInfo(diagnostics.appInfo())
+                            .withHostLibraryPath(
+                                runCatching { diagnostics.hostLibraryPath("chat_ffi") }
+                                    .getOrElse { error -> "解析失败：" + (error.message ?: "unknown") },
+                            )
+                    }.onFailure { error ->
+                        aboutState = aboutState.withAboutError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+                },
+            ),
             pluginState = pluginState,
             pluginHandlers = PluginHandlers(
                 updateManifest = { pluginState = pluginState.updateManifest(it) },
