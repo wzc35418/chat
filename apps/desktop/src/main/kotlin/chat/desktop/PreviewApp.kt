@@ -1035,7 +1035,30 @@ fun main() = application {
                 }
                 storeState = storeState.beginBusy()
                 runCatching { service.syncOnce() }
-                    .onSuccess { storeState = storeState.withSyncOnce(it) }
+                    .onSuccess { once ->
+                        storeState = storeState.withSyncOnce(once)
+                        // 拉回来的条目要能看见：收完一轮顺手把当前会话的消息重载一遍。
+                        val local = store
+                        val conversationId = storeState.selectedConversationId
+                        if (local != null && conversationId != null) {
+                            when (val opened = facadeOf(local).openConversation(conversationId, null, 50)) {
+                                is chat.presentation.UseCaseResult.Ok -> {
+                                    var updated = storeState
+                                    for (message in opened.value.messages) {
+                                        updated = updated.withMessagePreview(message.messageId, message.body)
+                                    }
+                                    storeState = updated.copy(
+                                        busy = false,
+                                        notice = "收一轮：拉取 " + once.fetched + " 条 / 落库 " + once.applied +
+                                            " 条；当前会话共 " + opened.value.messages.size + " 条消息",
+                                    )
+                                }
+                                is chat.presentation.UseCaseResult.Failed -> {
+                                    storeState = storeState.withError(opened.code, opened.message)
+                                }
+                            }
+                        }
+                    }
                     .onFailure { error ->
                         storeState = storeState.withError(
                             (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
