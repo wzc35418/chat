@@ -178,7 +178,7 @@ fun main() = application {
             .onSuccess { storeState = storeState.withConversations(it.nextCursor, it.items) }
             .onFailure { error ->
                 storeState = storeState.withError(
-                    (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                    failureCode(error),
                     error.message,
                 )
             }
@@ -190,7 +190,7 @@ fun main() = application {
             .onSuccess { storeState = storeState.withMessages(conversationId, it.nextCursor, it.items) }
             .onFailure { error ->
                 storeState = storeState.withError(
-                    (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                    failureCode(error),
                     error.message,
                 )
             }
@@ -337,7 +337,7 @@ fun main() = application {
                 }
                 .onFailure { error ->
                     storeState = storeState.withError(
-                        (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                        failureCode(error),
                         error.message,
                     )
                 }
@@ -645,7 +645,7 @@ fun main() = application {
             runCatching { service.start() }
                 .onSuccess { storeState = storeState.withSyncStatus(it) }
                 .onFailure { error ->
-                    storeState = storeState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                    storeState = storeState.withError(failureCode(error), error.message)
                 }
         }
 
@@ -655,7 +655,7 @@ fun main() = application {
             runCatching { service.stop() }
                 .onSuccess { storeState = storeState.withSyncStatus(it) }
                 .onFailure { error ->
-                    storeState = storeState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                    storeState = storeState.withError(failureCode(error), error.message)
                 }
         }
 
@@ -664,7 +664,7 @@ fun main() = application {
             runCatching { service.status() }
                 .onSuccess { storeState = storeState.withSyncStatus(it) }
                 .onFailure { error ->
-                    storeState = storeState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                    storeState = storeState.withError(failureCode(error), error.message)
                 }
         }
     }
@@ -693,7 +693,7 @@ fun main() = application {
                 }.onSuccess { groupState = groupState.withMemberAddReceipt(it) }
                     .onFailure { error ->
                         groupState = groupState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -715,7 +715,7 @@ fun main() = application {
                 }.onSuccess { groupState = groupState.withRegistration(it) }
                     .onFailure { error ->
                         groupState = groupState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -745,7 +745,7 @@ fun main() = application {
                     }
                     .onFailure { error ->
                         groupState = groupState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -759,7 +759,7 @@ fun main() = application {
                     .onSuccess { groupState = groupState.withSnapshot(it) }
                     .onFailure { error ->
                         groupState = groupState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -795,7 +795,7 @@ fun main() = application {
                     groupState = groupState.withCreatedGroup(created)
                 }.onFailure { error ->
                     groupState = groupState.withError(
-                        (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                        failureCode(error),
                         error.message,
                     )
                 }
@@ -819,7 +819,7 @@ fun main() = application {
                 }.onSuccess { groupState = groupState.withInviteReceipt(it) }
                     .onFailure { error ->
                         groupState = groupState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -839,7 +839,7 @@ fun main() = application {
                 }.onSuccess { groupState = groupState.withFetchedInvite(it) }
                     .onFailure { error ->
                         groupState = groupState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -853,7 +853,7 @@ fun main() = application {
                     .onSuccess { groupState = groupState.withSnapshot(it).copy(ready = true) }
                     .onFailure { error ->
                         groupState = groupState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -867,7 +867,7 @@ fun main() = application {
                     .onSuccess { groupState = groupState.withSnapshot(it).copy(ready = true) }
                     .onFailure { error ->
                         groupState = groupState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -881,7 +881,7 @@ fun main() = application {
                 withGroup { service -> service.rename(current.groupId, groupState.newName.trim()) }
                     .onSuccess { groupState = groupState.withSnapshot(it) }
                     .onFailure { error ->
-                        groupState = groupState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                        groupState = groupState.withError(failureCode(error), error.message)
                     }
             }
         },
@@ -892,7 +892,7 @@ fun main() = application {
                 withGroup { service -> service.setMuted(current.groupId, credential, muted) }
                     .onSuccess { groupState = groupState.withSnapshot(it) }
                     .onFailure { error ->
-                        groupState = groupState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                        groupState = groupState.withError(failureCode(error), error.message)
                     }
             }
         },
@@ -903,7 +903,7 @@ fun main() = application {
                 withGroup { service -> service.setRole(current.groupId, credential, role) }
                     .onSuccess { groupState = groupState.withSnapshot(it) }
                     .onFailure { error ->
-                        groupState = groupState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                        groupState = groupState.withError(failureCode(error), error.message)
                     }
             }
         },
@@ -914,7 +914,7 @@ fun main() = application {
                 withGroup { service -> service.removeMember(current.groupId, credential) }
                     .onSuccess { groupState = groupState.withSnapshot(it) }
                     .onFailure { error ->
-                        groupState = groupState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                        groupState = groupState.withError(failureCode(error), error.message)
                     }
             }
         },
@@ -925,7 +925,7 @@ fun main() = application {
                 withGroup { service -> service.acceptPending(current.groupId) }
                     .onSuccess { groupState = groupState.withSnapshot(it) }
                     .onFailure { error ->
-                        groupState = groupState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                        groupState = groupState.withError(failureCode(error), error.message)
                     }
             }
         },
@@ -936,7 +936,7 @@ fun main() = application {
                 withGroup { service -> service.discardPending(current.groupId, "operator_discarded") }
                     .onSuccess { groupState = groupState.withSnapshot(it) }
                     .onFailure { error ->
-                        groupState = groupState.withError((error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT", error.message)
+                        groupState = groupState.withError(failureCode(error), error.message)
                     }
             }
         },
@@ -964,7 +964,7 @@ fun main() = application {
                     .onSuccess { storeState = storeState.withCancel(it) }
                     .onFailure { error ->
                         storeState = storeState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -987,7 +987,7 @@ fun main() = application {
                     }
                     .onFailure { error ->
                         storeState = storeState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -1002,7 +1002,7 @@ fun main() = application {
                     .onSuccess { storeState = storeState.withSendStep(it) }
                     .onFailure { error ->
                         storeState = storeState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -1017,7 +1017,7 @@ fun main() = application {
                     .onSuccess { storeState = storeState.withSendStep(it) }
                     .onFailure { error ->
                         storeState = storeState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -1032,7 +1032,7 @@ fun main() = application {
                     .onSuccess { storeState = storeState.withSendStep(it) }
                     .onFailure { error ->
                         storeState = storeState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -1094,7 +1094,7 @@ fun main() = application {
                     )
                 }.onFailure { error ->
                     storeState = storeState.withError(
-                        (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                        failureCode(error),
                         error.message,
                     )
                 }
@@ -1114,7 +1114,7 @@ fun main() = application {
                     }
                     .onFailure { error ->
                         storeState = storeState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -1181,7 +1181,7 @@ fun main() = application {
                     }
                     .onFailure { error ->
                         storeState = storeState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -1196,7 +1196,7 @@ fun main() = application {
                     .onSuccess { storeState = storeState.withSendStep(it) }
                     .onFailure { error ->
                         storeState = storeState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -1210,7 +1210,7 @@ fun main() = application {
                     .onSuccess { storeState = storeState.withEvents(it) }
                     .onFailure { error ->
                         storeState = storeState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -1274,7 +1274,7 @@ fun main() = application {
                     }
                     .onFailure { error ->
                         storeState = storeState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -1346,7 +1346,7 @@ fun main() = application {
                     .onSuccess { attachmentState = attachmentState.withImported(it) }
                     .onFailure { error ->
                         attachmentState = attachmentState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -1362,7 +1362,7 @@ fun main() = application {
                     .onSuccess { attachmentState = attachmentState.withExported(attachmentId, it, target) }
                     .onFailure { error ->
                         attachmentState = attachmentState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -1376,7 +1376,7 @@ fun main() = application {
                     .onSuccess { attachmentState = attachmentState.withUpdated(it) }
                     .onFailure { error ->
                         attachmentState = attachmentState.withError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -1644,7 +1644,7 @@ PreviewChatScreen(
                             )
                     }.onFailure { error ->
                         aboutState = aboutState.withAboutError(
-                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            failureCode(error),
                             error.message,
                         )
                     }
@@ -1761,7 +1761,7 @@ PreviewChatScreen(
 /**
  * 稳定错误码提取：统一走 presentation 的投影（带 code 的异常用它自己的码，其它归 UNKNOWN_RESULT）。
  *
- * 收敛点：以前这里是 `(error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT"`，
+ * 收敛点：以前这里是 `failureCode(error)`，
  * 只认得一种异常；现在任何“带稳定码”的异常都能正确投影。
  */
 private fun codeOf(error: Throwable): String = chat.presentation.preview.projectFailure(error).code
