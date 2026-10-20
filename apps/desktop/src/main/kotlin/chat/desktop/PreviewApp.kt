@@ -149,6 +149,7 @@ fun main() = application {
     var transportFingerprintText by remember { mutableStateOf("") }
     var tlsCertificateText by remember { mutableStateOf("") }
     var tlsCertificateCritical by remember { mutableStateOf(false) }
+    var selfCheckLines by remember { mutableStateOf<List<String>>(emptyList()) }
     var keySlotBackend by remember { mutableStateOf(KeySlotBackend.None) }
     var keySlotDetail by remember { mutableStateOf("") }
     var keySlotMigrationPending by remember { mutableStateOf(false) }
@@ -1453,6 +1454,7 @@ PreviewChatScreen(
             transportMode = transportMode,
             transportFingerprints = transportFingerprintText,
             tlsCertificate = tlsCertificateText,
+            selfCheckLines = selfCheckLines,
             tlsCertificateCritical = tlsCertificateCritical,
             keySlotBackend = keySlotBackend.label,
             keySlotDetail = keySlotDetail,
@@ -1463,6 +1465,26 @@ PreviewChatScreen(
             aboutState = aboutState,
             aboutHandlers = AboutHandlers(
                 updateTransportFingerprints = { transportFingerprintText = it },
+                runSelfCheck = {
+                    scope.launch {
+                        val saved = runCatching { nodeConfigStore.load() }.getOrNull()
+                        val endpoint = saved?.endpointUrl?.trim().orEmpty()
+                        if (endpoint.isEmpty()) {
+                            selfCheckLines = listOf("FAIL endpoint: 先在首启引导里配置节点地址")
+                            return@launch
+                        }
+                        val steps = runCatching {
+                            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                NodeSelfCheck.run(endpoint, saved?.tlsFingerprints ?: emptyList(), saved?.nodeId.orEmpty())
+                            }
+                        }.getOrElse { error ->
+                            listOf(SelfCheckStep("exception", false, error.message ?: error::class.simpleName ?: "自检失败"))
+                        }
+                        selfCheckLines = steps.map { step ->
+                            (if (step.ok) "PASS " else "FAIL ") + step.name + ": " + step.detail
+                        }
+                    }
+                },
                 refreshTlsCertificate = {
                     scope.launch {
                         val saved = runCatching { nodeConfigStore.load() }.getOrNull()

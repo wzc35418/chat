@@ -18,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import chat.presentation.preview.PreviewAboutState
@@ -39,6 +40,8 @@ data class AboutHandlers(
     val updateTransportFingerprints: (String) -> Unit = {},
     /** 重新读取节点证书状态（/v1/tls/info）。 */
     val refreshTlsCertificate: () -> Unit = {},
+    /** 跑一次节点连通性自检。 */
+    val runSelfCheck: () -> Unit = {},
 ) {
     companion object {
         val None = AboutHandlers()
@@ -66,6 +69,8 @@ fun AboutPanel(
     transportMode: String = "",
     /** 输入框里的指纹文本。 */
     transportFingerprints: String = "",
+    /** 节点连通性自检结果（每行"PASS/FAIL 步骤: 说明"），空 = 未跑过。 */
+    selfCheckLines: List<String> = emptyList(),
     /** 节点证书剩余天数（人话），空 = 未取到。 */
     tlsCertificate: String = "",
     /** 证书是否应显红（过期或 < 30 天）。 */
@@ -108,6 +113,17 @@ fun AboutPanel(
                 "证书快过期或已过期：请尽快轮换，并同步更新指纹（否则客户端会连不上）。",
                 style = MaterialTheme.typography.labelSmall,
                 color = Color(0xFFB3261E),
+            )
+        }
+        TextButton(
+            onClick = handlers.runSelfCheck,
+            modifier = Modifier.semantics { contentDescription = "运行节点连通性自检" },
+        ) { Text("节点连通性自检", style = MaterialTheme.typography.labelMedium) }
+        selfCheckLines.forEach { line ->
+            Text(
+                line,
+                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                color = if (line.startsWith("FAIL")) Color(0xFFB3261E) else Color(0xFF5F6B63),
             )
         }
         TextButton(

@@ -333,3 +333,13 @@ tasks.register<JavaExec>("keySlotSelectorSmoke") {
     mainClass.set("chat.desktop.KeySlotSelectorSmokeKt")
     systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
 }
+
+
+// 节点连通性自检冒烟：对一个真实运行中的节点跑 NodeSelfCheck（参数由脚本/手工给）。
+tasks.register<JavaExec>("nodeSelfCheckSmoke") {
+    group = "verification"
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.NodeSelfCheckSmokeKt")
+    systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+}
