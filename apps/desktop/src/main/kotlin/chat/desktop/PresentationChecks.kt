@@ -1372,7 +1372,19 @@ private fun checkRawErrorPresentation() {
     check(unknown.title == "操作未完成") { "未知码应回退，实际：" + unknown.title }
     check(unknown.reason == null)
 
-    // 5) 原因为超长 -> 截断到 300 字符
+    // 5) 可重试性来自冻结码表（不是我猜的）：NODE_UNAVAILABLE 可重试，STORAGE_LOCKED 不可。
+    val retryable = chat.presentation.display.presentRawError("NODE_UNAVAILABLE", "connect failed")
+    check(retryable.retryable) { "NODE_UNAVAILABLE 在冻结表里可重试" }
+    check(retryable.autoRetryAllowed) { "NODE_UNAVAILABLE 允许自动退避" }
+    check(retryable.actionLabel?.contains("重试") == true) { "可重试时应给出重试动作，实际：" + retryable.actionLabel }
+    // 注意：STORAGE_LOCKED **在**冻结可重试表里（锁竞争值得重试），别拿它当反例。
+    val locked = chat.presentation.display.presentRawError("STORAGE_LOCKED", "busy")
+    check(locked.retryable) { "STORAGE_LOCKED 属于冻结可重试集合" }
+    val denied = chat.presentation.display.presentRawError("PERMISSION_DENIED", "not a member")
+    check(!denied.retryable) { "PERMISSION_DENIED 不可重试" }
+    check(!denied.autoRetryAllowed) { "PERMISSION_DENIED 不允许自动退避" }
+
+    // 6) 原因为超长 -> 截断到 300 字符
     val long = chat.presentation.display.presentRawError("INTERNAL_FAILURE", "x".repeat(500))
     check(long.reason != null && long.reason!!.length == 300) { "原因应截断到 300 字符" }
 

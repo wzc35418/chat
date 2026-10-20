@@ -397,7 +397,13 @@ private val TRANSPORT_TRUST_MARKERS = listOf("PIN_MISMATCH", "TLS_TRUST_REQUIRED
  * - 原因里出现传输/信任标记时，覆盖成可执行的排障指引（"去关于面板核对证书指纹"），
  *   因为这类失败的通用文案（"操作未完成"）帮不到用户。
  */
-fun presentRawError(code: String, reason: String?, retryable: Boolean = false): UserActionableError {
+fun presentRawError(
+    code: String,
+    reason: String?,
+    // 默认按 PROTOCOL-014 的**冻结可重试码表**判定——这不是猜，而是同一张表；
+    // 调用方若拿到内核的明确 retryable（CoreFailure 路径），可以覆盖它。
+    retryable: Boolean = code.trim().ifEmpty { "UNKNOWN_RESULT" } in FROZEN_AUTO_RETRY_CODES,
+): UserActionableError {
     val trimmedCode = code.trim().ifEmpty { "UNKNOWN_RESULT" }
     val safeReason = reason
         ?.replace('\n', ' ')

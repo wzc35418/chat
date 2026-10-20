@@ -170,6 +170,12 @@ fun LocalStorePanel(
                                 view.actionLabel?.takeIf { it.isNotBlank() }?.let { label ->
                                     Text("建议：" + label, style = MaterialTheme.typography.labelSmall, color = Color(0xFF246B58))
                                 }
+                                // 可重试性来自 PROTOCOL-014 冻结表（不是 UI 猜的）。
+                                Text(
+                                    if (view.retryable) "可重试（允许自动退避）" else "此错误不会自动重试",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color(0xFF5F6B63),
+                                )
                             }
                         }
                     }
