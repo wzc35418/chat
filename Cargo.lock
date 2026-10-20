@@ -694,9 +694,11 @@ dependencies = [
  "chat-protocol",
  "ed25519-dalek 3.0.0",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

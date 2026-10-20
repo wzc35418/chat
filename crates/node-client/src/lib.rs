@@ -8,6 +8,7 @@
 pub mod client;
 pub mod endpoint;
 pub mod error;
+pub mod transport_security;
 
 pub use client::{ClientLimits, NodeClient};
 pub use endpoint::NodeEndpoint;

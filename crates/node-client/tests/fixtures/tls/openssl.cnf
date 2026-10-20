@@ -1,0 +1,11 @@
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = 127.0.0.1
+[ext]
+subjectAltName = IP:127.0.0.1
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,digitalSignature,keyCertSign
+extendedKeyUsage = serverAuth

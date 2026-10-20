@@ -44,6 +44,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::endpoint::NodeEndpoint;
+use crate::transport_security::TransportSecurity;
 use crate::error::{NodeClientError, NodeClientErrorKind};
 
 /// DTO schema 版本；必须与节点 [crates/node-api/src/dto.rs] 的 DTO_SCHEMA_VERSION 一致。
@@ -427,6 +428,30 @@ fn validate_query_token(value: &str) -> Result<(), NodeClientError> {
     Ok(())
 }
 
+/// 按传输安全配置构造 HTTP 客户端。
+///
+/// 固定证书时**关闭系统根**（`tls_built_in_root_certs(false)`），只信调用方给的那张：
+/// 自托管场景通常没有 CA 链，固定证书比信任一堆根更小、更可审计。
+fn build_http_client(
+    timeout: Duration,
+    trust: &TransportSecurity,
+) -> Result<reqwest::Client, NodeClientError> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        // 不跟随重定向：跳转后的路径与签名原文不再一致，属于协议违规。
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("chat-node-client/1");
+    if let TransportSecurity::PinnedCertificate(pem) = trust {
+        builder = builder.add_root_certificate(
+            reqwest::Certificate::from_pem(pem)
+                .map_err(|_| NodeClientError::config("TLS_CERT_INVALID: 固定证书 PEM 无法解析"))?,
+        );
+    }
+    builder
+        .build()
+        .map_err(|_| NodeClientError::config("http client could not be built"))
+}
+
 impl NodeClient {
     /// 用固定端点与设备签名钥建立客户端（默认上限与超时）。
     pub fn new(
@@ -435,6 +460,34 @@ impl NodeClient {
         signing_key: SigningKey,
     ) -> Result<Self, NodeClientError> {
         Self::with_limits(endpoint, device_id, signing_key, ClientLimits::default())
+    }
+
+    /// 用显式上限、超时与传输安全配置建立客户端。
+    ///
+    /// `https://` 必须给 [TransportSecurity::PinnedCertificate]（自签场景没有 CA 链可依赖）；
+    /// `http://` 必须用 [TransportSecurity::Plain]。不自洽直接拒绝，绝不静默降级。
+    pub fn with_limits_and_trust(
+        endpoint: NodeEndpoint,
+        device_id: impl Into<String>,
+        signing_key: SigningKey,
+        limits: ClientLimits,
+        trust: TransportSecurity,
+    ) -> Result<Self, NodeClientError> {
+        let device_id = device_id.into();
+        validate_bounded_id("device id", &device_id, MAX_DEVICE_ID_BYTES)
+            .map_err(|error| NodeClientError::from_local_node_error(&error))?;
+        limits.validate()?;
+        trust.validate(endpoint.url().as_str())?;
+        let http = build_http_client(limits.timeout, &trust)?;
+        Ok(Self {
+            endpoint,
+            http,
+            device_id,
+            signing_key,
+            limits,
+            capabilities: std::sync::Mutex::new(std::collections::HashMap::new()),
+            capability_required: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// 用显式上限与超时建立客户端；越界配置显式拒绝。
@@ -448,13 +501,10 @@ impl NodeClient {
         validate_bounded_id("device id", &device_id, MAX_DEVICE_ID_BYTES)
             .map_err(|error| NodeClientError::from_local_node_error(&error))?;
         limits.validate()?;
-        let http = reqwest::Client::builder()
-            .timeout(limits.timeout)
-            // 不跟随重定向：跳转后的路径与签名原文不再一致，属于协议违规。
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("chat-node-client/1")
-            .build()
-            .map_err(|_| NodeClientError::config("http client could not be built"))?;
+        // 默认明文传输（本地/可信网络）；https 必须走 with_limits_and_trust。
+        let trust = TransportSecurity::Plain;
+        trust.validate(endpoint.url().as_str())?;
+        let http = build_http_client(limits.timeout, &trust)?;
         Ok(Self {
             endpoint,
             http,

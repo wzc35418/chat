@@ -19,4 +19,7 @@ ed25519-dalek.workspace = true
 chat-node-api.workspace = true
 axum.workspace = true
 tokio = { workspace = true, features = ["net", "io-util"] }
+# 真 TLS 握手测试：用自签证书起本地 TLS 服务端，验证固定证书路径。
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde_json.workspace = true
