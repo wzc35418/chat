@@ -63,7 +63,7 @@ pub struct NodeClientError {
     kind: NodeClientErrorKind,
     status: Option<u16>,
     node_code: Option<&'static str>,
-    detail: &'static str,
+    detail: std::borrow::Cow<'static, str>,
     /// 有界的响应体片段（≤512 字节，UTF-8 有损，已截断；不含密钥/签名）。
     body_snippet: Option<String>,
 }
@@ -82,14 +82,14 @@ impl NodeClientError {
         kind: NodeClientErrorKind,
         status: Option<u16>,
         node_code: Option<&'static str>,
-        detail: &'static str,
+        detail: impl Into<std::borrow::Cow<'static, str>>,
     ) -> Self {
         Self {
             code,
             kind,
             status,
             node_code,
-            detail,
+            detail: detail.into(),
             body_snippet: None,
         }
     }
@@ -126,9 +126,9 @@ impl NodeClientError {
         self.node_code
     }
 
-    /// 固定短说明（不含节点正文/密钥/URL）。
-    pub fn detail(&self) -> &'static str {
-        self.detail
+    /// 固定短说明（不含节点正文/密钥/URL）；TLS 这类本地失败会带上可诊断的底层原因。
+    pub fn detail(&self) -> &str {
+        self.detail.as_ref()
     }
 
     /// 是否值得自动重试（沿用 PROTOCOL-014 的 retryable 定义）。
@@ -137,12 +137,12 @@ impl NodeClientError {
     }
 
     /// 客户端配置错误。
-    pub(crate) fn config(detail: &'static str) -> Self {
+    pub(crate) fn config(detail: impl Into<std::borrow::Cow<'static, str>>) -> Self {
         Self::new(ErrorCode::InvalidId, NodeClientErrorKind::Config, None, None, detail)
     }
 
     /// 网络失败。
-    pub(crate) fn network(detail: &'static str) -> Self {
+    pub(crate) fn network(detail: impl Into<std::borrow::Cow<'static, str>>) -> Self {
         Self::new(
             ErrorCode::NetworkUnavailable,
             NodeClientErrorKind::Network,
@@ -153,7 +153,7 @@ impl NodeClientError {
     }
 
     /// 超时。
-    pub(crate) fn timeout(detail: &'static str) -> Self {
+    pub(crate) fn timeout(detail: impl Into<std::borrow::Cow<'static, str>>) -> Self {
         Self::new(
             ErrorCode::NetworkUnavailable,
             NodeClientErrorKind::Timeout,
@@ -164,7 +164,7 @@ impl NodeClientError {
     }
 
     /// 节点响应不符合协议（含本地无法验证的节点产物）。
-    pub(crate) fn protocol(code: ErrorCode, detail: &'static str) -> Self {
+    pub(crate) fn protocol(code: ErrorCode, detail: impl Into<std::borrow::Cow<'static, str>>) -> Self {
         Self::new(code, NodeClientErrorKind::Protocol, None, None, detail)
     }
 
@@ -191,7 +191,7 @@ impl NodeClientError {
     }
 
     /// 本地输入/参数不合法（不来自节点）。
-    pub(crate) fn local_invalid(detail: &'static str) -> Self {
+    pub(crate) fn local_invalid(detail: impl Into<std::borrow::Cow<'static, str>>) -> Self {
         Self::new(
             ErrorCode::MalformedFrame,
             NodeClientErrorKind::InvalidRequest,
@@ -314,7 +314,7 @@ impl NodeClientError {
                 .copied()
                 .find(|known| *known == node_code)
                 .unwrap_or("UNKNOWN_NODE_CODE")),
-            detail: Self::detail_for_kind(kind),
+            detail: std::borrow::Cow::Borrowed(Self::detail_for_kind(kind)),
             body_snippet: None,
         }
     }
@@ -338,7 +338,7 @@ impl NodeClientError {
             kind,
             status: Some(status),
             node_code: None,
-            detail: Self::detail_for_kind(kind),
+            detail: std::borrow::Cow::Borrowed(Self::detail_for_kind(kind)),
             body_snippet: None,
         }
     }
@@ -352,7 +352,7 @@ impl NodeClientError {
             kind,
             status: None,
             node_code: None,
-            detail: "local request validation failed",
+            detail: std::borrow::Cow::Borrowed("local request validation failed"),
             body_snippet: None,
         }
     }

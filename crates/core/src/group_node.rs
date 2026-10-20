@@ -502,11 +502,12 @@ pub fn build_node_client(
         })?;
         endpoint = endpoint.with_node_public_key(key);
     }
-    NodeClient::new(endpoint, seeds.device_id.clone(), signing_key).map_err(|_| {
-        ControlReceiptError::new(
-            ErrorCode::InvalidTarget.as_str(),
-            "node client could not be created from the persisted device identity",
-        )
+    NodeClient::new(endpoint, seeds.device_id.clone(), signing_key).map_err(|error| {
+        let detail = format!(
+            "node client could not be created from the persisted device identity: {}",
+            error.detail()
+        );
+        ControlReceiptError::new(ErrorCode::InvalidTarget.as_str(), detail)
     })
 }
 

@@ -243,11 +243,12 @@ pub fn node_blob_transport(
     if let Some(public_key) = config.node_public_key {
         endpoint = endpoint.with_node_public_key(public_key);
     }
-    let client = NodeClient::new(endpoint, device_id, signing_key).map_err(|_| {
-        AttachmentError::transport(
-            "INVALID_TARGET",
-            "node client could not be created from the persisted device identity",
-        )
+    let client = NodeClient::new(endpoint, device_id, signing_key).map_err(|error| {
+        let detail = format!(
+            "node client could not be created from the persisted device identity: {}",
+            error.detail()
+        );
+        AttachmentError::transport("INVALID_TARGET", detail)
     })?;
     NodeBlobTransport::new(client, config.group_id.clone(), config.source_seq)
 }

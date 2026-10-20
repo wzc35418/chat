@@ -213,11 +213,14 @@ impl SyncFfi {
             }
         }
         drop(store);
-        NodeClient::new(endpoint, seeds.device_id.clone(), signing_key).map_err(|_| {
+        NodeClient::new(endpoint, seeds.device_id.clone(), signing_key).map_err(|error| {
             FfiError::Store {
                 code: "INVALID_TARGET".to_owned(),
-                reason: "node client could not be created from the persisted device identity"
-                    .to_owned(),
+                // 带上底层原因：TLS 指纹不匹配 / 端点不自洽都会在这里显形，而不是只说"连不上"。
+                reason: format!(
+                    "node client could not be created from the persisted device identity: {}",
+                    error.detail()
+                ),
             }
         })
     }

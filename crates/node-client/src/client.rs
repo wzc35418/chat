@@ -446,11 +446,10 @@ fn build_http_client(
         let config = crate::transport_security::pinned_client_config_many(fingerprints)?;
         builder = builder.use_preconfigured_tls(config);
     }
-    // 注意：错误详情目前是静态常量（NodeClientError 存 &'static str），
-    // 因此这里**不**拼接底层错误文本；需要详情时用 Debug 打点（见 tests）。
-    builder
-        .build()
-        .map_err(|_| NodeClientError::config("http client could not be built"))
+    // 带上底层原因（TLS 配置与后端不匹配时没有这条几乎无法定位）；detail 现在是 Cow，可以携带动态文本。
+    builder.build().map_err(|error| {
+        NodeClientError::config(format!("http client could not be built: {error}"))
+    })
 }
 
 impl NodeClient {
