@@ -1076,6 +1076,38 @@ impl NodeService {
             ],
         )?;
         checkpoint(AppendCheckpoint::AfterLogInsert);
+        // NODE-006b：控制提交里声明的**新增成员**（字段 59）同步进节点成员表。
+        // 这是“成员变更提交”这条既有载体的落地：节点不解析正文，只用已验签的公开元数据。
+        if kind == KIND_CONTROL {
+            if let Some(metadata) = candidate.candidate.control_metadata.as_ref() {
+                for added in &metadata.added_credentials {
+                    if added.is_empty() {
+                        continue;
+                    }
+                    let existing: Option<i64> = tx
+                        .query_row(
+                            "SELECT joined_seq FROM group_members WHERE group_id = ?1 AND device_id = ?2",
+                            params![group, added],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if existing.is_some() {
+                        continue;
+                    }
+                    tx.execute(
+                        "INSERT INTO group_members (group_id, device_id, account_id, role, muted, joined_seq, left_seq)
+                         VALUES (?1, ?2, ?3, ?4, 0, ?5, NULL)",
+                        params![
+                            group,
+                            added,
+                            actor.account_id.clone(),
+                            "member",
+                            to_i64("joined seq", seq)?
+                        ],
+                    )?;
+                }
+            }
+        }
         // 控制候选推进“节点可观察的控制链头”。公开 policy/epoch 不由节点猜测推进。
         if kind == KIND_CONTROL {
             tx.execute(

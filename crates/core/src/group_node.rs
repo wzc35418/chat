@@ -785,6 +785,12 @@ fn registration_request_for(
     })
 }
 
+/// 把节点的真实拒绝原因带进本层错误（含节点稳定码，便于定位）。
+fn node_rejection(error: NodeClientError, what: &'static str) -> ControlReceiptError {
+    let node_code = error.node_code().unwrap_or("UNKNOWN");
+    ControlReceiptError::new(error.code().as_str(), format!("{what} (node code {node_code})"))
+}
+
 /// 游标是否需要初始化（读不到状态视为需要；读失败按损坏处理）。
 fn chat_core_pull_state_missing(store: &Store, group_id: &str) -> bool {
     matches!(crate::sync_worker::load_pull_state(store, group_id), Ok(None))
@@ -907,7 +913,7 @@ pub fn submit_group_invite(
                 .map(|(_, receipt)| receipt)
                 .ok_or_else(|| ControlReceiptError::from(error))?
         }
-        Err(error) => return Err(ControlReceiptError::from(error)),
+        Err(error) => return Err(node_rejection(error, "the node rejected the invite submission")),
     };
     if receipt.group_id != group_id
         || receipt.submission_id != candidate.submission_id

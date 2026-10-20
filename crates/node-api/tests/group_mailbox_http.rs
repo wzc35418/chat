@@ -2265,3 +2265,81 @@ async fn an_unknown_operation_text_is_rejected_and_never_audited_as_invite() {
     assert_eq!(audit.status, 200);
     assert_eq!(audit.json()["events"].as_array().expect("events").len(), 0);
 }
+
+// ---------------------------------------------------------------- NODE-006b 成员表同步
+
+/// 控制提交里声明的 added_credentials 必须把新成员写进节点成员表（否则新成员读不到日志）。
+#[tokio::test]
+async fn a_control_commit_with_added_credentials_makes_the_new_member_authorized() {
+    let (node, group) = setup(NodeAuthPolicy {
+        max_devices_per_account: 6,
+        ..NodeAuthPolicy::default()
+    })
+    .await;
+    // 新设备 23：在节点注册过，但**不在群成员表**里。
+    register_device(&node, 23).await;
+    let log_path = format!("/v1/groups/{group}/log");
+    let headers = request_headers(&node, 23, "GET", &log_path, "after=0&limit=10", b"").await;
+    let denied = http(
+        &node.address,
+        "GET",
+        &format!("{log_path}?after=0&limit=10"),
+        &headers,
+        b"",
+    )
+    .await;
+    assert_eq!(denied.status, 403);
+    assert_eq!(denied.error_code(), "HISTORY_NOT_AUTHORIZED");
+
+    // alice(21，owner) 提交 control 候选，公开元数据里声明新增成员 bob。
+    let candidate = GroupCandidate {
+        protocol_major: 1,
+        protocol_minor: 0,
+        submission_id: submission_text(211),
+        group_id: group.clone(),
+        author_device_id: device_text(21),
+        kind: KIND_CONTROL.to_owned(),
+        expected_control_head: hex_encode(&INITIAL_CONTROL_HEAD),
+        policy_version: 1,
+        mls_epoch: 0,
+        encrypted_payload: hex_encode(b"sealed add-member commit"),
+        control_metadata: Some(CandidateControlMetadata {
+            operation: "invite".into(),
+            target_digest: hex_encode(&[0x33_u8; 32]),
+            added_credentials: vec![device_text(23)],
+            removed_credentials: Vec::new(),
+        }),
+    };
+    let unsigned = candidate
+        .to_unsigned(chat_protocol::MAX_CIPHERTEXT_BYTES)
+        .expect("candidate converts");
+    let signing = candidate_signing_bytes(&unsigned).expect("signing bytes");
+    let signature: Signature = device(21).sign(signing.as_bytes());
+    let body = entry_body(&candidate, &hex_encode(&signature.to_bytes()));
+    let entries = format!("/v1/groups/{group}/entries");
+    let headers = request_headers(&node, 21, "POST", &entries, "", &body).await;
+    let accepted = http(&node.address, "POST", &entries, &headers, &body).await;
+    assert_eq!(
+        accepted.status,
+        200,
+        "control append: {:?}",
+        String::from_utf8_lossy(&accepted.body)
+    );
+
+    // 现在 23 读日志被允许（成员表已有他）。
+    let headers = request_headers(&node, 23, "GET", &log_path, "after=0&limit=10", b"").await;
+    let allowed = http(
+        &node.address,
+        "GET",
+        &format!("{log_path}?after=0&limit=10"),
+        &headers,
+        b"",
+    )
+    .await;
+    assert_eq!(
+        allowed.status,
+        200,
+        "bob must be authorized after the member commit: {:?}",
+        String::from_utf8_lossy(&allowed.body)
+    );
+}
