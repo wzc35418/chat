@@ -177,12 +177,42 @@ pub struct SharedSyncOnceFfi {
     pub unknown_authors: u64,
 }
 
+/// 本机身份的脱敏投影（登记结果；不含任何种子）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct SharedAccountFfi {
+    /// 账户 ID。
+    pub account_id: String,
+    /// 设备 ID。
+    pub device_id: String,
+    /// 显示名。
+    pub display_name: String,
+    /// 核验指纹（小写 hex）。
+    pub fingerprint: String,
+}
+
+/// 已验证的拉取起点（来自**节点签名回执**落库后的持久状态，不是节点自报 head）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct SharedPullStateFfi {
+    /// 游标处的已验证日志序号。
+    pub cursor_seq: u64,
+    /// 游标处的日志链尾摘要（小写 hex）。
+    pub cursor_log_hash: String,
+    /// 控制头（小写 hex）。
+    pub control_head: String,
+    /// 策略版本。
+    pub policy_version: u64,
+    /// MLS epoch。
+    pub mls_epoch: u64,
+}
+
 /// 共享核心门面：**一个** `Store` 句柄 + 既有 core 业务函数。
 #[derive(uniffi::Object)]
 pub struct ChatCoreFfi {
     database_path: String,
     master_key_hex: String,
     core: Mutex<Option<ConversationCore>>,
+    /// 本机 MLS 设备（懒创建；导出 KeyPackage 与接受 Welcome 必须是**同一个实例**）。
+    mls_device: Mutex<Option<chat_crypto::engine::MlsDevice>>,
 }
 
 /// 内核错误 → FFI 错误（稳定码 + 脱敏消息；不需要在这里点名 `anyhow` 类型）。
@@ -207,6 +237,35 @@ fn core_closed() -> FfiError {
     FfiError::Store {
         code: "CORE_CLOSED".to_owned(),
         reason: "the shared core has been closed".to_owned(),
+    }
+}
+
+/// 邀请方口径守卫：`invitee_credential` 必须是**被邀请设备的凭据**（`dev:1:…`），
+/// 因为 KeyPackage 的 leaf credential 就是导出方设备的 credential —— 传账户 ID 一定对不上。
+fn ensure_device_credential(invitee_credential: &str) -> Result<(), FfiError> {
+    if invitee_credential.trim().starts_with("acct:") {
+        return Err(FfiError::Store {
+            code: "INVALID_INPUT".to_owned(),
+            reason: format!(
+                "invitee_credential must be the invited **device** id (dev:1:…), not the account id                  ({invitee_credential}): the KeyPackage leaf credential is the exporting device's                  credential, and create_group_with_invitee_key_package compares them byte for byte"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// 把 core 的 `INVALID_CANDIDATE` 附上口径提示（口径不一致是最常见的成因）。
+fn invitee_candidate_failure(error: chat_core::groups::GroupError) -> FfiError {
+    let code = error.code();
+    let mut reason = error.to_string();
+    if code == "INVALID_CANDIDATE" {
+        reason.push_str(
+            " (hint: invitee_credential must be byte-identical to the KeyPackage leaf credential —              use the exporting device id dev:1:…, not an account id acct:1:…)",
+        );
+    }
+    FfiError::Store {
+        code: code.to_owned(),
+        reason,
     }
 }
 
@@ -346,6 +405,7 @@ impl ChatCoreFfi {
             database_path,
             master_key_hex,
             core: Mutex::new(Some(core)),
+            mls_device: Mutex::new(None),
         }))
     }
 
@@ -358,7 +418,10 @@ impl ChatCoreFfi {
     }
 
     /// 关闭：释放唯一的 Store 句柄；之后所有方法 `CORE_CLOSED`。幂等。
-    pub fn close(&self) {
+    ///
+    /// 命名注意：**不能叫 `close`**——UniFFI 生成的 Kotlin 绑定里 `Disposable.close()`
+    /// 会造成 "conflicting overloads" 编译错误（本项目已在 Kotlin 侧实测踩到）。
+    pub fn shutdown(&self) {
         if let Ok(mut guard) = self.core.lock()
             && let Some(core) = guard.take()
         {
@@ -398,6 +461,7 @@ impl ChatCoreFfi {
         if key_package_bytes.is_empty() {
             return Err(invalid_input("invitee key package must not be empty"));
         }
+        ensure_device_credential(&invitee_credential)?;
         let mut guard = self.lock()?;
         let core = guard.as_mut().ok_or_else(core_closed)?;
         let (view, welcome) = core
@@ -407,7 +471,7 @@ impl ChatCoreFfi {
                 &invitee_credential,
                 &key_package_bytes,
             )
-            .map_err(|error| failure!(error))?;
+            .map_err(invitee_candidate_failure)?;
         let invite = invite_view(&view, &local_credential, &invitee_credential, welcome);
         Ok(SharedCreatedGroupFfi {
             group: group_view(&view),
@@ -647,6 +711,244 @@ impl ChatCoreFfi {
             status: draft.state,
             submission_id: draft.submission_id,
         }))
+    }
+
+
+    // ---------------------------------------------------------------- 身份与入群（双设备演示收口）
+
+    /// 把**另一份身份库**里的本机身份登记进本核心打开的库（复用 `save_identity_account`）。
+    ///
+    /// - 幂等：同账户同显示信息不写行、库版本不涨；
+    /// - 本库已绑定**另一个账户** → `IDENTITY_ACCOUNT_CONFLICT` 原样透出（绝不覆盖）；
+    /// - 源库主密钥错/损坏、目标库主密钥错 → 存储层稳定码原样透出；
+    /// - 种子只在内存里搬运（来源是源库密封记录），不进日志、不进返回值。
+    pub fn enroll_local_identity(
+        &self,
+        source_identity_database_path: String,
+        source_master_key_hex: String,
+    ) -> Result<SharedAccountFfi, FfiError> {
+        let mut guard = self.lock()?;
+        let Some(core) = guard.take() else {
+            return Err(core_closed());
+        };
+        core.close();
+        let outcome = (|| -> Result<SharedAccountFfi, FfiError> {
+            let source = open_formal_store(
+                &source_identity_database_path,
+                &source_master_key_hex,
+            )?;
+            let seeds = source
+                .load_identity_seeds()
+                .map_err(storage_failure)?
+                .ok_or_else(|| invalid_input("the source database holds no identity seeds"))?;
+            let projection = source
+                .load_identity_account()
+                .map_err(storage_failure)?
+                .ok_or_else(|| {
+                    FfiError::Store {
+                        code: "STATE_CORRUPTED".to_owned(),
+                        reason: "the source identity projection is missing".to_owned(),
+                    }
+                })?;
+            let mut account_seed = seeds.account_seed.to_vec();
+            let mut device_seed = seeds.device_seed.to_vec();
+            let mut target = open_formal_store(&self.database_path, &self.master_key_hex)?;
+            let written = target
+                .save_identity_account(chat_storage::formal::IdentityAccountInput {
+                    account_id: projection.account_id.clone(),
+                    device_id: projection.device_id.clone(),
+                    account_public_key: [0_u8; 32],
+                    device_public_key: [0_u8; 32],
+                    account_seed: account_seed.clone(),
+                    device_seed: device_seed.clone(),
+                    display_name: projection.display_name.clone(),
+                    fingerprint: projection.fingerprint,
+                    created_at_ms: projection.created_at_ms,
+                })
+                .map_err(storage_failure)?;
+            account_seed.iter_mut().for_each(|byte| *byte = 0);
+            device_seed.iter_mut().for_each(|byte| *byte = 0);
+            Ok(SharedAccountFfi {
+                account_id: written.account_id,
+                device_id: written.device_id,
+                display_name: written.display_name,
+                fingerprint: written.fingerprint.iter().map(|byte| format!("{byte:02x}")).collect(),
+            })
+        })();
+        match ConversationCore::open(&self.database_path, &self.master_key_hex) {
+            Ok(core) => *guard = Some(core),
+            Err(error) => return Err(failure!(error)),
+        }
+        outcome
+    }
+
+    /// 导出本机 MLS KeyPackage（交给建群方；**单次使用**、只含公钥材料）。
+    pub fn export_key_package(&self) -> Result<Vec<u8>, FfiError> {
+        let device_id = {
+            let guard = self.core.lock().map_err(|_| core_closed())?;
+            let core = guard.as_ref().ok_or_else(core_closed)?;
+            core.load_identity_account()
+                .map_err(|error| failure!(error))?
+                .ok_or_else(|| FfiError::Store {
+                    code: "INVALID_STATE_TRANSITION".to_owned(),
+                    reason: "the local identity is not enrolled in this database".to_owned(),
+                })?
+                .device_id
+        };
+        let mut slot = self.mls_device.lock().map_err(|_| core_closed())?;
+        if slot.is_none() {
+            *slot = Some(
+                chat_crypto::engine::MlsDevice::new(&device_id).map_err(|error| FfiError::Store {
+                    code: "STATE_CORRUPTED".to_owned(),
+                    reason: format!("MLS device failed: {error}"),
+                })?,
+            );
+        }
+        let device = slot.as_ref().ok_or_else(|| FfiError::Store {
+            code: "STATE_CORRUPTED".to_owned(),
+            reason: "the MLS device is unavailable".to_owned(),
+        })?;
+        device.key_package().map_err(|error| FfiError::Store {
+            code: "STATE_CORRUPTED".to_owned(),
+            reason: format!("MLS key package failed: {error}"),
+        })
+    }
+
+    /// 读取某个群的**已验证**拉取起点（来自节点签名回执落库后的持久状态）。
+    ///
+    /// 未初始化 → `None`。这是把可信起点交给**另一台设备**的唯一正规途径：
+    /// 调用方只能在持有已验证回执的一侧拿到它，绝不接受节点自报 head。
+    pub fn pull_state(&self, group_id: String) -> Result<Option<SharedPullStateFfi>, FfiError> {
+        let mut guard = self.lock()?;
+        let Some(core) = guard.take() else {
+            return Err(core_closed());
+        };
+        core.close();
+        let outcome = (|| -> Result<Option<SharedPullStateFfi>, FfiError> {
+            let store = open_formal_store(&self.database_path, &self.master_key_hex)?;
+            let state = chat_core::sync_worker::load_pull_state(&store, &group_id).map_err(
+                |error| FfiError::Store {
+                    code: error.code().as_str().to_owned(),
+                    reason: error.to_string(),
+                },
+            )?;
+            Ok(state.map(|view| SharedPullStateFfi {
+                cursor_seq: view.cursor_seq,
+                cursor_log_hash: view.cursor_log_hash,
+                control_head: view.control_head,
+                policy_version: view.policy_version,
+                mls_epoch: view.mls_epoch,
+            }))
+        })();
+        match ConversationCore::open(&self.database_path, &self.master_key_hex) {
+            Ok(core) => *guard = Some(core),
+            Err(error) => return Err(failure!(error)),
+        }
+        outcome
+    }
+
+    /// 用 Welcome 入群（B 侧），并用**已验证起点**初始化拉取游标。
+    ///
+    /// - `invite` 必须是建群方返回的邀请（含 Welcome 原文与元数据）；
+    /// - 前置：本对象先 `export_key_package` 过（同一个 MLS 设备实例持有该 KeyPackage 的私钥材料），
+    ///   否则 `INVALID_STATE_TRANSITION`；
+    /// - `verified_head` **必填**：缺失时**在入群之前**显式失败，并说明缺哪些字段
+    ///   （log_sequence / log_hash / control_head / policy_version / mls_epoch），绝不信任节点自报 head；
+    /// - 游标初始化是幂等的（core 的 `initialize_pull_state` 语义）；已入群再调 → 显式失败且不动库。
+    pub fn join_group_from_welcome(
+        &self,
+        name: String,
+        invite: SharedInviteFfi,
+        verified_head: Option<SharedPullStateFfi>,
+    ) -> Result<SharedGroupFfi, FfiError> {
+        let Some(head) = verified_head else {
+            return Err(FfiError::Store {
+                code: "INVALID_STATE_TRANSITION".to_owned(),
+                reason: "a verified pull anchor is required before joining: missing \
+                    log_sequence / log_hash / control_head / policy_version / mls_epoch \
+                    (take them from pull_state() on the side that holds the signed registration receipt)"
+                    .to_owned(),
+            });
+        };
+        let mut slot = self.mls_device.lock().map_err(|_| core_closed())?;
+        let Some(mut device) = slot.take() else {
+            return Err(FfiError::Store {
+                code: "INVALID_STATE_TRANSITION".to_owned(),
+                reason: "export a key package before joining a group".to_owned(),
+            });
+        };
+        let acceptance = chat_crypto::control::WelcomeAcceptance {
+            group_id: invite.mls_group_id.clone(),
+            expected_epoch: invite.epoch,
+            members: invite.members.clone(),
+        };
+        let mut guard = self.lock()?;
+        let Some(core) = guard.take() else {
+            *slot = Some(device);
+            return Err(core_closed());
+        };
+        core.close();
+        let outcome = (|| -> Result<SharedGroupFfi, FfiError> {
+            let mut store = open_formal_store(&self.database_path, &self.master_key_hex)?;
+            let view = chat_core::groups::group_join_from_welcome(
+                &mut device,
+                &mut store,
+                &name,
+                &invite.welcome_bytes,
+                &acceptance,
+                &invite.invitee_credential,
+                &invite.owner_credential,
+            )
+            .map_err(|error| FfiError::Store {
+                code: error.code().to_owned(),
+                reason: error.to_string(),
+            })?;
+            let group = group_view(&view);
+            // 用已验证起点初始化游标（幂等；失败显式返回，绝不退回“问节点要 head”）。
+            let group_id = chat_protocol::GroupId::parse(&view.group_id).map_err(|_| {
+                FfiError::Store {
+                    code: "STATE_CORRUPTED".to_owned(),
+                    reason: "the joined group id is malformed".to_owned(),
+                }
+            })?;
+            let control_head = chat_protocol::ControlHead::from_hex(&head.control_head)
+                .map_err(|_| FfiError::Store {
+                    code: "STATE_CORRUPTED".to_owned(),
+                    reason: "the verified control head is malformed".to_owned(),
+                })?;
+            let log_hash = chat_protocol::Digest::from_hex(&head.cursor_log_hash).map_err(|_| {
+                FfiError::Store {
+                    code: "STATE_CORRUPTED".to_owned(),
+                    reason: "the verified log hash is malformed".to_owned(),
+                }
+            })?;
+            chat_core::sync_worker::initialize_pull_state(
+                &mut store,
+                &view.group_id,
+                chat_protocol::VerifiedHead {
+                    group_id,
+                    control_head,
+                    policy_version: head.policy_version,
+                    mls_epoch: head.mls_epoch,
+                    log_sequence: head.cursor_seq,
+                    log_hash,
+                },
+            )
+            .map_err(|error| FfiError::Store {
+                code: error.code().as_str().to_owned(),
+                reason: error.to_string(),
+            })?;
+            Ok(group)
+        })();
+        match ConversationCore::open(&self.database_path, &self.master_key_hex) {
+            Ok(core) => *guard = Some(core),
+            Err(error) => {
+                *slot = Some(device);
+                return Err(failure!(error));
+            }
+        }
+        *slot = Some(device);
+        outcome
     }
 
     // ---------------------------------------------------------------- 同步

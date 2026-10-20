@@ -1157,5 +1157,43 @@ log_hash 64 hex）→ `fetch_invite`（按 bob 过滤、Welcome 逐字节回传�
 **已知限制**：① 这是"门面"而不是新的权限边界（调用方仍拿到同一库的全部能力）；② `sync_once`
 期间会短暂释放句柄（同进程其它持库者若抢到锁，重开会失败并显式返回错误）；③ 未覆盖的方案
 （邀请接受、恢复导入）仍在各自既有对象上，后续可逐步并入本门面。
+### 收口：B 侧入群并入共享核心（2026-10-18）
+
+~~~text
+ChatCoreFfi.enroll_local_identity(source_identity_database_path, source_master_key_hex)
+    -> SharedAccountFfi { account_id, device_id, display_name, fingerprint }
+ChatCoreFfi.export_key_package() -> Vec<u8>
+ChatCoreFfi.pull_state(group_id) -> Option<SharedPullStateFfi>
+    { cursor_seq, cursor_log_hash, control_head, policy_version, mls_epoch }
+ChatCoreFfi.join_group_from_welcome(name, invite: SharedInviteFfi,
+                                    verified_head: Option<SharedPullStateFfi>) -> SharedGroupFfi
+~~~
+
+- `enroll_local_identity`：从**另一份身份库**读种子（密封记录）后，用既有 `save_identity_account`
+  登记进本核心的库；幂等、冲突 `IDENTITY_ACCOUNT_CONFLICT` 原样透出；种子仍在内存里清零、不外泄；
+- `export_key_package`：本核心缓存**一个** MLS 设备实例（导出与入群必须同一个），单次 KeyPackage；
+- `join_group_from_welcome`：先要求 `verified_head` —— 缺失时**在入群之前**显式失败并说明缺
+  `log_sequence / log_hash / control_head / policy_version / mls_epoch`，**绝不问节点要 head**；
+  有起点则入群 + `initialize_pull_state`（幂等）；重复入群显式失败且游标不变；
+- `pull_state` 把**签名回执落库后的持久状态**读出来，这是把可信起点交给另一台设备的唯一正规途径。
+
+证据（[crates/ffi/tests/shared_core.rs](../../crates/ffi/tests/shared_core.rs) 第 5 例）：
+A/B 各一份身份库 → 两个 ChatCore 各自 `enroll_local_identity` → B `export_key_package` →
+A 用它建群 → A `group_register_on_node` → A `pull_state` 取**已验证起点** → A `submit_invite` →
+B 先不带起点入群被拒（`INVALID_STATE_TRANSITION`）→ B 带起点入群成功（group/epoch/成员一致）→
+B 的 `pull_state` 与 A 的起点逐字段相同 → 重复入群被拒且游标不变 →
+B `sync_once` 不再报缺游标（见下）。
+
+复现：`cargo test --offline -p chat-ffi` → **120 passed**（既有 119 继续通过）。
+
+**如实回报的限制（未绕过、未复制 MLS 逻辑）**：
+1) Agent 要求“复用 identity 的 join_group_from_welcome”——identity 侧的实现持有它**自己的**设备句柄，
+   跨对象拿不到；因此共享核心改为**自己缓存一个 MLS 设备实例**（`export_key_package` 与入群同一个），
+   复用 core 的 `groups::group_join_from_welcome` 与 `sync_worker::initialize_pull_state`；
+2) B 侧入群后 **`sync_once` 仍可能被节点拒绝**（`INVALID_CREDENTIAL`）：节点成员表里只有 A
+   （建群方自注册），B 还没在节点登记设备/成员。这是独立的"节点成员同步"缺口，不是本地游标问题；
+   本地游标已按已验证起点初始化，重复初始化幂等 —— 要真正拉到 B 的日志，还需要把 B 的成员变更
+   提交到节点（或让 B 走一次节点设备登记），这一块本轮未做，已在本文件与测试注释里写明。
+
 
 

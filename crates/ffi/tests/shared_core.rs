@@ -345,6 +345,150 @@ fn sync_once_pulls_the_group_log_through_the_same_handle() {
     assert!(harness.core.is_open());
 }
 
+
+#[test]
+fn the_b_side_joins_through_the_same_shared_handle() {
+    // 两份**身份库**（A 与 B 各自的账户/设备），共享核心把它们各自登记进自己的工作库。
+    let a_identity_dir = FixtureDir::new();
+    enroll_identity_with_seeds(
+        &a_identity_dir.database(),
+        &master_key_hex(),
+        &ACCOUNT_SEED,
+        &DEVICE_SEED,
+    );
+    let b_identity_dir = FixtureDir::new();
+    let b_account_seed = [0x44_u8; 32];
+    let b_device_seed = [0x55_u8; 32];
+    let b_identity = enroll_identity_with_seeds(
+        &b_identity_dir.database(),
+        &master_key_hex(),
+        &b_account_seed,
+        &b_device_seed,
+    );
+    let b_device_id = b_identity.device_id.clone();
+
+    let node = start_node();
+    let b_dir = FixtureDir::new();
+    let b_core = ChatCoreFfi::open(b_dir.database(), master_key_hex()).expect("open B core");
+    let enrolled = b_core
+        .enroll_local_identity(b_identity_dir.database(), master_key_hex())
+        .expect("B enrolls its identity");
+    assert_eq!(enrolled.device_id, b_device_id);
+    // 幂等：再登记一次仍成功且设备不变。
+    let again = b_core
+        .enroll_local_identity(b_identity_dir.database(), master_key_hex())
+        .expect("idempotent enroll");
+    assert_eq!(again.device_id, b_device_id);
+    let key_package = b_core.export_key_package().expect("B exports a key package");
+    assert!(key_package.len() > 100);
+
+    // A 侧：同一形态的共享核心 + 自己的身份库。
+    let a_dir = FixtureDir::new();
+    let a_core = ChatCoreFfi::open(a_dir.database(), master_key_hex()).expect("open A core");
+    a_core
+        .enroll_local_identity(a_identity_dir.database(), master_key_hex())
+        .expect("A enrolls its identity");
+    let created = a_core
+        .create_group_with_invitee_key_package(
+            "双设备单句柄群".to_owned(),
+            b_device_id.clone(),
+            key_package,
+            String::new(),
+        )
+        .expect("A creates the group with B's key package");
+    assert_eq!(created.group.members.len(), 2);
+    let registration = a_core
+        .group_register_on_node(
+            created.group.group_id.clone(),
+            node.endpoint_url(),
+            NODE_ID.to_owned(),
+            Some(node.public_key_hex()),
+        )
+        .expect("A registers the group on the node");
+    assert_eq!(registration.group_id, created.group.group_id);
+    // 已签名的登记回执落库后的**已验证起点**（唯一正规的可信锚点来源）。
+    let verified_head = a_core
+        .pull_state(created.group.group_id.clone())
+        .expect("A reads its verified pull state")
+        .expect("the registration receipt initialized the pull state");
+    let receipt = a_core
+        .submit_invite(
+            created.group.group_id.clone(),
+            created.invite.clone(),
+            node.endpoint_url(),
+            NODE_ID.to_owned(),
+            Some(node.public_key_hex()),
+        )
+        .expect("A submits the invite");
+    assert!(receipt.seq >= 1);
+
+    // B 侧：同一个共享核心上入群（先失败一次：没有已验证起点时**不**入群）。
+    let missing = b_core
+        .join_group_from_welcome(
+            "双设备单句柄群".to_owned(),
+            created.invite.clone(),
+            None,
+        )
+        .expect_err("joining without a verified anchor is rejected");
+    assert_eq!(code(missing), "INVALID_STATE_TRANSITION");
+    // 真的入群：带上 A 侧从签名回执得到的已验证起点。
+    let joined = b_core
+        .join_group_from_welcome(
+            "双设备单句柄群".to_owned(),
+            created.invite.clone(),
+            Some(verified_head.clone()),
+        )
+        .expect("B joins through the same shared handle");
+    assert_eq!(joined.group_id, created.group.group_id);
+    assert_eq!(joined.epoch, created.group.epoch);
+    assert_eq!(joined.members.len(), 2);
+    // 游标已初始化且与 A 的起点一致（幂等起点，不是问节点要的）。
+    let b_state = b_core
+        .pull_state(created.group.group_id.clone())
+        .expect("B reads its pull state")
+        .expect("the join initialized B's pull cursor");
+    assert_eq!(b_state.cursor_seq, verified_head.cursor_seq);
+    assert_eq!(b_state.cursor_log_hash, verified_head.cursor_log_hash);
+    // 再次入群：已经入群 → 显式失败，且游标不变（不会把起点改坏）。
+    let duplicate = b_core
+        .join_group_from_welcome(
+            "双设备单句柄群".to_owned(),
+            created.invite.clone(),
+            Some(verified_head.clone()),
+        )
+        .expect_err("a duplicate join is rejected");
+    assert_eq!(code(duplicate), "INVALID_STATE_TRANSITION");
+    let b_state_after = b_core
+        .pull_state(created.group.group_id.clone())
+        .expect("pull state after duplicate")
+        .expect("still initialized");
+    assert_eq!(b_state_after.cursor_seq, b_state.cursor_seq);
+
+    // B 的 sync_once 不再因“游标缺失”失败（INVALID_STATE_TRANSITION）。
+    // 说明：B 侧还没在**节点**登记设备（节点成员表只登记了 A），节点可能以
+    // INVALID_CREDENTIAL / NODE_UNAVAILABLE 拒绝拉取 —— 那是独立的“节点成员同步”缺口，
+    // 与本地游标无关，因此这里只锁“不再报缺游标”这一条。
+    match b_core.sync_once(
+        created.group.group_id.clone(),
+        node.endpoint_url(),
+        NODE_ID.to_owned(),
+        Some(node.public_key_hex()),
+    ) {
+        Ok(outcome) => {
+            // 拉到了多少都行（可能 0 条），关键是不再缺游标。
+            let _ = outcome.fetched;
+        }
+        Err(error) => {
+            let error_code = code(error);
+            assert_ne!(
+                error_code, "INVALID_STATE_TRANSITION",
+                "the joined side must have a pull cursor; got {error_code}"
+            );
+        }
+    }
+    a_core.shutdown();
+    b_core.shutdown();
+}
 #[test]
 fn a_closed_handle_and_a_second_instance_are_explicit() {
     let harness = Harness::new();
@@ -356,7 +500,7 @@ fn a_closed_handle_and_a_second_instance_are_explicit() {
     assert_eq!(code(second), "STORAGE_LOCKED");
 
     // 关闭后所有方法 CORE_CLOSED。
-    harness.core.close();
+    harness.core.shutdown();
     assert!(!harness.core.is_open());
     assert_eq!(
         code(harness.core.snapshot(harness.group_id.clone()).unwrap_err()),
@@ -382,8 +526,27 @@ fn a_closed_handle_and_a_second_instance_are_explicit() {
         "CORE_CLOSED"
     );
     // 关闭是幂等的。
-    harness.core.close();
+    harness.core.shutdown();
 }
+fn enroll_identity_with_seeds(
+    database: &str,
+    master_key_hex: &str,
+    account_seed: &[u8; 32],
+    device_seed: &[u8; 32],
+) -> IdentityAccountView {
+    let mut core = ConversationCore::open(database, master_key_hex).expect("open core");
+    let view = core
+        .save_identity_account(IdentityAccountInput {
+            display_name: "共享核心".to_owned(),
+            account_seed_hex: acct(account_seed),
+            device_seed_hex: acct(device_seed),
+            created_at_ms: NOW_S * 1_000,
+        })
+        .expect("save identity");
+    core.close();
+    view
+}
+
 fn enroll_identity(database: &str, master_key_hex: &str) -> IdentityAccountView {
     let mut core = ConversationCore::open(database, master_key_hex).expect("open core");
     let view = core
