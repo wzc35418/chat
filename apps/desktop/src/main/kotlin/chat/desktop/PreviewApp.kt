@@ -209,6 +209,30 @@ fun main() = application {
         }.onFailure { error ->
             transportMode = "配置失败：" + ((error as? Exception)?.message ?: error::class.simpleName)
         }
+
+        // 启动时顺手读一次节点证书状态：用户不点按钮也能看到"还剩多少天"。
+        // 失败不阻断启动，但必须在界面上显示原因（不静默）。
+        val startupConfig = runCatching { nodeConfigStore.load() }.getOrNull()
+        val startupEndpoint = startupConfig?.endpointUrl?.trim().orEmpty()
+        if (startupEndpoint.isNotEmpty()) {
+            runCatching {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    TlsInfoFetcher.fetch(startupEndpoint, startupConfig?.tlsFingerprints ?: emptyList())
+                }
+            }.onSuccess { info ->
+                if (info == null) {
+                    tlsCertificateText = "（该节点未启用 TLS）"
+                    tlsCertificateCritical = false
+                } else {
+                    val view = chat.presentation.display.presentTlsCertificate(info.daysRemaining)
+                    tlsCertificateText = view.label
+                    tlsCertificateCritical = view.critical
+                }
+            }.onFailure { error ->
+                tlsCertificateText = "（读取失败：" + ((error as? Exception)?.message ?: error::class.simpleName) + "）"
+                tlsCertificateCritical = false
+            }
+        }
     }
 
     LaunchedEffect(Unit) {

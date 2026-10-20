@@ -272,3 +272,13 @@ keytool -list -v -keystore plugin.p12 -storepass changeit | Select-String "SHA25
 5. **负例**：改一个字节后重新加载 → `PLUGIN_SIGNATURE_INVALID`；换签名密钥（不同证书）→ `PLUGIN_SIGNATURE_MISMATCH`（不会自动接受）。
 
 信任列表文件：`%APPDATA%\Chat\plugin-trust.json`（插件 id → 64 位小写 hex，非机密）。
+
+## 21. 证书状态自动读取（R-241）
+
+1. 先在首启引导里配好节点地址（https 还要配指纹）；
+2. 打开应用 → 「关于」面板 → 「节点证书」应**自动**显示 `剩余 N 天`（不需要点按钮）；
+3. 节点没开 TLS → 显示「（该节点未启用 TLS）」；
+4. 连不上 / 指纹不对 → 显示「（读取失败：原因）」；
+5. 手动点「刷新证书状态」可重试。
+
+**注意**：这是启动时读一次；证书在运行期过期不会弹窗（见 SHIPPING 的已知限制）。
