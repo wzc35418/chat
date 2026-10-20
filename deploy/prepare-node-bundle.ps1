@@ -76,36 +76,40 @@ $seedBytes = New-Object byte[] 32
 Write-Host 'PASS bundle: seed.hex'
 
 # 4. run script for the server
-$run = @"
+# 注意：这里必须用**单引号** here-string。双引号 here-string 会把行尾的反引号当转义吃掉，
+# 导致生成的 run-node.ps1 里续行消失，服务器上报「一元运算符 -- 后面缺少表达式」。
+$run = @'
 # Start chat-node on this Windows server (console host).
 # Keep the window open; for boot persistence run register-service.ps1 once as admin.
-`$here = Split-Path -Parent `$MyInvocation.MyCommand.Path
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Write-Host 'chat-node starting...'
-& (Join-Path `$here 'chat-node.exe') `
-  --bind 0.0.0.0:$Port `
+& (Join-Path $here 'chat-node.exe') `
+  --bind 0.0.0.0:PORT_PLACEHOLDER `
   --allow-public-bind `
-  --data-dir (Join-Path `$here 'data') `
-  --seed-file (Join-Path `$here 'seed.hex') `
-  --node-id $NodeId `
-  --tls-cert (Join-Path `$here 'cert.pem') `
-  --tls-key (Join-Path `$here 'key.pem')
-"@
+  --data-dir (Join-Path $here 'data') `
+  --seed-file (Join-Path $here 'seed.hex') `
+  --node-id NODEID_PLACEHOLDER `
+  --tls-cert (Join-Path $here 'cert.pem') `
+  --tls-key (Join-Path $here 'key.pem')
+'@
+# 端口/节点 ID 由脚本参数决定：生成后再替换占位符（单引号 here-string 内不插值）。
+$run = $run.Replace('PORT_PLACEHOLDER', $Port.ToString()).Replace('NODEID_PLACEHOLDER', $NodeId)
 Set-Content -Path (Join-Path $bundle 'run-node.ps1') -Value $run -Encoding utf8
 
 # 4b. 服务器侧自检脚本（拷进 bundle，服务器上先跑它再启动）
 $verifier = Join-Path $PSScriptRoot 'verify-bundle.ps1'
 if (Test-Path $verifier) { Copy-Item $verifier (Join-Path $bundle 'verify-bundle.ps1') -Force }
 
-$svc = @"
+$svc = @'
 # Register a boot-time scheduled task so the node survives reboots (run as admin on the server).
-`$here = Split-Path -Parent `$MyInvocation.MyCommand.Path
-`$ps = (Get-Command powershell.exe).Source
-`$action = New-ScheduledTaskAction -Execute `$ps -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path `$here 'run-node.ps1') + '"')
-`$trigger = New-ScheduledTaskTrigger -AtStartup
-`$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-Register-ScheduledTask -TaskName 'chat-node' -Action `$action -Trigger `$trigger -Principal `$principal -Force | Out-Null
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ps = (Get-Command powershell.exe).Source
+$action = New-ScheduledTaskAction -Execute $ps -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $here 'run-node.ps1') + '"')
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName 'chat-node' -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
 Write-Host 'registered scheduled task: chat-node (starts at boot)'
-"@
+'@
 Set-Content -Path (Join-Path $bundle 'register-service.ps1') -Value $svc -Encoding utf8
 
 # 5. server README + fingerprint file
