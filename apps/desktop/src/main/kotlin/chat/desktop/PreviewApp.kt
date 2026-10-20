@@ -1561,6 +1561,7 @@ PreviewChatScreen(
                 },
             ),
             pluginState = pluginState,
+            trustedPlugins = runCatching { pluginTrustStore.load().toList() }.getOrDefault(emptyList()),
             pluginHandlers = PluginHandlers(
                 updateManifest = { pluginState = pluginState.updateManifest(it) },
                 chooseManifestFile = {
@@ -1630,6 +1631,11 @@ PreviewChatScreen(
                             .onSuccess { pluginState = pluginState.withStateNotice("插件输出：" + it) }
                             .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
                     }
+                },
+                forgetTrustedPlugin = { pluginId ->
+                    runCatching { pluginTrustStore.forget(pluginId) }
+                        .onSuccess { pluginState = pluginState.withStateNotice("已移除信任：" + pluginId) }
+                        .onFailure { pluginState = pluginState.withError("PLUGIN_TRUST_STORE_FAILED", it.message) }
                 },
                 rememberSignerFingerprint = {
                     val host = pluginJvmHost

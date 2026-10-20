@@ -134,6 +134,8 @@ fun PreviewChatScreen(
     groupHandlers: GroupHandlers = GroupHandlers.None,
     initialGroupOpen: Boolean = false,
     pluginState: chat.presentation.preview.PreviewPluginState = chat.presentation.preview.PreviewPluginState.Empty,
+    /** 已信任的插件签名（插件 id -> 完整指纹）；空 = 没有任何信任记录。 */
+    trustedPlugins: List<Pair<String, String>> = emptyList(),
     pluginHandlers: PluginHandlers = PluginHandlers.None,
     initialPluginOpen: Boolean = false,
     transportMode: String = "",
@@ -288,6 +290,7 @@ fun PreviewChatScreen(
                 ) {
                     PluginPanel(
                         state = pluginState,
+                        trustedPlugins = trustedPlugins,
                         handlers = pluginHandlers,
                         modifier = Modifier.padding(16.dp),
                     )

@@ -487,3 +487,10 @@ fun presentTlsCertificate(daysRemaining: Int): TlsCertificateView {
     val warning = daysRemaining in 30..90
     return TlsCertificateView(label = label, critical = critical, warning = warning)
 }
+
+/** 指纹短展示：前 16 位 + 省略号（完整值太长，界面上放不下）；非法输入原样返回并可标记。 */
+fun shortFingerprint(fingerprint: String?): String {
+    val value = fingerprint?.trim()?.lowercase().orEmpty()
+    if (value.length != 64 || value.any { it !in "0123456789abcdef" }) return value.ifEmpty { "（无）" }
+    return value.take(16) + "…"
+}

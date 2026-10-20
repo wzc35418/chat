@@ -23,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import chat.api.DispatchPlanView
@@ -45,6 +46,8 @@ data class PluginHandlers(
     val toggleTrusted: (Boolean) -> Unit = {},
     val loadJar: () -> Unit = {},
     val runAction: () -> Unit = {},
+    /** 移除某个插件的签名信任（下次加载恢复默认策略）。 */
+    val forgetTrustedPlugin: (String) -> Unit = {},
     /** 记住当前插件的签名指纹（下次自动按它校验）。 */
     val rememberSignerFingerprint: () -> Unit = {},
     val unloadJar: () -> Unit = {},
@@ -64,6 +67,8 @@ fun PluginPanel(
     state: PreviewPluginState,
     handlers: PluginHandlers = PluginHandlers.None,
     modifier: Modifier = Modifier,
+    /** 已信任的插件签名（插件 id -> 完整指纹）；短展示由面板负责。 */
+    trustedPlugins: List<Pair<String, String>> = emptyList(),
 ) {
     Surface(
         modifier = modifier.widthIn(min = 320.dp, max = 720.dp).fillMaxWidth(),
@@ -88,6 +93,25 @@ fun PluginPanel(
                 )
             }
             ErrorBanner(state.lastErrorCode, state.notice)
+            if (trustedPlugins.isNotEmpty()) {
+                Text("已信任签名（" + trustedPlugins.size + "）", style = MaterialTheme.typography.labelLarge)
+                trustedPlugins.forEach { (pluginId, fingerprint) ->
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            pluginId + " · " + chat.presentation.display.shortFingerprint(fingerprint),
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                            modifier = Modifier.semantics { contentDescription = "已信任插件 " + pluginId },
+                        )
+                        TextButton(
+                            onClick = { handlers.forgetTrustedPlugin(pluginId) },
+                            modifier = Modifier.semantics { contentDescription = "移除信任 " + pluginId },
+                        ) { Text("移除", style = MaterialTheme.typography.labelSmall) }
+                    }
+                }
+            }
 
             HorizontalDivider(color = Color(0xFFE1E6E1))
             Text("安装", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
