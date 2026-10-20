@@ -998,7 +998,7 @@ fun main() = application {
                 if (store == null) return@launch
                 val draft = storeState.drafts.lastOrNull() ?: return@launch
                 storeState = storeState.beginBusy()
-                val outcome = sendNow(store, draft.draftId)
+                val outcome = sendWithRecovery(store, draft.draftId)
                 if (outcome.ok) {
                     storeState = storeState.copy(
                         busy = false,

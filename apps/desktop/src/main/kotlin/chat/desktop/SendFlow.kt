@@ -1,6 +1,7 @@
 package chat.desktop
 
 import chat.api.LocalStore
+import chat.presentation.display.FROZEN_AUTO_RETRY_CODES
 
 /** 一次「发送」的结果：要么成功（prepare→dispatch 都过），要么带失败步骤与原始异常。 */
 data class SendOutcome(val steps: List<String>, val failure: Throwable?) {
@@ -26,5 +27,50 @@ internal suspend fun sendNow(store: LocalStore, draftId: String): SendOutcome {
         SendOutcome(steps.toList(), null)
     } catch (error: Throwable) {
         SendOutcome(steps.toList(), error)
+    }
+}
+
+/**
+ * 一步发送 + 自动恢复：
+ *   1. prepare → dispatch；
+ *   2. dispatch 失败且错误码在**冻结可重试表**里 → 重建一次尝试（retry）再 dispatch；
+ *   3. 仍然失败且结果**未确定** → 按 SubmissionId 对账（reconcile），把对账结论带回去。
+ *
+ * 为什么只在可重试码上重试：协议层只保证这些码"可以安全重试"，其余码重试可能造成重复提交。
+ */
+internal suspend fun sendWithRecovery(store: LocalStore, draftId: String): SendOutcome {
+    val steps = mutableListOf<String>()
+    try {
+        store.sendPrepare(draftId)
+        steps += "prepared"
+    } catch (error: Throwable) {
+        return SendOutcome(steps.toList(), error)
+    }
+    try {
+        store.sendDispatch(draftId)
+        steps += "accepted"
+        return SendOutcome(steps.toList(), null)
+    } catch (first: Throwable) {
+        val code = failureCode(first)
+        if (code !in FROZEN_AUTO_RETRY_CODES) {
+            steps += "dispatch-failed(" + code + ")"
+            return SendOutcome(steps.toList(), first)
+        }
+        steps += "retry(" + code + ")"
+        return try {
+            store.sendRetry(draftId)
+            store.sendDispatch(draftId)
+            steps += "accepted-after-retry"
+            SendOutcome(steps.toList(), null)
+        } catch (second: Throwable) {
+            val secondCode = failureCode(second)
+            steps += "retry-failed(" + secondCode + ")"
+            runCatching { store.sendReconcile(draftId) }
+                .onSuccess { reconciled ->
+                    steps += if (reconciled.settled) "reconciled(" + reconciled.status + ")" else "reconcile-pending"
+                }
+                .onFailure { steps += "reconcile-failed" }
+            SendOutcome(steps.toList(), second)
+        }
     }
 }
