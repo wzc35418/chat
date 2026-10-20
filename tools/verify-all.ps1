@@ -153,7 +153,8 @@ if ($SkipGradle) {
         ":apps:desktop:attachmentSmoke",
         ":apps:desktop:pluginSmoke",
         ":apps:desktop:pluginJvmSmoke",
-        ":apps:desktop:platformSmoke"
+        ":apps:desktop:platformSmoke",
+        ":apps:desktop:credentialManagerSmoke"
     )
     Write-Host ""
     Write-Host ("== gradle == " + $tasks.Count + " tasks, max-workers=1")

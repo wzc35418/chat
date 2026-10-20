@@ -313,3 +313,13 @@ tasks.register<Zip>("appImageZip") {
     destinationDirectory.set(rootProject.layout.buildDirectory.dir("dist"))
     from(rootProject.layout.buildDirectory.dir("dist/app-image/Chat")) { into("Chat") }
 }
+
+
+// OS 凭据库（Windows Credential Manager）冒烟：真写/真读/真删。
+tasks.register<JavaExec>("credentialManagerSmoke") {
+    group = "verification"
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.CredentialManagerSmokeKt")
+    systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+}
