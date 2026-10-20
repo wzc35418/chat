@@ -95,21 +95,7 @@ fun AttachmentPanel(
                     ) { Text("关闭") }
                 }
 
-                state.notice?.let { notice ->
-                    Surface(
-                        color = if (state.lastErrorCode == null) Color(0xFFEDF1E9) else Color(0xFFFDECEA),
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier.fillMaxWidth().semantics {
-                            liveRegion = LiveRegionMode.Polite
-                            stateDescription = notice
-                        },
-                    ) {
-                        Text(notice, Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-                state.lastErrorCode?.let { code ->
-                    Text("错误码：" + code, style = MaterialTheme.typography.labelSmall, color = Color(0xFFB3261E))
-                }
+                ErrorBanner(state.lastErrorCode, state.notice)
 
                 OutlinedTextField(
                     value = state.importPath,
