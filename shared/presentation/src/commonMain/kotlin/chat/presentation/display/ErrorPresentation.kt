@@ -432,6 +432,20 @@ fun presentRawError(
             reason = safeReason,
         )
     }
+    // 证书即将过期：越早换越好，但要给出"怎么换"的下一步。
+    if (trimmedCode.contains("TLS_CERT_EXPIRING") || safeReason?.contains("TLS_CERT_EXPIRING") == true) {
+        return UserActionableError(
+            title = "节点证书即将过期",
+            detail = "证书剩余天数已低于告警阈值（30 天）。到期后所有客户端都会连不上，需要先用 -PublicIp <公网IP> 重新生成部署包（会得到新证书），把新指纹同步到各客户端后再替换节点上的证书文件。",
+            actionLabel = "轮换证书并同步新指纹",
+            action = ErrorAction.NONE,
+            retryable = false,
+            diagnosticCode = safeDiagnosticToken(trimmedCode),
+            diagnosticId = null,
+            autoRetryAllowed = false,
+            reason = safeReason,
+        )
+    }
     val marker = TRANSPORT_TRUST_MARKERS.firstOrNull { marker -> safeReason?.contains(marker) == true }
     val base = knownErrors[trimmedCode]
     val transportTitle = marker?.let {

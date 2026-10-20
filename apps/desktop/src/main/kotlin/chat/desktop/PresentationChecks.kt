@@ -1378,6 +1378,12 @@ private fun checkRawErrorPresentation() {
     check(sanMismatch.detail.contains("SAN")) { "说明里应提到 SAN" }
     check(!sanMismatch.retryable) { "证书/地址不匹配不应标成可重试" }
 
+    // 3c) 证书即将过期 -> 必须给"轮换证书并同步指纹"的下一步
+    val expiring = chat.presentation.display.presentRawError("TLS_CERT_EXPIRING", "节点证书剩余 12 天")
+    check(expiring.title.contains("即将过期")) { "到期告警应给出明确标题，实际：" + expiring.title }
+    check(expiring.detail.contains("重新生成部署包")) { "说明里应给轮换做法" }
+    check(!expiring.retryable) { "证书到期不是可重试错误" }
+
     // 4) 未知码走回退，不崩
     val unknown = chat.presentation.display.presentRawError("SOME_NEW_CODE", null)
     check(unknown.title == "操作未完成") { "未知码应回退，实际：" + unknown.title }

@@ -236,6 +236,34 @@ fun main() = application {
         }
     }
 
+    // 运行期定时刷新证书状态（默认每 5 分钟一次）：启动后再过期也能发现，而不是只在启动时看一眼。
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(5 * 60 * 1000L)
+            val saved = runCatching { nodeConfigStore.load() }.getOrNull()
+            val endpoint = saved?.endpointUrl?.trim().orEmpty()
+            if (endpoint.isEmpty()) continue
+            runCatching {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    TlsInfoFetcher.fetch(endpoint, saved?.tlsFingerprints ?: emptyList())
+                }
+            }.onSuccess { info ->
+                if (info != null) {
+                    val view = chat.presentation.display.presentTlsCertificate(info.daysRemaining)
+                    tlsCertificateText = view.label
+                    tlsCertificateCritical = view.critical
+                    // 快到期时进入统一错误条（带可执行建议），而不是只把字变红。
+                    if (view.critical) {
+                        aboutState = aboutState.withAboutError(
+                            "TLS_CERT_EXPIRING",
+                            "节点证书剩余 " + info.daysRemaining + " 天",
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     LaunchedEffect(Unit) {
         if (identityDir == null) {
             keySlotSummary = "密钥槽不可用（目录创建失败）"
