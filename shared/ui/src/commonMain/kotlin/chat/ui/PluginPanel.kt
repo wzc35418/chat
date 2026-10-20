@@ -85,14 +85,7 @@ fun PluginPanel(
                     modifier = Modifier.semantics { contentDescription = "插件提示" },
                 )
             }
-            state.lastErrorCode?.let {
-                Text(
-                    "错误码 " + it,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = Color(0xFFB3261E),
-                    modifier = Modifier.semantics { contentDescription = "插件错误码" },
-                )
-            }
+            ErrorBanner(state.lastErrorCode, state.notice)
 
             HorizontalDivider(color = Color(0xFFE1E6E1))
             Text("安装", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)

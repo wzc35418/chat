@@ -119,13 +119,7 @@ fun OnboardingPanel(
             }
         }
 
-        if (state.lastErrorCode != null) {
-            Text(
-                "错误码：" + state.lastErrorCode + (state.notice?.let { " · " + it } ?: ""),
-                style = MaterialTheme.typography.labelSmall,
-                color = Color(0xFFB3261E),
-            )
-        }
+        ErrorBanner(state.lastErrorCode, state.notice)
 
         HorizontalDivider(color = Color(0xFFE1E6E1))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

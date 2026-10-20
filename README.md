@@ -107,11 +107,11 @@ powershell -File tools\verify-all.ps1 -TargetDir C:\chat-target  # 把 cargo tar
 
 | 项 | 值 |
 | --- | --- |
-| 版本 / 基线 commit | 0.1.x / `4d566cd`（10 阶段全绿） |
+| 版本 / 基线 commit | 0.1.x / `8343543`（**11 阶段全绿**） |
 | Rust 测试 | **1141 passed / 0 failed**（14 个 crate） |
 | 桌面冒烟 | **11 个 Gradle 任务**（含 pluginSmoke / pluginJvmSmoke 沙箱断言） |
 | Android | `assembleDebug` PASS |
-| 一键回归 | `tools/verify-all.ps1` **10 阶段全 PASS**（+ lan / tls / offline） |
+| 一键回归 | `tools/verify-all.ps1` **11 阶段全 PASS**（+ lan / tls / offline / tls-e2e） |
 | 交付物 | `build/dist/Chat-app-0.1.0.zip`（免 JDK，双击 `Chat.exe`） |
 | 双设备互通 | `tools/demo-two-devices.ps1` 全 PASS |
 | 错时投递 | `tools/verify-offline-delivery.ps1` 全 PASS（发送时对方离线，上线后 applied=1） |

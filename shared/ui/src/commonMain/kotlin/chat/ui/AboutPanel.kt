@@ -173,12 +173,7 @@ fun AboutPanel(
         HorizontalDivider(color = Color(0xFFE1E6E1))
         LabeledRow("host 库路径", state.hostLibraryPath.ifBlank { "（未解析）" })
         LabeledRow("数据目录", state.dataDir.ifBlank { "（未知）" })
-        state.lastErrorCode?.let { code ->
-            LabeledRow("错误码", code)
-        }
-        state.notice?.let { notice ->
-            Text(notice, style = MaterialTheme.typography.labelSmall, color = Color(0xFF5F6B63))
-        }
+        ErrorBanner(state.lastErrorCode, state.notice)
         HorizontalDivider(color = Color(0xFFE1E6E1))
         Text(
             "遇到问题请附带：版本 + 平台 + host 库路径 + 错误码（不要附口令或密钥）。",

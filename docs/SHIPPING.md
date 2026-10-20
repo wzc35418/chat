@@ -210,3 +210,30 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 - 证书轮换：库层已支持指纹集合（新旧同时信任），但 FFI/应用尚未透传指纹；到期告警未做；
 - 后台消息通知、安装器/自动更新、soak 稳定性；
 - 插件签名信任链（权限门已有，签名没有）。
+
+## 0.1.x 第三基线（2026-10-21 冻结，11 阶段全绿）
+
+| 项 | 值 |
+| --- | --- |
+| commit | `8343543` |
+| Rust | `cargo check --workspace --locked` PASS；`chat-core`+`chat-ffi` **72 suites / 389 passed**；`chat-node-client` 8 suites（含 7 例 TLS） |
+| Gradle | 13 个桌面任务 PASS |
+| Android | `assembleDebug` PASS（97.6s） |
+| 一键回归 | `tools/verify-all.ps1` **11 阶段全 PASS**（含 lan / tls / offline / tls-e2e） |
+| 回归报告 | `build/verify-all-20261021-010454.md` |
+| 交付包 | `Chat-app-0.1.0.zip` 81.79 MB（SHA256 `996E799E…23C7`） |
+| 免 JDK 启动器 | `Chat.exe`（SHA256 `644E1672…5BD36`） |
+
+### 本基线相比上一基线新增的证明
+
+1. **TLS 端到端**：打包产物经 FFI 指纹连 https 节点 → accepted + applied；**错误指纹被拒**；
+2. **错时投递**：四进程顺序，发送时对方离线、上线后 applied=1；
+3. **跨进程入群**：KeyPackage 私钥加密落库（migration 0014）；
+4. **错误可诊断 + 分层展示**：`Cow` 详情 + 统一 `ErrorBanner`（7 处），可重试性取自冻结码表。
+
+### 仍未证明（需要外部条件或下一批）
+
+- 真正跨机器 / NAT / 中继服务；
+- 证书轮换自动化与到期告警；
+- 后台通知、安装器/自动更新、soak；
+- 插件签名信任链（权限门已有）。
