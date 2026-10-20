@@ -119,6 +119,7 @@ fun main() {
         host.shutdown()
         verifySandbox()
     verifySignatures(work)
+    verifyTrustStore(work)
 
     println("PASS plugin P4 slice: trusted load, SPI discovery, bounded execution, unload")
     println("PASS plugin sandbox slice: host classes blocked, sensitive packages gated by declared permissions")
@@ -336,4 +337,24 @@ private fun readSignerFingerprint(jar: File): String? {
     } finally {
         runCatching { archive.close() }
     }
+}
+
+/** 插件签名信任列表：读写往返、非法值拒绝、指纹变化需显式覆盖。 */
+private fun verifyTrustStore(work: File) {
+    val file = File(work, "plugin-trust.json")
+    val store = PluginTrustStore(file)
+    check(store.load().isEmpty()) { "初始信任列表应为空" }
+    val fingerprint = "ab".repeat(32)
+    check(store.remember("demo.echo", fingerprint)) { "合法指纹应被接受" }
+    check(store.load()["demo.echo"] == fingerprint) { "应能读回指纹" }
+    check(!store.remember("demo.echo", "not-hex")) { "非法指纹必须被拒绝" }
+    check(store.load()["demo.echo"] == fingerprint) { "失败写入不得覆盖已有值" }
+    // 大写归一：写大写读回小写
+    check(store.remember("demo.other", "CD".repeat(32)))
+    check(store.load()["demo.other"] == "cd".repeat(32)) { "大写应归一为小写" }
+    store.forget("demo.other")
+    check(store.load()["demo.other"] == null) { "forget 应删除条目" }
+    // 重新打开同一文件仍可读（持久化生效）
+    check(PluginTrustStore(file).load()["demo.echo"] == fingerprint) { "重开后应仍能读到" }
+    println("PASS plugin trust store: remember/normalize/forget/persist")
 }

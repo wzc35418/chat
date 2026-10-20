@@ -262,3 +262,13 @@ keytool -list -v -keystore plugin.p12 -storepass changeit | Select-String "SHA25
 2. **改一个字节**（篡改） → 必须失败 `PLUGIN_SIGNATURE_INVALID`；
 3. 未签名 JAR → 默认失败 `PLUGIN_SIGNATURE_MISSING`；
 4. 给了错误指纹 → `PLUGIN_SIGNATURE_MISMATCH`。
+
+## 20. 插件签名信任列表（R-233）
+
+1. 用第 19 节的方法签名插件 JAR（未签名会被拒）；
+2. 插件面板加载该 JAR（需勾选信任）；
+3. 加载成功后点「记住签名指纹」→ 提示「已记住签名指纹：xxxxxxxx…」；
+4. 关掉应用重开，再加载同一插件 → 自动按已记住的指纹校验；
+5. **负例**：改一个字节后重新加载 → `PLUGIN_SIGNATURE_INVALID`；换签名密钥（不同证书）→ `PLUGIN_SIGNATURE_MISMATCH`（不会自动接受）。
+
+信任列表文件：`%APPDATA%\Chat\plugin-trust.json`（插件 id → 64 位小写 hex，非机密）。

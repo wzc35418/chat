@@ -45,6 +45,8 @@ data class PluginHandlers(
     val toggleTrusted: (Boolean) -> Unit = {},
     val loadJar: () -> Unit = {},
     val runAction: () -> Unit = {},
+    /** 记住当前插件的签名指纹（下次自动按它校验）。 */
+    val rememberSignerFingerprint: () -> Unit = {},
     val unloadJar: () -> Unit = {},
 ) {
     companion object {
@@ -97,6 +99,11 @@ fun PluginPanel(
             )
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 TextButton(
+                onClick = handlers.rememberSignerFingerprint,
+                enabled = state.loadedPlugins.isNotEmpty(),
+                modifier = Modifier.semantics { contentDescription = "记住当前插件的签名指纹" },
+            ) { Text("记住签名指纹", style = MaterialTheme.typography.labelMedium) }
+            TextButton(
                     onClick = handlers.chooseManifestFile,
                     modifier = Modifier.semantics { contentDescription = "选择清单文件" },
                 ) { Text("选择文件", style = MaterialTheme.typography.labelMedium) }

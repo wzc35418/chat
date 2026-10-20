@@ -122,6 +122,7 @@ fun main() = application {
     var aboutState by remember { mutableStateOf(chat.presentation.preview.PreviewAboutState()) }
     // 节点配置持久化（非机密）：首启读取，未配置则弹引导。
     val uiPrefsStore = remember { UiPreferencesStore(UiPreferencesStore.defaultFile()) }
+    val pluginTrustStore = remember { PluginTrustStore(PluginTrustStore.defaultFile()) }
     var uiPrefs by remember { mutableStateOf(runCatching { uiPrefsStore.load() }.getOrDefault(UiPreferences())) }
     // 命令面板（插件 palette.commands 槽位）：null = 关闭。
     var paletteFilter by remember { mutableStateOf("") }
@@ -1560,11 +1561,19 @@ PreviewChatScreen(
                         pluginState = pluginState.beginBusy()
                         runCatching {
                             // 清单声明的权限 → 沙箱：只把四个沙箱权限透给类加载器（其余是用户可见权限）。
+                            // 信任列表里记过指纹就按它校验（换签名密钥会直接失败，不会静默接受）。
+                            val expectedFingerprint = pluginTrustStore.load()[view.pluginId]
                             val sandboxPermissions = view.permissions
                                 .map { it.trim() }
                                 .filter { it in PluginSandboxClassLoader.KNOWN }
                                 .toSet()
-                            host.load(pluginState.jarPath, view.pluginId, pluginState.trusted, sandboxPermissions)
+                            host.load(
+                                pluginState.jarPath,
+                                view.pluginId,
+                                pluginState.trusted,
+                                sandboxPermissions,
+                                expectedSignerFingerprint = expectedFingerprint,
+                            )
                             host.loadedPluginIds()
                         }.onSuccess { pluginState = pluginState.withLoadedPlugins(it) }
                             .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
@@ -1578,6 +1587,23 @@ PreviewChatScreen(
                         runCatching { host.runSelectedTextAction(id, "echo", "ping") }
                             .onSuccess { pluginState = pluginState.withStateNotice("插件输出：" + it) }
                             .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+                    }
+                },
+                rememberSignerFingerprint = {
+                    val host = pluginJvmHost
+                    val view = pluginState.packageView
+                    val fingerprint = host?.signerFingerprint(view?.pluginId ?: "")
+                    if (host == null || view == null) {
+                        pluginState = pluginState.withError("PLUGIN_STATE_CONFLICT", "还没有加载中的插件")
+                    } else if (fingerprint == null) {
+                        pluginState = pluginState.withError(
+                            "PLUGIN_SIGNATURE_MISSING",
+                            "该插件未签名，无法记录签名指纹；请先用 keytool/jarsigner 签名",
+                        )
+                    } else if (pluginTrustStore.remember(view.pluginId, fingerprint)) {
+                        pluginState = pluginState.withStateNotice("已记住签名指纹：" + fingerprint.take(16) + "…")
+                    } else {
+                        pluginState = pluginState.withError("PLUGIN_SIGNATURE_INVALID", "无法写入插件信任列表")
                     }
                 },
                 unloadJar = {

@@ -66,6 +66,13 @@ object PluginSignatures {
                 "PLUGIN_SIGNATURE_INVALID",
                 "插件 JAR 签名校验失败（可能被篡改）：" + (error.message ?: "security exception"),
             )
+        } catch (error: java.util.zip.ZipException) {
+            // 篡改可能落在 deflate 流上：读条目时就炸（invalid distance code / unexpected end）。
+            // 这仍然是「完整性被破坏」，必须收敛到同一个稳定码，而不是把 ZipException 漏出去。
+            throw PluginLoadException(
+                "PLUGIN_SIGNATURE_INVALID",
+                "插件 JAR 读取条目失败（可能被篡改）：" + (error.message ?: "zip error"),
+            )
         } finally {
             runCatching { archive.close() }
         }
