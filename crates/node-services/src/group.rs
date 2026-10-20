@@ -1107,16 +1107,16 @@ impl NodeService {
                     if member_state != "active" {
                         return Err(NodeError::DeviceRevoked);
                     }
-                    if member_account != actor.account_id {
-                        return Err(NodeError::PermissionDenied);
-                    }
+                    // 邀请的成员可以属于**另一个账户**（双设备演示就是两条独立身份）；
+                    // 安全边界是“已注册且 active”，不是同账户。成员行记录设备自己的账户。
+                    let member_account_for_row = member_account;
                     tx.execute(
                         "INSERT INTO group_members (group_id, device_id, account_id, role, muted, joined_seq, left_seq)
                          VALUES (?1, ?2, ?3, ?4, 0, ?5, NULL)",
                         params![
                             group,
                             added,
-                            actor.account_id.clone(),
+                            member_account_for_row.clone(),
                             "member",
                             to_i64("joined seq", seq)?
                         ],

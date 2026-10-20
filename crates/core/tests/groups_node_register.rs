@@ -96,15 +96,27 @@ impl Drop for FixtureDir {
 }
 
 fn enroll_identity(database: &str) -> (String, String) {
-    enroll_identity_with(database, DEVICE_SEED)
+    enroll_identity_full(database, DEVICE_SEED, [0x22u8; 32])
 }
 
-fn enroll_identity_with(database: &str, device_seed: [u8; 32]) -> (String, String) {
+fn enroll_identity_with_account(
+    database: &str,
+    device_seed: [u8; 32],
+    account_seed: [u8; 32],
+) -> (String, String) {
+    enroll_identity_full(database, device_seed, account_seed)
+}
+
+fn enroll_identity_full(
+    database: &str,
+    device_seed: [u8; 32],
+    account_seed: [u8; 32],
+) -> (String, String) {
     let mut core = ConversationCore::open(database, &master_key_hex()).expect("open core");
     let view = core
         .save_identity_account(IdentityAccountInput {
             display_name: "register".to_owned(),
-            account_seed_hex: hex_of(&[0x22u8; 32]),
+            account_seed_hex: hex_of(&account_seed),
             device_seed_hex: hex_of(&device_seed),
             // 身份创建时间用真实当前时间：节点按自己的时钟校验凭据有效期。
             created_at_ms: now_s() * 1_000,
@@ -425,7 +437,7 @@ fn a_self_registered_member_is_authorized_after_a_member_add_commit() {
 
     // B 侧：独立库里的持久身份 + 自注册到节点。
     let dir_b = FixtureDir::new();
-    let (account_b, device_b) = enroll_identity_with(&dir_b.database_text(), [0x66u8; 32]);
+    let (account_b, device_b) = enroll_identity_full(&dir_b.database_text(), [0x66u8; 32], [0x26u8; 32]);
     let store_b = dir_b.open();
     chat_core::group_node::register_device_on_node(
         &store_b,
@@ -504,4 +516,74 @@ fn a_member_add_for_an_unregistered_device_is_rejected() {
         "INVALID_CREDENTIAL",
         "an unregistered device must be rejected explicitly"
     );
+}
+
+/// 与双设备演示**完全同序**（两个**独立账户**）：
+/// A 用 B 的 kp 建群 → A register_on_node → B register_device → A submit_member_add(B) → B fetch 群日志/head。
+#[test]
+fn the_demo_order_with_two_independent_accounts_lets_the_invitee_pull() {
+    let node = TestNode::start("alice-placeholder");
+
+    // A：独立账户 + 用 B 的 KeyPackage 建群（邀请者凭据 = B 的设备 ID）。
+    let dir_a = FixtureDir::new();
+    let (account_a, device_a) = enroll_identity_with_account(&dir_a.database_text(), [0x51u8; 32], [0x24u8; 32]);
+    let mut store_a = dir_a.open();
+    // B 的设备 ID 由**设备公钥**派生（identity 层），必须先登记身份才能拿到。
+    let dir_b = FixtureDir::new();
+    let (_account_b, bob_device_id) =
+        enroll_identity_with_account(&dir_b.database_text(), [0x52u8; 32], [0x25u8; 32]);
+    assert!(bob_device_id.starts_with("dev:1:"));
+    let mut alice = MlsDevice::new("alice").expect("alice");
+    let bob = MlsDevice::new(&bob_device_id).expect("bob");
+    let key_package = bob.key_package().expect("bob kp");
+    let request = CreateGroupRequest::new("demo-order", "alice");
+    let (view, _welcome) = chat_core::groups::create_group_with_invitee_key_package(
+        &mut alice,
+        &bob_device_id,
+        &key_package,
+        &mut store_a,
+        &request,
+    )
+    .expect("group created with the invitee kp");
+
+    // A 登记（内部会自注册设备）。
+    chat_core::group_node::group_register_on_node(
+        &mut store_a,
+        &view.group_id,
+        &node.endpoint_url(),
+        NODE_ID,
+        Some(&node.public_key_hex()),
+    )
+    .expect("A registers the group");
+    let _ = (account_a, device_a);
+
+    // B：**独立账户** + 独立库，自注册设备。
+    let store_b = dir_b.open();
+    chat_core::group_node::register_device_on_node(
+        &store_b,
+        &node.endpoint_url(),
+        NODE_ID,
+        Some(&node.public_key_hex()),
+    )
+    .expect("B registers its device");
+
+    // A 提交成员变更（把 B 的设备 ID 写进节点成员表）。
+    chat_core::group_node::submit_member_add(
+        &mut store_a,
+        &view.group_id,
+        &bob_device_id,
+        &node.endpoint_url(),
+        NODE_ID,
+        Some(&node.public_key_hex()),
+    )
+    .expect("A adds B as a node member");
+
+    // B 拉取：head + log 都必须 200。
+    let bob_client = node.client_with(&bob_device_id, [0x52u8; 32]);
+    let head = block_on(bob_client.get_head(&view.group_id))
+        .expect("the invitee must be able to read the group head");
+    assert_eq!(head.group_id, view.group_id);
+    let page = block_on(bob_client.fetch_log(&view.group_id, 0, 10))
+        .expect("the invitee must be able to read the group log");
+    assert_eq!(page.group_id, view.group_id);
 }

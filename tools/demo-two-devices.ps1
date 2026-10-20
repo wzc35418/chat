@@ -72,10 +72,13 @@ Step 'bob-keypackage' (Test-Path $kp) 'bob.kp'
 Step 'alice' ((Run-Smoke 'alice' 'alice.log') -eq 0) (Join-Path $logs 'alice.log')
 
 # 6) bob joins and pulls
-$bob.WaitForExit(120000) | Out-Null
-$bobCode = if ($bob.HasExited) { $bob.ExitCode } else { Stop-Process -Id $bob.Id -Force; -1 }
-Step 'bob-join-pull' ($bobCode -eq 0) ('exit ' + $bobCode + ' (see ' + $bobLog + ')')
-
+$exited = $bob.WaitForExit(120000)
+if (-not $exited) { Stop-Process -Id $bob.Id -Force -ErrorAction SilentlyContinue }
+$bob.Refresh(); $bobCode = $bob.ExitCode
+$bobLogText = if (Test-Path $bobLog) { Get-Content $bobLog -Raw } else { '' }
+# PowerShell 偶尔拿不到 ExitCode（进程对象未及时刷新）；此时以日志为准，但必须同时没有 FAIL 行。
+$bobOk = ($bobCode -eq 0) -or (($bobLogText -match 'PASS bob applied') -and ($bobLogText -notmatch 'FAIL bob'))
+Step 'bob-join-pull' $bobOk ('exit ' + $bobCode + ' (see ' + $bobLog + ')')
 if ($node -and -not $node.HasExited) { Stop-Process -Id $node.Id -Force -ErrorAction SilentlyContinue }
 Write-Host ''
 foreach ($name in @('alice.log','bob.log')) {

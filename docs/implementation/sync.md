@@ -1114,3 +1114,23 @@ reason 固定为 “a sync loop is running; stop it before a one-shot pull”。
 
 - `cargo test --offline -p chat-core -p chat-ffi` → **EXIT=0，373 passed，0 警告**（既有 254/115 继续通过 + 本轮新增）。
 
+## 双设备演示的两个节点侧问题（GROUPS-020/021，2026-10-20）
+
+### 1) B 拉取 `PERMISSION_DENIED` —— 已修（根因：跨账户成员被拒）
+
+- `get_group_head` 用 `load_membership(...).ok_or(NodeError::PermissionDenied)`，所以“不在成员表”表现为 `PERMISSION_DENIED`（不是 `HISTORY_NOT_AUTHORIZED`）；
+- 节点授权用的键是 **device id**（`group_members.device_id`，成员的持久设备 ID＝由设备公钥派生，形如 `dev:1:<64hex>`），**不是** credential，也**不是** account id；
+- 真凶：成员变更插入时把成员行的 `account_id` 写成 **作者账户**，并对“成员账户 ≠ 作者账户”直接 `PermissionDenied`——双设备演示是两条**独立账户**，于是 member_add 被拒（即使通过也会记错账户）；
+- 修正：邀请成员可以属于**另一个账户**（安全边界是“该 device 已注册且 active”，这条保留），成员行记录**设备自己的账户**；
+- 用例（与演示同序、两个独立账户）：`the_demo_order_with_two_independent_accounts_lets_the_invitee_pull`：A 用 B 的 kp 建群 → A register_on_node → B register_device → A submit_member_add(B device id) → **B `get_head`/`fetch_log` 均 200**。
+
+### 2) `submitInvite` 的 `INVALID_CANDIDATE` —— 当前源码已放行，需确认节点产物不是旧的
+
+- 选项 (a)（保留 `operation=invite` 标记，`/v1/audit?kind=invite` 依赖它）已确认与 protocol 一致：节点侧转换走 `GroupCandidate::to_unsigned_with_domain` → protocol `validate`，白名单就是那一条；
+- 新增 `crates/node-services/tests/invite_candidate.rs` **5 例**：放行 `application + invite + 非零 digest + 无声明 + 无凭据`；反例 4 类（零 digest / 带成员凭据 / 非 invite 操作 / —— 另含 control + invite 仍放行）全部拒绝/放行如预期；
+- 结论：**当前源码的节点侧没有额外拦截**（node-api 既有的 `an_invite_marked_append_is_recorded_as_kind_invite_in_the_audit` 也证明 HTTP 端 200）；演示里拿到 `INVALID_CANDIDATE` 最可能是**打包的节点二进制早于 protocol 白名单**。请重建节点产物后重跑；若仍失败，用现在会带 `node code + body` 的 detail 贴回来。
+
+### 验收
+
+- `cargo test --offline -p chat-core -p chat-node-services -p chat-node-api -p chat-ffi -p chat-node-client` → **EXIT=0，585 passed，0 警告**。
+

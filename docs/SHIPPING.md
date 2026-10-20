@@ -130,3 +130,22 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 `verify-all -SkipAndroid -SkipGradle` → `disk/rust-check/verify-project` PASS、`package` PASS（detail 给出 verify-package 报告路径）、**overall PASS、退出码 0**；
 `verify-package -SkipBuild` → structure + 四个冒烟 + `gui PASS (8.7s)`、**overall PASS、退出码 0**。
 
+
+## 0.1.0 已知限制（交付时必须告知）
+
+| 限制 | 影响 | 现状 |
+| --- | --- | --- |
+| 插件无沙箱 | 同 JVM 加载执行；trusted 只是确认，不是安全边界 | 未做 |
+| 传输仅回环/LAN | 无真实中继/NAT 穿透 | 未做 |
+| 无 MSI 安装器 | 只有 app-image（免安装目录） | 离线无法构建 WiX |
+| 双设备互发未打通 | 邀请的节点投递与非建群方拉取日志仍被节点规则拒绝 | 进行中 |
+| KeyPackage 私钥内存态 | 重开身份对象需重新导出 | 未做落库 |
+| 无托盘环境无系统通知 | 已明确提示不可用并回退应用内提示 | 诚实降级 |
+
+### 关于「双设备」的准确说法
+
+- 单机闭环已自动化验证：tools/verify-package-e2e.ps1 证明打包产物能提交到节点并被 accepted，也能 syncOnce 拉回条目（fetched=2 applied=1）。
+- 双设备（A 与 B）：tools/demo-two-devices.ps1 已能完成 建群 -> 登记节点 -> 把对方加为节点成员（seq=1） -> 对方凭 Welcome 入群；但两处节点规则尚未打通：
+  1. 邀请候选（application + control_metadata）被节点判 INVALID_CANDIDATE；
+  2. 非建群方读群日志仍 PERMISSION_DENIED。
+- 因此目前不建议对外宣称 两台设备可直接互发；可行的手工路径是用 .kp 文件加节点投递（邀请体可离线传递），或等上述两条规则修好。

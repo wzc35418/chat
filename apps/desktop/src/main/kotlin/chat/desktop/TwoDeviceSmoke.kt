@@ -157,6 +157,9 @@ private fun alice(dir: File, endpoint: String, nodeId: String, nodeKey: String):
         log("PASS alice added bob as node member: seq=" + memberAdd.seq)
         val receipt = core.submitInvite(created.group.groupId, created.invite, endpoint, nodeId, nodeKey)
         log("PASS alice submitted invite: seq=" + receipt.seq)
+        // 发送配置可能被后续的登记/邀请调用重置，发消息前再确认一次（幂等）。
+        core.configureSendNode(endpoint, nodeId, nodeKey)
+        core.configureSendGroup(created.group.mlsGroupKey)
         val draft = core.createDraft("conv:1:" + "11".repeat(32), "op:1:" + "22".repeat(32), "hello from alice")
         core.sendPrepare(draft.draftId)
         val dispatched = core.sendDispatch(draft.draftId)
