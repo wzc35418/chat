@@ -92,6 +92,10 @@ Write-Host 'chat-node starting...'
 "@
 Set-Content -Path (Join-Path $bundle 'run-node.ps1') -Value $run -Encoding utf8
 
+# 4b. 服务器侧自检脚本（拷进 bundle，服务器上先跑它再启动）
+$verifier = Join-Path $PSScriptRoot 'verify-bundle.ps1'
+if (Test-Path $verifier) { Copy-Item $verifier (Join-Path $bundle 'verify-bundle.ps1') -Force }
+
 $svc = @"
 # Register a boot-time scheduled task so the node survives reboots (run as admin on the server).
 `$here = Split-Path -Parent `$MyInvocation.MyCommand.Path

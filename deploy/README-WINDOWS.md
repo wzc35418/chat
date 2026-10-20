@@ -56,6 +56,15 @@ powershell -ExecutionPolicy Bypass -File tools\watch-remote.ps1 `
 
 `watch-remote.ps1` 每 5 秒探一次端口；一旦通了就跑完整 `verify-remote.ps1`（可用 `-DiagnoseOnly` 只做快速诊断）。
 
+## 二点五、服务器上先自检再启动（推荐）
+
+```powershell
+cd C:\chat-node
+powershell -ExecutionPolicy Bypass -File .\verify-bundle.ps1 -Port 8443 -StartProbe
+```
+
+它会检查：6 个必需文件是否都在（拷贝是否完整）、**`cert.pem` 的 SHA-256 是否与 `fingerprint.txt` 一致**、`chat-node.exe` 能否执行；加 `-StartProbe` 还会临时起一个实例读 `/v1/health`。全部 PASS 打印 `BUNDLE OK`。
+
 ## 三、回到开发机验证（跨机器）
 
 ```powershell
