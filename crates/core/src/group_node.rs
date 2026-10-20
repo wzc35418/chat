@@ -796,10 +796,14 @@ fn node_rejection(error: NodeClientError, what: &'static str) -> ControlReceiptE
         Some(status) => status.to_string(),
         None => "none".to_owned(),
     };
+    let body = match error.body_snippet() {
+        Some(snippet) => format!(", body {snippet}"),
+        None => String::new(),
+    };
     ControlReceiptError::new(
         error.code().as_str(),
         format!(
-            "{what} (node code {node_code}, http {status}, kind {:?}, detail {})",
+            "{what} (node code {node_code}, http {status}, kind {:?}, detail {}{body})",
             error.kind(),
             error.detail()
         ),
@@ -844,6 +848,160 @@ fn seed_pull_cursor(
     );
     crate::sync_worker::initialize_pull_state(store, group_id, head)
         .map_err(|error| ControlReceiptError::new(error.code().as_str(), error.to_string()))
+}
+
+// ---------------------------------------------------------------- 节点侧设备注册与成员变更（GROUPS-021）
+
+/// GROUPS-021a：把本机设备注册到节点（幂等：已注册视为成功）。
+///
+/// 语义：未入库身份 → `INVALID_STATE_TRANSITION`；端点不可解析 → `INVALID_TARGET`；
+/// 不可达 → `NODE_UNAVAILABLE`；节点其它拒绝原样透出（带 node-client 的响应体片段）。
+pub fn register_device_on_node(
+    store: &Store,
+    endpoint_url: &str,
+    node_id: &str,
+    node_public_key_hex: Option<&str>,
+) -> ControlReceiptResult<()> {
+    let seeds = store
+        .load_identity_seeds()
+        .map_err(|_| {
+            ControlReceiptError::new(
+                ErrorCode::StorageFailure.as_str(),
+                "the persisted identity could not be read",
+            )
+        })?
+        .ok_or_else(|| {
+            ControlReceiptError::new(
+                ErrorCode::InvalidStateTransition.as_str(),
+                "the local identity is not enrolled in this database",
+            )
+        })?;
+    let client = build_node_client(store, endpoint_url, node_id, node_public_key_hex)?;
+    let registration = registration_request_for(
+        &seeds.account_id,
+        &seeds.device_id,
+        seeds.device_seed.as_slice(),
+        seeds.account_seed.as_slice(),
+        seeds.created_at_ms,
+    )?;
+    let outcome = block_on_node(&client, |client| {
+        Box::pin(async move { Ok(client.register_device(&registration).await) })
+    })?;
+    match outcome {
+        Ok(_) => Ok(()),
+        // 已注册：按幂等成功处理（节点真实答复）。
+        Err(error) if error.node_code() == Some("ALREADY_EXISTS") => Ok(()),
+        Err(error) => Err(node_rejection(
+            error,
+            "the node rejected the device registration",
+        )),
+    }
+}
+
+/// 成员变更回执的公开投影。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberAddReceiptView {
+    /// 节点分配的提交标识（重复提交返回同一个）。
+    pub submission_id: String,
+    /// 节点日志序号。
+    pub seq: u64,
+    /// 节点身份。
+    pub node_id: String,
+}
+
+/// GROUPS-021b：把“新增成员”作为控制提交投递到节点（走既有 append 通道）。
+///
+/// 载体：`kind = control` + 公开元数据 `operation = invite` + `added_credentials = [device_id]`。
+/// 节点接受后会把该设备写进成员表（NODE-006b），之后它才能读日志/拉取。
+/// 真实的 MLS 成员变更仍走 `prepare_control(AddMembers)`（需要对方的 KeyPackage）；
+/// 本函数只承担**节点侧成员表**这一步，payload 是不透明的成员声明（节点不解析正文）。
+pub fn submit_member_add(
+    store: &mut Store,
+    group_id: &str,
+    device_id: &str,
+    endpoint_url: &str,
+    node_id: &str,
+    node_public_key_hex: Option<&str>,
+) -> ControlReceiptResult<MemberAddReceiptView> {
+    GroupId::parse(group_id).map_err(|_| {
+        ControlReceiptError::new(
+            ErrorCode::InvalidId.as_str(),
+            "group id must be PROTOCOL-001 group text",
+        )
+    })?;
+    let member = chat_protocol::DeviceId::parse(device_id).map_err(|_| {
+        ControlReceiptError::new(
+            ErrorCode::InvalidId.as_str(),
+            "member device id must be a device id",
+        )
+    })?;
+    let view = groups::group_snapshot(store, group_id)?;
+    let client = build_node_client(store, endpoint_url, node_id, node_public_key_hex)?;
+    let head = fetch_head(&client, group_id)?;
+    if head.group_id != group_id {
+        return Err(ControlReceiptError::new(
+            ErrorCode::InvalidReceiptScope.as_str(),
+            "node head is for another group",
+        ));
+    }
+    let payload = format!("member-add:{}", member.encode()).into_bytes();
+    let digest = sha256_concat(&[
+        b"chat/core/member-add-submission/v1",
+        group_id.as_bytes(),
+        member.as_bytes(),
+    ]);
+    let candidate = chat_node_services::group::GroupCandidate {
+        protocol_major: 1,
+        protocol_minor: 0,
+        submission_id: SubmissionId::from_bytes(digest).encode(),
+        group_id: group_id.to_owned(),
+        author_device_id: client.device_id().to_owned(),
+        kind: KIND_CONTROL.to_owned(),
+        expected_control_head: head.control_head.clone(),
+        policy_version: head.policy_version,
+        mls_epoch: head.mls_epoch,
+        encrypted_payload: hex_encode(&payload),
+        control_metadata: Some(chat_node_services::group::CandidateControlMetadata {
+            operation: "invite".to_owned(),
+            target_digest: hex_encode(&digest),
+            added_credentials: vec![member.encode()],
+            removed_credentials: Vec::new(),
+        }),
+    };
+    let receipt = match append_candidate(&client, &candidate)? {
+        Ok(receipt) => receipt,
+        Err(error) if error.node_code() == Some("SUBMISSION_ID_CONFLICT") => {
+            reconcile_submission(&client, group_id, &candidate.submission_id)?
+                .map(|(_, receipt)| receipt)
+                .ok_or_else(|| ControlReceiptError::from(error))?
+        }
+        Err(error) => {
+            return Err(node_rejection(
+                error,
+                "the node rejected the member-add submission",
+            ))
+        }
+    };
+    if receipt.group_id != group_id
+        || receipt.submission_id != candidate.submission_id
+        || receipt.author_device_id != candidate.author_device_id
+    {
+        return Err(ControlReceiptError::new(
+            ErrorCode::InvalidReceiptScope.as_str(),
+            "the receipt does not bind this member-add submission",
+        ));
+    }
+    let node_public_key = hex_decode::<32>("node public key", &head.node_public_key)
+        .map_err(|error| ControlReceiptError::new(error.code(), "node public key is malformed"))?;
+    receipt
+        .verify(&node_public_key)
+        .map_err(|error| ControlReceiptError::new(error.code(), "the node receipt signature is invalid"))?;
+    let _ = view;
+    Ok(MemberAddReceiptView {
+        submission_id: receipt.submission_id,
+        seq: receipt.seq,
+        node_id: receipt.node_id,
+    })
 }
 
 // ---------------------------------------------------------------- GROUPS-019 邀请投递

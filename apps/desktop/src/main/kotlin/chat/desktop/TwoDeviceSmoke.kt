@@ -72,6 +72,8 @@ private fun bobWait(dir: File, endpoint: String, nodeId: String, nodeKey: String
     return try {
         val account = core.enrollLocalIdentity(File(dir, "bob-identity.db").absolutePath, MASTER_KEY)
         log("bob enrolled: " + account.deviceId)
+        core.registerDeviceOnNode(endpoint, nodeId, nodeKey)
+        log("bob device registered on node (idempotent)")
         val kp = core.exportKeyPackage()
         File(dir, "bob.kp").writeBytes(kp)
         // MLS 里用的是**凭据**而不是设备 ID；把凭据一并交给 alice，否则她会用错凭据建不出群。
@@ -150,6 +152,9 @@ private fun alice(dir: File, endpoint: String, nodeId: String, nodeKey: String):
             ?: run { log("FAIL no pull state after registration"); return 5 }
         writeInviteHandoff(File(dir, "a2b.txt"), created.invite.welcomeBytes, created.invite, head)
         log("handoff written for bob")
+        // 节点成员表：先把 bob 的设备登记为群成员，否则他读不到日志（403/INVALID_CREDENTIAL）。
+        val memberAdd = core.submitMemberAdd(created.group.groupId, bobCredential, endpoint, nodeId, nodeKey)
+        log("PASS alice added bob as node member: seq=" + memberAdd.seq)
         val receipt = core.submitInvite(created.group.groupId, created.invite, endpoint, nodeId, nodeKey)
         log("PASS alice submitted invite: seq=" + receipt.seq)
         val draft = core.createDraft("conv:1:" + "11".repeat(32), "op:1:" + "22".repeat(32), "hello from alice")

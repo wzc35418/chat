@@ -815,8 +815,9 @@ impl NodeClient {
         match serde_json::from_slice::<ErrorEnvelope>(bytes) {
             Ok(envelope) if !envelope.error.code.is_empty() => {
                 NodeClientError::from_node_code(status, &envelope.error.code)
+                    .with_body_snippet(bytes)
             }
-            _ => NodeClientError::from_status(status),
+            _ => NodeClientError::from_status(status).with_body_snippet(bytes),
         }
     }
 

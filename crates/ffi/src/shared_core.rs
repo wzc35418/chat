@@ -83,6 +83,17 @@ pub struct SharedReceiptFfi {
 }
 
 /// 群在节点登记的结果。
+/// 成员变更提交的公开回执（单句柄版）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct SharedMemberAddReceiptFfi {
+    /// 节点分配的提交标识（重复提交返回同一个）。
+    pub submission_id: String,
+    /// 节点日志序号。
+    pub seq: u64,
+    /// 节点身份。
+    pub node_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct SharedRegistrationFfi {
     /// 协议群 ID。
@@ -501,6 +512,53 @@ impl ChatCoreFfi {
             group_id: view.group_id,
             registered_seq: view.registered_seq,
             node_id: view.node_id,
+        })
+    }
+
+    /// GROUPS-021a：把本机设备注册到节点（幂等；已注册视为成功）。
+    ///
+    /// 与 `GroupFfi::register_device_on_node` 同一个实现，只是挂在**单句柄** `ChatCoreFfi` 上，
+    /// 避免双设备演示里 ChatCore 与 GroupFfi 抢同一个库（STORAGE_LOCKED）。
+    pub fn register_device_on_node(
+        &self,
+        endpoint_url: String,
+        node_id: String,
+        node_public_key_hex: Option<String>,
+    ) -> Result<(), FfiError> {
+        let mut guard = self.lock()?;
+        let core = guard.as_mut().ok_or_else(core_closed)?;
+        core.register_device_on_node(
+            &endpoint_url,
+            &node_id,
+            node_public_key_hex.as_deref(),
+        )
+        .map_err(|error| failure!(error))
+    }
+
+    /// GROUPS-021b：把“新增成员”作为控制提交投递到节点（写节点成员表），返回节点真实回执。
+    pub fn submit_member_add(
+        &self,
+        group_id: String,
+        device_id: String,
+        endpoint_url: String,
+        node_id: String,
+        node_public_key_hex: Option<String>,
+    ) -> Result<SharedMemberAddReceiptFfi, FfiError> {
+        let mut guard = self.lock()?;
+        let core = guard.as_mut().ok_or_else(core_closed)?;
+        let receipt = core
+            .submit_member_add(
+                &group_id,
+                &device_id,
+                &endpoint_url,
+                &node_id,
+                node_public_key_hex.as_deref(),
+            )
+            .map_err(|error| failure!(error))?;
+        Ok(SharedMemberAddReceiptFfi {
+            submission_id: receipt.submission_id,
+            seq: receipt.seq,
+            node_id: receipt.node_id,
         })
     }
 

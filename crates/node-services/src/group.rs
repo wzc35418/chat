@@ -1094,6 +1094,22 @@ impl NodeService {
                     if existing.is_some() {
                         continue;
                     }
+                    // 成员必须是本节点**已注册且 active** 的设备（显式拒绝，不让外键报成存储故障）。
+                    let device: Option<(String, String)> = tx
+                        .query_row(
+                            "SELECT account_id, state FROM devices WHERE device_id = ?1",
+                            [added],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?;
+                    let (member_account, member_state) =
+                        device.ok_or(NodeError::InvalidCredential)?;
+                    if member_state != "active" {
+                        return Err(NodeError::DeviceRevoked);
+                    }
+                    if member_account != actor.account_id {
+                        return Err(NodeError::PermissionDenied);
+                    }
                     tx.execute(
                         "INSERT INTO group_members (group_id, device_id, account_id, role, muted, joined_seq, left_seq)
                          VALUES (?1, ?2, ?3, ?4, 0, ?5, NULL)",

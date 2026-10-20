@@ -64,8 +64,18 @@ pub struct NodeClientError {
     status: Option<u16>,
     node_code: Option<&'static str>,
     detail: &'static str,
+    /// 有界的响应体片段（≤512 字节，UTF-8 有损，已截断；不含密钥/签名）。
+    body_snippet: Option<String>,
 }
 
+/// 错误体片段的最大字节数（截断上限）。
+pub const MAX_ERROR_BODY_SNIPPET_BYTES: usize = 512;
+
+/// 把节点响应体转成**有界**片段：超长截断、非法 UTF-8 有损替换。
+fn bounded_snippet(bytes: &[u8]) -> String {
+    let end = bytes.len().min(MAX_ERROR_BODY_SNIPPET_BYTES);
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
 impl NodeClientError {
     pub(crate) fn new(
         code: ErrorCode,
@@ -80,8 +90,21 @@ impl NodeClientError {
             status,
             node_code,
             detail,
+            body_snippet: None,
         }
     }
+
+    /// 附带**有界**响应体片段（≤512 字节，UTF-8 有损）。
+    pub(crate) fn with_body_snippet(mut self, bytes: &[u8]) -> Self {
+        self.body_snippet = Some(bounded_snippet(bytes));
+        self
+    }
+
+    /// 节点错误响应体的有界片段（没有则为 None）。
+    pub fn body_snippet(&self) -> Option<&str> {
+        self.body_snippet.as_deref()
+    }
+
 
     /// PROTOCOL-014 稳定错误码。
     pub fn code(&self) -> ErrorCode {
@@ -279,7 +302,7 @@ impl NodeClientError {
         }
     }
 
-    /// 节点返回的稳定错误码 → 客户端错误。
+/// 节点返回的稳定错误码 → 客户端错误。
     pub(crate) fn from_node_code(status: u16, node_code: &str) -> Self {
         let kind = Self::kind_for_node_code(node_code);
         Self {
@@ -292,6 +315,7 @@ impl NodeClientError {
                 .find(|known| *known == node_code)
                 .unwrap_or("UNKNOWN_NODE_CODE")),
             detail: Self::detail_for_kind(kind),
+            body_snippet: None,
         }
     }
 
@@ -315,6 +339,7 @@ impl NodeClientError {
             status: Some(status),
             node_code: None,
             detail: Self::detail_for_kind(kind),
+            body_snippet: None,
         }
     }
 
@@ -328,6 +353,7 @@ impl NodeClientError {
             status: None,
             node_code: None,
             detail: "local request validation failed",
+            body_snippet: None,
         }
     }
 }
@@ -400,6 +426,27 @@ impl std::error::Error for NodeClientError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_snippet_is_bounded_and_lossy() {
+        let long = vec![b'a'; MAX_ERROR_BODY_SNIPPET_BYTES + 100];
+        let error = NodeClientError::from_status(400).with_body_snippet(&long);
+        let snippet = error.body_snippet().expect("snippet present");
+        assert_eq!(snippet.len(), MAX_ERROR_BODY_SNIPPET_BYTES, "truncated to the cap");
+        assert!(snippet.bytes().all(|byte| byte == b'a'));
+
+        // 非法 UTF-8 有损替换，长度仍然有界。
+        let invalid = [0xffu8, 0xfe, 0x80];
+        let error = NodeClientError::from_status(500).with_body_snippet(&invalid);
+        let snippet = error.body_snippet().expect("snippet present");
+        assert!(snippet.contains('�'), "lossy replacement: {snippet:?}");
+        assert!(snippet.len() <= MAX_ERROR_BODY_SNIPPET_BYTES);
+
+        // 没有 body 时是 None（既有语义不变）。
+        let plain = NodeClientError::from_status(403);
+        assert!(plain.body_snippet().is_none());
+        assert_eq!(plain.http_status(), Some(403));
+    }
 
     #[test]
     fn every_known_node_code_maps_to_a_frozen_code() {

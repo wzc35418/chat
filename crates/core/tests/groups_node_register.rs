@@ -96,12 +96,16 @@ impl Drop for FixtureDir {
 }
 
 fn enroll_identity(database: &str) -> (String, String) {
+    enroll_identity_with(database, DEVICE_SEED)
+}
+
+fn enroll_identity_with(database: &str, device_seed: [u8; 32]) -> (String, String) {
     let mut core = ConversationCore::open(database, &master_key_hex()).expect("open core");
     let view = core
         .save_identity_account(IdentityAccountInput {
             display_name: "register".to_owned(),
             account_seed_hex: hex_of(&[0x22u8; 32]),
-            device_seed_hex: hex_of(&DEVICE_SEED),
+            device_seed_hex: hex_of(&device_seed),
             // 身份创建时间用真实当前时间：节点按自己的时钟校验凭据有效期。
             created_at_ms: now_s() * 1_000,
         })
@@ -400,4 +404,104 @@ fn an_unregistered_invitee_cannot_be_listed_as_an_initial_node_member() {
     });
     let error = block_on(client.create_group(&rejected)).expect_err("unregistered member is rejected");
     assert_eq!(error.node_code(), Some("INVALID_CREDENTIAL"));
+}
+
+/// GROUPS-021：B 自注册 → A 提交 member_add → B 读日志从 403 变 200；重复提交幂等。
+#[test]
+fn a_self_registered_member_is_authorized_after_a_member_add_commit() {
+    let dir_a = FixtureDir::new();
+    let (_account_id_a, device_a) = enroll_identity(&dir_a.database_text());
+    let mut store_a = dir_a.open();
+    let (group_id, _head) = local_group(&mut store_a);
+    let node = TestNode::start(&device_a);
+    group_register_on_node(
+        &mut store_a,
+        &group_id,
+        &node.endpoint_url(),
+        NODE_ID,
+        Some(&node.public_key_hex()),
+    )
+    .expect("owner group registers");
+
+    // B 侧：独立库里的持久身份 + 自注册到节点。
+    let dir_b = FixtureDir::new();
+    let (account_b, device_b) = enroll_identity_with(&dir_b.database_text(), [0x66u8; 32]);
+    let store_b = dir_b.open();
+    chat_core::group_node::register_device_on_node(
+        &store_b,
+        &node.endpoint_url(),
+        NODE_ID,
+        Some(&node.public_key_hex()),
+    )
+    .expect("B self-registers on the node");
+
+    // B 还不是群成员：读日志被拒。
+    let bob_client = node.client_with(&device_b, [0x66u8; 32]);
+    let denied = block_on(bob_client.fetch_log(&group_id, 0, 10));
+    assert!(denied.is_err(), "a non-member must not read the log");
+
+    // A 提交成员变更（added_credentials=[B 的设备 ID]）。
+    let first = chat_core::group_node::submit_member_add(
+        &mut store_a,
+        &group_id,
+        &device_b,
+        &node.endpoint_url(),
+        NODE_ID,
+        Some(&node.public_key_hex()),
+    )
+    .expect("member add is accepted");
+    assert_eq!(first.node_id, NODE_ID);
+
+    // 现在 B 能读日志。
+    let page = block_on(bob_client.fetch_log(&group_id, 0, 10))
+        .expect("the new member is authorized after the member-add commit");
+    assert_eq!(page.group_id, group_id);
+
+    // 幂等：重复提交返回同一回执（节点按提交 ID 去重）。
+    let second = chat_core::group_node::submit_member_add(
+        &mut store_a,
+        &group_id,
+        &device_b,
+        &node.endpoint_url(),
+        NODE_ID,
+        Some(&node.public_key_hex()),
+    )
+    .expect("repeat member add is idempotent");
+    assert_eq!(second.submission_id, first.submission_id);
+    assert_eq!(second.seq, first.seq);
+    let _ = (account_b, store_b);
+}
+
+/// 未注册设备直接 member_add：节点拒绝（不放宽）。
+#[test]
+fn a_member_add_for_an_unregistered_device_is_rejected() {
+    let dir = FixtureDir::new();
+    let (_account_id, device_id) = enroll_identity(&dir.database_text());
+    let mut store = dir.open();
+    let (group_id, _head) = local_group(&mut store);
+    let node = TestNode::start(&device_id);
+    group_register_on_node(
+        &mut store,
+        &group_id,
+        &node.endpoint_url(),
+        NODE_ID,
+        Some(&node.public_key_hex()),
+    )
+    .expect("group registers");
+    // 一个从未在节点注册过的设备 ID。
+    let stranger = chat_protocol::DeviceId::from_bytes([0x79u8; 32]).encode();
+    let error = chat_core::group_node::submit_member_add(
+        &mut store,
+        &group_id,
+        &stranger,
+        &node.endpoint_url(),
+        NODE_ID,
+        Some(&node.public_key_hex()),
+    )
+    .expect_err("unregistered device must be rejected");
+    assert_eq!(
+        error.code(),
+        "INVALID_CREDENTIAL",
+        "an unregistered device must be rejected explicitly"
+    );
 }

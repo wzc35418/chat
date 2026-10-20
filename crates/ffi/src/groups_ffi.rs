@@ -556,6 +556,17 @@ pub struct InviteReceiptFfi {
 }
 
 /// 建群结果：快照 + **原始 Welcome 字节** + 与之逐字段一致的邀请元数据。
+/// 成员变更提交的公开回执（只含公开字段，无密钥）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct MemberAddReceiptFfi {
+    /// 节点分配的提交标识（重复提交返回同一个）。
+    pub submission_id: String,
+    /// 节点日志序号。
+    pub seq: u64,
+    /// 节点身份。
+    pub node_id: String,
+}
+
 /// 群在节点登记成功的公开回执（只含公开字段，无密钥）。
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct GroupRegistrationFfi {
@@ -842,6 +853,47 @@ impl GroupFfi {
     /// GROUPS-001b：把本地群登记到节点（纯数据 + 公开回执，**不传任何密钥**）。
     ///
     /// 建群后必须调用一次：否则节点不知道这个群，后续条目会被拒绝。
+    /// GROUPS-021a：把本机设备注册到节点（幂等；已注册视为成功）。
+    pub fn register_device_on_node(
+        &self,
+        endpoint_url: String,
+        node_id: String,
+        node_public_key_hex: Option<String>,
+    ) -> Result<(), FfiError> {
+        let core = self.lock()?;
+        core.register_device_on_node(
+            &endpoint_url,
+            &node_id,
+            node_public_key_hex.as_deref(),
+        )
+        .map_err(|error| failure!(error))
+    }
+
+    /// GROUPS-021b：把“新增成员”作为控制提交投递到节点（写节点成员表）。
+    pub fn submit_member_add(
+        &self,
+        group_id: String,
+        device_id: String,
+        endpoint_url: String,
+        node_id: String,
+        node_public_key_hex: Option<String>,
+    ) -> Result<MemberAddReceiptFfi, FfiError> {
+        let mut core = self.lock()?;
+        let receipt = core
+            .submit_member_add(
+                &group_id,
+                &device_id,
+                &endpoint_url,
+                &node_id,
+                node_public_key_hex.as_deref(),
+            )
+            .map_err(|error| failure!(error))?;
+        Ok(MemberAddReceiptFfi {
+            submission_id: receipt.submission_id,
+            seq: receipt.seq,
+            node_id: receipt.node_id,
+        })
+    }
     pub fn group_register_on_node(
         &self,
         group_id: String,
