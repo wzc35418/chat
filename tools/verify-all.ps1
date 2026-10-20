@@ -25,6 +25,7 @@ param(
     [switch]$SkipLan,
     [switch]$SkipTls,
     [switch]$SkipOffline,
+    [switch]$SkipTlsE2e,
     [switch]$SkipAndroid,
     [switch]$SkipGradle,
     [string]$TargetDir = ""
@@ -305,6 +306,33 @@ if ($SkipOffline) {
             Add-Stage -Name "offline" -Status "PASS" -Seconds $seconds -Detail "sent with receiver offline; delivered on next sync" -Log $log
         } else {
             Add-Stage -Name "offline" -Status "FAIL" -Seconds $seconds -Detail ("exit " + $code + "; " + (Get-LogTail -Path $log)) -Log $log
+        }
+    }
+}
+
+# ---------------------------------------------------------------- stage 11: TLS e2e (packaged artifact)
+if ($SkipTlsE2e) {
+    Add-SkippedStage -Name "tls-e2e" -Reason "-SkipTlsE2e"
+} else {
+    Write-Host ""
+    Write-Host "== tls-e2e =="
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $log = Join-Path $logDir "tls-e2e.log"
+    $script = Join-Path $root "tools/verify-tls-e2e.ps1"
+    if (-not (Test-Path $script)) {
+        $sw.Stop()
+        Add-Stage -Name "tls-e2e" -Status "FAIL" -Seconds ([math]::Round($sw.Elapsed.TotalSeconds, 1)) -Detail "tools/verify-tls-e2e.ps1 is missing" -Log ""
+    } else {
+        cmd /c ("powershell -NoProfile -ExecutionPolicy Bypass -File `"" + $script + "`" > `"" + $log + "`" 2>&1") | Out-Null
+        $code = $LASTEXITCODE
+        $sw.Stop()
+        $seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+        if ($code -eq 0) {
+            Add-Stage -Name "tls-e2e" -Status "PASS" -Seconds $seconds -Detail "https send accepted + sync applied; wrong fingerprint rejected" -Log $log
+        } elseif ($code -eq 3) {
+            Add-Stage -Name "tls-e2e" -Status "SKIP" -Seconds $seconds -Detail "openssl not installed" -Log $log
+        } else {
+            Add-Stage -Name "tls-e2e" -Status "FAIL" -Seconds $seconds -Detail ("exit " + $code + "; " + (Get-LogTail -Path $log)) -Log $log
         }
     }
 }

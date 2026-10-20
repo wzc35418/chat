@@ -17,6 +17,40 @@ import kotlinx.coroutines.runBlocking
  * 语义边界：只用真实 FFI + 真实 HTTP 节点；任何一步失败都以非 0 退出并打印**明确的稳定错误码**，
  * 不做重试掩盖、不把"本地准备好了"当成"节点收了"。
  */
+/**
+ * 在 https 端点上取节点公钥：**按指纹固定证书**（只接受 SHA-256 匹配的那张）。
+ *
+ * 语义：这里不能用 TrustManager 全信任——那会让"公钥自动获取"变成绕过 pinning 的后门。
+ */
+private fun fetchNodePublicKeyPinned(endpoint: String, fingerprintHex: String): String? = runCatching {
+    val expected = fingerprintHex.trim().lowercase()
+    val trust = object : javax.net.ssl.X509TrustManager {
+        override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) =
+            throw java.security.cert.CertificateException("client auth not supported")
+
+        override fun checkServerTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {
+            val der = chain.first().encoded
+            val actual = java.security.MessageDigest.getInstance("SHA-256").digest(der)
+                .joinToString("") { b -> String.format("%02x", b.toInt() and 0xff) }
+            if (actual != expected) {
+                throw java.security.cert.CertificateException("PIN_MISMATCH: $actual")
+            }
+        }
+
+        override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = emptyArray()
+    }
+    val context = javax.net.ssl.SSLContext.getInstance("TLS")
+    context.init(null, arrayOf<javax.net.ssl.TrustManager>(trust), java.security.SecureRandom())
+    val url = java.net.URI(endpoint.trimEnd('/') + "/v1/health").toURL()
+    val connection = url.openConnection() as javax.net.ssl.HttpsURLConnection
+    connection.sslSocketFactory = context.socketFactory
+    connection.requestMethod = "GET"
+    connection.connectTimeout = 5000
+    connection.readTimeout = 5000
+    val body = connection.inputStream.bufferedReader().readText()
+    Regex("\"node_public_key\"\\s*:\\s*\"([0-9a-fA-F]{64})\"").find(body)?.groupValues?.get(1)
+}.getOrNull()
+
 private fun fetchNodePublicKey(endpoint: String): String? = runCatching {
     val url = java.net.URI(endpoint.trimEnd('/') + "/v1/health").toURL()
     val connection = url.openConnection() as java.net.HttpURLConnection
@@ -29,13 +63,28 @@ private fun fetchNodePublicKey(endpoint: String): String? = runCatching {
 
 fun main(args: Array<String>): Unit = runBlocking {
     if (args.size < 2) {
-        println("usage: PackageE2eSmokeKt <endpointUrl> <nodeId> [nodePublicKeyHex]")
+        println("usage: PackageE2eSmokeKt <endpointUrl> <nodeId> [nodePublicKeyHex] [tlsFingerprintHex]")
         kotlin.system.exitProcess(2)
     }
     val endpoint = args[0]
     val nodeId = args[1]
+    // 可选：进程级传输信任（https 节点必须给；给了指纹再连明文端点会被内核拒绝）。
+    // 位置：0=endpoint 1=nodeId 2=nodePublicKey(可空) 3=tlsFingerprint
+    // 位置：0=endpoint 1=nodeId 2=nodePublicKey("-"=自动) 3=tlsFingerprint("-"=无)
+    val tlsFingerprint = if (args.size >= 4) args[3].trim().takeIf { it.isNotEmpty() && it != "-" } else null
+    if (tlsFingerprint != null) {
+        uniffi.chat_ffi.configureTransportTrust(listOf(tlsFingerprint))
+        println("INFO transport trust configured: pinned 1 certificate")
+    }
     // 节点公钥从 /v1/health 的公开身份取（不靠人工传参，避免 pinning 被跳过）。
-    val nodeKey = if (args.size >= 3) args[2] else fetchNodePublicKey(endpoint)
+    val nodeKey = if (args.size >= 3 && args[2].trim().isNotEmpty() && args[2].trim() != "-") {
+        args[2].trim()
+    } else if (tlsFingerprint != null) {
+        // https：按指纹取公钥（不是"信任一切"）。
+        fetchNodePublicKeyPinned(endpoint, tlsFingerprint)
+    } else {
+        fetchNodePublicKey(endpoint)
+    }
     println("INFO node public key: " + (nodeKey ?: "(unavailable)"))
     val tempDir = java.io.File(System.getProperty("java.io.tmpdir"), "chat-pkg-e2e-" + System.nanoTime())
     tempDir.mkdirs()
