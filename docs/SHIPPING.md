@@ -237,3 +237,28 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 - 证书轮换自动化与到期告警；
 - 后台通知、安装器/自动更新、soak；
 - 插件签名信任链的**吊销/信任列表 UI**（签名校验本身已实现，见 R-232）。
+
+## 0.1.x 第四基线（2026-10-21 冻结，11 阶段全绿）
+
+| 项 | 值 |
+| --- | --- |
+| commit | `f8907ba` |
+| 一键回归 | `tools/verify-all.ps1` **11 阶段全 PASS**（gradle 33.5s / android 22.6s / package 16.1s / two-device 5.8s / lan 4.1s / tls 3.6s / offline 4.7s / tls-e2e 5.4s） |
+| 回归报告 | `build/verify-all-20261021-011445.md` |
+| Rust | `cargo check --workspace --locked` PASS（本批详情见计划书第五批总结） |
+| Gradle | 13 个桌面任务 PASS |
+| 交付包 | `Chat-app-0.1.0.zip` 81.79 MB（SHA256 `996E799E…23C7`） |
+| 免 JDK 启动器 | `Chat.exe`（SHA256 `644E1672…5BD36`） |
+
+### 本基线相比上一基线新增的证明
+
+1. **证书轮换**：客户端按**指纹集合**校验（新旧同时信任），命中任一即通过；
+2. **界面可配置 TLS 指纹**：关于面板保存/清除 + 启动自动应用（失败显式提示，不降级明文）；
+3. **错误可诊断 + 分层展示**：`Cow` 详情 + 整条错误链 + 统一 `ErrorBanner`（7 处）+ 可重试性取自冻结码表；
+4. **插件签名信任链**：默认要求签名（篡改/未签/指纹不符全拒）+ 信任列表持久化。
+
+### 仍未证明
+
+- 真正跨机器 / NAT / 中继服务（需外部条件）；
+- 证书到期告警；信任列表管理页 / 吊销；
+- 后台通知、安装器/自动更新、soak。

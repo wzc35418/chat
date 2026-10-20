@@ -107,7 +107,7 @@ powershell -File tools\verify-all.ps1 -TargetDir C:\chat-target  # 把 cargo tar
 
 | 项 | 值 |
 | --- | --- |
-| 版本 / 基线 commit | 0.1.x / `8343543`（**11 阶段全绿**） |
+| 版本 / 基线 commit | 0.1.x / `f8907ba`（**11 阶段全绿**） |
 | Rust 测试 | **1141 passed / 0 failed**（14 个 crate） |
 | 桌面冒烟 | **11 个 Gradle 任务**（含 pluginSmoke / pluginJvmSmoke 沙箱断言） |
 | Android | `assembleDebug` PASS |
@@ -115,7 +115,8 @@ powershell -File tools\verify-all.ps1 -TargetDir C:\chat-target  # 把 cargo tar
 | 交付物 | `build/dist/Chat-app-0.1.0.zip`（免 JDK，双击 `Chat.exe`） |
 | 双设备互通 | `tools/demo-two-devices.ps1` 全 PASS |
 | 错时投递 | `tools/verify-offline-delivery.ps1` 全 PASS（发送时对方离线，上线后 applied=1） |
-| 加密传输 | 节点 TLS 监听 + 客户端严格 pinning（SHA-256 指纹） |
+| 加密传输 | 节点 TLS 监听 + 客户端严格 pinning（指纹集合，可轮换），界面可配置 |
+| 插件安全 | 权限门 + 签名闸门（默认要求签名）+ 信任列表 |
 
 **能做什么**：建身份、加密存储、群治理、附件、插件（带权限门）、发消息到真实节点、从节点拉回消息、两台设备互通。
 
