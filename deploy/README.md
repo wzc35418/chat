@@ -29,6 +29,12 @@ fingerprint : <64 位小写 hex>
 1. **云厂商安全组**：入站放行 TCP **8443**（腾讯云控制台 → 安全组）；
 2. **本机防火墙**：`ufw allow 8443/tcp`（或 `firewall-cmd --add-port=8443/tcp --permanent && firewall-cmd --reload`）。
 
+### 部署后自检（推荐）
+
+```bash
+sudo bash deploy/selfcheck.sh        # 服务/监听/健康/证书/指纹 一次列清，PASS 时直接打印要发给客户端的值
+```
+
 ### 常用排查
 
 ```bash
@@ -57,6 +63,17 @@ powershell -ExecutionPolicy Bypass -File tools\verify-remote.ps1 `
 3. **打包产物**（`app.jar` + FFI）配置指纹后，向公网节点提交消息 → 期望 `accepted`；
 4. 从公网节点**拉取** → 期望 `applied ≥ 1`；
 5. **错误指纹必须失败**（证明 pinning 真在生效）。
+
+## 二点五、如果 TLS 暂时起不来
+
+先用明文模式验证「能不能通」，再回头修 TLS：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\verify-remote.ps1 `
+  -Endpoint http://106.54.223.171:8080 -NodeId <node_id> -PlainHttp
+```
+
+明文模式只验证 TCP 可达 + 打包产物提交/拉取；证书与指纹相关的断言会跳过并明确打印 INFO（不会伪装成通过）。
 
 ## 三、注意事项（诚实说明）
 

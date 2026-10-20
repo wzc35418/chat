@@ -1,18 +1,18 @@
-# Cross-machine verification against a PUBLIC node over TLS with pinned fingerprint.
+﻿# Cross-machine verification against a PUBLIC node (TLS with pinned fingerprint, or plain HTTP).
 #
-# What it proves (each step is a real network call to the remote host):
-#   1. anonymous /v1/health reachable with the served certificate verified
-#   2. /v1/tls/info readable (cert fingerprint + days remaining)
-#   3. the PACKAGED artifact (app-image jar + FFI) submits a message -> node accepts
-#   4. the same artifact pulls entries back -> applied >= 1
-#   5. a WRONG fingerprint is rejected (pinning really is enforced)
+# Proves, over the real network:
+#   1. TCP reachability (distinguishes closed port from TLS/fingerprint errors)
+#   2. served certificate fingerprint matches the pinned one (HTTPS mode)
+#   3. /v1/tls/info readable (HTTPS mode)
+#   4. the PACKAGED artifact submits a message -> node accepts, and pulls entries back
+#   5. a WRONG fingerprint is rejected (HTTPS mode)
 #
 # Exit codes: 0 = PASS, 1 = FAIL, 3 = SKIP (missing artifact/openssl).
 param(
     [Parameter(Mandatory = $true)][string]$Endpoint,
     [Parameter(Mandatory = $true)][string]$NodeId,
-    [Parameter(Mandatory = $true)][string]$Fingerprint,
-    [int]$TimeoutSeconds = 20
+    [string]$Fingerprint = '',
+    [switch]$PlainHttp
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -21,12 +21,23 @@ $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $logDir = Join-Path $build ('remote-logs\' + $stamp)
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 
-$fp = ($Fingerprint -replace ':', '').Trim().ToLowerInvariant()
-if ($fp -notmatch '^[0-9a-f]{64}$') { Write-Host 'FAIL remote check: fingerprint must be 64 lowercase hex chars'; exit 1 }
 $Endpoint = $Endpoint.TrimEnd('/')
-Write-Host ('endpoint: ' + $Endpoint + ' (node ' + $NodeId + ')')
-Write-Host ('fingerprint: ' + $fp.Substring(0, 16) + '...')
+if ($Endpoint -notmatch '^https?://') { Write-Host 'FAIL remote check: endpoint must start with http:// or https://'; exit 1 }
+$isHttps = $Endpoint.StartsWith('https://', [System.StringComparison]::OrdinalIgnoreCase)
+$tlsMode = ($isHttps -and -not $PlainHttp)
 
+$fp = ''
+if ($tlsMode) {
+    $fp = ($Fingerprint -replace ':', '').Trim().ToLowerInvariant()
+    if ($fp -notmatch '^[0-9a-f]{64}$') {
+        Write-Host 'FAIL remote check: HTTPS endpoint needs -Fingerprint (64 lowercase hex). Use -PlainHttp only if the node has no TLS.'
+        exit 1
+    }
+}
+Write-Host ('endpoint: ' + $Endpoint + ' (node ' + $NodeId + ')')
+if ($tlsMode) { Write-Host ('fingerprint: ' + $fp.Substring(0, 16) + '...') }
+
+# 0. packaged artifact + openssl presence
 $app = Join-Path $build 'dist\app-image\Chat'
 $java = Join-Path $app 'runtime\bin\java.exe'
 $jar = Join-Path $app 'app\app.jar'
@@ -35,62 +46,79 @@ foreach ($p in @($java, $jar, $native)) {
     if (-not (Test-Path $p)) { Write-Host ('SKIP remote check: packaged artifact missing (' + $p + ')'); exit 3 }
 }
 $openssl = 'C:\Program Files\OpenSSL-Win64\bin\openssl.exe'
-if (-not (Test-Path $openssl)) { Write-Host 'SKIP remote check: openssl not installed'; exit 3 }
+if ($tlsMode -and -not (Test-Path $openssl)) { Write-Host 'SKIP remote check: openssl not installed'; exit 3 }
 
-# 1. 证书本身：连上去取服务端证书，比对指纹（这一步证明「拿到的证书就是我们钉的那张」）。
-$certOut = Join-Path $logDir 'served-cert.pem'
-$probe = 'cmd /c ""' + $openssl + '" s_client -connect ' + ($Endpoint -replace '^https?://', '') + ' -servername localhost -showcerts < NUL 2>&1 > "' + $certOut + '""'
-cmd /c $probe | Out-Null
-$served = (Get-Content $certOut -Raw -ErrorAction SilentlyContinue)
-if ($null -eq $served) { $served = '' }
-if ($served -notmatch 'BEGIN CERTIFICATE') {
-    Write-Host ('FAIL remote check: could not fetch the served certificate from ' + $Endpoint)
-    Write-Host '  hint: is the port open in the cloud security group and local firewall?'
+# 1. TCP reachability
+$hostPart = ($Endpoint -replace '^https?://', '').Split('/')[0]
+$hostName = $hostPart.Split(':')[0]
+$port = if ($hostPart.Contains(':')) { [int]$hostPart.Split(':')[1] } elseif ($isHttps) { 443 } else { 80 }
+$reachable = $false
+try { $reachable = Test-NetConnection -ComputerName $hostName -Port $port -InformationLevel Quiet -WarningAction SilentlyContinue } catch { $reachable = $false }
+if (-not $reachable) {
+    Write-Host ('FAIL remote check: TCP ' + $hostName + ':' + $port + ' unreachable')
+    Write-Host '  check order: (1) cloud security group inbound (2) ufw/firewalld (3) systemctl status chat-node (4) ss -ltnp'
     exit 1
 }
-$servedFingerprint = (& $openssl x509 -in $certOut -noout -fingerprint -sha256 2>&1 | Out-String)
-$match = [regex]::Match($servedFingerprint, 'Fingerprint=([0-9A-Fa-f:]+)')
-if (-not $match.Success) { Write-Host 'FAIL remote check: could not read the served fingerprint'; exit 1 }
-$actual = ($match.Groups[1].Value -replace ':', '').ToLowerInvariant()
-if ($actual -ne $fp) {
-    Write-Host ('FAIL remote check: served certificate fingerprint mismatch')
-    Write-Host ('  expected: ' + $fp)
-    Write-Host ('  actual  : ' + $actual)
-    exit 1
-}
-Write-Host 'PASS remote: served certificate matches the pinned fingerprint'
+Write-Host ('PASS remote: TCP ' + $hostName + ':' + $port + ' reachable')
 
-# 2. 匿名 /v1/tls/info（用 openssl 做带信任的请求）。
-$infoReq = Join-Path $logDir 'tlsinfo.request.txt'
-Set-Content -Path $infoReq -Value "GET /v1/tls/info HTTP/1.1`r`nHost: $($Endpoint -replace '^https?://','')`r`nConnection: close`r`n`r`n" -NoNewline -Encoding ascii
-$infoCmd = 'cmd /c ""' + $openssl + '" s_client -connect ' + ($Endpoint -replace '^https?://', '') + ' -CAfile "' + $certOut + '" -verify_return_error -quiet -ign_eof < "' + $infoReq + '" 2>&1"'
-$infoResponse = cmd /c $infoCmd | Out-String
-Set-Content -Path (Join-Path $logDir 'tlsinfo.response.txt') -Value $infoResponse -Encoding utf8
-if ($infoResponse -notmatch '"days_remaining"\s*:\s*(-?\d+)') {
-    Write-Host 'FAIL remote check: /v1/tls/info unusable'
-    exit 1
-}
-$days = [int]$matches[1]
-if ($days -le 0) { Write-Host ('FAIL remote check: remote certificate expired (' + $days + ' days)'); exit 1 }
-Write-Host ('PASS remote: /v1/tls/info ok (days_remaining=' + $days + ')')
+if ($tlsMode) {
+    # 2. served certificate fingerprint
+    $certOut = Join-Path $logDir 'served-cert.pem'
+    $probe = 'cmd /c ""' + $openssl + '" s_client -connect ' + $hostPart + ' -servername ' + $hostName + ' -showcerts < NUL 2>&1 > "' + $certOut + '""'
+    cmd /c $probe | Out-Null
+    $served = Get-Content $certOut -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $served) { $served = '' }
+    if ($served -notmatch 'BEGIN CERTIFICATE') { Write-Host 'FAIL remote check: could not fetch the served certificate'; exit 1 }
+    $printed = (& $openssl x509 -in $certOut -noout -fingerprint -sha256 2>&1 | Out-String)
+    $m = [regex]::Match($printed, 'Fingerprint=([0-9A-Fa-f:]+)')
+    if (-not $m.Success) { Write-Host 'FAIL remote check: could not read served fingerprint'; exit 1 }
+    $actual = ($m.Groups[1].Value -replace ':', '').ToLowerInvariant()
+    if ($actual -ne $fp) {
+        Write-Host 'FAIL remote check: served certificate fingerprint mismatch'
+        Write-Host ('  expected: ' + $fp)
+        Write-Host ('  actual  : ' + $actual)
+        exit 1
+    }
+    Write-Host 'PASS remote: served certificate matches the pinned fingerprint'
 
-# 3+4. 打包产物：配置指纹后提交 + 拉取（真实跨机器）。
+    # 3. /v1/tls/info
+    $infoReq = Join-Path $logDir 'tlsinfo.request.txt'
+    $requestText = 'GET /v1/tls/info HTTP/1.1' + "`r`n" + 'Host: ' + $hostPart + "`r`n" + 'Connection: close' + "`r`n`r`n"
+    Set-Content -Path $infoReq -Value $requestText -NoNewline -Encoding ascii
+    $infoCmd = 'cmd /c ""' + $openssl + '" s_client -connect ' + $hostPart + ' -CAfile "' + $certOut + '" -verify_return_error -quiet -ign_eof < "' + $infoReq + '" 2>&1"'
+    $infoResponse = cmd /c $infoCmd | Out-String
+    Set-Content -Path (Join-Path $logDir 'tlsinfo.response.txt') -Value $infoResponse -Encoding utf8
+    $daysMatch = [regex]::Match($infoResponse, '"days_remaining"\s*:\s*(-?[0-9]+)')
+    if (-not $daysMatch.Success) { Write-Host 'FAIL remote check: /v1/tls/info unusable'; exit 1 }
+    $days = [int]$daysMatch.Groups[1].Value
+    if ($days -le 0) { Write-Host ('FAIL remote check: remote certificate expired (' + $days + ' days)'); exit 1 }
+    Write-Host ('PASS remote: /v1/tls/info ok (days_remaining=' + $days + ')')
+} else {
+    Write-Host 'INFO remote: plain HTTP mode, skipping certificate/fingerprint checks'
+}
+
+# 4. packaged artifact submit + pull
 $goodLog = Join-Path $logDir 'e2e-good.log'
 & $java ('-Djna.library.path=' + $native) '-cp' $jar 'chat.desktop.PackageE2eSmokeKt' $Endpoint $NodeId '-' $fp *> $goodLog
 $goodCode = $LASTEXITCODE
 $goodText = Get-Content $goodLog -Raw -ErrorAction SilentlyContinue
 if ($null -eq $goodText) { $goodText = '' }
 if ($goodCode -ne 0 -or $goodText -notmatch 'accepted' -or $goodText -notmatch 'syncOnce') {
-    Write-Host ('FAIL remote check: packaged artifact did not complete submit+sync against the remote node (exit ' + $goodCode + ')')
+    Write-Host ('FAIL remote check: packaged artifact did not complete submit+sync (exit ' + $goodCode + ')')
     Get-Content $goodLog -Tail 15 | Out-Host
     exit 1
 }
-Write-Host 'PASS remote: packaged artifact submitted to the PUBLIC node (accepted) and pulled entries back'
+Write-Host 'PASS remote: packaged artifact submitted (accepted) and pulled entries back'
 
-# 5. 错误指纹必须失败。
-$badFp = ('0' * 64)
+if (-not $tlsMode) {
+    Write-Host ('logs: ' + $logDir)
+    Write-Host 'REMOTE CONNECTIVITY: PASS (plaintext)'
+    exit 0
+}
+
+# 5. wrong fingerprint must fail
 $badLog = Join-Path $logDir 'e2e-bad.log'
-& $java ('-Djna.library.path=' + $native) '-cp' $jar 'chat.desktop.PackageE2eSmokeKt' $Endpoint $NodeId '-' $badFp *> $badLog
+& $java ('-Djna.library.path=' + $native) '-cp' $jar 'chat.desktop.PackageE2eSmokeKt' $Endpoint $NodeId '-' ('0' * 64) *> $badLog
 $badCode = $LASTEXITCODE
 if ($badCode -eq 0) {
     Write-Host 'FAIL remote check: wrong fingerprint was accepted (pinning not enforced)'
