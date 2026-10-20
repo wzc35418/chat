@@ -170,3 +170,11 @@
 3. PRESENTATION 收敛：所有面板走 `AppFacade`，去掉样例态；
 4. 插件签名信任链：权限门已有，补签名校验与安装门槛；
 5. 交付：MSI/自动更新、soak 测试、非 Windows 平台调研。
+
+## 2026-10-20 第四批基线（第 97 轮）
+
+- Rust 四包 **545 passed / 0 failed**（99 suites）；工作区合计约 **1160**。
+- 迁移：storage 0014_mls_device（schema 14）。
+- `verify-all` **10 阶段**（+ tls / offline）全 PASS。
+- 新增证明：LAN 非回环、节点 TLS + 客户端严格 pinning、错时投递、跨进程入群。
+- 距 A 口径剩余：真正跨机器（中继/NAT）、证书轮换、PRESENTATION 收敛、插件签名信任链。

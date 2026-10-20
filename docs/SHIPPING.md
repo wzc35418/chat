@@ -180,3 +180,30 @@ powershell -File tools\verify-package.ps1 -SkipBuild -Only PlatformSmoke,P0Smoke
 - OS 级凭据保护（当前 DPAPI 文件封装 + 演示口令）；
 - 长期运行稳定性（没有 soak 测试）；
 - 非 Windows 平台。
+
+## 0.1.x 第二基线（2026-10-20 冻结，10 阶段全绿）
+
+| 项 | 值 |
+| --- | --- |
+| commit | `4d566cd` |
+| Rust 测试 | **545 passed / 0 failed**（chat-crypto / chat-storage / chat-core / chat-ffi 四包，99 suites；工作区合计约 1160） |
+| Gradle | 13 个桌面任务 PASS |
+| Android | `assembleDebug` PASS（98.4s） |
+| 一键回归 | `tools/verify-all.ps1` **10 阶段全 PASS**（disk / rust-check / verify-project / gradle 32.7s / android 98.4s / package 16.9s / two-device 6.3s / lan 4.7s / tls 3.7s / offline 5.4s） |
+| 回归报告 | `build/verify-all-20261020-235645.md` |
+| 交付包 | `build/dist/Chat-app-0.1.0.zip`（81.79 MB，SHA256 `996E799E…23C7`） |
+| 免 JDK 启动器 | `Chat.exe`（SHA256 `644E1672…5BD36`） |
+
+### 与上一基线相比新增的证明
+
+1. **LAN**：不依赖回环接口（192.168.x 上发消息 accepted + 同步 applied）；
+2. **TLS**：节点真监听 https，客户端严格 pinning（只认 SHA-256 指纹，系统根不参与）；
+3. **错时投递**：发送时接收方离线，四进程顺序验证，稍后上线 applied=1；
+4. **跨进程入群**：KeyPackage 私钥加密落库，drop 进程重开仍能入群。
+
+### 仍未证明（下一批目标）
+
+- 真正跨机器/NAT/中继服务（同机 LAN ≠ 公网可达）；
+- 证书轮换与过期告警；
+- 后台消息通知、安装器/自动更新、soak 稳定性；
+- 插件签名信任链（权限门已有，签名没有）。
