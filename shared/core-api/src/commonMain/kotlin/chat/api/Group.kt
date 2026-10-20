@@ -69,6 +69,19 @@ interface GroupService {
         nodePublicKeyHex: String?,
     ): GroupRegistration
 
+    /**
+     * 把某个**已注册设备**加为本群的节点成员（对方才能读群日志 / 拉取消息）。
+     *
+     * 语义：设备必须已在节点注册（否则节点拒绝，原样透出）；重复提交幂等（同一回执）。
+     */
+    suspend fun submitNodeMemberAdd(
+        groupId: String,
+        deviceId: String,
+        endpointUrl: String,
+        nodeId: String,
+        nodePublicKeyHex: String?,
+    ): NodeMemberAddReceipt
+
     /** 把邀请（元数据 + Welcome）提交到节点；回执真实、幂等可重投。 */
     suspend fun submitInvite(
         groupId: String,
@@ -169,5 +182,12 @@ data class CreatedGroup(
 data class GroupRegistration(
     val groupId: String,
     val registeredSeq: Long,
+    val nodeId: String,
+)
+
+/** 节点成员添加回执（纯数据）。 */
+data class NodeMemberAddReceipt(
+    val submissionId: String,
+    val seq: Long,
     val nodeId: String,
 )

@@ -30,6 +30,10 @@ data class PreviewGroupState(
     val inviteeKeyPackagePath: String = "",
     /** 最近一次用 KeyPackage 建群的结果（含可用 Welcome）。 */
     val createdGroup: chat.api.CreatedGroup? = null,
+    /** 待添加为节点成员的设备 ID。 */
+    val memberDeviceId: String = "",
+    /** 最近一次节点成员添加回执。 */
+    val memberAddReceipt: chat.api.NodeMemberAddReceipt? = null,
     /** 最近一次节点登记回执。 */
     val registration: chat.api.GroupRegistration? = null,
     /** 最近一次从节点取回的邀请。 */
@@ -154,5 +158,14 @@ fun PreviewGroupState.withRegistration(view: chat.api.GroupRegistration): Previe
     registration = view,
     busy = false,
     notice = "已在节点登记：" + view.groupId + "（seq " + view.registeredSeq + "）",
+    lastErrorCode = null,
+)
+
+fun PreviewGroupState.updateMemberDeviceId(value: String): PreviewGroupState = copy(memberDeviceId = value)
+
+fun PreviewGroupState.withMemberAddReceipt(receipt: chat.api.NodeMemberAddReceipt): PreviewGroupState = copy(
+    memberAddReceipt = receipt,
+    busy = false,
+    notice = "已加为节点成员：seq " + receipt.seq,
     lastErrorCode = null,
 )

@@ -46,6 +46,8 @@ data class GroupHandlers(
     val acceptPending: () -> Unit = {},
     val discardPending: () -> Unit = {},
     val registerOnNode: () -> Unit = {},
+    val updateMemberDeviceId: (String) -> Unit = {},
+    val addNodeMember: () -> Unit = {},
     val loadGroupList: () -> Unit = {},
     val selectGroup: (String) -> Unit = {},
     val updateInvitee: (String) -> Unit = {},

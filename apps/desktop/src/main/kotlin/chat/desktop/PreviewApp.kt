@@ -62,6 +62,8 @@ import chat.presentation.preview.withCreatedGroup
 import chat.presentation.preview.withDataDir
 import chat.presentation.preview.withHostLibraryPath
 import chat.presentation.preview.withFetchedInvite
+import chat.presentation.preview.updateMemberDeviceId
+import chat.presentation.preview.withMemberAddReceipt
 import chat.presentation.preview.withRegistration
 import chat.presentation.preview.withInviteReceipt
 import chat.presentation.preview.withMessagePreview
@@ -579,6 +581,35 @@ fun main() = application {
     }
 
     val groupHandlers = GroupHandlers(
+        updateMemberDeviceId = { value -> groupState = groupState.updateMemberDeviceId(value) },
+        addNodeMember = {
+            scope.launch {
+                val snapshot = groupState.snapshot ?: return@launch
+                val deviceId = groupState.memberDeviceId.trim()
+                if (deviceId.isBlank()) {
+                    groupState = groupState.withError("INVALID_INPUT", "先填对方设备 ID（dev:1:...）")
+                    return@launch
+                }
+                groupState = groupState.beginBusy()
+                runCatching {
+                    withGroup { service ->
+                        service.submitNodeMemberAdd(
+                            snapshot.groupId,
+                            deviceId,
+                            storeState.sendNodeUrl.trim(),
+                            storeState.sendNodeId.trim(),
+                            storeState.sendNodePublicKey.trim().ifEmpty { null },
+                        )
+                    }.getOrThrow()
+                }.onSuccess { groupState = groupState.withMemberAddReceipt(it) }
+                    .onFailure { error ->
+                        groupState = groupState.withError(
+                            (error as? LocalStoreException)?.code ?: "UNKNOWN_RESULT",
+                            error.message,
+                        )
+                    }
+            }
+        },
         registerOnNode = {
             scope.launch {
                 val snapshot = groupState.snapshot ?: return@launch

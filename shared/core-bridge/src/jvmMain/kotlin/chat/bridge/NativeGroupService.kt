@@ -102,6 +102,21 @@ class NativeGroupService(
         )
     }
 
+    override suspend fun submitNodeMemberAdd(
+        groupId: String,
+        deviceId: String,
+        endpointUrl: String,
+        nodeId: String,
+        nodePublicKeyHex: String?,
+    ): chat.api.NodeMemberAddReceipt = call {
+        val receipt = it.submitMemberAdd(groupId, deviceId, endpointUrl, nodeId, nodePublicKeyHex)
+        chat.api.NodeMemberAddReceipt(
+            submissionId = receipt.submissionId,
+            seq = receipt.seq.toLong(),
+            nodeId = receipt.nodeId,
+        )
+    }
+
     override suspend fun submitInvite(
         groupId: String,
         meta: chat.api.GroupInviteMeta,
