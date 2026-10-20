@@ -849,7 +849,7 @@ impl GroupFfi {
         node_id: String,
         node_public_key_hex: Option<String>,
     ) -> Result<GroupRegistrationFfi, FfiError> {
-        let core = self.lock()?;
+        let mut core = self.lock()?;
         let view = core
             .group_register_on_node(
                 &group_id,

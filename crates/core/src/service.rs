@@ -1519,14 +1519,14 @@ impl ConversationCore {
     }
     /// GROUPS-001b：把本地群登记到节点（建群后必须做一次，否则消息发不出去）。
     pub fn group_register_on_node(
-        &self,
+        &mut self,
         group_id: &str,
         endpoint_url: &str,
         node_id: &str,
         node_public_key_hex: Option<&str>,
     ) -> anyhow::Result<crate::group_node::GroupRegistrationView> {
-        let guard = self.store_guard()?;
-        let store = guard.as_ref().ok_or_else(closed)?;
+        let mut guard = self.store_guard()?;
+        let store = guard.as_mut().ok_or_else(closed)?;
         crate::group_node::group_register_on_node(
             store,
             group_id,

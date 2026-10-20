@@ -235,7 +235,7 @@ fn a_local_group_is_registered_on_the_node_and_repeats_idempotently() {
     // 注意：这里**不**预先注册设备——group_register_on_node 内部必须先自注册（NODE-001）。
 
     let first = group_register_on_node(
-        &store,
+        &mut store,
         &group_id,
         &node.endpoint_url(),
         NODE_ID,
@@ -247,7 +247,7 @@ fn a_local_group_is_registered_on_the_node_and_repeats_idempotently() {
 
     // 幂等：重复登记返回同一群、同一节点，且不报错。
     let second = group_register_on_node(
-        &store,
+        &mut store,
         &group_id,
         &node.endpoint_url(),
         NODE_ID,
@@ -256,6 +256,44 @@ fn a_local_group_is_registered_on_the_node_and_repeats_idempotently() {
     .expect("repeat registration is idempotent");
     assert_eq!(second.group_id, first.group_id);
     assert_eq!(second.node_id, first.node_id);
+
+    // SYNC：登记后拉取游标必须已初始化（以节点签名回执为可信起点），且重复登记不覆盖。
+    let state = chat_core::sync_worker::load_pull_state(&store, &group_id)
+        .expect("pull state")
+        .expect("the pull cursor is seeded by a successful registration");
+    assert_eq!(state.cursor_log_hash, chat_protocol::Digest::ZERO.to_hex());
+    let cursor_after_first = state.cursor_seq;
+    let epoch_after_first = state.mls_epoch;
+    // 单写者：先释放 store，再开新的连接做一次单轮拉取。
+    drop(store);
+    let mut store_for_pull = dir.open();
+    let again = chat_core::sync_worker::load_pull_state(&store_for_pull, &group_id)
+        .expect("pull state")
+        .expect("initialized");
+    assert_eq!(again.cursor_seq, cursor_after_first, "repeat registration must not move the cursor");
+    assert_eq!(again.mls_epoch, epoch_after_first);
+    // 登记后先往节点写一条条目（节点日志在 create_group 时是空的），再单轮拉取。
+    let client = node.client();
+    let head_before = block_on(client.get_head(&group_id)).expect("node head");
+    let candidate = chat_node_services::group::GroupCandidate {
+        protocol_major: 1,
+        protocol_minor: 0,
+        submission_id: chat_protocol::SubmissionId::from_bytes([0x91; 32]).encode(),
+        group_id: group_id.clone(),
+        author_device_id: device_id.clone(),
+        kind: "application".to_owned(),
+        expected_control_head: head_before.control_head.clone(),
+        policy_version: head_before.policy_version,
+        mls_epoch: head_before.mls_epoch,
+        encrypted_payload: chat_node_services::canonical::hex_encode(b"after registration"),
+        control_metadata: None,
+    };
+    block_on(client.append_entry(&candidate)).expect("entry accepted");
+    let outcome = chat_core::sync_worker::run_pull_once(&mut store_for_pull, &client, &group_id)
+        .expect("one-shot pull after registration");
+    assert!(outcome.applied >= 1, "the registration entry is pulled: {outcome:?}");
+    let head = block_on(client.get_head(&group_id)).expect("node head");
+    assert_eq!(outcome.cursor_after, head.seq, "the cursor settles on the node head");
 }
 
 #[test]
@@ -265,7 +303,7 @@ fn an_unreachable_node_is_node_unavailable_and_the_local_snapshot_is_untouched()
     let mut store = dir.open();
     let (group_id, _head) = local_group(&mut store);
     let before = group_snapshot(&store, &group_id).expect("snapshot");
-    let error = group_register_on_node(&store, &group_id, UNREACHABLE, NODE_ID, None)
+    let error = group_register_on_node(&mut store, &group_id, UNREACHABLE, NODE_ID, None)
         .expect_err("unreachable node");
     assert_eq!(error.code(), "NODE_UNAVAILABLE");
     let after = group_snapshot(&store, &group_id).expect("snapshot");
@@ -277,7 +315,6 @@ fn an_unknown_group_is_invalid_target() {
     let dir = FixtureDir::new();
     let (account_id, device_id) = enroll_identity(&dir.database_text());
     let mut store = dir.open();
-    // 先建一个真实群，再把最后一位十六进制翻掉：格式合法但库里不存在 → INVALID_TARGET。
     let (existing, _head) = local_group(&mut store);
     let mut unknown = existing.clone();
     let last = unknown.pop().expect("group id");
@@ -285,7 +322,7 @@ fn an_unknown_group_is_invalid_target() {
     let node = TestNode::start(&device_id);
     node.register_device(&account_id);
     let error = group_register_on_node(
-        &store,
+        &mut store,
         &unknown,
         &node.endpoint_url(),
         NODE_ID,
@@ -303,10 +340,10 @@ fn a_device_key_mismatch_is_rejected_and_the_local_state_is_untouched() {
     let (group_id, _head) = local_group(&mut store);
     let before = group_snapshot(&store, &group_id).expect("snapshot");
     let node = TestNode::start(&device_id);
-    // 节点上该账户的主管钥被**固定**为测试夹具的密钥（与 core 派生的不同）→ core 的自注册会被拒。
+    // 节点上该账户的主管钥被固定成夹具的密钥（与 core 派生的不同）→ 自注册被拒。
     node.register_device(&account_id);
     let error = group_register_on_node(
-        &store,
+        &mut store,
         &group_id,
         &node.endpoint_url(),
         NODE_ID,

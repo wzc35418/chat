@@ -625,7 +625,7 @@ pub struct GroupRegistrationView {
 /// - **幂等**：重复登记时节点答复“已存在”，此时回读节点 head 并返回它的真实 seq（不伪造）；
 /// - 非群主/无权限：节点的拒绝原样透出，**本地快照不变**。
 pub fn group_register_on_node(
-    store: &Store,
+    store: &mut Store,
     group_id: &str,
     endpoint_url: &str,
     node_id: &str,
@@ -683,15 +683,29 @@ pub fn group_register_on_node(
         Box::pin(async move { Ok(client.create_group(&creation).await) })
     })?;
     match outcome {
-        Ok(registration) => Ok(GroupRegistrationView {
-            group_id: registration.group_id,
-            // 登记回执里没有日志序号：序号来自节点 head（真实值），这里回读一次。
-            registered_seq: fetch_head(&client, group_id)?.seq,
-            node_id: registration.node_id,
-        }),
+        Ok(registration) => {
+            // SYNC：用**节点签名的登记回执**作为可信起点初始化拉取游标。
+            // 回执绑定 group/initial_control_head/policy_version/mls_epoch，并且已在上面的
+            // 节点回执校验里验过签名，因此它是可信锚点（不是“问节点要 head 就相信”）。
+            seed_pull_cursor(store, group_id, &registration)?;
+            Ok(GroupRegistrationView {
+                group_id: registration.group_id,
+                // 登记回执里没有日志序号：序号来自节点 head（真实值），这里回读一次。
+                registered_seq: fetch_head(&client, group_id)?.seq,
+                node_id: registration.node_id,
+            })
+        }
         // 重复登记：节点会说“已存在”；回读 head 拿真实序号（幂等，不伪造）。
         Err(error) if error.node_code() == Some("ALREADY_EXISTS") => {
             let head = fetch_head(&client, group_id)?;
+            // 游标若还没初始化，这里**不能**用节点自报的 head 当可信起点（那等于把信任根交给节点）。
+            // 只有携带节点签名的登记回执才是可信锚点，因此要求调用方走一次“可校验的登记”。
+            if chat_core_pull_state_missing(store, group_id) {
+                return Err(ControlReceiptError::new(
+                    ErrorCode::InvalidStateTransition.as_str(),
+                    "the pull cursor is not initialized and no signed registration receipt is available",
+                ));
+            }
             Ok(GroupRegistrationView {
                 group_id: head.group_id,
                 registered_seq: head.seq,
@@ -769,6 +783,46 @@ fn registration_request_for(
         credential,
         capability,
     })
+}
+
+/// 游标是否需要初始化（读不到状态视为需要；读失败按损坏处理）。
+fn chat_core_pull_state_missing(store: &Store, group_id: &str) -> bool {
+    matches!(crate::sync_worker::load_pull_state(store, group_id), Ok(None))
+}
+
+/// 用节点签名的登记回执初始化拉取游标（幂等：已有游标不覆盖、不推进）。
+fn seed_pull_cursor(
+    store: &mut Store,
+    group_id: &str,
+    registration: &chat_node_services::group::GroupRegistration,
+) -> ControlReceiptResult<()> {
+    match crate::sync_worker::load_pull_state(store, group_id) {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(error) => return Err(ControlReceiptError::new(error.code().as_str(), error.to_string())),
+    }
+    let group = GroupId::parse(group_id).map_err(|_| {
+        ControlReceiptError::new(
+            ErrorCode::InvalidId.as_str(),
+            "group id must be PROTOCOL-001 group text",
+        )
+    })?;
+    let control_head = chat_protocol::ControlHead::from_bytes(
+        hex_decode::<32>("initial control head", &registration.initial_control_head).map_err(|_| {
+            ControlReceiptError::new(
+                ErrorCode::StateCorrupted.as_str(),
+                "the registration receipt carries a malformed control head",
+            )
+        })?,
+    );
+    let head = chat_protocol::VerifiedHead::genesis(
+        group,
+        control_head,
+        registration.policy_version,
+        registration.mls_epoch,
+    );
+    crate::sync_worker::initialize_pull_state(store, group_id, head)
+        .map_err(|error| ControlReceiptError::new(error.code().as_str(), error.to_string()))
 }
 
 // ---------------------------------------------------------------- GROUPS-019 邀请投递

@@ -1076,3 +1076,41 @@ reason 固定为 “a sync loop is running; stop it before a one-shot pull”。
 2. 应用失败（需要追赶）返回**成功 + `settled=false`**而不是错误码：这是 core 既有语义（避免把“暂时追不上”当成故障）；若上层需要显式码，应在 `sync_once` 里把 `resync_required` 映射成新的稳定码（需协议/FFI 双方确认）；
 3. 一次性拉取只处理**一页**；多页需要循环调用（何时停由 `settled`/`next_cursor` 决定）。
 
+## SYNC 游标播种：登记成功后用**节点签名回执**初始化（2026-10-20）
+
+实测缺口：`syncOnce` 报 `INVALID_STATE_TRANSITION: pull cursor is not initialized for this group`——
+因为建群/登记路径从来不初始化拉取游标。
+
+### 修正
+
+`group_register_on_node` 在**登记成功**之后，用**节点签名的登记回执**（`GroupRegistration`）作为可信起点，
+调用 `chat_core::sync_worker::initialize_pull_state`：
+
+    VerifiedHead::genesis(
+        group_id,
+        ControlHead::from_bytes(回执的 initial_control_head),
+        回执的 policy_version,
+        回执的 mls_epoch,
+    )
+
+- 回执签名**已在校验路径里验证**，因此它是可信锚点；**绝不**用“问节点要 head 就相信”的方式起点（代码注释明确禁止）；
+- **幂等**：已有游标时直接返回，不覆盖、不推进（重复登记不影响游标）；
+- 若节点返回 `ALREADY_EXISTS` 而本地游标仍未初始化（没有可校验的回执可用）→ 显式 `INVALID_STATE_TRANSITION`，
+  reason: “the pull cursor is not initialized and no signed registration receipt is available”，**不退化成信任节点自报 head**。
+
+### 需要的回执字段（回答“如果拿不到已验证 head”）
+
+`GroupRegistration` 里已提供三个必需字段：`initial_control_head`（控制头）、`policy_version`、`mls_epoch`，
+外加 `group_id` 与节点签名。**不需要新增协议/回执字段**。
+
+### 证据（`crates/core/tests/groups_node_register.rs`，4 例全部通过）
+
+- 登记成功：`load_pull_state` 非空、`cursor_log_hash = 全零`、`mls_epoch` 与回执一致；
+- 重复登记：游标**不覆盖、不推进**；
+- 登记后可立即单轮拉取：先往节点写一条条目 → `run_pull_once` 的 `applied >= 1`，且 `cursor_after == 节点 head.seq`；
+- 其余 3 例（不可达 / 未知群 / 凭据不匹配）继续覆盖失败语义与“快照不变”。
+
+### 验收
+
+- `cargo test --offline -p chat-core -p chat-ffi` → **EXIT=0，373 passed，0 警告**（既有 254/115 继续通过 + 本轮新增）。
+
