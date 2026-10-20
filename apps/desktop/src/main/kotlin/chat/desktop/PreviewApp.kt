@@ -146,6 +146,8 @@ fun main() = application {
     var keySlotSummary by remember { mutableStateOf("密钥槽未初始化") }
     var keySlotBackend by remember { mutableStateOf(KeySlotBackend.None) }
     var keySlotDetail by remember { mutableStateOf("") }
+    var keySlotMigrationPending by remember { mutableStateOf(false) }
+    var keySlotMigrationBusy by remember { mutableStateOf(false) }
     var groupState by remember { mutableStateOf(PreviewGroupState()) }
     val store = remember { runCatching { createLocalStore() }.getOrNull() }
     val storeDirectory = remember { runCatching { Files.createTempDirectory("chat-preview-store-").toFile() }.getOrNull() }
@@ -1405,8 +1407,48 @@ PreviewChatScreen(
             uiScale = uiPrefs.scale,
             showPluginEntry = uiPrefs.showPlugins,
             showAboutEntry = uiPrefs.showAbout,
+            keySlotBackend = keySlotBackend.label,
+            keySlotDetail = keySlotDetail,
+            keySlotSummary = keySlotSummary,
+            keySlotMigrationPending = keySlotMigrationPending,
+            keySlotMigrationAvailable = keySlotBackend != KeySlotBackend.CredentialManager &&
+                System.getProperty("os.name", "").lowercase().contains("windows"),
             aboutState = aboutState,
             aboutHandlers = AboutHandlers(
+                requestKeySlotMigration = { keySlotMigrationPending = true },
+                cancelKeySlotMigration = { keySlotMigrationPending = false },
+                confirmKeySlotMigration = {
+                    scope.launch {
+                        val dir = identityDir
+                        if (dir == null) {
+                            aboutState = aboutState.withAboutError("KEY_SLOT_UNAVAILABLE", "身份目录不可用")
+                            return@launch
+                        }
+                        if (keySlotMigrationBusy) return@launch
+                        keySlotMigrationBusy = true
+                        val slotDirectory = File(dir, "keyslot").apply { mkdirs() }
+                        val selector = KeySlotSelector.default(slotDirectory)
+                        runCatching {
+                            selector.migrate("storage-main", DpapiKeySlot(slotDirectory), WinCredKeySlot())
+                        }.onSuccess { message ->
+                            val selection = selector.probe("storage-main")
+                            keySlotBackend = selection.backend
+                            keySlotDetail = selection.detail
+                            keySlotSummary = selection.backend.label + "：" + message
+                            aboutState = aboutState.copy(
+                                notice = "密钥槽已迁移： " + message + "（重启后生效）",
+                                lastErrorCode = null,
+                            )
+                        }.onFailure { error ->
+                            aboutState = aboutState.withAboutError(
+                                (error as? chat.platform.KeyProtectionException)?.code ?: "KEY_SLOT_MIGRATION_FAILED",
+                                error.message,
+                            )
+                        }
+                        keySlotMigrationBusy = false
+                        keySlotMigrationPending = false
+                    }
+                },
                 setScale = { factor ->
                     val next = uiPrefs.copy(scale = factor)
                     runCatching { uiPrefsStore.save(next) }

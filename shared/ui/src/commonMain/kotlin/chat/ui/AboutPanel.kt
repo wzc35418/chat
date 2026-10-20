@@ -26,6 +26,12 @@ data class AboutHandlers(
     val refresh: () -> Unit = {},
     /** 界面缩放（0.9 / 1.0 / 1.15 / 1.3）。 */
     val setScale: (Float) -> Unit = {},
+    /** 请求迁移密钥槽（第一步：显示确认）。 */
+    val requestKeySlotMigration: () -> Unit = {},
+    /** 确认迁移。 */
+    val confirmKeySlotMigration: () -> Unit = {},
+    /** 取消迁移。 */
+    val cancelKeySlotMigration: () -> Unit = {},
 ) {
     companion object {
         val None = AboutHandlers()
@@ -43,6 +49,16 @@ fun AboutPanel(
     state: PreviewAboutState,
     handlers: AboutHandlers = AboutHandlers.None,
     modifier: Modifier = Modifier,
+    /** 当前密钥槽后端（人类可读）。 */
+    keySlotBackend: String = "",
+    /** 探测依据（为什么选了这个后端）。 */
+    keySlotDetail: String = "",
+    /** 密钥槽保护说明。 */
+    keySlotSummary: String = "",
+    /** 是否正在等待"确认迁移"。 */
+    keySlotMigrationPending: Boolean = false,
+    /** 迁移目标后端是否可用（不可用时按钮禁用并说明）。 */
+    keySlotMigrationAvailable: Boolean = true,
 ) {
     Column(
         modifier = modifier
@@ -68,6 +84,42 @@ fun AboutPanel(
             LabeledRow("FFI 契约版本", info.ffiVersion)
             LabeledRow("平台", info.platform)
         } ?: Text("还没有读取版本信息。", style = MaterialTheme.typography.bodySmall)
+        HorizontalDivider(color = Color(0xFFE1E6E1))
+        Text("密钥槽（主密钥保护）", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+        LabeledRow("当前后端", keySlotBackend.ifBlank { "（未探测）" })
+        if (keySlotDetail.isNotBlank()) LabeledRow("探测依据", keySlotDetail)
+        if (keySlotSummary.isNotBlank()) {
+            Text(keySlotSummary, style = MaterialTheme.typography.labelSmall, color = Color(0xFF5F6B63))
+        }
+        if (keySlotMigrationPending) {
+            Text(
+                "确认迁移到 Windows 凭据管理器？迁移后旧 DPAPI 文件会被删除；换 Windows 用户或换机器将无法解包。",
+                style = MaterialTheme.typography.labelSmall,
+                color = Color(0xFFB3261E),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                TextButton(
+                    onClick = handlers.confirmKeySlotMigration,
+                    modifier = Modifier.semantics { contentDescription = "确认迁移密钥槽" },
+                ) { Text("确认迁移", style = MaterialTheme.typography.labelMedium) }
+                TextButton(
+                    onClick = handlers.cancelKeySlotMigration,
+                    modifier = Modifier.semantics { contentDescription = "取消迁移密钥槽" },
+                ) { Text("取消", style = MaterialTheme.typography.labelMedium) }
+            }
+        } else {
+            TextButton(
+                onClick = handlers.requestKeySlotMigration,
+                enabled = keySlotMigrationAvailable,
+                modifier = Modifier.semantics { contentDescription = "迁移密钥槽到凭据管理器" },
+            ) {
+                Text(
+                    if (keySlotMigrationAvailable) "迁移到凭据管理器" else "（已是凭据管理器或不可用）",
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
+        }
+
         HorizontalDivider(color = Color(0xFFE1E6E1))
         Text("界面缩放", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {

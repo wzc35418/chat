@@ -136,6 +136,11 @@ fun PreviewChatScreen(
     pluginState: chat.presentation.preview.PreviewPluginState = chat.presentation.preview.PreviewPluginState.Empty,
     pluginHandlers: PluginHandlers = PluginHandlers.None,
     initialPluginOpen: Boolean = false,
+    keySlotBackend: String = "",
+    keySlotDetail: String = "",
+    keySlotSummary: String = "",
+    keySlotMigrationPending: Boolean = false,
+    keySlotMigrationAvailable: Boolean = true,
     aboutState: chat.presentation.preview.PreviewAboutState = chat.presentation.preview.PreviewAboutState(),
     aboutHandlers: AboutHandlers = AboutHandlers.None,
     initialAboutOpen: Boolean = false,
@@ -326,6 +331,11 @@ fun PreviewChatScreen(
                         state = aboutState,
                         handlers = aboutHandlers,
                         modifier = Modifier.padding(16.dp),
+                        keySlotBackend = keySlotBackend,
+                        keySlotDetail = keySlotDetail,
+                        keySlotSummary = keySlotSummary,
+                        keySlotMigrationPending = keySlotMigrationPending,
+                        keySlotMigrationAvailable = keySlotMigrationAvailable,
                     )
                 }
             }
