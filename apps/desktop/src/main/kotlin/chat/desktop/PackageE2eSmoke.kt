@@ -46,6 +46,9 @@ fun main(args: Array<String>): Unit = runBlocking {
         val snapshot = groups.createGroup("pkg-e2e-group")
         println("PASS group created: " + snapshot.groupId + " epoch=" + snapshot.epoch)
         val groupKey = snapshot.mlsGroupKey
+        // 关键一步：本地建群必须在节点登记，否则节点会 rejected（R-182 的缺口）。
+        val registered = groups.registerOnNode(snapshot.groupId, endpoint, nodeId, nodeKey)
+        println("PASS group registered on node: " + registered.groupId + " seq=" + registered.registeredSeq)
         groups.shutdown()
 
         store.open(dbPath, "0".repeat(64))

@@ -556,6 +556,17 @@ pub struct InviteReceiptFfi {
 }
 
 /// 建群结果：快照 + **原始 Welcome 字节** + 与之逐字段一致的邀请元数据。
+/// 群在节点登记成功的公开回执（只含公开字段，无密钥）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupRegistrationFfi {
+    /// 协议群 ID。
+    pub group_id: String,
+    /// 节点日志里登记条的序号。
+    pub registered_seq: u64,
+    /// 节点身份。
+    pub node_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct CreatedGroupFfi {
     /// 群快照（与 `group_snapshot` 同形）。
@@ -825,6 +836,32 @@ impl GroupFfi {
             view: group_view(view),
             welcome_bytes,
             invite,
+        })
+    }
+
+    /// GROUPS-001b：把本地群登记到节点（纯数据 + 公开回执，**不传任何密钥**）。
+    ///
+    /// 建群后必须调用一次：否则节点不知道这个群，后续条目会被拒绝。
+    pub fn group_register_on_node(
+        &self,
+        group_id: String,
+        endpoint_url: String,
+        node_id: String,
+        node_public_key_hex: Option<String>,
+    ) -> Result<GroupRegistrationFfi, FfiError> {
+        let core = self.lock()?;
+        let view = core
+            .group_register_on_node(
+                &group_id,
+                &endpoint_url,
+                &node_id,
+                node_public_key_hex.as_deref(),
+            )
+            .map_err(|error| failure!(error))?;
+        Ok(GroupRegistrationFfi {
+            group_id: view.group_id,
+            registered_seq: view.registered_seq,
+            node_id: view.node_id,
         })
     }
 

@@ -57,6 +57,18 @@ interface GroupService {
         localCredential: String,
     ): CreatedGroup
 
+    /**
+     * 在节点登记本群（把本机设备登记为 owner）。**建群后必须调用**，否则提交会被节点拒绝。
+     *
+     * 幂等：重复登记返回同一群的登记结果；不可达 → `NODE_UNAVAILABLE`；非群主被拒原样透出。
+     */
+    suspend fun registerOnNode(
+        groupId: String,
+        endpointUrl: String,
+        nodeId: String,
+        nodePublicKeyHex: String?,
+    ): GroupRegistration
+
     /** 把邀请（元数据 + Welcome）提交到节点；回执真实、幂等可重投。 */
     suspend fun submitInvite(
         groupId: String,
@@ -151,4 +163,11 @@ data class CreatedGroup(
     val snapshot: GroupSnapshot,
     val welcomeBytes: ByteArray,
     val invite: GroupInviteMeta,
+)
+
+/** 节点登记回执（纯数据）。 */
+data class GroupRegistration(
+    val groupId: String,
+    val registeredSeq: Long,
+    val nodeId: String,
 )

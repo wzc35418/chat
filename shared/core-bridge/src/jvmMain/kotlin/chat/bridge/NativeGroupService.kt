@@ -88,6 +88,20 @@ class NativeGroupService(
         )
     }
 
+    override suspend fun registerOnNode(
+        groupId: String,
+        endpointUrl: String,
+        nodeId: String,
+        nodePublicKeyHex: String?,
+    ): chat.api.GroupRegistration = call {
+        val view = it.groupRegisterOnNode(groupId, endpointUrl, nodeId, nodePublicKeyHex)
+        chat.api.GroupRegistration(
+            groupId = view.groupId,
+            registeredSeq = view.registeredSeq.toLong(),
+            nodeId = view.nodeId,
+        )
+    }
+
     override suspend fun submitInvite(
         groupId: String,
         meta: chat.api.GroupInviteMeta,

@@ -1105,6 +1105,12 @@ AccountView { account_id, device_id, display_name, fingerprint }
 - 种子不进日志、不进返回值（返回脱敏 `AccountView`）；
 - 测试：[crates/ffi/tests/identity_enroll.rs](../../crates/ffi/tests/identity_enroll.rs)（5 个，真库）。
 
+## GROUPS-001b · FFI 群登记（2026-10-20）
 
+新增 `GroupFfi::group_register_on_node(group_id, endpoint_url, node_id, node_public_key_hex) -> GroupRegistrationFfi`
+（`GroupRegistrationFfi { group_id, registered_seq, node_id }`，纯公开数据、**不传任何密钥**）。
 
+- 建群后必须调用一次，否则节点不认识该群、后续条目会被拒；
+- 幂等：重复调用返回节点给出的同一结果（已登记时回读 head 取真实序号）；
+- 错误：未登记身份 `INVALID_STATE_TRANSITION`、群不存在 `INVALID_TARGET`、不可达 `NODE_UNAVAILABLE`、节点拒绝原样透出。
 

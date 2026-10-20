@@ -570,6 +570,22 @@ mod tests {
         .expect("invite")
     }
 
+    /// 把 body 的第 offset 个字节改成**与原来一定不同**的值（原来等于 value 时用 value+1 取反）。
+    ///
+    /// 修复：原先直接写入固定值 0x5a，若该字节本来就是 0x5a 则"篡改"其实没改，
+    /// 签名仍然有效 → 测试随机失败（真实存在过的 flaky）。
+    fn flip_body_byte(token: &InviteToken, offset: usize, value: u8) -> String {
+        let text = token.as_str();
+        let mut parts = text.split('.');
+        let prefix = parts.next().expect("prefix");
+        let body_hex = parts.next().expect("body");
+        let signature = parts.next().expect("signature");
+        let mut body = hex_decode(body_hex).expect("body hex");
+        let original = body[offset];
+        body[offset] = if original == value { value.wrapping_add(1) } else { value };
+        format!("{}.{}.{}", prefix, hex_encode(&body), signature)
+    }
+
     fn replace_body_byte(token: &InviteToken, offset: usize, value: u8) -> String {
         let text = token.as_str();
         let mut parts = text.split('.');
@@ -697,7 +713,7 @@ mod tests {
         let token = token();
         // 篡改 nonce（签名覆盖），应为验签失败。
         let nonce_offset = BODY_BYTES - INVITE_NONCE_BYTES;
-        let tampered_nonce = replace_body_byte(&token, nonce_offset, 0x5a);
+        let tampered_nonce = flip_body_byte(&token, nonce_offset, 0x5a);
         assert_eq!(
             verify_invite(&tampered_nonce, &InviteExpectations::at(ISSUED_AT)).unwrap_err(),
             IdentityError::InvalidSignature

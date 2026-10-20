@@ -603,6 +603,174 @@ pub fn submit_proposal_entry(
     })
 }
 
+// ---------------------------------------------------------------- 建群后在节点登记（GROUPS-001b）
+
+/// 群在节点登记成功后的公开投影。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupRegistrationView {
+    /// 协议群 ID。
+    pub group_id: String,
+    /// 节点日志里登记条的序号（节点真实返回，不本地伪造）。
+    pub registered_seq: u64,
+    /// 节点身份（节点真实返回）。
+    pub node_id: String,
+}
+
+/// GROUPS-001b：把**本地已建好的群**登记到节点（建群后必须做一次，否则消息永远发不出去）。
+///
+/// 语义：
+/// - 群信息（群主账户、成员、控制头、epoch、策略版本）全部取自**本地正式快照**；
+/// - 节点客户端用**持久身份**的设备种子构造（未入库身份 → `INVALID_STATE_TRANSITION`）；
+/// - 群不存在/端点不可解析 → `INVALID_TARGET`；不可达 → `NODE_UNAVAILABLE`；
+/// - **幂等**：重复登记时节点答复“已存在”，此时回读节点 head 并返回它的真实 seq（不伪造）；
+/// - 非群主/无权限：节点的拒绝原样透出，**本地快照不变**。
+pub fn group_register_on_node(
+    store: &Store,
+    group_id: &str,
+    endpoint_url: &str,
+    node_id: &str,
+    node_public_key_hex: Option<&str>,
+) -> ControlReceiptResult<GroupRegistrationView> {
+    let view = groups::group_snapshot(store, group_id)?;
+    let seeds = store
+        .load_identity_seeds()
+        .map_err(|_| {
+            ControlReceiptError::new(
+                ErrorCode::StorageFailure.as_str(),
+                "the persisted identity could not be read",
+            )
+        })?
+        .ok_or_else(|| {
+            ControlReceiptError::new(
+                ErrorCode::InvalidStateTransition.as_str(),
+                "the local identity is not enrolled in this database",
+            )
+        })?;
+    let client = build_node_client(store, endpoint_url, node_id, node_public_key_hex)?;
+    // NODE-001：节点要求设备**先注册**才允许建群。这里用同一客户端做一次幂等自注册。
+    let registration = registration_request_for(
+        &seeds.account_id,
+        &seeds.device_id,
+        seeds.device_seed.as_slice(),
+        seeds.account_seed.as_slice(),
+        seeds.created_at_ms,
+    )?;
+    let registered = block_on_node(&client, |client| {
+        Box::pin(async move { Ok(client.register_device(&registration).await) })
+    })?;
+    match registered {
+        Ok(_) => {}
+        // 已注册：按幂等成功处理（以节点真实答复为准）。
+        Err(error) if error.node_code() == Some("ALREADY_EXISTS") => {}
+        // 真正的拒绝（凭据/公钥不匹配等）原样透出，不继续建群。
+        Err(error) => return Err(ControlReceiptError::from(error)),
+    }
+    // 节点侧成员表用的是**设备 ID**，而群快照里存的是**凭据**；两者不是同一命名空间。
+    // 因此登记时只登记本机设备为 owner（其余成员通过后续成员变更提交逐步进入节点成员表）。
+    let members = vec![chat_node_services::group::GroupMemberSpec {
+        device_id: seeds.device_id.clone(),
+        role: "owner".to_owned(),
+    }];
+    let creation = chat_node_services::group::GroupCreation {
+        group_id: view.group_id.clone(),
+        owner_account_id: seeds.account_id.clone(),
+        initial_control_head: view.control_head.clone(),
+        policy_version: view.policy_version,
+        mls_epoch: view.epoch,
+        members,
+    };
+    let outcome = block_on_node(&client, |client| {
+        Box::pin(async move { Ok(client.create_group(&creation).await) })
+    })?;
+    match outcome {
+        Ok(registration) => Ok(GroupRegistrationView {
+            group_id: registration.group_id,
+            // 登记回执里没有日志序号：序号来自节点 head（真实值），这里回读一次。
+            registered_seq: fetch_head(&client, group_id)?.seq,
+            node_id: registration.node_id,
+        }),
+        // 重复登记：节点会说“已存在”；回读 head 拿真实序号（幂等，不伪造）。
+        Err(error) if error.node_code() == Some("ALREADY_EXISTS") => {
+            let head = fetch_head(&client, group_id)?;
+            Ok(GroupRegistrationView {
+                group_id: head.group_id,
+                registered_seq: head.seq,
+                node_id: head.node_id,
+            })
+        }
+        Err(error) => Err(ControlReceiptError::from(error)),
+    }
+}
+
+/// 设备自注册所需的凭据与能力令牌（NODE-001）。
+///
+/// 监督者密钥**由账户根种子确定性派生**（生产里监督者是账户授权方；P0 用账户根种子派生，
+/// 保证同一账户重启后仍然是同一个监督者）。时间戳用系统时钟（节点按自己的时钟校验）。
+fn registration_request_for(
+    account_id_in: &str,
+    device_id_in: &str,
+    device_seed_bytes: &[u8],
+    account_seed_bytes: &[u8],
+    created_at_ms: i64,
+) -> ControlReceiptResult<chat_node_services::registration::RegisterDeviceRequest> {
+    use chat_node_services::registration::{
+        DeviceCredential, REGISTRATION_CAPABILITY_PURPOSE, RegisterDeviceRequest,
+        RegistrationCapability,
+    };
+    let invalid = |detail: &'static str| ControlReceiptError::new(ErrorCode::StateCorrupted.as_str(), detail);
+    let device_seed: [u8; 32] = device_seed_bytes
+        .try_into()
+        .map_err(|_| invalid("the persisted device seed is not 32 bytes"))?;
+    let account_seed: [u8; 32] = account_seed_bytes
+        .try_into()
+        .map_err(|_| invalid("the persisted account seed is not 32 bytes"))?;
+    // 监督者：账户根种子的确定性派生（域分隔，避免与其它用途共用同一密钥）。
+    let supervisor_seed = sha256_concat(&[b"chat/core/registration-supervisor/v1", &account_seed]);
+    let supervisor = chat_protocol::signing_key_from_seed(&supervisor_seed);
+    let supervisor_public_key = hex_encode(&supervisor.verifying_key().to_bytes());
+    let device_key = chat_protocol::signing_key_from_seed(&device_seed);
+    // 时间戳必须**稳定**：节点按凭据摘要判幂等，若每次用当前时间，第二次注册会被判“凭据不同”并拒绝。
+    // 因此以身份创建时间作为签发时刻（同一身份永远得到同一份凭据字节）。
+    let issued_at = u64::try_from(created_at_ms / 1_000).unwrap_or(0);
+    let account_id = account_id_in.to_owned();
+    let device_id = device_id_in.to_owned();
+    let mut credential = DeviceCredential {
+        account_id: account_id.clone(),
+        device_id: device_id.clone(),
+        device_public_key: hex_encode(&device_key.verifying_key().to_bytes()),
+        endpoint_id: format!("endpoint-{device_id}"),
+        credential_version: 1,
+        not_before: issued_at,
+        expires_at: issued_at + chat_node_services::limits::MAX_CREDENTIAL_LIFETIME_SECONDS,
+        supervisor_public_key: supervisor_public_key.clone(),
+        signature: String::new(),
+    };
+    let signing_bytes = credential
+        .signing_bytes()
+        .map_err(|_| invalid("the device credential could not be serialized"))?;
+    credential.signature = hex_encode(&chat_protocol::sign_bytes(&supervisor, &signing_bytes));
+    let mut capability = RegistrationCapability {
+        capability_id: format!("reg-{device_id}"),
+        account_id,
+        device_id,
+        purpose: REGISTRATION_CAPABILITY_PURPOSE.into(),
+        issued_at,
+        expires_at: issued_at + chat_node_services::limits::MAX_CAPABILITY_LIFETIME_SECONDS,
+        revocation_version: 1,
+        supervisor_public_key,
+        signature: String::new(),
+    };
+    let signing_bytes = capability
+        .signing_bytes()
+        .map_err(|_| invalid("the registration capability could not be serialized"))?;
+    capability.signature = hex_encode(&chat_protocol::sign_bytes(&supervisor, &signing_bytes));
+    Ok(RegisterDeviceRequest {
+        account_id: account_id_in.to_owned(),
+        credential,
+        capability,
+    })
+}
+
 // ---------------------------------------------------------------- GROUPS-019 邀请投递
 
 /// 邀请条目的提交标识派生域（同群同 blob 永远同一 SubmissionId → 节点侧天然幂等）。

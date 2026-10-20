@@ -1716,3 +1716,68 @@ GroupFfi.group_create_with_welcome(name, bootstrap_credential, local_credential)
 2. 被邀请者凭据由调用方给出，绑定校验只保证 KeyPackage 的 leaf 凭据与之一致（账户级授权仍属身份层）；
 3. FFI 侧 Welcome 上限 64 KiB（与邀请 blob 一致）。
 
+## GROUPS-001b · 建群后在节点登记（2026-10-20）
+
+**真实缺口**：本地建群从来不在节点登记，节点不认识这个群，消息提交一律被拒（打包冒烟证实）。
+
+### 接口
+
+    core:    group_register_on_node(store, group_id, endpoint_url, node_id, node_public_key_hex) -> GroupRegistrationView{group_id, registered_seq, node_id}
+    service: ConversationCore::group_register_on_node(...)
+    ffi:     GroupFfi::group_register_on_node(group_id, endpoint_url, node_id, node_public_key_hex) -> GroupRegistrationFfi
+
+语义：
+
+1. 群信息取自**本地正式快照**（群 ID / 控制头 / 策略版本 / epoch），节点客户端用**持久身份**的设备种子构造（未入库身份 → `INVALID_STATE_TRANSITION`）；
+2. **节点成员表用设备 ID，群快照成员存的是凭据**——两者不是同一命名空间，因此登记时只登记本机设备为 `owner`；其它成员通过后续成员变更提交逐步进入节点成员表；
+3. **幂等**：重复登记时节点答复“已存在”，此时回读节点 head 取真实序号返回（不伪造）；
+4. 群不存在/端点不可解析 → `INVALID_TARGET`；不可达 → `NODE_UNAVAILABLE`；节点拒绝（未注册设备/非群主）原样透出，**本地快照不变**。
+
+### 证据（`crates/core/tests/groups_node_register.rs`，4 例，真节点 + 真库 + 真 MLS）
+
+- `a_local_group_is_registered_on_the_node_and_repeats_idempotently`：登记成功（返回 group_id/node_id），重复登记幂等返回同一结果；
+- `an_unreachable_node_is_node_unavailable_and_the_local_snapshot_is_untouched`：`NODE_UNAVAILABLE` 且快照逐字段不变；
+- `an_unknown_group_is_invalid_target`：格式合法但不存在的群 → `INVALID_TARGET`；
+- `a_non_owner_registration_is_rejected_by_the_node`：换成不认识该设备的节点 → 鉴权拒绝透出，快照不变。
+
+### 验收
+
+- `cargo test --offline -p chat-core -p chat-ffi` → **EXIT=0，368 passed，0 警告**（既有 254/110 继续通过 + 本轮 4 例）。
+
+### 已知限制
+
+1. 登记只登记本机设备为 owner（凭据 ≠ 设备 ID）；远端成员要等成员变更提交后才会出现在节点成员表；
+2. `registered_seq` 取自节点 head（登记回执本身不带序号）；
+3. 没有自动触发点：建群后需要调用方显式调用（FFI 已暴露）。
+
+## GROUPS-001b 补充 · 自注册 → 建群（2026-10-20）
+
+打包冒烟实测暴露：`group_register_on_node` 直接调 `create_group` 会被节点以 `INVALID_CREDENTIAL` 拒绝——
+因为 **NODE-001 要求设备先注册**才允许建群。
+
+### 修正后的流程
+
+1. 用持久身份（账户种子/设备种子/设备 ID）构造 `RegisterDeviceRequest`：
+   - 设备凭据与注册能力都由**账户根种子确定性派生**的监督者密钥签名（域分隔 `chat/core/registration-supervisor/v1`）；
+   - **时间戳稳定**：签发时刻取身份创建时间（`created_at_ms`），凭据有效期取 `MAX_CREDENTIAL_LIFETIME_SECONDS`、能力取 `MAX_CAPABILITY_LIFETIME_SECONDS`。
+     这样同一身份每次得到**逐字节相同**的凭据 → 节点按摘要判幂等；用“当前时间”会导致第二次注册被判“凭据不同”而拒绝。
+2. 同一 `NodeClient` 先 `register_device`（已注册/`ALREADY_EXISTS` 视为幂等成功；其它拒绝原样透出，**不继续建群**）；
+3. 再 `create_group`；重复登记仍走 `ALREADY_EXISTS` → 回读 head 取真实序号。
+
+### 证据（`crates/core/tests/groups_node_register.rs`，4 例）
+
+- `a_local_group_is_registered_on_the_node_and_repeats_idempotently`：**全新节点、未预先注册设备** → 一次调用即成功（证明内部先注册），重复调用幂等；
+- `a_device_key_mismatch_is_rejected_and_the_local_state_is_untouched`：节点上该账户的主管钥已被固定成另一把 → `INVALID_CREDENTIAL`，本地快照不变；
+- `an_unreachable_node_is_node_unavailable_and_the_local_snapshot_is_untouched`：`NODE_UNAVAILABLE` 且快照不变；
+- `an_unknown_group_is_invalid_target`：`INVALID_TARGET`。
+
+### 验收
+
+- `cargo test --offline -p chat-core -p chat-ffi` → **EXIT=0，368 passed，0 警告**（既有 368 继续通过）。
+
+### 新的已知限制
+
+1. 监督者密钥由账户根种子派生（P0 取舍）；节点按账户**固定**首把主管钥，因此同一账户换种子后再注册会被拒；
+2. 凭据有效期从身份创建时间起算（最长 366 天）；身份很旧时可能需要重新签发（后续任务）；
+3. 设备注册与建群之间没有原子性：注册成功但建群失败时，设备仍留在节点（可重试，无副作用）。
+
