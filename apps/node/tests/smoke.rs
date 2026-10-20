@@ -61,6 +61,7 @@ fn in_process_node_serves_health_and_shuts_down_cleanly() {
         expect_public_key: None,
         require_capability: false,
         audit: true,
+        tls: None,
     };
     let running = spawn_node(config).expect("node starts");
     let address = running.address.to_string();
@@ -252,6 +253,7 @@ fn capability_required_mode_serves_401_without_token_and_200_with_one() {
         expect_public_key: None,
         require_capability: true,
         audit: true,
+        tls: None,
     };
     let running = spawn_node(config).expect("node starts with capability enforcement");
     assert!(running.require_capability, "the handle reports the effective mode");

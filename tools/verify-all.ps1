@@ -23,6 +23,7 @@
 param(
     [switch]$SkipTwoDevice,
     [switch]$SkipLan,
+    [switch]$SkipTls,
     [switch]$SkipAndroid,
     [switch]$SkipGradle,
     [string]$TargetDir = ""
@@ -251,6 +252,33 @@ if ($SkipLan) {
             Add-Stage -Name "lan" -Status "SKIP" -Seconds $seconds -Detail "no non-loopback IPv4" -Log $log
         } else {
             Add-Stage -Name "lan" -Status "FAIL" -Seconds $seconds -Detail ("exit " + $code + "; " + (Get-LogTail -Path $log)) -Log $log
+        }
+    }
+}
+
+# ---------------------------------------------------------------- stage 9: node-side TLS
+if ($SkipTls) {
+    Add-SkippedStage -Name "tls" -Reason "-SkipTls"
+} else {
+    Write-Host ""
+    Write-Host "== tls =="
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $log = Join-Path $logDir "tls.log"
+    $script = Join-Path $root "tools/verify-tls.ps1"
+    if (-not (Test-Path $script)) {
+        $sw.Stop()
+        Add-Stage -Name "tls" -Status "FAIL" -Seconds ([math]::Round($sw.Elapsed.TotalSeconds, 1)) -Detail "tools/verify-tls.ps1 is missing" -Log ""
+    } else {
+        cmd /c ("powershell -NoProfile -ExecutionPolicy Bypass -File `"" + $script + "`" > `"" + $log + "`" 2>&1") | Out-Null
+        $code = $LASTEXITCODE
+        $sw.Stop()
+        $seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+        if ($code -eq 0) {
+            Add-Stage -Name "tls" -Status "PASS" -Seconds $seconds -Detail "https health 200; plaintext refused; untrusted refused" -Log $log
+        } elseif ($code -eq 3) {
+            Add-Stage -Name "tls" -Status "SKIP" -Seconds $seconds -Detail "openssl not installed" -Log $log
+        } else {
+            Add-Stage -Name "tls" -Status "FAIL" -Seconds $seconds -Detail ("exit " + $code + "; " + (Get-LogTail -Path $log)) -Log $log
         }
     }
 }

@@ -77,6 +77,17 @@ pub struct NodeConfig {
     pub require_capability: bool,
     /// NODE-018：是否记录审计（默认开；`--no-audit` / `CHAT_NODE_AUDIT=0` 关闭）。
     pub audit: bool,
+    /// 可选 TLS：给出证书与私钥即用 https 监听（否则明文 HTTP）。
+    pub tls: Option<TlsConfig>,
+}
+
+/// 节点 TLS 监听配置（PEM 文件路径）。 */
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TlsConfig {
+    /// 证书链（PEM，可含多张）。
+    pub cert_file: PathBuf,
+    /// 私钥（PEM，PKCS#8 或 RSA）。
+    pub key_file: PathBuf,
 }
 
 const DEFAULT_BIND: &'static str = "127.0.0.1:8080";
@@ -91,6 +102,8 @@ const ENV_EXPECT_PUBLIC_KEY: &'static str = "CHAT_NODE_EXPECT_PUBLIC_KEY";
 const ENV_REQUIRE_CAPABILITY: &'static str = "CHAT_NODE_CAPABILITY_REQUIRED";
 const ENV_CAPABILITY_MAX_TTL: &'static str = "CHAT_NODE_CAPABILITY_MAX_TTL_SECONDS";
 const ENV_AUDIT: &'static str = "CHAT_NODE_AUDIT";
+const ENV_TLS_CERT: &'static str = "CHAT_NODE_TLS_CERT_FILE";
+const ENV_TLS_KEY: &'static str = "CHAT_NODE_TLS_KEY_FILE";
 
 impl NodeConfig {
     /// 解析命令行参数与环境变量（命令行优先）。
@@ -124,6 +137,9 @@ impl NodeConfig {
             ))?,
         };
 
+        let mut tls_cert = env(ENV_TLS_CERT);
+        let mut tls_key = env(ENV_TLS_KEY);
+
         let mut arguments = args.into_iter();
         while let Some(argument) = arguments.next() {
             let mut take_value = |name: &'static str| -> Result<String, NodeStartError> {
@@ -143,7 +159,9 @@ impl NodeConfig {
                 "--require-capability" => require_capability = true,
                 "--no-audit" => audit = false,
                 "--init-seed" => init_seed = true,
-                "--help" | "-h" => return Err(NodeStartError::Config("usage: chat-node --bind <addr> --data-dir <dir> --seed-file <file> [--node-id <id>] [--expect-public-key <hex>] [--allow-public-bind] [--init-seed] [--require-capability]")),
+                "--tls-cert" => tls_cert = Some(take_value("--tls-cert needs a value")?),
+                "--tls-key" => tls_key = Some(take_value("--tls-key needs a value")?),
+                "--help" | "-h" => return Err(NodeStartError::Config("usage: chat-node --bind <addr> --data-dir <dir> --seed-file <file> [--node-id <id>] [--expect-public-key <hex>] [--allow-public-bind] [--init-seed] [--require-capability] [--tls-cert <pem> --tls-key <pem>]")),
                 other => {
                     let _ = other;
                     return Err(NodeStartError::Config("unknown command line argument"));
@@ -188,6 +206,31 @@ impl NodeConfig {
             .map_err(|_| NodeStartError::Config("--expect-public-key must be 64 hex characters"))?),
             None => None,
         };
+        // TLS 必须成对给出：只给一半属于配置错误（绝不静默降级成明文）。
+        let tls = match (tls_cert, tls_key) {
+            (None, None) => None,
+            (Some(_), None) => {
+                return Err(NodeStartError::Config("--tls-cert requires --tls-key"));
+            }
+            (None, Some(_)) => {
+                return Err(NodeStartError::Config("--tls-key requires --tls-cert"));
+            }
+            (Some(cert), Some(key)) => {
+                if cert.trim().is_empty() || key.trim().is_empty() {
+                    return Err(NodeStartError::Config("--tls-cert / --tls-key must not be empty"));
+                }
+                Some(TlsConfig {
+                    cert_file: PathBuf::from(cert),
+                    key_file: PathBuf::from(key),
+                })
+            }
+        };
+        if tls.is_some() && !bind.ip().is_loopback() && !allow_public_bind {
+            // 有 TLS 也不能静默公开暴露：公开绑定依然要显式确认。
+            return Err(NodeStartError::Config(
+                "refusing a non-loopback bind without --allow-public-bind",
+            ));
+        }
         Ok(Self {
             bind,
             data_dir: PathBuf::from(data_dir),
@@ -198,6 +241,7 @@ impl NodeConfig {
             expect_public_key,
             require_capability,
             audit,
+            tls,
         })
     }
 
@@ -350,6 +394,11 @@ pub fn spawn_node(config: NodeConfig) -> Result<RunningNode, NodeStartError> {
         .local_addr()
         .map_err(|_| NodeStartError::Bind("listener has no local address".to_owned()))?;
 
+    // TLS 配置在起线程之前装载：证书/私钥有问题要立刻失败，不能"启动了但握手全挂"。
+    let tls_acceptor = match config.tls.as_ref() {
+        Some(tls) => Some(load_tls_acceptor(tls)?),
+        None => None,
+    };
     let state = AppState::with_system_clock(service);
     let router = build_router(state);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -363,12 +412,17 @@ pub fn spawn_node(config: NodeConfig) -> Result<RunningNode, NodeStartError> {
             runtime.block_on(async move {
                 let listener = tokio::net::TcpListener::from_std(listener)
                     .map_err(|_| NodeStartError::Bind("listener could not be registered".to_owned()))?;
-                axum::serve(listener, router)
-                    .with_graceful_shutdown(async move {
-                        let _ = shutdown_rx.await;
-                    })
-                    .await
-                    .map_err(|_| NodeStartError::Runtime("http server stopped unexpectedly"))
+                match tls_acceptor {
+                    None => axum::serve(listener, router)
+                        .with_graceful_shutdown(async move {
+                            let _ = shutdown_rx.await;
+                        })
+                        .await
+                        .map_err(|_| NodeStartError::Runtime("http server stopped unexpectedly")),
+                    Some(acceptor) => {
+                        serve_tls(listener, router, acceptor, shutdown_rx).await
+                    }
+                }
             })
         })
         .map_err(|_| NodeStartError::Runtime("node thread could not be started"))?;
@@ -685,6 +739,7 @@ mod tests {
             expect_public_key: None,
             require_capability: false,
             audit: true,
+            tls: None,
         };
         let running = spawn_node(config.clone()).expect("node starts");
         assert!(running.node_id.starts_with("node-"));
@@ -703,5 +758,121 @@ mod tests {
         assert!(matches!(error, NodeStartError::Config(_)));
         assert!(!dir.join("data2").join("node.db").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// 从 PEM 文件装载 TLS acceptor。
+///
+/// 失败一律**启动即报错**（缺文件、空文件、无证书、无可用私钥、配置异常），
+/// 因为"TLS 起不来却照常开明文端口"是最危险的行为。
+fn load_tls_acceptor(tls: &TlsConfig) -> Result<tokio_rustls::TlsAcceptor, NodeStartError> {
+    let cert_pem = fs::read(&tls.cert_file)
+        .map_err(|_| NodeStartError::Config("TLS certificate file could not be read"))?;
+    let key_pem = fs::read(&tls.key_file)
+        .map_err(|_| NodeStartError::Config("TLS private key file could not be read"))?;
+    let certs = parse_pem_certificates(&cert_pem)
+        .ok_or(NodeStartError::Config("TLS certificate PEM contains no certificate"))?;
+    let key = parse_pem_private_key(&key_pem)
+        .ok_or(NodeStartError::Config("TLS private key PEM is not supported (PKCS#8 or RSA expected)"))?;
+    // rustls 需要显式安装 CryptoProvider（本项目统一用 ring）。
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        // 已安装过不是错误：说明本进程其它组件先装了同一个 provider。
+    }
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|_| NodeStartError::Config("TLS certificate and private key do not match"))?;
+    Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
+}
+
+/// 极简 PEM 解析：只取第一个 `-----BEGIN CERTIFICATE-----` 块（支持多张证书的链）。
+fn parse_pem_certificates(pem: &[u8]) -> Option<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let text = std::str::from_utf8(pem).ok()?;
+    let mut certs = Vec::new();
+    let mut rest = text;
+    while let Some(begin) = rest.find("-----BEGIN CERTIFICATE-----") {
+        let after = &rest[begin + "-----BEGIN CERTIFICATE-----".len()..];
+        let end = after.find("-----END CERTIFICATE-----")?;
+        let der = decode_base64(&after[..end])?;
+        certs.push(rustls::pki_types::CertificateDer::from(der));
+        rest = &after[end..];
+    }
+    if certs.is_empty() { None } else { Some(certs) }
+}
+
+/// 极简 PEM 解析：`PRIVATE KEY`（PKCS#8）或 `RSA PRIVATE KEY`。
+fn parse_pem_private_key(pem: &[u8]) -> Option<rustls::pki_types::PrivateKeyDer<'static>> {
+    let text = std::str::from_utf8(pem).ok()?;
+    if let Some(der) = pem_block(text, "PRIVATE KEY") {
+        return Some(rustls::pki_types::PrivateKeyDer::Pkcs8(der.into()));
+    }
+    pem_block(text, "RSA PRIVATE KEY").map(|der| rustls::pki_types::PrivateKeyDer::Pkcs1(der.into()))
+}
+
+fn pem_block(text: &str, label: &str) -> Option<Vec<u8>> {
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let start = text.find(&begin)? + begin.len();
+    let stop = text[start..].find(&end)? + start;
+    decode_base64(&text[start..stop])
+}
+
+/// 宽松的 base64 解码（忽略空白；遇到非法字符返回 None）。
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buffer: u32 = 0;
+    let mut bits = 0u32;
+    for byte in input.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        let index = TABLE.iter().position(|candidate| *candidate == byte)?;
+        buffer = (buffer << 6) | index as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// TLS 监听循环：每条连接独立握手，握手失败只影响该连接（不拖垮节点）。
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    acceptor: tokio_rustls::TlsAcceptor,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), NodeStartError> {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as AutoBuilder;
+    use tower::ServiceExt;
+
+    let mut shutdown = std::pin::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return Ok(()),
+            accepted = listener.accept() => {
+                let Ok((stream, _peer)) = accepted else { continue };
+                let acceptor = acceptor.clone();
+                let service = router.clone();
+                tokio::spawn(async move {
+                    let Ok(tls_stream) = acceptor.accept(stream).await else { return };
+                    let io = TokioIo::new(tls_stream);
+                    let hyper_service = hyper::service::service_fn(move |request| {
+                        service.clone().oneshot(request)
+                    });
+                    let builder = AutoBuilder::new(TokioExecutor::new());
+                    let _ = builder.serve_connection(io, hyper_service).await;
+                });
+            }
+        }
     }
 }

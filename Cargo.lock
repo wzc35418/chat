@@ -667,8 +667,13 @@ dependencies = [
  "chat-node-services",
  "chat-protocol",
  "ed25519-dalek 3.0.0",
+ "hyper",
+ "hyper-util",
  "rand 0.10.3",
+ "rustls",
  "tokio",
+ "tokio-rustls",
+ "tower",
 ]
 
 [[package]]
