@@ -152,6 +152,9 @@ class DpapiKeySlot(private val directory: File) : KeyProtection {
         }
     }
 
+    /** 只读探测：该别名在本机是否已有 DPAPI blob 文件。 */
+    fun exists(alias: String): Boolean = blobFile(alias).isFile
+
     private fun blobFile(alias: String) = File(directory, alias + ".dpapi")
 
     private fun writeBlob(alias: String, cipher: ByteArray) {

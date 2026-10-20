@@ -144,6 +144,8 @@ fun main() = application {
     val identityDatabase = remember { identityDir?.let { File(it, "identity.db").absolutePath } }
     var identityKey by remember { mutableStateOf<String?>(null) }
     var keySlotSummary by remember { mutableStateOf("密钥槽未初始化") }
+    var keySlotBackend by remember { mutableStateOf(KeySlotBackend.None) }
+    var keySlotDetail by remember { mutableStateOf("") }
     var groupState by remember { mutableStateOf(PreviewGroupState()) }
     val store = remember { runCatching { createLocalStore() }.getOrNull() }
     val storeDirectory = remember { runCatching { Files.createTempDirectory("chat-preview-store-").toFile() }.getOrNull() }
@@ -194,13 +196,20 @@ fun main() = application {
             return@LaunchedEffect
         }
         val slotDirectory = File(identityDir, "keyslot").apply { mkdirs() }
-        val slot: chat.platform.KeyProtection = if (System.getProperty("os.name", "").lowercase().contains("windows")) {
+        val alias = "storage-main"
+        // 探测本机密钥在哪个后端（凭据管理器 / DPAPI 文件 / 都没有），再决定用哪个读写。
+        val selector = KeySlotSelector.default(slotDirectory)
+        val selection = selector.probe(alias)
+        keySlotBackend = selection.backend
+        keySlotDetail = selection.detail
+        val slot: chat.platform.KeyProtection = if (selection.backend == KeySlotBackend.CredentialManager) {
+            WinCredKeySlot()
+        } else if (System.getProperty("os.name", "").lowercase().contains("windows")) {
             DpapiKeySlot(slotDirectory)
         } else {
             PassphraseKeySlot(slotDirectory, DEMO_KEY_PASSPHRASE.toCharArray())
         }
         keySlotSummary = slot.protectionSummary()
-        val alias = "storage-main"
         val restored = runCatching {
             val buffer = slot.unwrapByAlias(alias)
             try {

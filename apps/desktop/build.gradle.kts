@@ -323,3 +323,13 @@ tasks.register<JavaExec>("credentialManagerSmoke") {
     mainClass.set("chat.desktop.CredentialManagerSmokeKt")
     systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
 }
+
+
+// 密钥槽探测与迁移（DPAPI 文件 <-> Windows 凭据管理器）冒烟。
+tasks.register<JavaExec>("keySlotSelectorSmoke") {
+    group = "verification"
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.KeySlotSelectorSmokeKt")
+    systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+}
