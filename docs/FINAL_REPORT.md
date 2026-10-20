@@ -66,3 +66,34 @@ powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1     # 11 个阶段
 2. **证书生命周期**：自动续签 + 到期告警横幅 + 信任列表管理页（现在只有 CLI/面板单点操作）。
 3. **`AppFacade` 深层收敛**：把各面板各自调 service 的重复收掉（技术债，影响后续迭代速度）。
 4. **生产化**：安装器/自动更新、后台通知、soak、指标。
+
+## 八、怎么验收（10 分钟）
+
+```powershell
+cd D:\AgentProject\chat
+. .\tools\activate.ps1
+powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1      # 11 阶段，期望 overall: PASS
+```
+
+手工检查点（细节见 `docs/manual-test-guide.md`）：
+
+1. 双击 `build\dist\app-image\Chat\Chat.exe` → 能启动、不弹引导（已配过则不再弹）；
+2. 「本机存储」发一条消息 → 状态 `queued → prepared → accepted`（节点在线时）；点「收一轮」→ 消息入库；
+3. 「关于」→「传输安全」填节点证书指纹 → 模式变 `pinned N 张证书`；「节点证书」自动显示 `剩余 N 天`；
+4. 把指纹改错 → 发消息**必须失败**（这是 pinning 真的在生效的证据）。
+
+## 九、下次接手从哪开始（5 步）
+
+1. **跨机器联调**（唯一外部依赖）：拿到可公网/VPN 可达的节点，把 `tools/verify-lan.ps1` 与 `tools/verify-tls-e2e.ps1` 里的 endpoint 换成该地址即可复用全部断言；同时确认节点 `--bind` 与防火墙。
+2. **证书生命周期自动化**：把「启动读一次」升级为定时刷新 + 到期弹窗；补自动续签与信任列表导入/导出/吊销。
+3. **`AppFacade` 深层收敛**：目前只收敛了失败投影与错误展示；面板仍各自调 service（40+ 处理器），收敛后迭代速度会明显提升。
+4. **生产化**：安装器（MSI 需联网取 WiX）、后台通知、soak 测试、指标/告警。
+5. **多平台**：macOS 钥匙串、Linux Secret Service、路径与文件权限（当前只有 Windows 实现）。
+
+## 十、交接提示（容易踩的坑）
+
+- 改 Rust FFI 后**必须** `gradlew :prepareRustHost --rerun-tasks`，并确认 `build/generated/chat-ffi/uniffi/chat_ffi/chat_ffi.kt` 里出现新符号（否则 Kotlin 侧根本看不到）；
+- uniffi 绑定是从 **`target/debug/chat_ffi.dll`** 生成的：如果你用 `CARGO_TARGET_DIR` 构建，记得把 dll 同步过去，否则绑定是旧的；
+- 脚本里给 `java.exe` 传空字符串参数会被丢弃，用 `-` 占位；
+- PowerShell 5.1 没有 `Invoke-WebRequest -SkipCertificateCheck`，TLS 检查统一用 `openssl s_client`；
+- 冻结码表（`FROZEN_AUTO_RETRY_CODES`）决定“能不能重试”，不要凭记忆判断（`STORAGE_LOCKED` 在表里）。
