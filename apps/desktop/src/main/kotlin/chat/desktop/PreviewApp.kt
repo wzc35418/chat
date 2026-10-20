@@ -1146,6 +1146,19 @@ fun main() = application {
         updateDraftText = { value -> storeDraftText = value.take(8 * 1024) },
         openPalette = { paletteFilter = ""; paletteOpen = true },
         pluginComposerActions = { pluginJvmHost?.composerActions() ?: emptyList() },
+        pluginStatusLines = {
+            val host = pluginJvmHost
+            if (host == null) emptyList() else {
+                // 只给这四个字段（写死在宿主里）：插件拿不到群名/消息/账户/密钥。
+                val facts = PluginJvmHost.PluginStatusFacts(
+                    groupCount = groupState.summaryList.size,
+                    currentEpoch = groupState.snapshot?.epoch ?: 0,
+                    syncState = storeState.syncStatus?.state ?: "idle",
+                    appliedTotal = storeState.syncStatus?.appliedTotal ?: 0L,
+                )
+                host.statusBarLines(facts).map { (pluginId, text) -> pluginId + ": " + text }
+            }
+        },
         runPluginComposerAction = { pluginId, name ->
             scope.launch {
                 val host = pluginJvmHost ?: return@launch

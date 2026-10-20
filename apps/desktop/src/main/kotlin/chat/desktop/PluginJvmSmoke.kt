@@ -74,6 +74,24 @@ fun main() {
         check(commandOutput == "命令：摘要输出") { "命令输出不符：" + commandOutput }
         println("      槽位 palette.commands：" + palette.size + " 条，运行输出 " + commandOutput.length + " 字符")
 
+        // 2d) status_bar.items 槽位：只读固定字段 + 超长截断。
+        val facts = PluginJvmHost.PluginStatusFacts(
+            groupCount = 2,
+            currentEpoch = 7,
+            syncState = "idle",
+            appliedTotal = 3L,
+        )
+        val lines = host.statusBarLines(facts)
+        check(lines.size == 1) { "应有一条状态栏文本，实际：" + lines }
+        check(lines[0].second.contains("群 2") && lines[0].second.contains("epoch 7")) {
+            "状态栏文本不符：" + lines[0].second
+        }
+        println("      槽位 status_bar.items：" + lines[0].second)
+        val longText = host.statusBarLines(PluginJvmHost.PluginStatusFacts(2, 7, "x".repeat(400), 0L))
+        check(longText.size == 1 && longText[0].second.length <= 121) {
+            "过长的状态栏文本必须被截断（≤120+省略号），实际长度：" + longText.firstOrNull()?.second?.length
+        }
+
         // 3) 插件 id 不符 → 显式失败（清单与自报必须一致）。
         val mismatch = runCatching { host.load(jar.absolutePath, "other.id", trusted = true) }.exceptionOrNull()
         check(mismatch is PluginLoadException)
@@ -89,6 +107,7 @@ fun main() {
         // 卸载后槽位必须清空（否则界面还显示按钮、点了却报未知动作）。
         check(host.composerActions().isEmpty()) { "卸载后 composer 槽位必须清空，实际：" + host.composerActions() }
         check(host.paletteCommands().isEmpty()) { "卸载后 palette 槽位必须清空，实际：" + host.paletteCommands() }
+        check(host.statusBarLines(facts).isEmpty()) { "卸载后状态栏槽位必须清空" }
         val afterUnload = runCatching { host.runComposerAction("demo.echo", "template") }.exceptionOrNull()
         check(afterUnload is PluginLoadException) { "卸载后运行槽位动作应显式失败" }
         check(host.loadedPluginIds().isEmpty())
@@ -123,6 +142,8 @@ private fun buildFixtureJar(work: File): File {
                 context.registerSelectedTextAction("echo", text -> "echo:" + text);
                 context.registerComposerAction("template", "插入问候模板", () -> "你好，这是一条由插件填入的草稿（请自行确认后发送）");
                 context.registerCommand("summary", () -> "命令：摘要输出");
+                context.registerStatusBarItem("status", facts ->
+                        "群 " + facts.getGroupCount() + " · epoch " + facts.getCurrentEpoch() + " · " + facts.getSyncState());
             }
             public void stop() { this.context = null; }
         }

@@ -23,8 +23,34 @@ interface PluginContext {
      *
      * 默认实现返回空注册：老插件不实现也能照常加载（向后兼容）。
      */
+    /**
+     * 声明式槽位 `status_bar.items`：在状态栏放一段短文本。
+     *
+     * **只能读**宿主给的这几个字段（写死在 SDK 里，宿主不会给更多）：
+     * 群数、当前群 epoch、同步状态字符串、已应用条数。
+     * 文本上限 120 字符（超长由宿主截断）。默认空实现，向后兼容。
+     */
+    fun registerStatusBarItem(
+        name: String,
+        render: (PluginStatusFacts) -> String,
+    ): Registration = object : Registration {
+        override fun dispose() = Unit
+    }
+
     fun registerComposerAction(name: String, description: String, action: () -> String): Registration =
         object : Registration {
             override fun dispose() = Unit
         }
 }
+
+/**
+ * 状态栏可读事实（**这是插件能看到的全部数据面**）。
+ *
+ * 刻意不含：群名、成员、消息正文、账户 ID、节点地址、任何密钥材料。
+ */
+data class PluginStatusFacts(
+    val groupCount: Int,
+    val currentEpoch: Int,
+    val syncState: String,
+    val appliedTotal: Long,
+)

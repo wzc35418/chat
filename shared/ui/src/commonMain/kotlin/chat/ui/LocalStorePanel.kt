@@ -52,6 +52,8 @@ data class StoreHandlers(
     val selectConversation: (String) -> Unit = {},
     val refreshMessages: () -> Unit = {},
     val updateDraftText: (String) -> Unit = {},
+    /** 插件声明的 status_bar.items（只读文本）。 */
+    val pluginStatusLines: () -> List<String> = { emptyList() },
     /** 打开命令面板（插件 palette.commands 槽位）。 */
     val openPalette: () -> Unit = {},
     /** 插件声明的 composer.actions（插件 id / 动作名 / 说明）。 */
@@ -225,6 +227,14 @@ fun LocalStorePanel(
                     onFormat = { applyFormat(it) },
                     enabled = state.ready && !state.busy,
                 )
+                val statusLines = handlers.pluginStatusLines()
+                if (statusLines.isNotEmpty()) {
+                    Text(
+                        "插件状态：" + statusLines.joinToString(" · "),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color(0xFF5F6B63),
+                    )
+                }
                 TextButton(
                     onClick = handlers.openPalette,
                     enabled = state.ready && !state.busy,

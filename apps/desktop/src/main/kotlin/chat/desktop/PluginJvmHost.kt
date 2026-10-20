@@ -105,6 +105,7 @@ class PluginJvmHost {
             commandNames,
             selectedTextActions,
             commandImpls,
+            statusBarItems,
             composerActions,
             composerImpls,
         )
@@ -135,6 +136,7 @@ class PluginJvmHost {
         composerActions.remove(pluginId)
         composerImpls.remove(pluginId)
         commandImpls.remove(pluginId)
+        statusBarItems.remove(pluginId)
         return true
     }
 
@@ -142,6 +144,37 @@ class PluginJvmHost {
     fun shutdown() {
         loaded.keys.toList().forEach { unload(it) }
         executor.shutdownNow()
+    }
+
+    /**
+     * 声明式槽位 status_bar.items：插件 id -> 短文本。
+     *
+     * 安全边界：插件只能读**宿主给的固定字段**（群数 / 当前 epoch / 同步状态 / 已应用条数），
+     * 拿不到群名、消息、账户、密钥；文本上限 120 字符，超长截断并记一次显式失败。
+     */
+    private val statusBarItems = LinkedHashMap<String, MutableMap<String, (PluginStatusFacts) -> String>>()
+
+    /** 宿主提供给插件的只读事实（**唯一数据面**，字段写死在这里）。 */
+    data class PluginStatusFacts(
+        val groupCount: Int,
+        val currentEpoch: Int,
+        val syncState: String,
+        val appliedTotal: Long,
+    )
+
+    fun registerStatusBarEntry(pluginId: String, name: String, render: (PluginStatusFacts) -> String) {
+        statusBarItems.getOrPut(pluginId) { LinkedHashMap() }[name] = render
+    }
+
+    /** 渲染状态栏条目：返回 (插件 id, 文本)；单条失败只跳过该条，不拖垮整条状态栏。 */
+    fun statusBarLines(facts: PluginStatusFacts): List<Pair<String, String>> = buildList {
+        for ((pluginId, items) in statusBarItems) {
+            for ((_, render) in items) {
+                val text = runCatching { withDeadline("PLUGIN_TASK_TIMEOUT") { render(facts) } }.getOrNull() ?: continue
+                if (text.isBlank()) continue
+                add(pluginId to if (text.length > MAX_STATUS_CHARS) text.take(MAX_STATUS_CHARS) + "…" else text)
+            }
+        }
     }
 
     /** 命令面板条目：插件 id -> 命令名（只给元数据，不含实现）。 */
@@ -202,6 +235,7 @@ class PluginJvmHost {
         private val commands: MutableMap<String, MutableList<String>>,
         private val actions: MutableMap<String, MutableMap<String, (String) -> String>>,
         private val impls: MutableMap<String, MutableMap<String, () -> String>>,
+        private val statusItems: MutableMap<String, MutableMap<String, (PluginStatusFacts) -> String>>,
         private val composerMeta: MutableMap<String, MutableMap<String, String>>,
         private val composerImpls: MutableMap<String, MutableMap<String, () -> String>>,
     ) : PluginContext {
@@ -213,6 +247,28 @@ class PluginJvmHost {
                 override fun dispose() {
                     commands[record.id]?.remove(name)
                     impls[record.id]?.remove(name)
+                }
+            }
+        }
+
+        override fun registerStatusBarItem(
+            name: String,
+            render: (chat.plugin.PluginStatusFacts) -> String,
+        ): Registration {
+            // 只写进传进来的状态栏表（不回调外层，避免嵌套类持有外层实例）。
+            statusItems.getOrPut(record.id) { LinkedHashMap() }[name] = { facts ->
+                render(
+                    chat.plugin.PluginStatusFacts(
+                        groupCount = facts.groupCount,
+                        currentEpoch = facts.currentEpoch,
+                        syncState = facts.syncState,
+                        appliedTotal = facts.appliedTotal,
+                    ),
+                )
+            }
+            return object : Registration {
+                override fun dispose() {
+                    statusItems[record.id]?.remove(name)
                 }
             }
         }
@@ -256,6 +312,8 @@ class PluginJvmHost {
     }
 
     companion object {
+        /** 状态栏单条文本上限（超长截断，不报错刷屏）。 */
+        private const val MAX_STATUS_CHARS = 120
         private const val EXECUTION_TIMEOUT_MS = 2_000L
         private const val MAX_INPUT_BYTES = 64 * 1024
         private const val MAX_OUTPUT_BYTES = 256 * 1024
