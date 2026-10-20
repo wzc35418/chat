@@ -11,6 +11,7 @@
 //!
 //! 状态全部是计数/稳定码/时间戳，不含任何密钥或正文。
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chat_core::sync_runtime::{
     SyncRuntime, SyncRuntimeConfig, SyncState, SyncStatusHandle, SyncStatusView,
@@ -79,6 +80,21 @@ fn decode_nibble(byte: u8) -> Result<u8, FfiError> {
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => Err(invalid_input("master key must be hexadecimal")),
     }
+}
+
+/// 一次性拉取的结果投影（SYNC 单轮：拉一页 → 验签 → 应用 → 前进游标）。
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct SyncOnceFfi {
+    /// 本页拉到的条目数（取自应用报告：applied + skipped；取不到时退化为 applied）。
+    pub fetched: u64,
+    /// 真正验签并应用（消息/Commit/提案）的条目数。
+    pub applied: u64,
+    /// 被跳过的条目数（stale + unsupported）。
+    pub skipped: u64,
+    /// 本轮结束后的游标（没有新条目/失败时保持不变）。
+    pub next_cursor: u64,
+    /// 是否已经追平（没有待重对齐、也没有建议退避）。
+    pub settled: bool,
 }
 
 /// 同步状态投影（供界面轮询；不含密钥或正文）。
@@ -344,6 +360,48 @@ impl SyncFfi {
     }
 
     /// 是否仍处于打开状态。
+    /// 一次性拉取：拉一页 → 验签 → 应用 → 前进游标，返回本页结果。
+    ///
+    /// 单写者约定：常驻循环在运行时**拒绝**（`INVALID_STATE_TRANSITION`），调用方必须先 `stop()`。
+    /// 语义：没有新条目（`applied=0` 且无跳过）时游标不前进、不写库；
+    /// 网络/节点错误显式透出（`NODE_UNAVAILABLE` 等）；应用失败时游标不前进（由 core 保证）。
+    pub fn sync_once(&self) -> Result<SyncOnceFfi, FfiError> {
+        let inner = self.lock()?;
+        if inner.closed {
+            return Err(core_closed());
+        }
+        if inner.runtime.is_some() {
+            return Err(invalid_state(
+                "a sync loop is running; stop it before a one-shot pull",
+            ));
+        }
+        let client = self.build_client()?;
+        let mut store = open_store(
+            StoreOptions::new(&self.database_path, KeyProvenance::Raw32),
+            ProtectedStorageKey::from_bytes(decode_master_key(&self.master_key_hex)?),
+        )
+        .map_err(|error| failure(error.code(), error.to_string()))?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        let (outcome, report) =
+            chat_core::sync_worker::run_pull_once_reporting_at(&mut store, &client, &self.group_id, now_ms)
+                .map_err(|error| failure(error.code().as_str(), error.to_string()))?;
+        let skipped = report.skipped();
+        let fetched = outcome.applied.saturating_add(skipped);
+        // `settled` 表示“不需要上层做事”：没有待重对齐、拉取循环也没有终止。
+        // `backoff_ms` 只是“下次多久再拉”的建议（已到 head 时也会给），不算未追平。
+        let settled = !outcome.resync_required && outcome.stopped.is_none();
+        Ok(SyncOnceFfi {
+            fetched,
+            applied: outcome.applied,
+            skipped,
+            next_cursor: outcome.cursor_after,
+            settled,
+        })
+    }
+
     pub fn is_open(&self) -> bool {
         match self.inner.lock() {
             Ok(inner) => !inner.closed,

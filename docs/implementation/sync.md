@@ -1029,4 +1029,50 @@ cargo test --offline -p chat-protocol                    # 88 passed（lib 74 + 
    属于 chat-sync 的日志对齐语义，本包不改它的枚举）。
 5. 应用阶段每条消息一次 storage 事务；大批量页（上百条）会变慢，尚未批处理。
 
+## SYNC 单轮 FFI：`SyncFfi.sync_once()`（2026-10-20）
+
+把“收一次消息”变成可验证的一步：拉一页 → 验签 → 应用 → 前进游标，返回本页结果。
+
+    SyncFfi.sync_once() -> SyncOnceFfi { fetched, applied, skipped, next_cursor, settled }
+
+实现只调既有 core 入口 `chat_core::sync_worker::run_pull_once_reporting_at(store, client, group_id, now_ms)`，
+**没有新写任何拉取/应用逻辑**。
+
+### 字段口径（重要，避免误读）
+
+- `applied`：真正验签并应用（消息 / Commit / 提案）的条目数；
+- `skipped`：`ApplyReport::skipped()` = `stale`（epoch 过期）+ `unsupported`（载荷不是本群的 MLS 消息、本机不在群里、非 UTF-8 等）；
+- **`fetched` = `applied + skipped`**：`ApplyReport` 没有单独的“本页条数”字段，这是**本页实际处理过的条目数**的保守口径；
+  将来若 `ApplyReport` 增加页内总数，应以页内总数为准并改这里；
+- `next_cursor`：本轮结束后的游标；**没有新条目或应用无法推进时保持不变**；
+- `settled`：`!resync_required && stopped.is_none()` —— 表示“不需要上层做事”。注意 `backoff_ms`（下次多久再拉的建议）**不影响** `settled`，已到 head 时也会给 backoff。
+
+### 单写者语义
+
+常驻循环（`start()`）运行期间调用 `sync_once()` → `INVALID_STATE_TRANSITION`，
+reason 固定为 “a sync loop is running; stop it before a one-shot pull”。调用方必须先 `stop()`（与“先关 store 再开 sync”一致）。
+
+### 错误语义
+
+- 网络/节点不可达 → `NODE_UNAVAILABLE`（游标不变）；
+- 应用侧无法推进（如条目 epoch 超前，需要先追赶）→ 不抛错、`settled=false` 且**游标不前进**（由 core 的 `needs_catchup` 语义保证）；
+- 载荷不可用 → 计入 `skipped`（不谎报 `applied`）。
+
+### 证据（`crates/ffi/tests/sync_once.rs`，5 例，真节点 + 真库）
+
+- 无新条目：`fetched=0/applied=0/skipped=0`、`next_cursor` 不变、`settled=true`，持久游标同样不变；
+- 有新条目：`fetched>=1`、游标前进并与持久游标一致；
+- 网络不可达：`NODE_UNAVAILABLE` 且游标不变；
+- 坏载荷：计入 `skipped` 且 `fetched = applied + skipped`；
+- 循环运行中：`INVALID_STATE_TRANSITION`；`stop()` 之后一次性拉取恢复可用。
+
+### 验收
+
+- `cargo test --offline -p chat-ffi` → **EXIT=0，115 passed，0 警告**（既有 110 继续通过 + 本轮 5 例）。
+
+### 已知限制
+
+1. `fetched` 是“处理过的条目数”而非“下载字节/条数”，见上面的口径说明；
+2. 应用失败（需要追赶）返回**成功 + `settled=false`**而不是错误码：这是 core 既有语义（避免把“暂时追不上”当成故障）；若上层需要显式码，应在 `sync_once` 里把 `resync_required` 映射成新的稳定码（需协议/FFI 双方确认）；
+3. 一次性拉取只处理**一页**；多页需要循环调用（何时停由 `settled`/`next_cursor` 决定）。
 

@@ -1,6 +1,7 @@
 package chat.desktop
 
 import chat.bridge.createGroupService
+import chat.bridge.createSyncService
 import chat.bridge.createIdentityService
 import chat.bridge.createLocalStore
 import chat.api.LocalStoreException
@@ -16,6 +17,16 @@ import kotlinx.coroutines.runBlocking
  * 语义边界：只用真实 FFI + 真实 HTTP 节点；任何一步失败都以非 0 退出并打印**明确的稳定错误码**，
  * 不做重试掩盖、不把"本地准备好了"当成"节点收了"。
  */
+private fun fetchNodePublicKey(endpoint: String): String? = runCatching {
+    val url = java.net.URI(endpoint.trimEnd('/') + "/v1/health").toURL()
+    val connection = url.openConnection() as java.net.HttpURLConnection
+    connection.requestMethod = "GET"
+    connection.connectTimeout = 5000
+    connection.readTimeout = 5000
+    val body = connection.inputStream.bufferedReader().readText()
+    Regex("\"node_public_key\"\\s*:\\s*\"([0-9a-fA-F]{64})\"").find(body)?.groupValues?.get(1)
+}.getOrNull()
+
 fun main(args: Array<String>): Unit = runBlocking {
     if (args.size < 2) {
         println("usage: PackageE2eSmokeKt <endpointUrl> <nodeId> [nodePublicKeyHex]")
@@ -23,7 +34,9 @@ fun main(args: Array<String>): Unit = runBlocking {
     }
     val endpoint = args[0]
     val nodeId = args[1]
-    val nodeKey = if (args.size >= 3) args[2] else null
+    // 节点公钥从 /v1/health 的公开身份取（不靠人工传参，避免 pinning 被跳过）。
+    val nodeKey = if (args.size >= 3) args[2] else fetchNodePublicKey(endpoint)
+    println("INFO node public key: " + (nodeKey ?: "(unavailable)"))
     val tempDir = java.io.File(System.getProperty("java.io.tmpdir"), "chat-pkg-e2e-" + System.nanoTime())
     tempDir.mkdirs()
     val dbPath = java.io.File(tempDir, "pkg-e2e.sqlite").absolutePath
@@ -79,6 +92,22 @@ fun main(args: Array<String>): Unit = runBlocking {
         println("INFO draft status after dispatch: " + (draftStatus?.status ?: "unknown"))
         if (dispatched.status == "accepted" && dispatched.settled) {
             println("PASS node accepted the packaged submit")
+
+            // 收消息：关掉 store（单写者）后用同一份库开同步对象，拉一轮。
+            runCatching { store.close() }
+            val sync = createSyncService(dbPath, "0".repeat(64), endpoint, nodeId, nodeKey!!, snapshot.groupId)
+            val once = sync.syncOnce()
+            println(
+                "PASS syncOnce: fetched=" + once.fetched + " applied=" + once.applied +
+                    " skipped=" + once.skipped + " cursor=" + once.nextCursor + " settled=" + once.settled,
+            )
+            if (once.fetched < 1) {
+                println("FAIL node returned no entries for the pull (expected at least the accepted one)")
+                failures += 1
+            } else {
+                println("PASS packaged artifact pulled entries from the node")
+            }
+            runCatching { sync.shutdown() }
         } else {
             println("FAIL node did not accept (status=" + dispatched.status + ", settled=" + dispatched.settled + ", detail=" + dispatched.detail + ")")
             failures += 1

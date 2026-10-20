@@ -32,9 +32,31 @@ class NativeSyncService(private val native: SyncFfi) : SyncService {
 
     override suspend fun status(): SyncStatusView = call { it.status() }
 
+    override suspend fun syncOnce(): chat.api.SyncOnceView = callOnce {
+        val view = it.syncOnce()
+        chat.api.SyncOnceView(
+            fetched = view.fetched.toLong(),
+            applied = view.applied.toLong(),
+            skipped = view.skipped.toLong(),
+            nextCursor = view.nextCursor.toLong(),
+            settled = view.settled,
+        )
+    }
+
     override suspend fun shutdown(): Unit = mutex.withLock {
         withContext(Dispatchers.IO) { runCatching { native.shutdown() } }
         Unit
+    }
+
+    /** 单轮拉取用：返回同步视图之外的形状，故不复用 call()。 */
+    private suspend fun <T> callOnce(block: (SyncFfi) -> T): T = mutex.withLock {
+        withContext(Dispatchers.IO) {
+            try {
+                block(native)
+            } catch (error: FfiException.Store) {
+                throw LocalStoreException(error.code, error.reason)
+            }
+        }
     }
 
     private suspend fun call(block: (SyncFfi) -> SyncStatusFfi): SyncStatusView = mutex.withLock {
