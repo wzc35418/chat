@@ -160,10 +160,14 @@ impl TestNode {
     }
 
     fn client(&self) -> NodeClient {
+        self.client_with(&self.device_id(), DEVICE_SEED)
+    }
+
+    fn client_with(&self, device_id: &str, seed: [u8; 32]) -> NodeClient {
         let endpoint = NodeEndpoint::new(&self.endpoint_url(), NODE_ID)
             .expect("endpoint")
             .with_node_public_key(self.node_public_key);
-        NodeClient::new(endpoint, self.device_id(), SigningKey::from_bytes(&DEVICE_SEED))
+        NodeClient::new(endpoint, device_id.to_owned(), SigningKey::from_bytes(&seed))
             .expect("node client")
     }
 
@@ -172,13 +176,19 @@ impl TestNode {
     }
 
     fn register_device(&self, account_id: &str) {
+        let device_id = self.device_id();
+        self.register_device_for(&device_id, DEVICE_SEED, account_id, "cap-register");
+    }
+
+    fn register_device_for(&self, device_id: &str, seed: [u8; 32], account_id: &str, capability_id: &str) {
         let supervisor = SigningKey::from_bytes(&SUPERVISOR_SEED);
         let supervisor_public_key = hex_of(&supervisor.verifying_key().to_bytes());
-        let device_id = self.device_id();
+        let credential_device_id = device_id.to_owned();
+        let device_id = credential_device_id.clone();
         let mut credential = DeviceCredential {
             account_id: account_id.to_owned(),
             device_id: device_id.clone(),
-            device_public_key: hex_of(&SigningKey::from_bytes(&DEVICE_SEED).verifying_key().to_bytes()),
+            device_public_key: hex_of(&SigningKey::from_bytes(&seed).verifying_key().to_bytes()),
             endpoint_id: "endpoint-register".into(),
             credential_version: 1,
             not_before: now_s() - 10,
@@ -189,7 +199,7 @@ impl TestNode {
         let signature: Signature = supervisor.sign(&credential.signing_bytes().expect("credential"));
         credential.signature = hex_of(&signature.to_bytes());
         let mut capability = RegistrationCapability {
-            capability_id: "cap-register".into(),
+            capability_id: capability_id.to_owned(),
             account_id: account_id.to_owned(),
             device_id,
             purpose: REGISTRATION_CAPABILITY_PURPOSE.into(),
@@ -206,7 +216,7 @@ impl TestNode {
             credential,
             capability,
         };
-        block_on(self.client().register_device(&request)).expect("register device");
+        block_on(self.client_with(&credential_device_id, seed).register_device(&request)).expect("register device");
     }
 }
 
@@ -353,4 +363,41 @@ fn a_device_key_mismatch_is_rejected_and_the_local_state_is_untouched() {
     assert_eq!(error.code(), "INVALID_CREDENTIAL");
     let after = group_snapshot(&store, &group_id).expect("snapshot");
     assert_eq!(after, before, "a rejected registration must not change the snapshot");
+}
+
+/// 节点规则（真实约束，记录下来避免再次踩坑）：初始成员必须是 owner 账户下**已注册**的有效设备，
+/// 所以“未注册的被邀请者”不能进 GroupCreation.members；它只能通过成员变更提交（added_credentials）进表。
+#[test]
+fn an_unregistered_invitee_cannot_be_listed_as_an_initial_node_member() {
+    let dir = FixtureDir::new();
+    let (account_id, device_id) = enroll_identity(&dir.database_text());
+    let node = TestNode::start(&device_id);
+    node.register_device(&account_id);
+    // 只用本机 owner 的创建能成功。
+    let client = node.client();
+    let owner_group = chat_protocol::GroupId::from_bytes([0x33u8; 32]).encode();
+    let creation = chat_node_services::group::GroupCreation {
+        group_id: owner_group.clone(),
+        owner_account_id: account_id.clone(),
+        initial_control_head: chat_node_services::canonical::hex_encode(&[0x11u8; 32]),
+        policy_version: 1,
+        mls_epoch: 1,
+        members: vec![chat_node_services::group::GroupMemberSpec {
+            device_id: device_id.clone(),
+            role: "owner".into(),
+        }],
+    };
+    block_on(client.create_group(&creation)).expect("owner-only creation is accepted");
+
+    // 加一个**未注册**的设备作为初始成员 → 节点以 INVALID_CREDENTIAL 拒绝（这是节点既有规则）。
+    let stranger_group = chat_protocol::GroupId::from_bytes([0x34u8; 32]).encode();
+    let stranger = chat_protocol::DeviceId::from_bytes([0x78u8; 32]).encode();
+    let mut rejected = creation.clone();
+    rejected.group_id = stranger_group;
+    rejected.members.push(chat_node_services::group::GroupMemberSpec {
+        device_id: stranger,
+        role: "member".into(),
+    });
+    let error = block_on(client.create_group(&rejected)).expect_err("unregistered member is rejected");
+    assert_eq!(error.node_code(), Some("INVALID_CREDENTIAL"));
 }

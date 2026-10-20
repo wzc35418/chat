@@ -665,8 +665,10 @@ pub fn group_register_on_node(
         // 真正的拒绝（凭据/公钥不匹配等）原样透出，不继续建群。
         Err(error) => return Err(ControlReceiptError::from(error)),
     }
-    // 节点侧成员表用的是**设备 ID**，而群快照里存的是**凭据**；两者不是同一命名空间。
-    // 因此登记时只登记本机设备为 owner（其余成员通过后续成员变更提交逐步进入节点成员表）。
+    // 节点侧成员表用的是**设备 ID**；节点要求**初始成员必须已注册且在 owner 账户下**
+    // （node-services/group.rs::register_group：INVALID_CREDENTIAL）。
+    // 因此这里只登记本机设备为 owner；其余成员通过“成员变更提交（added_credentials）”
+    // 或由对端先完成设备注册后再登记进入成员表。
     let members = vec![chat_node_services::group::GroupMemberSpec {
         device_id: seeds.device_id.clone(),
         role: "owner".to_owned(),
@@ -787,8 +789,21 @@ fn registration_request_for(
 
 /// 把节点的真实拒绝原因带进本层错误（含节点稳定码，便于定位）。
 fn node_rejection(error: NodeClientError, what: &'static str) -> ControlReceiptError {
-    let node_code = error.node_code().unwrap_or("UNKNOWN");
-    ControlReceiptError::new(error.code().as_str(), format!("{what} (node code {node_code})"))
+    // 节点原始响应体不在 NodeClientError 里（只有静态短说明）；这里把可得的全部信息带上：
+    // 稳定码 / 节点码（未映射时为 UNKNOWN_NODE_CODE）/ HTTP status / 分类 / 短说明。
+    let node_code = error.node_code().unwrap_or("UNKNOWN_NODE_CODE");
+    let status = match error.http_status() {
+        Some(status) => status.to_string(),
+        None => "none".to_owned(),
+    };
+    ControlReceiptError::new(
+        error.code().as_str(),
+        format!(
+            "{what} (node code {node_code}, http {status}, kind {:?}, detail {})",
+            error.kind(),
+            error.detail()
+        ),
+    )
 }
 
 /// 游标是否需要初始化（读不到状态视为需要；读失败按损坏处理）。
