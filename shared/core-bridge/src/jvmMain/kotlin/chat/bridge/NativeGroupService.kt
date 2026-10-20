@@ -199,6 +199,7 @@ class NativeGroupService(
 private fun GroupViewFfi.toSnapshot() = GroupSnapshot(
     groupId = groupId,
     name = name,
+    mlsGroupKey = mlsGroupKey,
     epoch = epoch.toInt(),
     policyVersion = policyVersion.toLong(),
     role = role,

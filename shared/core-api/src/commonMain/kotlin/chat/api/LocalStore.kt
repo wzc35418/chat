@@ -103,6 +103,11 @@ interface LocalStore {
     suspend fun pollEvents(sinceSeq: Long, limit: Int): StoreEventBatch
 
     /** 配置发送用节点（只保存配置，不发请求）。 */
+    /**
+     * 把发送链路绑定到指定 MLS 群（当库里存在多个群时必须显式选择，否则内层会拒绝）。
+     */
+    suspend fun configureSendGroup(mlsGroupKey: String)
+
     suspend fun configureSendNode(endpointUrl: String, nodeId: String, nodePublicKeyHex: String?)
 
     /** 准备并加密（落 attempt/outbox），返回真实状态。 */

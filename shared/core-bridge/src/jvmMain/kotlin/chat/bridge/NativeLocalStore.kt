@@ -151,6 +151,10 @@ class NativeLocalStore : LocalStore {
     }
 
 
+    override suspend fun configureSendGroup(mlsGroupKey: String): Unit = withStore { store ->
+        store.configureSendGroup(mlsGroupKey)
+    }
+
     override suspend fun configureSendNode(
         endpointUrl: String,
         nodeId: String,

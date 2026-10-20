@@ -22,6 +22,8 @@ data class GroupPending(
 data class GroupSnapshot(
     val groupId: String,
     val name: String,
+    /** MLS 群的本地键（用于把"发送"绑定到具体群；不含密钥材料）。 */
+    val mlsGroupKey: String = "",
     val epoch: Int,
     val policyVersion: Long,
     val role: String,

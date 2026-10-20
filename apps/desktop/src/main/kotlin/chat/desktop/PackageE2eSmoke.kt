@@ -1,5 +1,6 @@
 package chat.desktop
 
+import chat.bridge.createGroupService
 import chat.bridge.createIdentityService
 import chat.bridge.createLocalStore
 import chat.api.LocalStoreException
@@ -39,6 +40,14 @@ fun main(args: Array<String>): Unit = runBlocking {
         val enrolled = identity.enrollIntoStore(dbPath, "0".repeat(64))
         println("PASS identity enrolled into message store: " + enrolled.accountId)
 
+        // 发送必须要有本机已加入的 MLS 群（sendPrepare 会检查），而入库是单写者：
+        // 所以按"建群 -> 关闭句柄 -> 打开消息库"的顺序做，模拟真实的一次性初始化。
+        val groups = createGroupService(dbPath, "0".repeat(64), null)
+        val snapshot = groups.createGroup("pkg-e2e-group")
+        println("PASS group created: " + snapshot.groupId + " epoch=" + snapshot.epoch)
+        val groupKey = snapshot.mlsGroupKey
+        groups.shutdown()
+
         store.open(dbPath, "0".repeat(64))
         println("PASS store opened: " + dbPath)
 
@@ -51,6 +60,9 @@ fun main(args: Array<String>): Unit = runBlocking {
         val draft = store.createDraft(conversationId, operationId, "packaged e2e hello")
         println("PASS draft created: " + draft.draftId + " state=" + draft.state)
 
+        // 库里有多个群时必须显式选择发送群（内层会 INVALID_TARGET 拒绝猜测）。
+        store.configureSendGroup(groupKey)
+        println("PASS send group configured")
         store.configureSendNode(endpoint, nodeId, nodeKey)
         println("PASS send node configured: " + endpoint)
 
