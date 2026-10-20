@@ -81,6 +81,17 @@ powershell -ExecutionPolicy Bypass -File tools\verify-remote.ps1 `
   -FingerprintFile build\node-bundle\fingerprint.txt
 ```
 
+## 三点五、指纹对不上时的应急验证（TOFU）
+
+如果你的文件夹里的证书和我给你的不是同一张（比如整包重拷过），可以先用 TOFU 模式验证连通与收发：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\verify-remote.ps1 `
+  -Endpoint https://<公网IP>:8443 -NodeId node-public -TrustServedCertificate
+```
+
+它会**醒目打印 WARNING**并接受服务端当前证书作为指纹（**这不是 pinning**，只用于首次联调）；随后照常跑完 health / 节点身份 / tls_info / 打包产物收发 / 错误指纹被拒。正式使用请核对指纹后写进配置。
+
 ## 四、注意
 
 - **不要**把 `seed.hex` / `key.pem` 提交进 git 或发给别人；`fingerprint.txt` 可以公开。
