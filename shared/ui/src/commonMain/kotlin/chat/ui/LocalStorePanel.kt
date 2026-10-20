@@ -141,16 +141,37 @@ fun LocalStorePanel(
                         color = Color(0xFF5F6B63),
                     )
                 }
+                // 错误分层展示：标题（人话）→ 原因链（可折叠地单独一行）→ 稳定码，避免把整串技术文本糊给用户。
+                val presented = state.lastErrorCode?.let { code ->
+                    chat.presentation.display.presentRawError(code, state.notice)
+                }
                 state.notice?.let { notice ->
                     Surface(
                         color = if (state.lastErrorCode == null) Color(0xFFEDF1E9) else Color(0xFFFDECEA),
                         shape = RoundedCornerShape(10.dp),
                         modifier = Modifier.fillMaxWidth().semantics {
                             liveRegion = LiveRegionMode.Polite
-                            contentDescription = notice
+                            contentDescription = presented?.title ?: notice
                         },
                     ) {
-                        Text(notice, Modifier.padding(horizontal = 12.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall)
+                        Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                            Text(presented?.title ?: notice, style = MaterialTheme.typography.bodySmall)
+                            presented?.let { view ->
+                                if (view.detail.isNotBlank() && view.detail != view.title) {
+                                    Text(view.detail, style = MaterialTheme.typography.labelSmall)
+                                }
+                                view.reason?.let { reason ->
+                                    Text(
+                                        "原因：" + reason,
+                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                        color = Color(0xFF5F6B63),
+                                    )
+                                }
+                                view.actionLabel?.takeIf { it.isNotBlank() }?.let { label ->
+                                    Text("建议：" + label, style = MaterialTheme.typography.labelSmall, color = Color(0xFF246B58))
+                                }
+                            }
+                        }
                     }
                 }
                 state.lastErrorCode?.let { code ->

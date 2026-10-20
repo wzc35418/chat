@@ -27,6 +27,8 @@ data class UserActionableError(
     val diagnosticId: String?,
     /** 底层是否允许自动退避重试：只取自 PROTOCOL-014 冻结规则，与手动重试分开。 */
     val autoRetryAllowed: Boolean = false,
+    /** 底层原因链（已截断、已脱敏）：给用户排障用，可空。 */
+    val reason: String? = null,
 )
 
 private data class ErrorCopy(
@@ -381,4 +383,74 @@ private fun safeDiagnosticToken(raw: String?): String? {
                 character == '-'
         }
     }
+}
+
+/** 传输/信任类底层标记：出现这些说明是**本机信任配置**的问题，需要明确的排障指引。 */
+private val TRANSPORT_TRUST_MARKERS = listOf("PIN_MISMATCH", "TLS_TRUST_REQUIRED", "INSECURE_TRANSPORT", "TLS_CERT_INVALID")
+
+/**
+ * 由**原始码 + 原始原因**生成可展示错误（UI 直接用，不必经过 CoreFailure）。
+ *
+ * 语义：
+ * - 文案仍按 PROTOCOL-014 冻结表给（未知码走回退文案）；
+ * - **原因链单独保留**（截断 300 字符、压平换行），不当成标题；
+ * - 原因里出现传输/信任标记时，覆盖成可执行的排障指引（"去关于面板核对证书指纹"），
+ *   因为这类失败的通用文案（"操作未完成"）帮不到用户。
+ */
+fun presentRawError(code: String, reason: String?, retryable: Boolean = false): UserActionableError {
+    val trimmedCode = code.trim().ifEmpty { "UNKNOWN_RESULT" }
+    val safeReason = reason
+        ?.replace('\n', ' ')
+        ?.trim()
+        ?.take(300)
+        ?.ifEmpty { null }
+    val marker = TRANSPORT_TRUST_MARKERS.firstOrNull { marker -> safeReason?.contains(marker) == true }
+    val base = knownErrors[trimmedCode]
+    val transportTitle = marker?.let {
+        when (it) {
+            "PIN_MISMATCH" -> "节点证书与固定指纹不匹配"
+            "TLS_TRUST_REQUIRED" -> "节点要求加密连接（缺信任配置）"
+            "INSECURE_TRANSPORT" -> "配置了指纹但端点是明文"
+            else -> "传输信任配置无效"
+        }
+    }
+    if (transportTitle != null) {
+        return UserActionableError(
+            title = transportTitle,
+            detail = "打开「关于」面板 → 传输安全（TLS）：填写节点证书的 SHA-256 指纹后重试；若刚换过证书，把新旧指纹一起填上。",
+            actionLabel = "去核对指纹",
+            action = ErrorAction.NONE,
+            retryable = false,
+            diagnosticCode = safeDiagnosticToken(trimmedCode),
+            diagnosticId = null,
+            autoRetryAllowed = false,
+            reason = safeReason,
+        )
+    }
+    if (base == null) {
+        val action = if (retryable) ErrorAction.RETRY else ErrorAction.NONE
+        return UserActionableError(
+            title = "操作未完成",
+            detail = "遇到暂未识别的错误。可以稍后重试，或返回当前页面后重新操作。",
+            actionLabel = if (action == ErrorAction.RETRY) "重试" else null,
+            action = action,
+            retryable = retryable,
+            diagnosticCode = safeDiagnosticToken(trimmedCode),
+            diagnosticId = null,
+            autoRetryAllowed = trimmedCode in FROZEN_AUTO_RETRY_CODES,
+            reason = safeReason,
+        )
+    }
+    val action = if (base.action == ErrorAction.RETRY && !retryable) ErrorAction.NONE else base.action
+    return UserActionableError(
+        title = base.title,
+        detail = base.detail,
+        actionLabel = if (action == ErrorAction.NONE) null else base.actionLabel,
+        action = action,
+        retryable = retryable,
+        diagnosticCode = safeDiagnosticToken(trimmedCode),
+        diagnosticId = null,
+        autoRetryAllowed = trimmedCode in FROZEN_AUTO_RETRY_CODES,
+        reason = safeReason,
+    )
 }

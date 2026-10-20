@@ -160,6 +160,7 @@ fun main() = runBlocking {
     checkRecoveryPresentation()
     checkMessageCardsPresentation()
     checkMarkdownFormatting()
+    checkRawErrorPresentation()
     println("PASS DS-02/DS-04/DS-05/DS-07/DS-08/DS-09/DS-10/DS-11/DS-12 presentation checks")
 }
 
@@ -1343,4 +1344,37 @@ private fun checkMarkdownFormatting() {
     check(code.text == "`x`") { "行内代码标记错误：" + code.text }
 
     println("PASS markdown formatting: bold/italic/strike/code toggle with selection preserved, whitespace kept outside markers, multi-line wrapped per line")
+}
+
+/** 错误分层展示：码/标题/原因链/建议动作分开，传输类错误必须给可执行指引。 */
+private fun checkRawErrorPresentation() {
+    // 1) TLS 指纹不匹配 -> 覆盖成可执行指引，且原因链保留。
+    val pin = chat.presentation.display.presentRawError(
+        "INVALID_TARGET",
+        "node client could not be created from the persisted device identity: node-client: PIN_MISMATCH: fingerprint abcd",
+    )
+    check(pin.title.contains("指纹")) { "指纹不匹配应给出明确标题，实际：" + pin.title }
+    check(pin.detail.contains("关于")) { "应指引到关于面板，实际：" + pin.detail }
+    check(pin.reason != null && pin.reason!!.contains("PIN_MISMATCH")) { "原因链必须保留" }
+    check(!pin.retryable) { "信任配置错误不应标成可重试" }
+
+    // 2) https 缺信任
+    val trust = chat.presentation.display.presentRawError("INVALID_TARGET", "TLS_TRUST_REQUIRED: https 端点必须提供证书指纹")
+    check(trust.title.contains("加密连接")) { "缺信任应说明清楚，实际：" + trust.title }
+
+    // 3) 已知码走冻结文案，原因单独保留
+    val known = chat.presentation.display.presentRawError("STORAGE_LOCKED", "another writer holds the store")
+    check(known.title == "本地数据已锁定") { "已知码应使用冻结文案，实际：" + known.title }
+    check(known.reason == "another writer holds the store") { "原因应原样保留" }
+
+    // 4) 未知码走回退，不崩
+    val unknown = chat.presentation.display.presentRawError("SOME_NEW_CODE", null)
+    check(unknown.title == "操作未完成") { "未知码应回退，实际：" + unknown.title }
+    check(unknown.reason == null)
+
+    // 5) 原因为超长 -> 截断到 300 字符
+    val long = chat.presentation.display.presentRawError("INTERNAL_FAILURE", "x".repeat(500))
+    check(long.reason != null && long.reason!!.length == 300) { "原因应截断到 300 字符" }
+
+    println("PASS error presentation: transport-trust guidance, frozen copy, unknown fallback, 300-char reason truncation")
 }
