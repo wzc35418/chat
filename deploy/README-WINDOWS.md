@@ -45,6 +45,17 @@ powershell -ExecutionPolicy Bypass -File deploy\prepare-node-bundle.ps1 -PublicI
    curl.exe --cacert cert.pem https://<公网IP>:8443/v1/tls/info
    ```
 
+### 也可以让它自己等（推荐）
+
+```powershell
+# 起来之后不用我们再手动跑：脚本会等端口打开，然后自动验证
+powershell -ExecutionPolicy Bypass -File tools\watch-remote.ps1 `
+  -Endpoint https://<公网IP>:8443 -NodeId node-public `
+  -FingerprintFile build\node-bundle\fingerprint.txt -TimeoutMinutes 20
+```
+
+`watch-remote.ps1` 每 5 秒探一次端口；一旦通了就跑完整 `verify-remote.ps1`（可用 `-DiagnoseOnly` 只做快速诊断）。
+
 ## 三、回到开发机验证（跨机器）
 
 ```powershell
