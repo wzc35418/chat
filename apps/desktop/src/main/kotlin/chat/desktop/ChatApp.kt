@@ -28,6 +28,9 @@ import chat.bridge.createSyncService
 import chat.presentation.AppFacade
 import chat.presentation.UseCaseResult
 import chat.ui.chat.ChatContactItem
+import chat.ui.chat.ChatGroupDetail
+import chat.ui.chat.ChatGroupMemberItem
+import chat.ui.chat.GroupDetailDialog
 import chat.ui.chat.ChatConversationItem
 import chat.ui.chat.ChatGroupItem
 import chat.ui.chat.ChatHomeHandlers
@@ -111,6 +114,40 @@ fun ChatAppRoot() {
 
     val handlers = ChatHomeHandlers(
         selectTab = { key -> state = state.copy(tab = key) },
+        openGroup = { groupId ->
+            scope.launch {
+                val detail = env.loadGroupDetail(groupId)
+                state = state.copy(
+                    groupDetail = detail,
+                    notice = if (detail == null) "群详情读取失败" else "群 " + detail.name,
+                )
+            }
+        },
+        closeGroup = { state = state.copy(groupDetail = null) },
+        renameGroup = { newName ->
+            scope.launch {
+                val current = state.groupDetail ?: return@launch
+                val result = env.renameGroup(current.id, newName)
+                state = state.copy(notice = result)
+                state = state.copy(groupDetail = env.loadGroupDetail(current.id) ?: current)
+            }
+        },
+        removeMember = { credential ->
+            scope.launch {
+                val current = state.groupDetail ?: return@launch
+                val result = env.removeMember(current.id, credential)
+                state = state.copy(notice = result)
+                state = state.copy(groupDetail = env.loadGroupDetail(current.id) ?: current)
+            }
+        },
+        acceptPending = {
+            scope.launch {
+                val current = state.groupDetail ?: return@launch
+                val result = env.acceptPending(current.id)
+                state = state.copy(notice = result)
+                state = state.copy(groupDetail = env.loadGroupDetail(current.id) ?: current)
+            }
+        },
         createInvite = {
             scope.launch {
                 val token = env.createInvite()
@@ -176,6 +213,10 @@ fun ChatAppRoot() {
     )
 
     ChatHomeScreen(state = state, handlers = handlers)
+
+    state.groupDetail?.let { detail ->
+        GroupDetailDialog(detail = detail, handlers = handlers, onClose = { state = state.copy(groupDetail = null) })
+    }
 
     if (settingsOpen) {
         NodeSettingsDialog(
@@ -279,6 +320,90 @@ private class ChatEnvironment {
             "已配置节点；会话与消息来自本地加密库"
         } else {
             "先点右上角「设置」填节点地址（例如 https://106.54.223.171:8443）"
+        }
+    }
+
+    /** 读群详情（成员/角色/待处理）。读之前先让出写者，读完重开 store。 */
+    suspend fun loadGroupDetail(groupId: String): ChatGroupDetail? = withContext(Dispatchers.IO) {
+        val database = databasePath ?: return@withContext null
+        val key = masterKey ?: return@withContext null
+        runCatching { store?.close() }
+        val snapshot = runCatching {
+            val service = createGroupService(database, key, nodeIdDefault)
+            try { service.snapshot(groupId) } finally { runCatching { service.shutdown() } }
+        }.getOrNull()
+        reopenStore(database, key)
+        if (snapshot == null) return@withContext null
+        ChatGroupDetail(
+            id = snapshot.groupId,
+            name = snapshot.name.ifBlank { snapshot.groupId },
+            epoch = snapshot.epoch,
+            role = snapshot.role,
+            members = snapshot.members.map { member ->
+                ChatGroupMemberItem(
+                    credential = member.credential,
+                    role = member.role,
+                    muted = member.muted,
+                    isLocal = member.isLocal,
+                    pending = member.pending,
+                )
+            },
+            pendingCount = snapshot.pendingMembers.size,
+        )
+    }
+
+    suspend fun renameGroup(groupId: String, newName: String): String = withContext(Dispatchers.IO) {
+        val database = databasePath ?: return@withContext "本地库未就绪"
+        val key = masterKey ?: return@withContext "本地库未就绪"
+        runCatching { store?.close() }
+        val attempt = runCatching {
+            val service = createGroupService(database, key, nodeIdDefault)
+            try { service.rename(groupId, newName) } finally { runCatching { service.shutdown() } }
+        }
+        reopenStore(database, key)
+        attempt.fold(
+            onSuccess = { "群名已改为「" + it.name + "」（epoch " + it.epoch + "）" },
+            onFailure = { "改名失败：" + (it.message ?: "未知原因") },
+        )
+    }
+
+    suspend fun removeMember(groupId: String, credential: String): String = withContext(Dispatchers.IO) {
+        val database = databasePath ?: return@withContext "本地库未就绪"
+        val key = masterKey ?: return@withContext "本地库未就绪"
+        runCatching { store?.close() }
+        val attempt = runCatching {
+            val service = createGroupService(database, key, nodeIdDefault)
+            try { service.removeMember(groupId, credential) } finally { runCatching { service.shutdown() } }
+        }
+        reopenStore(database, key)
+        attempt.fold(
+            onSuccess = { "已提交移除（epoch " + it.epoch + "）" },
+            onFailure = { "移除失败：" + (it.message ?: "未知原因") },
+        )
+    }
+
+    suspend fun acceptPending(groupId: String): String = withContext(Dispatchers.IO) {
+        val database = databasePath ?: return@withContext "本地库未就绪"
+        val key = masterKey ?: return@withContext "本地库未就绪"
+        runCatching { store?.close() }
+        val attempt = runCatching {
+            val service = createGroupService(database, key, nodeIdDefault)
+            try { service.acceptPending(groupId) } finally { runCatching { service.shutdown() } }
+        }
+        reopenStore(database, key)
+        attempt.fold(
+            onSuccess = { "待处理变更已接受（epoch " + it.epoch + "）" },
+            onFailure = { "接受失败：" + (it.message ?: "未知原因") },
+        )
+    }
+
+    /** 重开 store（多处复用：读群详情/改群名/移除/接受之后都要恢复本地库）。 */
+    private suspend fun reopenStore(database: String, key: String) = withContext(Dispatchers.IO) {
+        val reopened = runCatching { createLocalStore().also { it.open(database, key) } }.getOrNull()
+        if (reopened != null) {
+            store = reopened
+            facade = AppFacade(reopened)
+            mlsGroupKey?.let { runCatching { reopened.configureSendGroup(it) } }
         }
     }
 

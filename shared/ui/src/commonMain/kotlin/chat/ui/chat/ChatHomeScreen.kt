@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -16,6 +17,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -25,6 +27,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -68,8 +74,28 @@ data class ChatGroupItem(
     val members: Int,
 )
 
+/** 群详情里的一位成员。 */
+data class ChatGroupMemberItem(
+    val credential: String,
+    val role: String,
+    val muted: Boolean,
+    val isLocal: Boolean,
+    val pending: Boolean,
+)
+
+/** 群详情（打开后才加载；null = 未打开）。 */
+data class ChatGroupDetail(
+    val id: String,
+    val name: String,
+    val epoch: Int,
+    val role: String,
+    val members: List<ChatGroupMemberItem>,
+    val pendingCount: Int,
+)
+
 data class ChatHomeState(
     val loading: Boolean = true,
+    val groupDetail: ChatGroupDetail? = null,
     val tab: String = "conversations",
     val contacts: List<ChatContactItem> = emptyList(),
     val groups: List<ChatGroupItem> = emptyList(),
@@ -86,6 +112,11 @@ data class ChatHomeState(
 
 class ChatHomeHandlers(
     val selectTab: (String) -> Unit = {},
+    val openGroup: (String) -> Unit = {},
+    val closeGroup: () -> Unit = {},
+    val renameGroup: (String) -> Unit = {},
+    val removeMember: (String) -> Unit = {},
+    val acceptPending: () -> Unit = {},
     val selectConversation: (String) -> Unit = {},
     val createInvite: () -> Unit = {},
     val composerChange: (String) -> Unit = {},
@@ -184,7 +215,12 @@ fun ChatHomeScreen(state: ChatHomeState, handlers: ChatHomeHandlers, modifier: M
                         }
                         "groups" -> LazyColumn(Modifier.fillMaxSize()) {
                             items(state.groups) { group ->
-                                Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp)) {
+                                Column(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .clickable { handlers.openGroup(group.id) }
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                ) {
                                     Text(group.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
                                     Text(
                                         "epoch " + group.epoch + " · 成员 " + group.members + " · " + group.role,
@@ -293,4 +329,76 @@ fun ChatHomeScreen(state: ChatHomeState, handlers: ChatHomeHandlers, modifier: M
             }
         }
     }
+}
+/** 群详情对话框：成员列表 + 改群名 + 移除成员 + 接受待处理变更。 */
+@Composable
+fun GroupDetailDialog(
+    detail: ChatGroupDetail,
+    handlers: ChatHomeHandlers,
+    onClose: () -> Unit,
+) {
+    var name by remember { mutableStateOf(detail.name) }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("群组 · " + detail.name) },
+        text = {
+            Column(Modifier.width(560.dp)) {
+                Text(
+                    "epoch " + detail.epoch + " · 我的角色 " + detail.role + " · 成员 " + detail.members.size,
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                    color = Color(0xFF6C776E),
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it },
+                        label = { Text("群名") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Button(onClick = { handlers.renameGroup(name.trim()) }, enabled = name.trim().isNotEmpty()) { Text("改名") }
+                }
+                if (detail.pendingCount > 0) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "有 " + detail.pendingCount + " 条待处理变更（他人提案需要本机打包）",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color(0xFF9A6A00),
+                    )
+                    TextButton(onClick = { handlers.acceptPending() }) { Text("接受待处理变更") }
+                }
+                Spacer(Modifier.height(8.dp))
+                LazyColumn(Modifier.height(240.dp).fillMaxWidth()) {
+                    items(detail.members) { member ->
+                        Row(
+                            Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    chat.presentation.display.shortFingerprint(member.credential),
+                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                )
+                                Text(
+                                    member.role +
+                                        (if (member.isLocal) " · 本机" else "") +
+                                        (if (member.muted) " · 已禁言" else "") +
+                                        (if (member.pending) " · 待生效" else ""),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color(0xFF6C776E),
+                                )
+                            }
+                            if (!member.isLocal) {
+                                TextButton(onClick = { handlers.removeMember(member.credential) }) { Text("移除") }
+                            }
+                        }
+                        HorizontalDivider(color = Color(0xFFE3E8E2))
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onClose) { Text("关闭") } },
+    )
 }
