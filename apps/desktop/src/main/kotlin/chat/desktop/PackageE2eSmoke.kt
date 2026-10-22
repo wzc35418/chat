@@ -22,8 +22,8 @@ import kotlinx.coroutines.runBlocking
  *
  * 语义：这里不能用 TrustManager 全信任——那会让"公钥自动获取"变成绕过 pinning 的后门。
  */
-private fun fetchNodePublicKeyPinned(endpoint: String, fingerprintHex: String): String? = runCatching {
-    val expected = fingerprintHex.trim().lowercase()
+private fun fetchNodePublicKeyPinned(endpoint: String, fingerprints: List<String>): String? = runCatching {
+    val expected = fingerprints.map { it.trim().lowercase() }.filter { it.isNotEmpty() }.toSet()
     val trust = object : javax.net.ssl.X509TrustManager {
         override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) =
             throw java.security.cert.CertificateException("client auth not supported")
@@ -32,7 +32,7 @@ private fun fetchNodePublicKeyPinned(endpoint: String, fingerprintHex: String): 
             val der = chain.first().encoded
             val actual = java.security.MessageDigest.getInstance("SHA-256").digest(der)
                 .joinToString("") { b -> String.format("%02x", b.toInt() and 0xff) }
-            if (actual != expected) {
+            if (actual !in expected) {
                 throw java.security.cert.CertificateException("PIN_MISMATCH: $actual")
             }
         }
@@ -73,15 +73,17 @@ fun main(args: Array<String>): Unit = runBlocking {
     // 位置：0=endpoint 1=nodeId 2=nodePublicKey("-"=自动) 3=tlsFingerprint("-"=无)
     val tlsFingerprint = if (args.size >= 4) args[3].trim().takeIf { it.isNotEmpty() && it != "-" } else null
     if (tlsFingerprint != null) {
-        uniffi.chat_ffi.configureTransportTrust(listOf(tlsFingerprint))
-        println("INFO transport trust configured: pinned 1 certificate")
+        // 证书轮换期间要同时信任新旧两张：这里支持逗号分隔的指纹列表（内核按**集合**匹配）。
+        val pins = tlsFingerprint.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        uniffi.chat_ffi.configureTransportTrust(pins)
+        println("INFO transport trust configured: pinned " + pins.size + " certificate(s)")
     }
     // 节点公钥从 /v1/health 的公开身份取（不靠人工传参，避免 pinning 被跳过）。
     val nodeKey = if (args.size >= 3 && args[2].trim().isNotEmpty() && args[2].trim() != "-") {
         args[2].trim()
     } else if (tlsFingerprint != null) {
         // https：按指纹取公钥（不是"信任一切"）。
-        fetchNodePublicKeyPinned(endpoint, tlsFingerprint)
+        fetchNodePublicKeyPinned(endpoint, tlsFingerprint.split(",").map { it.trim() })
     } else {
         fetchNodePublicKey(endpoint)
     }
@@ -159,7 +161,12 @@ fun main(args: Array<String>): Unit = runBlocking {
 
             // 收消息：关掉 store（单写者）后用同一份库开同步对象，拉一轮。
             runCatching { store.close() }
-            val sync = createSyncService(dbPath, "0".repeat(64), endpoint, nodeId, nodeKey!!, snapshot.groupId)
+            if (nodeKey == null) {
+                println("FAIL node public key unavailable (cannot sync without it)")
+                failures += 1
+                kotlin.system.exitProcess(1)
+            }
+            val sync = createSyncService(dbPath, "0".repeat(64), endpoint, nodeId, nodeKey, snapshot.groupId)
             val once = sync.syncOnce()
             println(
                 "PASS syncOnce: fetched=" + once.fetched + " applied=" + once.applied +

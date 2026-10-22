@@ -92,7 +92,23 @@ powershell -ExecutionPolicy Bypass -File tools\verify-remote.ps1 `
 
 它会**醒目打印 WARNING**并接受服务端当前证书作为指纹（**这不是 pinning**，只用于首次联调）；随后照常跑完 health / 节点身份 / tls_info / 打包产物收发 / 错误指纹被拒。正式使用请核对指纹后写进配置。
 
-## 四、注意
+## 五、换证书（到期 / 换 IP）
+
+```powershell
+# 在开发机上，对部署包目录执行（保留节点身份，只换证书）
+powershell -ExecutionPolicy Bypass -File deploy\rotate-certificate.ps1 `
+  -BundleDir build\node-bundle -PublicIp 106.54.223.171 -Port 8443
+```
+
+它会把旧指纹写进 `fingerprint-history.txt`（审计），重写 `fingerprint.txt`，并自动跑 `verify-bundle.ps1` 自检。
+
+**轮换步骤**（本机已实证，见 R-266）：
+
+1. 把新的 `cert.pem` + `key.pem` + `fingerprint.txt` 拷到服务器，重启节点；
+2. 客户端先**同时配置新旧两个指纹**（轮换窗口，内核按集合匹配）；
+3. 确认客户端都能连上后，再把旧指纹从客户端配置里去掉。
+
+## 六、注意
 
 - **不要**把 `seed.hex` / `key.pem` 提交进 git 或发给别人；`fingerprint.txt` 可以公开。
 - 证书 SAN 必须等于客户端连接的 IP，否则 TLS 校验会失败（脚本已按 `-PublicIp` 生成）。

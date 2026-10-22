@@ -73,10 +73,10 @@ if ($StartProbe -and $fail -eq 0) {
 
 if ($fail -eq 0) {
     Write-Host ''
-    Write-Host 'BUNDLE OK —— start it with: powershell -ExecutionPolicy Bypass -File .\run-node.ps1'
+    Write-Host 'BUNDLE OK - start it with: powershell -ExecutionPolicy Bypass -File .\run-node.ps1'
     exit 0
 } else {
     Write-Host ''
-    Write-Host 'BUNDLE BROKEN —— copy the whole folder again (do not copy only some files)'
+    Write-Host 'BUNDLE BROKEN - copy the whole folder again (do not copy only some files)'
     exit 1
 }
