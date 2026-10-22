@@ -143,6 +143,21 @@ tasks.register<JavaExec>("groupSmoke") {
     systemProperty("stdout.encoding", "UTF-8")
 }
 
+tasks.register<JavaExec>("appFlowSmoke") {
+    group = "verification"
+    description = "应用真实链路：设置 → 建群/登记 → 发送（accepted）→ 关闭/同步/重开；用 -Dapp.* 传节点参数。"
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.AppFlowSmokeKt")
+    systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+    // Gradle 不会把命令行 -D 转发给 forked JVM，用 -Papp.* 转成系统属性。
+    listOf("endpoint", "nodeId", "nodeKey", "fingerprint").forEach { key ->
+        providers.gradleProperty("app." + key).orNull?.let { systemProperty("app." + key, it) }
+    }
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+}
+
 tasks.register<JavaExec>("pairingSmoke") {
     group = "verification"
     description = "配对包往返：KeyPackage 包 → 邀请包 → Welcome 入群（copy/paste 文本，不依赖网络）。"

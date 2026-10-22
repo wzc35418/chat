@@ -115,6 +115,14 @@ powershell -ExecutionPolicy Bypass -File tools\soak-disk.ps1                    
 
 最近一次结果（2026-10-23，`build/final-regression-20261023.log`）：**7 个套件全 PASS**；remote 64.6s、冷启动 p50 2075ms、公网稳态 p50 3855ms、三种故障注入全部如实失败。
 
+### 2.11 应用真实链路对公网节点（约 40 秒，需节点在线）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\verify-app-flow.ps1
+```
+
+期望 `APP FLOW: PASS`（指纹固定 → 建群/登记 → `sendDispatch: status=accepted settled=true` → 同步）。最近一次实测：`sync: fetched=2 applied=1 skipped=1`。
+
 ## 三、手工检查点（4 个，5 分钟）
 
 1. 双击 `build/dist/app-image/Chat/Chat.exe` → 能启动；
