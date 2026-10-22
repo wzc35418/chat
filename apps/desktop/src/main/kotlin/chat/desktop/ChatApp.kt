@@ -27,7 +27,9 @@ import chat.bridge.createLocalStore
 import chat.bridge.createSyncService
 import chat.presentation.AppFacade
 import chat.presentation.UseCaseResult
+import chat.ui.chat.ChatContactItem
 import chat.ui.chat.ChatConversationItem
+import chat.ui.chat.ChatGroupItem
 import chat.ui.chat.ChatHomeHandlers
 import chat.ui.chat.ChatHomeScreen
 import chat.ui.chat.ChatHomeState
@@ -98,10 +100,25 @@ fun ChatAppRoot() {
         state = state.copy(nodeLabel = env.nodeLabel(nodeConfig))
         env.start(nodeConfig)
         state = state.copy(nodeLabel = env.lastStatus, notice = env.lastNotice)
+        val side = env.loadSide()
+        state = state.copy(
+            contacts = side.contacts,
+            groups = side.groups,
+            identityLines = side.identityLines,
+        )
         reloadConversations()
     }
 
     val handlers = ChatHomeHandlers(
+        selectTab = { key -> state = state.copy(tab = key) },
+        createInvite = {
+            scope.launch {
+                val token = env.createInvite()
+                state = state.copy(
+                    notice = if (token == null) "邀请口令生成失败（先看设置里的身份是否就绪）" else "邀请口令（24 小时有效）：" + token,
+                )
+            }
+        },
         selectConversation = { conversationId -> openConversation(conversationId) },
         composerChange = { text -> state = state.copy(composer = text) },
         composeNew = {
@@ -265,6 +282,80 @@ private class ChatEnvironment {
         }
     }
 
+    /** 侧栏数据：身份摘要 + 联系人 + 群组（读之前先让出写者，读完再把 store 打开）。 */
+    suspend fun loadSide(): SideData = withContext(Dispatchers.IO) {
+        val database = databasePath
+        val key = masterKey
+        if (database == null || key == null) return@withContext SideData(emptyList(), emptyList(), emptyList())
+        runCatching { store?.close() }
+        val identityLines = mutableListOf<String>()
+        val contacts = mutableListOf<ChatContactItem>()
+        val groups = mutableListOf<ChatGroupItem>()
+        val identityService = runCatching { createIdentityService() }.getOrNull()
+        if (identityService != null) {
+            val opened = runCatching { identityService.openPersisted(database, key, nodeIdDefault) }.getOrNull()
+            if (opened != null) {
+                identityLines += "账户：" + opened.accountId
+                identityLines += "设备：" + opened.deviceId
+                identityLines += "指纹：" + opened.fingerprint
+            }
+            runCatching { identityService.contacts() }.getOrNull()?.forEach { contact ->
+                contacts += ChatContactItem(
+                    id = contact.contactId,
+                    name = contact.displayName.ifBlank { contact.accountId },
+                    fingerprint = contact.fingerprint,
+                    state = contact.state,
+                    canSend = contact.canSend,
+                )
+            }
+            runCatching { identityService.close() }
+        }
+        val groupService = runCatching { createGroupService(database, key, nodeIdDefault) }.getOrNull()
+        if (groupService != null) {
+            runCatching { groupService.listGroups() }.getOrNull()?.groups?.forEach { group ->
+                val members = runCatching { groupService.snapshot(group.groupId) }.getOrNull()?.members?.size ?: 0
+                groups += ChatGroupItem(
+                    id = group.groupId,
+                    name = group.name.ifBlank { group.groupId },
+                    epoch = group.epoch,
+                    role = group.role,
+                    members = members,
+                )
+            }
+            runCatching { groupService.shutdown() }
+        }
+        val reopened = runCatching { createLocalStore().also { it.open(database, key) } }.getOrNull()
+        if (reopened != null) {
+            store = reopened
+            facade = AppFacade(reopened)
+            mlsGroupKey?.let { runCatching { reopened.configureSendGroup(it) } }
+        }
+        SideData(identityLines, contacts, groups)
+    }
+
+    /** 生成邀请口令（24 小时有效）；失败返回 null，由界面显式提示。 */
+    suspend fun createInvite(): String? = withContext(Dispatchers.IO) {
+        val database = databasePath ?: return@withContext null
+        val key = masterKey ?: return@withContext null
+        runCatching { store?.close() }
+        val service = runCatching { createIdentityService() }.getOrNull()
+        val token = if (service == null) {
+            null
+        } else {
+            runCatching {
+                service.openPersisted(database, key, nodeIdDefault)
+                service.createInvite(24L * 60 * 60 * 1000).token
+            }.getOrNull().also { runCatching { service.close() } }
+        }
+        val reopened = runCatching { createLocalStore().also { it.open(database, key) } }.getOrNull()
+        if (reopened != null) {
+            store = reopened
+            facade = AppFacade(reopened)
+            mlsGroupKey?.let { runCatching { reopened.configureSendGroup(it) } }
+        }
+        token
+    }
+
     /** 同步必须独占写者：关 store → 同步 → 重开 store（与既有约束一致）。 */
     suspend fun syncOnce(config: NodeConfig): String = withContext(Dispatchers.IO) {
         val database = databasePath ?: return@withContext "本地库未就绪"
@@ -356,3 +447,11 @@ private fun NodeSettingsDialog(config: NodeConfig, onSave: (NodeConfig) -> Unit,
         dismissButton = { TextButton(onClick = onClose) { Text("取消") } },
     )
 }
+
+
+/** 侧栏数据（身份摘要 / 联系人 / 群组）。 */
+private data class SideData(
+    val identityLines: List<String>,
+    val contacts: List<ChatContactItem>,
+    val groups: List<ChatGroupItem>,
+)

@@ -50,8 +50,30 @@ data class ChatMessageItem(
 )
 
 /** 真实聊天界面状态（不做业务判断：语义来自 core/presentation）。 */
+/** 联系人一行（来自本机身份库，不可发送时如实标注状态）。 */
+data class ChatContactItem(
+    val id: String,
+    val name: String,
+    val fingerprint: String,
+    val state: String,
+    val canSend: Boolean,
+)
+
+/** 群组一行。 */
+data class ChatGroupItem(
+    val id: String,
+    val name: String,
+    val epoch: Int,
+    val role: String,
+    val members: Int,
+)
+
 data class ChatHomeState(
     val loading: Boolean = true,
+    val tab: String = "conversations",
+    val contacts: List<ChatContactItem> = emptyList(),
+    val groups: List<ChatGroupItem> = emptyList(),
+    val identityLines: List<String> = emptyList(),
     val conversations: List<ChatConversationItem> = emptyList(),
     val activeId: String? = null,
     val messages: List<ChatMessageItem> = emptyList(),
@@ -63,7 +85,9 @@ data class ChatHomeState(
 )
 
 class ChatHomeHandlers(
+    val selectTab: (String) -> Unit = {},
     val selectConversation: (String) -> Unit = {},
+    val createInvite: () -> Unit = {},
     val composerChange: (String) -> Unit = {},
     val send: () -> Unit = {},
     val sync: () -> Unit = {},
@@ -99,10 +123,27 @@ fun ChatHomeScreen(state: ChatHomeState, handlers: ChatHomeHandlers, modifier: M
             HorizontalDivider(color = Color(0xFFDCE3DC))
             Row(Modifier.fillMaxSize()) {
                 Column(Modifier.width(280.dp).fillMaxHeight().background(Color(0xFFF2F4F1))) {
-                    Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("会话", style = MaterialTheme.typography.titleSmall)
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        for ((key, label) in listOf("conversations" to "会话", "contacts" to "联系人", "groups" to "群组")) {
+                            val active = state.tab == key
+                            TextButton(onClick = { handlers.selectTab(key) }) {
+                                Text(
+                                    label,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                                )
+                            }
+                        }
                         Spacer(Modifier.weight(1f))
-                        TextButton(onClick = handlers.composeNew) { Text("新对话", style = MaterialTheme.typography.labelMedium) }
+                        if (state.tab == "conversations") {
+                            TextButton(onClick = handlers.composeNew) { Text("新对话", style = MaterialTheme.typography.labelMedium) }
+                        }
+                        if (state.tab == "contacts") {
+                            TextButton(onClick = handlers.createInvite) { Text("邀请", style = MaterialTheme.typography.labelMedium) }
+                        }
                     }
                     if (state.conversations.isEmpty() && !state.loading) {
                         Text(
@@ -112,24 +153,77 @@ fun ChatHomeScreen(state: ChatHomeState, handlers: ChatHomeHandlers, modifier: M
                             modifier = Modifier.padding(horizontal = 12.dp),
                         )
                     }
-                    LazyColumn(Modifier.fillMaxSize()) {
-                        items(state.conversations) { item ->
-                            val selected = item.id == state.activeId
-                            Column(
-                                Modifier
-                                    .fillMaxWidth()
-                                    .background(if (selected) Color(0xFFDDE7DC) else Color.Transparent)
-                                    .clickable { handlers.selectConversation(item.id) }
-                                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                            ) {
-                                Text(item.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-                                Text(
-                                    item.subtitle,
-                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                                    color = Color(0xFF6C776E),
-                                )
+                    when (state.tab) {
+                        "contacts" -> LazyColumn(Modifier.fillMaxSize()) {
+                            if (state.contacts.isEmpty()) {
+                                item {
+                                    Text(
+                                        "还没有联系人。点「邀请」生成口令发给对方。",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color(0xFF7A857C),
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    )
+                                }
                             }
-                            HorizontalDivider(color = Color(0xFFE3E8E2))
+                            items(state.contacts) { contact ->
+                                Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp)) {
+                                    Text(contact.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                                    Text(
+                                        chat.presentation.display.shortFingerprint(contact.fingerprint),
+                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                        color = Color(0xFF6C776E),
+                                    )
+                                    Text(
+                                        contact.state + (if (contact.canSend) "" else "（暂不可发送）"),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (contact.canSend) Color(0xFF3E6B4A) else Color(0xFF9A6A00),
+                                    )
+                                }
+                                HorizontalDivider(color = Color(0xFFE3E8E2))
+                            }
+                        }
+                        "groups" -> LazyColumn(Modifier.fillMaxSize()) {
+                            items(state.groups) { group ->
+                                Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp)) {
+                                    Text(group.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                                    Text(
+                                        "epoch " + group.epoch + " · 成员 " + group.members + " · " + group.role,
+                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                        color = Color(0xFF6C776E),
+                                    )
+                                }
+                                HorizontalDivider(color = Color(0xFFE3E8E2))
+                            }
+                        }
+                        else -> LazyColumn(Modifier.fillMaxSize()) {
+                            if (state.conversations.isEmpty() && !state.loading) {
+                                item {
+                                    Text(
+                                        "还没有会话。点「新对话」发第一条消息。",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color(0xFF7A857C),
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    )
+                                }
+                            }
+                            items(state.conversations) { item ->
+                                val selected = item.id == state.activeId
+                                Column(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .background(if (selected) Color(0xFFDDE7DC) else Color.Transparent)
+                                        .clickable { handlers.selectConversation(item.id) }
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                ) {
+                                    Text(item.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                                    Text(
+                                        item.subtitle,
+                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                        color = Color(0xFF6C776E),
+                                    )
+                                }
+                                HorizontalDivider(color = Color(0xFFE3E8E2))
+                            }
                         }
                     }
                 }
