@@ -1416,29 +1416,6 @@ fn block_on_node<'a, T>(
 where
     T: Send + 'a,
 {
-    // 控制提交前短超时预检：半死链路下否则要等到全局读超时才报错（实测约 26 秒）。
-    // 代价是每次控制提交多一次 /v1/health 往返；换来的是“链路死掉”秒级可见。
-    let probe = std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .ok()?;
-                runtime
-                    .block_on(client.health_probe(std::time::Duration::from_secs(3)))
-                    .ok()
-            })
-            .join()
-            .ok()
-            .flatten()
-    });
-    if probe.is_none() {
-        return Err(ControlReceiptError::new(
-            ErrorCode::NodeUnavailable.as_str(),
-            "node preflight failed: no /v1/health answer within 3s",
-        ));
-    }
     std::thread::scope(|scope| {
         let handle = scope.spawn(move || -> ControlReceiptResult<T> {
             let runtime = tokio::runtime::Builder::new_current_thread()
