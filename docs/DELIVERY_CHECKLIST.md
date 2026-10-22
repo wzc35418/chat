@@ -44,6 +44,14 @@ powershell -ExecutionPolicy Bypass -File deploy\inspect-node.ps1 `
 
 期望 `INSPECT: HEALTHY`（退出码 0）。
 
+### 2.6 Soak（可选，本机 20 轮约 1 分钟）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\soak.ps1 -Iterations 20
+```
+
+期望 `SOAK: PASS`（100% 成功，p50≈2 s）。数据与方法见 `docs/SOAK_2026-10-23.md`。
+
 ### 3. 应用本体冒烟
 
 ```powershell
