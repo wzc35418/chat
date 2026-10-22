@@ -554,7 +554,7 @@ fun main() = application {
             pluginState = pluginState.beginBusy()
             runCatching { service.listPlugins() }
                 .onSuccess { pluginState = pluginState.withPlugins(it) }
-                .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+                .onFailure { pluginState = pluginState.withError(failureCode(it), it.message) }
         }
 
         fun install() = scope.launch {
@@ -565,7 +565,7 @@ fun main() = application {
                 service.install(pluginState.manifestJson)
                 manifest.id
             }.onSuccess { pluginState = pluginState.withInstalled(it) }
-                .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+                .onFailure { pluginState = pluginState.withError(failureCode(it), it.message) }
             runCatching { service.listPlugins() }.onSuccess { pluginState = pluginState.withPlugins(it) }
         }
 
@@ -574,7 +574,7 @@ fun main() = application {
             pluginState = pluginState.beginBusy()
             runCatching { service.start(id) }
                 .onSuccess { pluginState = pluginState.withStateNotice("插件 " + id + " 已启动（宿主内状态）") }
-                .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+                .onFailure { pluginState = pluginState.withError(failureCode(it), it.message) }
             runCatching { service.listPlugins() }.onSuccess { pluginState = pluginState.withPlugins(it) }
         }
 
@@ -583,7 +583,7 @@ fun main() = application {
             pluginState = pluginState.beginBusy()
             runCatching { service.stop(id) }
                 .onSuccess { pluginState = pluginState.withStateNotice("插件 " + id + " 已停止") }
-                .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+                .onFailure { pluginState = pluginState.withError(failureCode(it), it.message) }
             runCatching { service.listPlugins() }.onSuccess { pluginState = pluginState.withPlugins(it) }
         }
 
@@ -592,7 +592,7 @@ fun main() = application {
             pluginState = pluginState.beginBusy()
             runCatching { service.uninstall(id, false) }
                 .onSuccess { pluginState = pluginState.withStateNotice("插件 " + id + " 已卸载（保留私有存储）") }
-                .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+                .onFailure { pluginState = pluginState.withError(failureCode(it), it.message) }
             runCatching { service.listPlugins() }.onSuccess { pluginState = pluginState.withPlugins(it) }
         }
 
@@ -601,7 +601,7 @@ fun main() = application {
             pluginState = pluginState.beginBusy()
             runCatching { service.dispatch(id, "composer.command", "ping") }
                 .onSuccess { pluginState = pluginState.withPlan(it) }
-                .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+                .onFailure { pluginState = pluginState.withError(failureCode(it), it.message) }
         }
 
         fun storage(pluginId: String) = scope.launch {
@@ -609,7 +609,7 @@ fun main() = application {
             pluginState = pluginState.beginBusy()
             runCatching { service.storageGet(pluginId, "probe") }
                 .onSuccess { pluginState = pluginState.withStorageValue(it) }
-                .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+                .onFailure { pluginState = pluginState.withError(failureCode(it), it.message) }
         }
     }
 
@@ -1317,7 +1317,7 @@ fun main() = application {
                         storeState = storeState.copy(busy = false, notice = "已插入插件内容（" + text.length + " 字符），确认后再发送")
                     }
                     .onFailure { error ->
-                        storeState = storeState.withError(codeOf(error), error.message)
+                        storeState = storeState.withError(failureCode(error), error.message)
                     }
             }
         },
@@ -1535,7 +1535,7 @@ PreviewChatScreen(
                                 )
                                 paletteOpen = false
                             }
-                            .onFailure { storeState = storeState.withError(codeOf(it), it.message) }
+                            .onFailure { storeState = storeState.withError(failureCode(it), it.message) }
                     }
                 },
                 close = { paletteOpen = false },
@@ -1752,7 +1752,7 @@ PreviewChatScreen(
                             val bytes = File(pluginState.jarPath).readBytes()
                             service.inspectPackage(bytes)
                         }.onSuccess { pluginState = pluginState.withPackage(it) }
-                            .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+                            .onFailure { pluginState = pluginState.withError(failureCode(it), it.message) }
                     }
                 },
                 toggleTrusted = { value -> pluginState = pluginState.toggleTrusted(value) },
@@ -1778,7 +1778,7 @@ PreviewChatScreen(
                             )
                             host.loadedPluginIds()
                         }.onSuccess { pluginState = pluginState.withLoadedPlugins(it) }
-                            .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+                            .onFailure { pluginState = pluginState.withError(failureCode(it), it.message) }
                     }
                 },
                 runAction = {
@@ -1788,7 +1788,7 @@ PreviewChatScreen(
                         pluginState = pluginState.beginBusy()
                         runCatching { host.runSelectedTextAction(id, "echo", "ping") }
                             .onSuccess { pluginState = pluginState.withStateNotice("插件输出：" + it) }
-                            .onFailure { pluginState = pluginState.withError(codeOf(it), it.message) }
+                            .onFailure { pluginState = pluginState.withError(failureCode(it), it.message) }
                     }
                 },
                 forgetTrustedPlugin = { pluginId ->
@@ -1826,14 +1826,6 @@ PreviewChatScreen(
         }
     }
 }
-
-/**
- * 稳定错误码提取：统一走 presentation 的投影（带 code 的异常用它自己的码，其它归 UNKNOWN_RESULT）。
- *
- * 收敛点：以前这里是 `failureCode(error)`，
- * 只认得一种异常；现在任何“带稳定码”的异常都能正确投影。
- */
-private fun codeOf(error: Throwable): String = chat.presentation.preview.projectFailure(error).code
 
 /** 演示口令：正式产品必须改为用户输入或操作系统密钥链（PLATFORM-001 未接线部分）。 */
 private const val DEMO_KEY_PASSPHRASE = "chat-preview-demo-passphrase"
