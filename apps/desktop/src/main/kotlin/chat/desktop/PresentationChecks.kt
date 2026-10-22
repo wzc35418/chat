@@ -1396,6 +1396,17 @@ private fun checkRawErrorPresentation() {
     check(chat.presentation.display.endpointScopeGuidance(chat.presentation.display.EndpointScope.Public) == null) { "公网地址不该有警告" }
     check(!chat.presentation.display.endpointScopeGuidance(chat.presentation.display.EndpointScope.Cgnat).isNullOrBlank()) { "CGNAT 必须给出说明" }
 
+    // 3e) 后台自动同步策略：退避 / 离线判定 / 文案必须如实
+    check(chat.presentation.preview.AutoSyncPolicy.nextDelayMillis(0) == 60_000L) { "0 次失败应为 60 秒" }
+    check(chat.presentation.preview.AutoSyncPolicy.nextDelayMillis(3) == 480_000L) { "3 次失败应为 480 秒（指数退避）" }
+    check(chat.presentation.preview.AutoSyncPolicy.nextDelayMillis(99) == 60_000L * 32) { "退避上限应为 5 档" }
+    check(!chat.presentation.preview.AutoSyncPolicy.looksOffline(1)) { "1 次失败不应判离线" }
+    check(chat.presentation.preview.AutoSyncPolicy.looksOffline(2)) { "2 次失败应判离线" }
+    check(chat.presentation.preview.AutoSyncPolicy.describeSuccess(0, 0).contains("暂无新消息")) { "零新增应说暂无" }
+    check(chat.presentation.preview.AutoSyncPolicy.describeSuccess(3, 2).contains("返回 3")) { "有新增应说条数" }
+    check(chat.presentation.preview.AutoSyncPolicy.describeFailure(1, null).contains("抖动")) { "第 1 次失败应为抖动" }
+    check(chat.presentation.preview.AutoSyncPolicy.describeFailure(2, "NODE_UNAVAILABLE").contains("离线")) { "第 2 次失败应说离线" }
+
     // 4) 未知码走回退，不崩
     val unknown = chat.presentation.display.presentRawError("SOME_NEW_CODE", null)
     check(unknown.title == "操作未完成") { "未知码应回退，实际：" + unknown.title }

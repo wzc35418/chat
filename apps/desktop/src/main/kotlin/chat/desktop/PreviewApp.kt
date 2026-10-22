@@ -614,6 +614,29 @@ fun main() = application {
     }
 
     var syncService by remember { mutableStateOf<chat.api.SyncService?>(null) }
+
+    // 后台自动同步：每 60 秒（失败后指数退避）拉一次；失败不弹错误条，但状态必须可见。
+    LaunchedEffect(syncService) {
+        var failures = 0
+        while (true) {
+            kotlinx.coroutines.delay(chat.presentation.preview.AutoSyncPolicy.nextDelayMillis(failures))
+            val service = syncService ?: continue
+            runCatching { service.syncOnce() }
+                .onSuccess { once ->
+                    failures = 0
+                    storeState = storeState.withSyncOnce(once).copy(
+                        notice = chat.presentation.preview.AutoSyncPolicy.describeSuccess(once.fetched.toInt(), once.applied.toInt()),
+                    )
+                }
+                .onFailure { error ->
+                    failures += 1
+                    storeState = storeState.copy(
+                        notice = chat.presentation.preview.AutoSyncPolicy.describeFailure(failures, error.message),
+                    )
+                }
+        }
+    }
+
     val trayNotifications = remember {
         runCatching { TrayNotifications().also { runCatching { it.installIcon() } } }.getOrNull()
     }
