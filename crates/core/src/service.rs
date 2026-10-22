@@ -964,9 +964,14 @@ impl ConversationCore {
             }
         };
         let step_result = runtime.step(draft_id, step);
-        match &step_result {
-            Ok(_) => crate::preflight::note_success(),
-            Err(_) => crate::preflight::note_failure(),
+        // 只有“确定被接受”才算成功：结果未知（status=unknown / settled=false）必须算失败，
+        // 否则失败窗口会被错误关闭，下一次请求就不会预检（实测第二次仍然慢 20 秒）。
+        // 只对 Dispatch 记账：Prepare 的 status 是 prepared，不该被当成“网络失败”而打开窗口。
+        if step == SendStep::Dispatch {
+            match &step_result {
+                Ok(view) if view.settled && view.status == "accepted" => crate::preflight::note_success(),
+                _ => crate::preflight::note_failure(),
+            }
         }
         // 本次运行时产生的事件（序号从 0 开始，因为 service 是本次新建的实例）。
         let mut produced = Vec::new();

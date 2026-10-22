@@ -47,7 +47,23 @@ internal suspend fun sendWithRecovery(store: LocalStore, draftId: String): SendO
         return SendOutcome(steps.toList(), error)
     }
     try {
-        store.sendDispatch(draftId)
+        val view = store.sendDispatch(draftId)
+        // **不能只看“没抛异常”**：节点结果未确定时内核会返回 status=unknown / settled=false，
+        // 那不是成功，而是“必须先对账”。这里必须如实报失败，否则界面会谎报已发送。
+        if (view.status != "accepted" || !view.settled) {
+            steps += "dispatch-" + view.status
+            return SendOutcome(
+                steps.toList(),
+                chat.api.LocalStoreException(
+                    if (view.settled) "SEND_REJECTED" else "UNKNOWN_RESULT",
+                    if (view.settled) {
+                        "节点未接受这次提交（status=" + view.status + "）：" + view.detail
+                    } else {
+                        "发送结果未确定（status=" + view.status + "）：必须按 SubmissionId 对账，不要重发"
+                    },
+                ),
+            )
+        }
         steps += "accepted"
         return SendOutcome(steps.toList(), null)
     } catch (first: Throwable) {
