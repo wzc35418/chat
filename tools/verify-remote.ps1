@@ -16,7 +16,9 @@ param(
     [string]$FingerprintFile = '',
     [switch]$DiagnoseOnly,
     [switch]$PlainHttp,
-    [switch]$TrustServedCertificate
+    [switch]$TrustServedCertificate,
+    # 跳过“打包产物是否比源码新”的检查（仅在明知故犯时用）。
+    [switch]$AllowStaleArtifact
 )
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
@@ -37,6 +39,20 @@ $native = Join-Path $app 'app\native'
 foreach ($p in @($java, $jar, $native)) {
     if (-not (Test-Path $p)) { Write-Host ('SKIP remote check: packaged artifact missing (' + $p + ')'); exit 3 }
 }
+# 防“旧 jar”事故（本会话踩过 4 次）：打包产物必须比源码新，否则后面的断言毫无意义。
+if (-not $AllowStaleArtifact) {
+    $freshness = Join-Path $root 'tools\check-artifact-freshness.ps1'
+    if (Test-Path $freshness) {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $freshness *> (Join-Path $logDir 'freshness.log')
+        if ($LASTEXITCODE -eq 1) {
+            Write-Host 'FAIL remote check: packaged artifact is stale (sources are newer)'
+            Get-Content (Join-Path $logDir 'freshness.log') | Select-Object -Last 4 | Out-Host
+            Write-Host '  fix: powershell -ExecutionPolicy Bypass -File tools\verify-package.ps1   (or pass -AllowStaleArtifact)'
+            exit 1
+        }
+    }
+}
+
 $openssl = 'C:\Program Files\OpenSSL-Win64\bin\openssl.exe'
 if ($tlsMode -and -not (Test-Path $openssl)) { Write-Host 'SKIP remote check: openssl not installed'; exit 3 }
 

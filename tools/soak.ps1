@@ -31,6 +31,17 @@ foreach ($p in @($java, $jar, $native)) {
 }
 
 # -Reuse N: 同一进程内同一身份/群连发 N 条（稳态），只跑 1 个进程；否则每次冷启动。
+# 防“旧 jar”事故：soak 用的必须是当前源码构建出来的包。
+$freshness = Join-Path $root 'tools\check-artifact-freshness.ps1'
+if (Test-Path $freshness) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $freshness *> (Join-Path $logDir 'freshness.log')
+    if ($LASTEXITCODE -eq 1) {
+        Write-Host 'FAIL soak: packaged artifact is stale (run tools\verify-package.ps1 first)'
+        Get-Content (Join-Path $logDir 'freshness.log') | Select-Object -Last 4 | Out-Host
+        exit 1
+    }
+}
+
 $nodeProc = $null
 $dataDir = Join-Path $logDir 'node-data'
 if ([string]::IsNullOrWhiteSpace($Endpoint)) {

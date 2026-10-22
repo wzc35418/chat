@@ -24,6 +24,14 @@ powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
 
 期望：`overall: PASS`（12 阶段；`remote` 阶段 7 条断言）。
 
+### 2.1 打包产物是否新鲜（10 秒，防“旧 jar”）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\check-artifact-freshness.ps1
+```
+
+期望 `PASS freshness`。过期会打印双方时间与修复命令（`tools\verify-package.ps1`）；`verify-remote` 与 `soak` 已内置这项检查。
+
 ### 2. 只验公网节点（35 秒左右）
 
 ```powershell

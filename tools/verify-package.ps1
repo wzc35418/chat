@@ -278,5 +278,16 @@ $report.Add("- Each smoke runs in its own temp working directory; -Djna.library.
 $report.Add("- A failing stage never stops later stages; the exit code is 1 when any stage failed.")
 Set-Content -Path $reportPath -Value $report -Encoding ASCII
 
+# 打包成功后把 app.jar 的时间戳刷成“刚刚”：
+# Gradle 按**内容**判断是否重建，源码只改 mtime 时 jar 不会重写，单看 mtime 会误判成 stale。
+# 这里之所以可以刷，是因为上面四个冒烟**确实是用这个 jar 跑过的**（不是空口说“已打包”）。
+if ($overall -eq "PASS") {
+    $jarPath = Join-Path $appDir "app/app.jar"
+    if (Test-Path $jarPath) {
+        (Get-Item $jarPath).LastWriteTimeUtc = [datetime]::UtcNow
+        Write-Host ("stamped: " + $jarPath)
+    }
+}
+
 if ($overall -eq "PASS") { exit 0 }
 exit 1
