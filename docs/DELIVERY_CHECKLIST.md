@@ -34,6 +34,16 @@ powershell -ExecutionPolicy Bypass -File tools\verify-remote.ps1 `
 
 期望 7 行 `PASS`，最后 `CROSS-MACHINE VERIFICATION: PASS`。
 
+### 2.5 节点巡检（30 秒，一条命令）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\inspect-node.ps1 `
+  -Endpoint https://106.54.223.171:8443 `
+  -Fingerprint 13be2f93162bd121cba6a91d4e05c22900dcc06abcd92cf843bd5ed772b8a053
+```
+
+期望 `INSPECT: HEALTHY`（退出码 0）。
+
 ### 3. 应用本体冒烟
 
 ```powershell
@@ -60,6 +70,7 @@ powershell -ExecutionPolicy Bypass -File tools\verify-package.ps1    # 结构 + 
 | `docs/DEEPSEEK_WORK_PLAN.md` | 每轮真实记录（R-140…R-263） |
 | `docs/implementation/P0_CHECKLIST.md` | 计划勾选与未完成项 |
 | `deploy/README-WINDOWS.md` | Windows Server 部署（复制 / 防火墙 / 自检 / 启动） |
+| `docs/OPS_RUNBOOK.md` | **节点运维手册**（巡检 / 自启 / 日志 / 备份 / 换证书 / 故障对照表 / 事故处置） |
 | `deploy/README.md` | Linux 部署脚本与公网验证说明 |
 
 ## 五、公网节点（当前唯一外部依赖）
