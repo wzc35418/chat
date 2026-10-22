@@ -130,3 +130,41 @@ powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
 ```
 
 先确认 12 阶段仍然全绿，再动代码；节点若已关停，把 `-RemoteEndpoint` 去掉即可（`remote` 会显式 SKIP，不算通过）。
+
+## 十二、第 152 轮最终状态（2026-10-23）
+
+| 口径 | 数值 | 依据 |
+| --- | --- | --- |
+| **A：功能闭环** | **100%** | 12 阶段 `verify-all` 全 PASS；`remote` 阶段 7 条断言直连公网（证书 pin / 节点身份 / 打包产物 accepted+applied / **UI 一步发送** / 错误指纹被拒） |
+| **B：生产就绪** | **≈ 85%** | 相比 140 轮增加了：证书轮换与双指纹窗口、运维手册与巡检脚本、soak（冷启动+稳态）、产物新鲜度断言、交付 zip 验证、后台自动同步与托盘通知；仍缺长稳/并发/资源曲线/故障注入、MSI、后台常驻、多平台、`AppFacade` 重写、P2P 中继接线 |
+
+### 这两批次（121–152）新增的可核对能力
+
+| 能力 | 证据 |
+| --- | --- |
+| 公网跨机器收发 | `remote` 阶段 7 断言 PASS（`106.54.223.171:8443`） |
+| 证书轮换 | `deploy/rotate-certificate.ps1` + 双指纹实测（`pinned 2 certificate(s)` → accepted → applied） |
+| 节点巡检 | `deploy/inspect-node.ps1` 远程 `INSPECT: HEALTHY`；本机正确报 2 问题 |
+| 冷启动 soak | 本机 20 轮 / 公网 10 轮 **100% 成功** |
+| 稳态 soak | 本机 **144 ms/条**、公网 4.4 s/条（各 10 条 100% 成功） |
+| 交付物可运行 | `tools/verify-zip.ps1` → `ZIP CHECK: PASS`（从解压副本跑冒烟） |
+| 防旧产物 | `tools/check-artifact-freshness.ps1` 已接入远程验证与 soak |
+
+### 仍然不能说的话（本轮复核后不变）
+
+- ❌ **不能说我生产可用** —— 缺长稳/并发/故障注入数据、无安装器、无后台常驻、只验证了 Windows；
+- ❌ **不能说它穿透 NAT** —— 消息走自建 HTTP 节点；iroh 中继有配置与 78 个测试但未接线；
+- ❌ **不能说证书自动轮换** —— 有轮换脚本与到期告警，但要人工执行；
+- ❌ **不能说多平台支持** —— 只有 Windows 凭据实现经验证。
+
+### 下次接手第一步（不变）
+
+```powershell
+cd D:\AgentProject\chat
+. .\tools\activate.ps1
+powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
+  -RemoteEndpoint https://106.54.223.171:8443 -RemoteNodeId node-public `
+  -RemoteFingerprint 13be2f93162bd121cba6a91d4e05c22900dcc06abcd92cf843bd5ed772b8a053
+```
+
+先确认 12 阶段全绿再动代码。节点若已关停，去掉 `-RemoteEndpoint`（`remote` 会显式 SKIP，不算通过）。

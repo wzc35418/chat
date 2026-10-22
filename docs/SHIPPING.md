@@ -373,3 +373,16 @@ powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
 | tls / offline / tls-e2e | PASS | 4.8s / 5.3s / 5.4s |
 | **remote（公网 7 断言）** | **PASS** | **68.1s** |
 | **overall** | **PASS（EXIT=0）** | `build/verify-all-20261021-032010.md` |
+
+## 最终回归（第 152 轮，2026-10-23，12 阶段含公网）
+
+| 阶段 | 结果 | 用时 |
+| --- | --- | --- |
+| disk / rust-check / verify-project | PASS | 0s / 6.5s / 0.9s |
+| gradle（13 任务） | PASS | 34.9s |
+| android | PASS | 30.2s |
+| package | PASS | 16s |
+| two-device / lan / tls | PASS | 5.9s / 3.7s / 4.8s |
+| offline / tls-e2e | PASS | 4.6s / 5.2s |
+| **remote（公网 7 断言）** | **PASS** | **61.4s** |
+| **overall** | **PASS（EXIT=0）** | `build/verify-all-20261023-003902.md` |
