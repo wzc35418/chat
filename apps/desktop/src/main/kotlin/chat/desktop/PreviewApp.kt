@@ -980,9 +980,17 @@ fun main() = application {
                 val key = storeState.sendNodePublicKey.trim().ifEmpty { null }
                 runCatching { store.configureSendNode(storeState.sendNodeUrl.trim(), storeState.sendNodeId.trim(), key) }
                     .onSuccess {
+                        val scope = chat.presentation.display.classifyEndpointHost(
+                            chat.presentation.display.endpointHost(storeState.sendNodeUrl),
+                        )
+                        val scopeGuidance = chat.presentation.display.endpointScopeGuidance(scope)
                         storeState = storeState.copy(
                             busy = false,
-                            notice = "节点配置已保存（未联网校验）；发送需要设备已注册且已加入群。",
+                            notice = if (scopeGuidance == null) {
+                                "节点配置已保存（未联网校验）；发送需要设备已注册且已加入群。"
+                            } else {
+                                "节点配置已保存，但地址类型是 " + scope + "：" + scopeGuidance
+                            },
                         )
                     }
                     .onFailure { error ->
@@ -1557,7 +1565,12 @@ PreviewChatScreen(
                                 else -> "UNKNOWN_RESULT"
                             }
                             // 把原始原因带上，让 presentRawError 的标记匹配能命中（PIN_MISMATCH / SAN 等）。
-                            val reason = failed.name + ": " + failed.detail
+                            val scope = chat.presentation.display.classifyEndpointHost(
+                                chat.presentation.display.endpointHost(endpoint),
+                            )
+                            val scopeHint = chat.presentation.display.endpointScopeGuidance(scope)
+                            val reason = failed.name + ": " + failed.detail +
+                                (if (scopeHint == null) "" else "（地址类型 " + scope + "：" + scopeHint + "）")
                             aboutState = aboutState.withAboutError(code, reason)
                         }
                     }

@@ -1384,6 +1384,18 @@ private fun checkRawErrorPresentation() {
     check(expiring.detail.contains("重新生成部署包")) { "说明里应给轮换做法" }
     check(!expiring.retryable) { "证书到期不是可重试错误" }
 
+    // 3d) 节点地址可达性分类：内网/回环/CGNAT 必须能识别并给出指引
+    check(chat.presentation.display.classifyEndpointHost("127.0.0.1") == chat.presentation.display.EndpointScope.Loopback) { "127.0.0.1 应判为回环" }
+    check(chat.presentation.display.classifyEndpointHost("localhost") == chat.presentation.display.EndpointScope.Loopback) { "localhost 应判为回环" }
+    check(chat.presentation.display.classifyEndpointHost("192.168.20.1") == chat.presentation.display.EndpointScope.PrivateNet) { "192.168/16 应判为内网" }
+    check(chat.presentation.display.classifyEndpointHost("10.1.2.3") == chat.presentation.display.EndpointScope.PrivateNet) { "10/8 应判为内网" }
+    check(chat.presentation.display.classifyEndpointHost("172.16.5.4") == chat.presentation.display.EndpointScope.PrivateNet) { "172.16/12 应判为内网" }
+    check(chat.presentation.display.classifyEndpointHost("100.100.1.1") == chat.presentation.display.EndpointScope.Cgnat) { "100.64/10 应判为 CGNAT" }
+    check(chat.presentation.display.classifyEndpointHost("106.54.223.171") == chat.presentation.display.EndpointScope.Public) { "公网 IP 应判为 Public" }
+    check(chat.presentation.display.classifyEndpointHost("chat.example.com") == chat.presentation.display.EndpointScope.Hostname) { "域名应判为 Hostname" }
+    check(chat.presentation.display.endpointScopeGuidance(chat.presentation.display.EndpointScope.Public) == null) { "公网地址不该有警告" }
+    check(!chat.presentation.display.endpointScopeGuidance(chat.presentation.display.EndpointScope.Cgnat).isNullOrBlank()) { "CGNAT 必须给出说明" }
+
     // 4) 未知码走回退，不崩
     val unknown = chat.presentation.display.presentRawError("SOME_NEW_CODE", null)
     check(unknown.title == "操作未完成") { "未知码应回退，实际：" + unknown.title }
