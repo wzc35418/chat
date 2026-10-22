@@ -244,6 +244,29 @@ fun ChatHomeScreen(state: ChatHomeState, handlers: ChatHomeHandlers, modifier: M
                                     )
                                 }
                             }
+                            // 新对话：还没入库时也要有一行，点击“新对话”才有可见反馈。
+                            if (state.activeId != null && state.conversations.none { it.id == state.activeId }) {
+                                item {
+                                Column(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .background(Color(0xFFDDE7DC))
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                ) {
+                                    Text(
+                                        "新对话（未发送）",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Medium,
+                                    )
+                                    Text(
+                                        chat.presentation.display.shortFingerprint(state.activeId ?: ""),
+                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                        color = Color(0xFF6C776E),
+                                    )
+                                }
+                                HorizontalDivider(color = Color(0xFFE3E8E2))
+                                }
+                            }
                             items(state.conversations) { item ->
                                 val selected = item.id == state.activeId
                                 Column(

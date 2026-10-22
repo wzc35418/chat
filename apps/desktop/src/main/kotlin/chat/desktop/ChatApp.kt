@@ -224,6 +224,7 @@ fun ChatAppRoot() {
             onSave = { updated ->
                 nodeConfigStore.save(updated)
                 nodeConfig = updated
+                env.applyTransportTrust(updated)
                 state = state.copy(nodeLabel = env.nodeLabel(updated), notice = "节点配置已保存")
                 settingsOpen = false
             },
@@ -252,6 +253,7 @@ private class ChatEnvironment {
     }
 
     suspend fun start(config: NodeConfig) = withContext(Dispatchers.IO) {
+        applyTransportTrust(config)
         if (facade != null) {
             lastStatus = nodeLabel(config)
             return@withContext
@@ -321,6 +323,16 @@ private class ChatEnvironment {
         } else {
             "先点右上角「设置」填节点地址（例如 https://106.54.223.171:8443）"
         }
+    }
+
+    /**
+     * 证书固定：自签名节点必须配指纹，否则 https 请求会因不受信任而失败。
+     * 空列表 = 不做固定（会被系统信任链拒绝，界面会在发送/同步时如实报错）。
+     */
+    fun applyTransportTrust(config: NodeConfig) {
+        val pins = config.tlsFingerprints.filter { it.length == 64 }
+        if (pins.isEmpty()) return
+        runCatching { uniffi.chat_ffi.configureTransportTrust(pins) }
     }
 
     /** 读群详情（成员/角色/待处理）。读之前先让出写者，读完重开 store。 */
@@ -521,6 +533,7 @@ private fun NodeSettingsDialog(config: NodeConfig, onSave: (NodeConfig) -> Unit,
     var endpoint by remember { mutableStateOf(config.endpointUrl) }
     var nodeId by remember { mutableStateOf(config.nodeId) }
     var publicKey by remember { mutableStateOf(config.nodePublicKeyHex) }
+    var fingerprints by remember { mutableStateOf(config.tlsFingerprints.joinToString("\n")) }
     AlertDialog(
         onDismissRequest = onClose,
         title = { Text("节点设置") },
@@ -549,8 +562,17 @@ private fun NodeSettingsDialog(config: NodeConfig, onSave: (NodeConfig) -> Unit,
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                 )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = fingerprints,
+                    onValueChange = { fingerprints = it },
+                    label = { Text("证书 SHA-256 指纹（自签名节点必填，可多行/逗号分隔）") },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 2,
+                    maxLines = 4,
+                )
                 Text(
-                    "证书指纹在「设置 → 传输安全」里配置（此窗口只改地址与身份）。",
+                    "指纹从节点目录的 fingerprint.txt 取（或 tools/inspect-node.ps1 打印）。留空表示不做证书固定。",
                     style = MaterialTheme.typography.labelSmall,
                     modifier = Modifier.padding(top = 8.dp),
                 )
@@ -559,11 +581,16 @@ private fun NodeSettingsDialog(config: NodeConfig, onSave: (NodeConfig) -> Unit,
         confirmButton = {
             TextButton(
                 onClick = {
+                    val parsed = fingerprints
+                        .split(',', '\n', ' ')
+                        .map { it.trim().lowercase().replace(":", "") }
+                        .filter { it.length == 64 && it.all { ch -> ch in "0123456789abcdef" } }
                     onSave(
                         config.copy(
-                            endpointUrl = endpoint.trim(),
-                            nodeId = nodeId.trim(),
+                            endpointUrl = endpoint.trim().trimEnd('/'),
+                            nodeId = nodeId.trim().ifEmpty { "node-public" },
                             nodePublicKeyHex = publicKey.trim(),
+                            tlsFingerprints = parsed,
                         ),
                     )
                 },
