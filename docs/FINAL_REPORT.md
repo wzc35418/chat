@@ -210,3 +210,51 @@ powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
 ```
 
 先确认 12 阶段全绿，再跑 `soak-faults` / `soak-partition` / `soak-disk` 确认故障语义没退化，最后才动代码。
+## 十四、第 179 轮交付基线（2026-10-23，最终数字）
+
+| 口径 | 数值 | 依据 |
+| --- | --- | --- |
+| **A：功能闭环** | **100%** | 12 阶段 + 应用真实链路 + 双人配对 + 3 soak + 3 故障注入，全部 PASS |
+| **B：生产就绪** | **≈ 90%** | 相比 164 轮增加：真实界面可用（会话=群/发送/同步/群管理/配对/自检）、`Chat.exe` FFI 修复、出站消息落库、打包原子化 |
+
+### 关键数字（第 177 轮回归，日志 `build/final-regression-177.log`）
+
+| 项目 | 结果 |
+| --- | --- |
+| `verify-all` 12 阶段（含公网跨机器） | PASS，remote **59.7 s** |
+| 应用真实链路（公网） | PASS，`dispatch=accepted settled=true`，`sync applied=1` |
+| 双人配对（本地节点） | PASS，Welcome 921 B，两端同 epoch |
+| 冷启动 soak 10 轮 | 10/10，p50 **2018 ms**，内存 13.8→14.1 MB |
+| 公网稳态 soak 10 条 | 10/10，p50 **3041 ms**，p95 6857 ms |
+| 杀节点 / 半死链路 / 库只读 | 全 PASS，零谎报（半死链路 26371 ms 后如实失败） |
+
+**口径**：公网 p50 3–4 s 属跨洲网络正常（新西兰 ↔ 上海），**不作缺陷、不作优化指标**。
+
+### 交付产物（当前哈希）
+
+| 产物 | 路径 | SHA-256 | 备注 |
+| --- | --- | --- | --- |
+| 免 JDK 启动器 | `build/dist/app-image/Chat/Chat.exe` | `644E16725B6F5E61B693158F25877DB1A7B04827BE27912C12A9B9FC8FE5BD36` | 启动器本身不含业务代码 |
+| 业务包 | `build/dist/app-image/Chat/app/app.jar` | `FA29A6EAA0821159F819BC053E8F5237015416C0D2C0B4843E5545FF3E2DCC33` | 界面 + 内核调用 |
+| 完整分发包 | `build/dist/Chat-app-0.1.0.zip` | `9BF370CD018396E1B7F951BC7A9E895535F83B1FC7D55ADF371C3B9C1A9405D5` | 82.8 MB |
+
+### 仍然不能说的话（第 179 轮复核）
+
+1. ❌ **不能说“两台真机通过公网配对成功”** —— 配对只在**本地节点**验证过（`PAIRING: PASS`）；两台机器 + 你的公网节点这条路**还没跑过**；
+2. ❌ 不能说生产可用：无长稳/并发数据、无安装器、无后台常驻、只验 Windows；
+3. ❌ 不能说穿透 NAT：消息走自建 HTTP 节点，iroh 中继未接线；
+4. ❌ 不能说证书自动轮换：只有脚本与告警；
+5. ❌ 不能说多平台支持：只有 Windows 凭据经验证；
+6. ❌ 不能说配对可中断续做：KeyPackage 私钥在内存，重启需重新导出。
+
+### 下次接手第一步
+
+```powershell
+cd D:\AgentProject\chat
+. .\tools\activate.ps1
+powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
+  -RemoteEndpoint https://106.54.223.171:8443 -RemoteNodeId node-public `
+  -RemoteFingerprint 13be2f93162bd121cba6a91d4e05c22900dcc06abcd92cf843bd5ed772b8a053
+```
+
+先确认 12 阶段全绿 → 再跑 `verify-app-flow`（应用链路）与 `verify-pairing`（配对）→ 最后才动代码。

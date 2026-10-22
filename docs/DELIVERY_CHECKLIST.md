@@ -1,3 +1,31 @@
+
+## 零、一页验收（第 179 轮定稿）
+
+```powershell
+cd D:\AgentProject\chat; . .\tools\activate.ps1
+# 1) 12 阶段（含公网跨机器）
+powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
+  -RemoteEndpoint https://106.54.223.171:8443 -RemoteNodeId node-public `
+  -RemoteFingerprint 13be2f93162bd121cba6a91d4e05c22900dcc06abcd92cf843bd5ed772b8a053
+# 2) 应用真实链路（就是点发送走的那条路）
+powershell -ExecutionPolicy Bypass -File tools\verify-app-flow.ps1
+# 3) 双人配对（本地节点）
+powershell -ExecutionPolicy Bypass -File tools\verify-pairing.ps1
+# 4) soak（冷启动 + 公网稳态）
+powershell -ExecutionPolicy Bypass -File tools\soak.ps1 -Iterations 10
+powershell -ExecutionPolicy Bypass -File tools\soak.ps1 -Reuse 10 -Endpoint https://106.54.223.171:8443 `
+  -NodeId node-public -Fingerprint 13be2f93…
+# 5) 三种故障注入
+powershell -ExecutionPolicy Bypass -File tools\soak-faults.ps1
+powershell -ExecutionPolicy Bypass -File tools\soak-partition.ps1
+powershell -ExecutionPolicy Bypass -File tools\soak-disk.ps1
+# 6) 交付包完整性
+powershell -ExecutionPolicy Bypass -File tools\verify-zip.ps1
+```
+
+当前产物：`Chat.exe` `644E1672…5BD36`；`app.jar` `FA29A6EA…DCC33`；`Chat-app-0.1.0.zip` `9BF370CD…405D5`（82.8 MB）。
+
+最近一次全绿：第 177 轮（`build/final-regression-177.log`），8 个套件全 PASS。
 # 交付清单（一页看完）
 
 最后更新：2026-10-21（第 139 轮）。这份文件只放**能立刻执行**的东西。
