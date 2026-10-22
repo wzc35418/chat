@@ -90,7 +90,23 @@ object NodeSelfCheck {
         return steps
     }
 
-    /** 只记录服务端证书指纹（不校验），用于诊断“配的指纹 vs 服务端的指纹”。 */
+    
+/**
+ * 从 `/v1/health` 取节点公钥（https 时**按指纹固定证书**，不全信任）。
+ * 首启没填公钥时用这个；取不到就返回 null，由调用方显式提示。
+ */
+internal fun fetchNodePublicKeyHex(endpointUrl: String, fingerprints: List<String>): String? = runCatching {
+    val url = endpointUrl.trimEnd('/') + "/v1/health"
+    val connection = java.net.URI(url).toURL().openConnection() as? javax.net.ssl.HttpsURLConnection ?: return null
+    if (fingerprints.isNotEmpty()) {
+        connection.sslSocketFactory = pinnedContext(fingerprints).socketFactory
+    }
+    connection.connectTimeout = 5000
+    connection.readTimeout = 5000
+    val body = connection.inputStream.bufferedReader().readText()
+    Regex("\"node_public_key\"\\s*:\\s*\"([0-9a-fA-F]+)\"").find(body)?.groupValues?.get(1)
+}.getOrNull()
+/** 只记录服务端证书指纹（不校验），用于诊断“配的指纹 vs 服务端的指纹”。 */
     private fun servedFingerprint(url: String): String? {
         var captured: String? = null
         val recorder = object : X509TrustManager {
