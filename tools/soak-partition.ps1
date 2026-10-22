@@ -132,6 +132,10 @@ try {
     }
 
     Write-Host ''
+
+    Write-Host ''
+
+    Write-Host ''
 } finally {
     if ($proxyProc -and -not $proxyProc.HasExited) { Stop-Process -Id $proxyProc.Id -Force -ErrorAction SilentlyContinue }
     Get-Process -Name chat-node -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue

@@ -114,10 +114,11 @@ fun main(args: Array<String>): Unit = runBlocking {
         // CHAT_DOUBLE_TRY=1 时跳过节点登记：这个模式只测“链路已死”时的失败语义，
         // 登记本身要走网络，节点停着的话会在 setup 阶段就失败，测不到发送路径。
         val doubleTryMode = System.getenv("CHAT_DOUBLE_TRY") == "1"
-        if (doubleTryMode) {
-            println("INFO double-try mode: skipping node registration (setup stays local)")
+        val syncOnlyMode = System.getenv("CHAT_SYNC_ONLY") == "1"
+        if (doubleTryMode || syncOnlyMode) {
+            println("INFO local-only mode: skipping node registration (setup stays local)")
         }
-        if (!doubleTryMode) {
+        if (!doubleTryMode && !syncOnlyMode) {
         val registered = groups.registerOnNode(snapshot.groupId, endpoint, nodeId, nodeKey)
         println("PASS group registered on node: " + registered.groupId + " seq=" + registered.registeredSeq)
         }
@@ -140,6 +141,33 @@ fun main(args: Array<String>): Unit = runBlocking {
         println("PASS send group configured")
         store.configureSendNode(endpoint, nodeId, nodeKey)
         println("PASS send node configured: " + endpoint)
+
+        // CHAT_SYNC_ONLY=1：只测“拉取路径”在死链路下的失败语义（不发送）。
+        if (System.getenv("CHAT_SYNC_ONLY") == "1") {
+            runCatching { store.close() }
+            val dummyKey = "00".repeat(32)
+            val sync = createSyncService(dbPath, "0".repeat(64), endpoint, nodeId, dummyKey, snapshot.groupId)
+            // 第一次拉取（链路正常）用来**初始化游标**；随后外部会把代理切成黑障。
+            val first = runCatching { sync.syncOnce() }
+            val gapMs = System.getenv("CHAT_SYNC_GAP_MS")?.toLongOrNull() ?: 3000L
+            Thread.sleep(gapMs)
+            val second = runCatching { sync.syncOnce() }
+            runCatching { sync.shutdown() }
+            println("SYNC_ONLY first_ok=" + first.isSuccess + " second_ok=" + second.isSuccess)
+            println("SYNC_ONLY second_reason=" +
+                (second.exceptionOrNull()?.let { failureCode(it) + " [" + (it.message ?: "") + "]" } ?: "none"))
+            if (first.isFailure) {
+                println("FAIL sync-only: the first pull (healthy link) already failed")
+                kotlin.system.exitProcess(1)
+            }
+            if (second.isSuccess) {
+                val applied = second.getOrNull()?.applied ?: 0L
+                println("FAIL sync-only: the pull CLAIMED success on a dead link (applied=" + applied + ")")
+                kotlin.system.exitProcess(1)
+            }
+            println("PASS sync-only: pull failed honestly after the link died")
+            kotlin.system.exitProcess(0)
+        }
 
         // CHAT_SENDFLOW=1 时走界面用的「一步发送 + 自动恢复」路径（sendWithRecovery），
         // 这样这条冒烟证明的就是**用户点按钮时实际执行的那段代码**。
