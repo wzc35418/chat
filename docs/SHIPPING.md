@@ -386,3 +386,18 @@ powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
 | offline / tls-e2e | PASS | 4.6s / 5.2s |
 | **remote（公网 7 断言）** | **PASS** | **61.4s** |
 | **overall** | **PASS（EXIT=0）** | `build/verify-all-20261023-003902.md` |
+
+## 终局全量回归（第 163 轮，2026-10-23）
+
+一次跑齐「12 阶段 + 三种 soak + 三种故障注入」，原始日志 `build/final-regression-20261023.log`。
+
+| 套件 | 结果 | 关键数字 |
+| --- | --- | --- |
+| `verify-all`（12 阶段，含公网） | **PASS** | remote **64.6s**；android 61.9s；gradle 36.5s |
+| soak 冷启动（10 轮） | **PASS** | 10/10，p50 **2075 ms**；内存 13.8→14.1 MB |
+| soak 稳态（公网 10 条） | **PASS** | 10/10，p50 **3855 ms** |
+| `soak-faults`（杀节点） | **PASS** | A 正常 / B 如实失败 / C 恢复 |
+| `soak-partition`（半死链路） | **PASS** | A 2065ms / B **26318ms 如实失败** / C 2027ms |
+| `soak-disk`（数据库只读） | **PASS** | 节点 `STORAGE_FAILURE` 启动失败，客户端如实失败 |
+
+复跑顺序（建议）：`verify-all` → `soak -Iterations 10` → `soak -Reuse 10`（公网）→ `soak-faults` → `soak-partition` → `soak-disk`。
