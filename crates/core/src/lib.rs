@@ -2,6 +2,7 @@
 //! p0 contains real ephemeral MLS/iroh verification; product services remain planned.
 #![forbid(unsafe_code)]
 pub mod attachment_message;
+mod preflight;
 pub mod attachment_node;
 pub mod attachment_transport;
 pub mod attachments;

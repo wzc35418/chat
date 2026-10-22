@@ -1416,7 +1416,30 @@ fn block_on_node<'a, T>(
 where
     T: Send + 'a,
 {
-    std::thread::scope(|scope| {
+    // 自适应预检：只在失败窗口内探活（健康链路不付这次往返，见 docs/SOAK 第十节）。
+    if crate::preflight::should_probe() {
+        let probed = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .ok()?;
+                    runtime.block_on(client.health_probe(crate::preflight::PROBE_TIMEOUT)).ok()
+                })
+                .join()
+                .ok()
+                .flatten()
+        });
+        if probed.is_none() {
+            crate::preflight::note_failure();
+            return Err(ControlReceiptError::new(
+                ErrorCode::NodeUnavailable.as_str(),
+                "node preflight failed: no /v1/health answer within 8s (failure window)",
+            ));
+        }
+    }
+    let outcome = std::thread::scope(|scope| {
         let handle = scope.spawn(move || -> ControlReceiptResult<T> {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1435,7 +1458,13 @@ where
                 "the node bridge thread panicked",
             )
         })?
-    })
+    });
+    // 失败/成功都要更新“失败窗口”，否则自适应预检永远不会被激活。
+    match &outcome {
+        Ok(_) => crate::preflight::note_success(),
+        Err(_) => crate::preflight::note_failure(),
+    }
+    outcome
 }
 
 #[cfg(test)]

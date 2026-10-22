@@ -916,6 +916,34 @@ impl ConversationCore {
                 )));
             }
         }
+        // 自适应预检：只在“最近 60 秒内失败过”的窗口里才探活（健康链路零额外往返）。
+        if step == SendStep::Dispatch && crate::preflight::should_probe() {
+            let client = {
+                let guard = self.store_guard()?;
+                let store = guard.as_ref().ok_or_else(closed)?;
+                self.node_client_for(store, &config.endpoint_url, &config.node_id, None)?
+            };
+            let probed = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .ok()?;
+                        runtime.block_on(client.health_probe(crate::preflight::PROBE_TIMEOUT)).ok()
+                    })
+                    .join()
+                    .ok()
+                    .flatten()
+            });
+            if probed.is_none() {
+                crate::preflight::note_failure();
+                return Err(anyhow::Error::new(SyncError::new(
+                    ErrorCode::NodeUnavailable,
+                    "node preflight failed: no /v1/health answer within 8s (failure window)",
+                )));
+            }
+        }
         let group_hint = {
             let guard = self.send_group.lock().map_err(|_| closed())?;
             guard.clone()
@@ -936,6 +964,10 @@ impl ConversationCore {
             }
         };
         let step_result = runtime.step(draft_id, step);
+        match &step_result {
+            Ok(_) => crate::preflight::note_success(),
+            Err(_) => crate::preflight::note_failure(),
+        }
         // 本次运行时产生的事件（序号从 0 开始，因为 service 是本次新建的实例）。
         let mut produced = Vec::new();
         if let Ok(batch) = runtime.poll_events(0, MAX_EVENT_BATCH) {

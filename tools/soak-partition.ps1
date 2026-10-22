@@ -13,7 +13,9 @@
 param(
     [int]$NodePort = 8492,
     [int]$ProxyPort = 8493,
-    [string]$NodeId = 'partition-node'
+    [string]$NodeId = 'partition-node',
+    # 连做两次 blackhole 尝试：第二次应落在“失败窗口”内，由自适应预检快速失败。
+    [switch]$SecondAttempt
 )
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
@@ -101,6 +103,22 @@ try {
         $violations += 1
     } else {
         Write-Host ('PHASE B: PASS (honest failure after ' + $b.Ms + ' ms: ' + $failLine.Trim() + ')')
+    if ($SecondAttempt) {
+        Write-Host ''
+        Write-Host '== phase B2: second attempt right after the failure (adaptive preflight window) =='
+        $b2 = Invoke-Smoke 'B2-second'
+        $b2Claimed = ($b2.Code -eq 0) -or ($b2.Text -match 'PASS package e2e slice')
+        $b2Fail = ($b2.Text -split "`n" | Where-Object { $_ -match 'FAIL ' } | Select-Object -First 1)
+        if ($b2Claimed) {
+            Write-Host ('PHASE B2: FAIL — second attempt claimed success (exit ' + $b2.Code + ')')
+            $violations += 1
+        } elseif ($b2.Ms -ge ($b.Ms * 0.6)) {
+            Write-Host ('PHASE B2: FAIL — second attempt not faster (' + $b2.Ms + ' ms vs ' + $b.Ms + ' ms)')
+            $violations += 1
+        } else {
+            Write-Host ('PHASE B2: PASS (fast failure in the window: ' + $b2.Ms + ' ms vs ' + $b.Ms + ' ms; ' + $b2Fail.Trim() + ')')
+        }
+    }
     }
 
     Write-Host ''
