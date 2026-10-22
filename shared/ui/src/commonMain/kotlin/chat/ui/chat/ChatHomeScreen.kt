@@ -33,6 +33,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -290,6 +293,41 @@ fun ChatHomeScreen(state: ChatHomeState, handlers: ChatHomeHandlers, modifier: M
                 }
                 HorizontalDivider(color = Color(0xFFDCE3DC))
                 Column(Modifier.weight(1f).fillMaxHeight()) {
+                    // 打开会话/新对话后：右栏要有标题和空状态，否则用户看到的就是一片空白。
+                    val activeTitle = state.conversations.firstOrNull { it.id == state.activeId }?.title
+                        ?: if (state.activeId != null) "新对话（未发送）" else "未选择会话"
+                    Row(
+                        Modifier.fillMaxWidth().background(Color(0xFFF2F4F1)).padding(horizontal = 16.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(activeTitle, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.width(12.dp))
+                        if (state.busy) {
+                            Text("处理中…", style = MaterialTheme.typography.labelSmall, color = Color(0xFF9A6A00))
+                        }
+                    }
+                    HorizontalDivider(color = Color(0xFFE3E8E2))
+                    if (state.messages.isEmpty()) {
+                        Column(
+                            Modifier.weight(1f).fillMaxWidth().padding(24.dp),
+                            verticalArrangement = Arrangement.Center,
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Text(
+                                if (state.activeId == null) "先在左边选一个会话，或点「新对话」" else "还没有消息",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Color(0xFF6C776E),
+                                textAlign = TextAlign.Center,
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                if (state.activeId == null) "" else "在下面输入框写第一条消息，按 Enter 或点「发送」",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color(0xFF8A948C),
+                                textAlign = TextAlign.Center,
+                            )
+                        }
+                    }
                     if (state.error != null) {
                         Text(
                             state.error,
@@ -337,11 +375,13 @@ fun ChatHomeScreen(state: ChatHomeState, handlers: ChatHomeHandlers, modifier: M
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                         )
                     }
+                    val composerFocus = remember { FocusRequester() }
+                    LaunchedEffect(state.activeId) { runCatching { composerFocus.requestFocus() } }
                     Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                         OutlinedTextField(
                             value = state.composer,
                             onValueChange = handlers.composerChange,
-                            modifier = Modifier.weight(1f),
+                            modifier = Modifier.weight(1f).focusRequester(composerFocus),
                             placeholder = { Text("输入消息，Enter 发送") },
                             maxLines = 4,
                             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
