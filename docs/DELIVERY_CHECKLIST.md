@@ -60,6 +60,14 @@ powershell -ExecutionPolicy Bypass -File tools\soak.ps1 -Iterations 20
 
 期望 `SOAK: PASS`（100% 成功，p50≈2 s）。数据与方法见 `docs/SOAK_2026-10-23.md`。
 
+### 2.7 交付 zip 是否完整可运行（30 秒）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\verify-zip.ps1
+```
+
+期望 `ZIP CHECK: PASS`：解压到临时目录并从**解压副本**跑一次打包冒烟，同时校验 exe 与 app-image 一致。
+
 ### 3. 应用本体冒烟
 
 ```powershell
