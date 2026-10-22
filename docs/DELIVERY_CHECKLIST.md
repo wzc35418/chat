@@ -74,7 +74,7 @@ powershell -ExecutionPolicy Bypass -File tools\verify-package.ps1    # 结构 + 
 
 ## 六、已知限制（不要当成 bug）
 
-1. **只能直连**：没有 NAT 打洞/中继，对称 NAT 环境下连不上；
+1. **只能直连节点**：消息走自建 HTTP 节点；iroh P2P 中继已有配置与测试但未接入消息路径（“穿透 NAT”不成立）；
 2. **证书不会自动续签**：只有到期告警（<30 天进错误条），轮换需人工；
 3. **无 MSI 安装器**：离线环境拉不到 WiX，只有 app-image + zip；
 4. **无后台通知**：应用关掉就不收消息；
