@@ -42,6 +42,18 @@ if (Test-Path $freshness) {
     }
 }
 
+# 资源采样：只在“自己起节点”的模式下有意义（外部节点的进程/库我们看不到）。
+function Sample-Resources([string]$dataDir, [int]$port) {
+    $mem = $null
+    $dbMb = $null
+    $proc = Get-Process -Name 'chat-node' -ErrorAction SilentlyContinue | Sort-Object StartTime -Descending | Select-Object -First 1
+    if ($proc) { $mem = [math]::Round($proc.WorkingSet64 / 1MB, 1) }
+    if ($dataDir) {
+        $db = Join-Path $dataDir 'node.db'
+        if (Test-Path $db) { $dbMb = [math]::Round((Get-Item $db).Length / 1MB, 2) }
+    }
+    return [pscustomobject]@{ MemoryMb = $mem; DbMb = $dbMb }
+}
 $nodeProc = $null
 $dataDir = Join-Path $logDir 'node-data'
 if ([string]::IsNullOrWhiteSpace($Endpoint)) {
@@ -121,7 +133,8 @@ try {
         $text = Get-Content $log -Raw -ErrorAction SilentlyContinue
         if ($null -eq $text) { $text = '' }
         $ok = ($code -eq 0 -and $text -match 'PASS package e2e slice')
-        $results += [pscustomobject]@{ Iteration = $i; Ok = $ok; Ms = $ms; Code = $code }
+        $sample = Sample-Resources -dataDir $dataDir -port $Port
+        $results += [pscustomobject]@{ Iteration = $i; Ok = $ok; Ms = $ms; Code = $code; MemoryMb = $sample.MemoryMb; DbMb = $sample.DbMb }
         if (-not $ok) {
             $match = [regex]::Match($text, 'FAIL ([A-Z_]+)')
             $key = if ($match.Success) { $match.Groups[1].Value } else { 'exit-' + $code }
@@ -154,6 +167,12 @@ $summary = [pscustomobject]@{
     MaxMs = (Percentile $times 1.0)
     FailCodes = ($failCodes.GetEnumerator() | ForEach-Object { $_.Key + '=' + $_.Value }) -join ',' 
 }
+$firstSample = $results | Where-Object { $_.MemoryMb -ne $null } | Select-Object -First 1
+$lastSample = $results | Where-Object { $_.MemoryMb -ne $null } | Select-Object -Last 1
+if ($firstSample -and $lastSample) {
+    Write-Host ('resources    : node memory ' + $firstSample.MemoryMb + ' MB -> ' + $lastSample.MemoryMb + ' MB; db ' + $firstSample.DbMb + ' MB -> ' + $lastSample.DbMb + ' MB')
+}
+
 $summary | ConvertTo-Json | Set-Content -Path (Join-Path $logDir 'summary.json') -Encoding utf8
 Write-Host ''
 Write-Host '===== soak summary ====='
