@@ -62,26 +62,13 @@ fun ChatAppRoot() {
     var settingsOpen by remember { mutableStateOf(false) }
     val env = remember { ChatEnvironment() }
 
-    fun reloadConversations() {
-        scope.launch {
-            val facade = env.facade ?: return@launch
-            when (val loaded = facade.bootstrap(50)) {
-                is UseCaseResult.Ok -> {
-                    val items = loaded.value.conversations.map {
-                        ChatConversationItem(it.conversationId, it.title.ifBlank { it.conversationId }, it.preview)
-                    }
-                    state = state.copy(conversations = items, loading = false)
-                }
-                is UseCaseResult.Failed -> state = state.copy(loading = false, error = loaded.message)
-            }
-        }
-    }
-
     fun openConversation(conversationId: String) {
         scope.launch {
+            env.selectGroupConversation(conversationId)
             val facade = env.facade ?: return@launch
+            val messageConversationId = conversationIdFor(conversationId)
             state = state.copy(activeId = conversationId, busy = true, error = null)
-            when (val opened = facade.openConversation(conversationId, null, 100)) {
+            when (val opened = facade.openConversation(messageConversationId, null, 100)) {
                 is UseCaseResult.Ok -> {
                     val formatter = DateTimeFormatter.ofPattern("HH:mm").withZone(ZoneId.systemDefault())
                     val messages = opened.value.messages.map { message ->
@@ -95,7 +82,32 @@ fun ChatAppRoot() {
                     }
                     state = state.copy(messages = messages, busy = false)
                 }
-                is UseCaseResult.Failed -> state = state.copy(busy = false, error = opened.message)
+                is UseCaseResult.Failed -> {
+                    // 会话行只有在“发过消息”后才存在；还没发过 = 空会话，不是错误。
+                    val detail = opened.message.orEmpty()
+                    if (detail.contains("does not exist")) {
+                        state = state.copy(messages = emptyList(), busy = false, error = null)
+                    } else {
+                        state = state.copy(busy = false, error = detail)
+                    }
+                }
+            }
+        }
+    }
+
+    // 会话 = 群：列表直接来自群状态（不再用假会话 id）。
+    fun reloadConversations() {
+        scope.launch {
+            val items = env.listGroupConversations().map { conversation ->
+                ChatConversationItem(
+                    id = conversation.groupId,
+                    title = conversation.name,
+                    subtitle = "epoch " + conversation.epoch + " · 成员 " + conversation.members,
+                )
+            }
+            state = state.copy(conversations = items, loading = false)
+            if (state.activeId == null && items.isNotEmpty()) {
+                openConversation(items.first().id)
             }
         }
     }
@@ -159,18 +171,25 @@ fun ChatAppRoot() {
         selectConversation = { conversationId -> openConversation(conversationId) },
         composerChange = { text -> state = state.copy(composer = text) },
         composeNew = {
-            val hex = UUID.randomUUID().toString().replace("-", "") + UUID.randomUUID().toString().replace("-", "")
-            state = state.copy(
-                activeId = "conv:1:" + hex.substring(0, 64),
-                messages = emptyList(),
-                composer = "",
-                notice = "新对话：输入内容后点发送",
-                error = null,
-            )
+            scope.launch {
+                state = state.copy(busy = true, notice = "正在建群…")
+                val result = runCatching { env.createGroupConversation("群 " + (state.conversations.size + 1)) }
+                state = state.copy(busy = false)
+                result.fold(
+                    onSuccess = { conversation ->
+                        state = state.copy(notice = "已新建会话：" + conversation.name)
+                        reloadConversations()
+                        openConversation(conversation.groupId)
+                    },
+                    onFailure = { error ->
+                        state = state.copy(error = "建群失败：" + (error.message ?: "未知原因"))
+                    },
+                )
+            }
         },
         send = {
             val body = state.composer.trim()
-            val conversationId = state.activeId
+            val conversationId = state.activeId?.let { conversationIdFor(it) }
             if (body.isEmpty()) {
                 state = state.copy(notice = "正文为空")
             } else if (env.facade == null) {
@@ -452,6 +471,96 @@ private class ChatEnvironment {
         } else {
             "先点右上角「设置」填节点地址（例如 https://106.54.223.171:8443）"
         }
+    }
+
+    /** 一个「会话」= 一个群（同一份 MLS 状态，不做假会话）。 */
+    data class GroupConversation(
+        val groupId: String,
+        val name: String,
+        val mlsGroupKey: String,
+        val epoch: Int,
+        val members: Int,
+    )
+
+    /** 列出群即会话（读之前让出写者，读完重开 store）。 */
+    suspend fun listGroupConversations(): List<GroupConversation> = withContext(Dispatchers.IO) {
+        val chatDb = storePath ?: return@withContext emptyList()
+        val key = masterKey ?: return@withContext emptyList()
+        runCatching { store?.close() }
+        store = null
+        facade = null
+        val service = runCatching { createGroupService(chatDb, key, nodeIdDefault) }.getOrNull()
+        val conversations = mutableListOf<GroupConversation>()
+        if (service != null) {
+            runCatching { service.listGroups() }.getOrNull()?.groups?.forEach { entry ->
+                if (entry.dissolved || entry.left) return@forEach
+                val snapshot = runCatching { service.snapshot(entry.groupId) }.getOrNull()
+                conversations += GroupConversation(
+                    groupId = entry.groupId,
+                    name = entry.name.ifBlank { entry.groupId },
+                    mlsGroupKey = snapshot?.mlsGroupKey.orEmpty(),
+                    epoch = entry.epoch,
+                    members = snapshot?.members?.size ?: 0,
+                )
+            }
+            runCatching { service.shutdown() }
+        }
+        reopenStore(chatDb, key)
+        conversations
+    }
+
+    /** 新建一个群会话（并在配置了节点时登记，否则发不出去）。 */
+    suspend fun createGroupConversation(name: String): GroupConversation = withContext(Dispatchers.IO) {
+        val chatDb = storePath ?: throw IllegalStateException("本地库未就绪")
+        val key = masterKey ?: throw IllegalStateException("本地库未就绪")
+        runCatching { store?.close() }
+        store = null
+        facade = null
+        val config = currentConfig
+        val result = runCatching {
+            val service = createGroupService(chatDb, key, nodeIdDefault)
+            try {
+                val snapshot = service.createGroup(name)
+                val endpoint = config?.endpointUrl?.trim().orEmpty()
+                if (endpoint.isNotEmpty()) {
+                    val keyHex = config?.nodePublicKeyHex?.trim()?.ifEmpty {
+                        NodeSelfCheck.fetchNodePublicKeyHex(endpoint, config?.tlsFingerprints ?: emptyList()).orEmpty()
+                    }.orEmpty()
+                    runCatching {
+                        service.registerOnNode(
+                            snapshot.groupId,
+                            endpoint,
+                            config?.nodeId?.trim()?.ifEmpty { "node-public" }.orEmpty(),
+                            keyHex.ifEmpty { null },
+                        )
+                    }
+                }
+                GroupConversation(snapshot.groupId, snapshot.name, snapshot.mlsGroupKey, snapshot.epoch, snapshot.members.size)
+            } finally {
+                runCatching { service.shutdown() }
+            }
+        }
+        reopenStore(chatDb, key)
+        result.getOrThrow()
+    }
+
+    /** 切换当前会话：把发送绑定到该群。 */
+    suspend fun selectGroupConversation(targetGroupId: String): Boolean = withContext(Dispatchers.IO) {
+        val chatDb = storePath ?: return@withContext false
+        val key = masterKey ?: return@withContext false
+        runCatching { store?.close() }
+        store = null
+        facade = null
+        val snapshot = runCatching {
+            val service = createGroupService(chatDb, key, nodeIdDefault)
+            try { service.snapshot(targetGroupId) } finally { runCatching { service.shutdown() } }
+        }.getOrNull()
+        reopenStore(chatDb, key)
+        if (snapshot == null) return@withContext false
+        groupId = snapshot.groupId
+        mlsGroupKey = snapshot.mlsGroupKey
+        runCatching { store?.configureSendGroup(snapshot.mlsGroupKey) }
+        true
     }
 
     /**
@@ -874,3 +983,7 @@ private data class SideData(
 
 /** 自检结果：逐行明细 + 一句话结论。 */
 private data class Diagnostics(val lines: List<String>, val summary: String)
+
+/** 协议里会话 id 与群 id 是两套命名空间：群 grp:1:<hex> 对应会话 conv:1:<同一 hex>。 */
+fun conversationIdFor(groupId: String): String =
+    if (groupId.startsWith("grp:1:")) "conv:1:" + groupId.removePrefix("grp:1:") else groupId
