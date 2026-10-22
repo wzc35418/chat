@@ -68,6 +68,14 @@ powershell -ExecutionPolicy Bypass -File tools\verify-zip.ps1
 
 期望 `ZIP CHECK: PASS`：解压到临时目录并从**解压副本**跑一次打包冒烟，同时校验 exe 与 app-image 一致。
 
+### 2.8 故障注入（节点被杀时必须如实失败，40 秒）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\soak-faults.ps1
+```
+
+期望 `FAULT INJECTION: PASS`（A 正常→PASS；B 杀节点→如实失败；C 恢复→PASS）。
+
 ### 3. 应用本体冒烟
 
 ```powershell
