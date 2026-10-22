@@ -1124,6 +1124,45 @@ impl NodeClient {
         Ok(head)
     }
 
+    /// 轻量连通性预检：一次 `GET /v1/health`，用**本次请求的超时**而不是全局超时。
+    ///
+    /// 用途：半死链路（TCP 握手成功但没人应答）下，发送要等到全局读超时才报错（实测约 26 秒）。
+    /// 发送前先做一次短超时预检，能把「链路死掉」的发现时间压到秒级，且**不改变错误码**：
+    /// 预检失败同样返回 `NODE_UNAVAILABLE`。
+    ///
+    /// 语义边界：预检只证明“节点此刻能应答 HTTP”，不证明提交会被接受；
+    /// 所以它**不能**替代三态提交，也绝不允许据此把结果当成成功。
+    pub async fn health_probe(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), NodeClientError> {
+        let url = self.endpoint.url().join("/v1/health").map_err(|_| {
+            NodeClientError::config("health url could not be built")
+        })?;
+        // 用请求级超时（reqwest 支持），不引入 tokio::time 依赖。
+        let response = self
+            .http
+            .get(url)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|error| {
+                let detail = format!("health probe failed: {error}");
+                if error.is_timeout() {
+                    NodeClientError::timeout(detail)
+                } else {
+                    NodeClientError::network(detail)
+                }
+            })?;
+        if !response.status().is_success() {
+            return Err(NodeClientError::protocol(
+                ErrorCode::NodeUnavailable,
+                "health probe returned a non-success status",
+            ));
+        }
+        Ok(())
+    }
+
     /// NODE-009：把客户端密文投递到目标设备信箱。
     pub async fn store_mailbox_item(
         &self,

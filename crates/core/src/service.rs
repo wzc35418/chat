@@ -916,6 +916,39 @@ impl ConversationCore {
                 )));
             }
         }
+        // 发送前短超时预检：半死链路下直接提交要等到全局读超时（实测约 26 秒）才报错；
+        // 先做一次 3 秒的 /v1/health，把“链路死掉”的发现时间压到秒级。
+        // 只对 dispatch 做（prepare 是纯本地加密）；预检失败仍报 NODE_UNAVAILABLE，不引入新码。
+        if step == SendStep::Dispatch {
+            let client = {
+                let guard = self.store_guard()?;
+                let store = guard.as_ref().ok_or_else(closed)?;
+                // 预检不校验节点签名（它只测可达性），因此公钥传 None。
+                self.node_client_for(store, &config.endpoint_url, &config.node_id, None)?
+            };
+            let probe = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .ok()?;
+                        runtime
+                            .block_on(client.health_probe(std::time::Duration::from_secs(3)))
+                            .ok()
+                    })
+                    .join()
+                    .ok()
+                    .flatten()
+            });
+            if probe.is_none() {
+                return Err(anyhow::Error::new(SyncError::new(
+                    ErrorCode::NodeUnavailable,
+                    "send preflight failed: the node did not answer /v1/health within 3s",
+                )));
+            }
+        }
+
         let group_hint = {
             let guard = self.send_group.lock().map_err(|_| closed())?;
             guard.clone()
