@@ -1,4 +1,4 @@
-# verify-package.ps1 - package-level regression for the self-contained app image (2026-10-20).
+﻿# verify-package.ps1 - package-level regression for the self-contained app image (2026-10-20).
 #
 # Purpose: prove that the SHIPPED artifact still works - not the build tree, not the
 # gradle classpath, but build/dist/app-image/Chat with its own bundled runtime.
@@ -108,6 +108,7 @@ $required = @(
     "Chat.exe",
     "app/app.jar",
     "app/native/chat_ffi.dll",
+    "app/Chat.cfg",
     "runtime/bin/java.exe"
 )
 if (-not (Should-Run "structure")) {

@@ -274,6 +274,13 @@ val jlinkRuntime = tasks.register<Exec>("jlinkRuntime") {
     doFirst { if (outDir.exists()) outDir.deleteRecursively() }
 }
 
+/**
+ * 自包含 app-image（jlink + jpackage）。
+ *
+ * **原子替换**：jpackage 先写 `app-image-next`，成功后才把它换成 `app-image`。
+ * 原因：以前先删 `app-image` 再生成，中间有几秒窗口——此时双击 Chat.exe 会报
+ * “Error opening ... app\Chat.cfg: 没有那个文件或目录”（用户实际撞到过）。
+ */
 val jpackageAppImage = tasks.register<Exec>("jpackageAppImage") {
     group = "distribution"
     dependsOn(portableJar, tasks.named("jlinkRuntime"))
@@ -281,6 +288,7 @@ val jpackageAppImage = tasks.register<Exec>("jpackageAppImage") {
     val javaHome = System.getProperty("java.home")
     val inputDir = rootProject.layout.buildDirectory.dir("portable").get().asFile
     val destDir = rootProject.layout.buildDirectory.dir("dist/app-image").get().asFile
+    val stageDir = rootProject.layout.buildDirectory.dir("dist/app-image-next").get().asFile
     inputs.dir(inputDir)
     outputs.dir(destDir)
     commandLine(
@@ -292,10 +300,20 @@ val jpackageAppImage = tasks.register<Exec>("jpackageAppImage") {
         "--main-jar", "app.jar",
         "--main-class", "chat.desktop.MainKt",
         "--runtime-image", jlinkRuntimeDir.get().asFile.absolutePath,
-        "--dest", destDir.absolutePath,
+        "--dest", stageDir.absolutePath,
         "--java-options", "-Dfile.encoding=UTF-8",
     )
-    doFirst { if (destDir.exists()) destDir.deleteRecursively(); destDir.mkdirs() }
+    doFirst {
+        if (stageDir.exists()) stageDir.deleteRecursively()
+        stageDir.mkdirs()
+    }
+    doLast {
+        // 只有新的镜像完整生成后，才替换旧目录（替换窗口在毫秒级，且不再出现“半成品目录”）。
+        if (destDir.exists()) destDir.deleteRecursively()
+        destDir.mkdirs()
+        stageDir.copyRecursively(destDir, overwrite = true)
+        stageDir.deleteRecursively()
+    }
 }
 
 // 把 Rust host 库塞进 app-image 的 app/ 目录，供 JNA 相对路径查找。
