@@ -401,3 +401,18 @@ powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
 | `soak-disk`（数据库只读） | **PASS** | 节点 `STORAGE_FAILURE` 启动失败，客户端如实失败 |
 
 复跑顺序（建议）：`verify-all` → `soak -Iterations 10` → `soak -Reuse 10`（公网）→ `soak-faults` → `soak-partition` → `soak-disk`。
+
+## 终局回归（第 177 轮，2026-10-23，含真实界面链路）
+
+一次跑齐「12 阶段 + 应用真实链路 + 配对 + 三种 soak + 三种故障注入」，原始日志 `build/final-regression-177.log`。
+
+| 套件 | 结果 | 关键数字 |
+| --- | --- | --- |
+| `verify-all`（12 阶段，含公网） | **PASS** | remote **59.7s**；two-device 6.4s；tls 4.9s；offline 5.3s；tls-e2e 6.0s；android 45.8s |
+| `verify-app-flow`（应用真实链路，公网） | **PASS** | `send prepare=prepared` / **`dispatch=accepted settled=true`** / `sync applied=1` |
+| `verify-pairing`（KeyPackage → 邀请包 → 入群） | **PASS** | `PAIRING: PASS`（Welcome 921B、两端同 epoch） |
+| soak 冷启动（10 轮） | **PASS** | 10/10，p50 **2018ms**；内存 13.8→14.1 MB |
+| soak 稳态（公网 10 条） | **PASS** | 10/10，p50 **3041 ms**，p95 6857 ms |
+| `soak-faults` / `soak-partition` / `soak-disk` | **PASS** | 杀节点 / 半死链路 26371ms 如实失败 / 库只读 `STORAGE_FAILURE` |
+
+**口径说明**：公网 p50 3–4 s 属**跨洲网络正常**（新西兰 ↔ 上海），不作为缺陷；本地链路 p50 约 2 s（含每次冷启动建库）。
