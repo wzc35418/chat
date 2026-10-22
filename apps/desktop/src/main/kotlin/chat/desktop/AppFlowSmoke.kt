@@ -51,6 +51,8 @@ private suspend fun run(endpoint: String, nodeId: String, nodeKey: String, finge
 
         val identity = createIdentityService()
         val account = identity.openPersisted(database, MASTER_KEY, node)
+        val myAccountId = account.accountId
+        val myDeviceId = account.deviceId
         log("PASS identity: " + account.deviceId + " fingerprint=" + account.fingerprint.take(12) + "…")
         runCatching { identity.close() }
 
@@ -91,14 +93,33 @@ private suspend fun run(endpoint: String, nodeId: String, nodeKey: String, finge
             return 1
         }
         log("PASS message accepted by the node")
+        // 发送方必须自己落库：MLS 不允许发送者解密自己的应用消息，所以同步永远拿不回它。
+        local.applyVerifiedMessage(
+            chat.api.VerifiedMessageInput(
+                conversationId = conversation,
+                title = "会话",
+                // PROTOCOL-001：message id 必须是 msg:1:<64 lowercase hex>；用 operation 的 hex 部分派生。
+                messageId = "msg:1:" + operation.removePrefix("op:1:"),
+                authorAccount = myAccountId,
+                authorDevice = myDeviceId,
+                body = "app flow smoke " + System.currentTimeMillis(),
+                mine = true,
+                createdAtMillis = System.currentTimeMillis(),
+            ),
+        )
+        val afterSend = local.listMessages(conversation, null, 5)
+        log("messages immediately after send: " + afterSend.items.size + " mine=" + afterSend.items.count { it.mine })
 
         // 同步：必须独占写者（关 store → syncOnce → 重开）。
         local.close()
         store = null
         storeClosedForSync = true
         val sync = createSyncService(database, MASTER_KEY, endpoint, nodeId, nodeKey, snapshot.groupId)
-        val once = sync.syncOnce()
-        log("sync: fetched=" + once.fetched + " applied=" + once.applied + " skipped=" + once.skipped)
+        for (round in 1..3) {
+            val once = sync.syncOnce()
+            log("sync round " + round + ": fetched=" + once.fetched + " applied=" + once.applied + " skipped=" + once.skipped)
+            Thread.sleep(400)
+        }
         runCatching { sync.shutdown() }
         val reopened = createLocalStore()
         reopened.open(database, MASTER_KEY)

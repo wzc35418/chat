@@ -271,6 +271,8 @@ private class ChatEnvironment {
     private var masterKey: String? = null
     private var groupId: String? = null
     private var mlsGroupKey: String? = null
+    private var myAccountId: String = ""
+    private var myDeviceId: String = ""
 
     private val nodeIdDefault = "node:1:" + "0a".repeat(32)
 
@@ -315,6 +317,10 @@ private class ChatEnvironment {
                 legacyNote = "（旧身份库不兼容，已改名保留：" + moved.joinToString(", ") + "，已新建身份库）"
             }
         }
+        runCatching { opened.getOrNull()?.let { account ->
+            myAccountId = account.accountId
+            myDeviceId = account.deviceId
+        } }
         runCatching { identityService.close() }
         if (opened.isFailure) {
             val reason = (opened.exceptionOrNull()?.message ?: "未知原因").replace(Regex("[\r\n]"), " ").take(140)
@@ -577,9 +583,31 @@ private class ChatEnvironment {
             val currentStore = store ?: return@withContext SendOutcome(emptyList(), IllegalStateException("本地库未就绪"))
             val hex = java.util.UUID.randomUUID().toString().replace("-", "") +
                 java.util.UUID.randomUUID().toString().replace("-", "")
-            when (val draft = currentFacade.submitComposer(conversationId, "op:1:" + hex.substring(0, 64), body)) {
+            val operation = "op:1:" + hex.substring(0, 64)
+            when (val draft = currentFacade.submitComposer(conversationId, operation, body)) {
                 is UseCaseResult.Failed -> SendOutcome(emptyList(), IllegalStateException(draft.message))
-                is UseCaseResult.Ok -> sendWithRecovery(currentStore, draft.value.draftId)
+                is UseCaseResult.Ok -> {
+                    val outcome = sendWithRecovery(currentStore, draft.value.draftId)
+                    if (outcome.ok) {
+                        // 发送方必须自己落库：MLS 不允许发送者解密自己的应用消息，
+                        // 所以同步永远拿不回这条消息（实测 3 轮 fetched=0）。
+                        runCatching {
+                            currentStore.applyVerifiedMessage(
+                                chat.api.VerifiedMessageInput(
+                                    conversationId = conversationId,
+                                    title = "会话",
+                                    messageId = "msg:1:" + operation.removePrefix("op:1:"),
+                                    authorAccount = myAccountId,
+                                    authorDevice = myDeviceId,
+                                    body = body,
+                                    mine = true,
+                                    createdAtMillis = System.currentTimeMillis(),
+                                ),
+                            )
+                        }
+                    }
+                    outcome
+                }
             }
         }
     }
