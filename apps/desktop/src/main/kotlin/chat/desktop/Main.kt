@@ -34,7 +34,7 @@ fun main(args: Array<String>) {
         } else {
             Window(
                 title = "Chat",
-                state = rememberWindowState(width = 1180.dp, height = 800.dp),
+                state = rememberWindowState(width = 1100.dp, height = 700.dp),
                 onCloseRequest = { exitApplication() },
             ) {
                 LaunchedEffect(Unit) {

@@ -25,6 +25,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -35,33 +36,18 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import chat.presentation.display.renderMarkdown
+import chat.presentation.display.shortFingerprint
 import chat.ui.MarkdownMessage
 
-/** 左侧会话列表的一项。 */
-data class ChatConversationItem(
-    val id: String,
-    val title: String,
-    val subtitle: String,
-)
+data class ChatConversationItem(val id: String, val title: String, val subtitle: String)
 
-/** 消息气泡的一项。 */
-data class ChatMessageItem(
-    val id: String,
-    val mine: Boolean,
-    val label: String,
-    val body: String,
-    val status: String,
-)
-
-/** 真实聊天界面状态（不做业务判断：语义来自 core/presentation）。 */
-/** 联系人一行（来自本机身份库，不可发送时如实标注状态）。 */
 data class ChatContactItem(
     val id: String,
     val name: String,
@@ -70,16 +56,8 @@ data class ChatContactItem(
     val canSend: Boolean,
 )
 
-/** 群组一行。 */
-data class ChatGroupItem(
-    val id: String,
-    val name: String,
-    val epoch: Int,
-    val role: String,
-    val members: Int,
-)
+data class ChatGroupItem(val id: String, val name: String, val epoch: Int, val role: String, val members: Int)
 
-/** 群详情里的一位成员。 */
 data class ChatGroupMemberItem(
     val credential: String,
     val role: String,
@@ -88,7 +66,6 @@ data class ChatGroupMemberItem(
     val pending: Boolean,
 )
 
-/** 群详情（打开后才加载；null = 未打开）。 */
 data class ChatGroupDetail(
     val id: String,
     val name: String,
@@ -98,14 +75,21 @@ data class ChatGroupDetail(
     val pendingCount: Int,
 )
 
+data class ChatMessageItem(
+    val id: String,
+    val mine: Boolean,
+    val label: String,
+    val body: String,
+    val status: String,
+)
+
 data class ChatHomeState(
     val loading: Boolean = true,
-    val groupDetail: ChatGroupDetail? = null,
     val tab: String = "conversations",
+    val conversations: List<ChatConversationItem> = emptyList(),
     val contacts: List<ChatContactItem> = emptyList(),
     val groups: List<ChatGroupItem> = emptyList(),
     val identityLines: List<String> = emptyList(),
-    val conversations: List<ChatConversationItem> = emptyList(),
     val activeId: String? = null,
     val messages: List<ChatMessageItem> = emptyList(),
     val composer: String = "",
@@ -113,306 +97,295 @@ data class ChatHomeState(
     val error: String? = null,
     val busy: Boolean = false,
     val nodeLabel: String = "节点未配置",
+    val groupDetail: ChatGroupDetail? = null,
 )
 
 class ChatHomeHandlers(
     val selectTab: (String) -> Unit = {},
-    val openGroup: (String) -> Unit = {},
-    val closeGroup: () -> Unit = {},
-    val renameGroup: (String) -> Unit = {},
-    val removeMember: (String) -> Unit = {},
-    val acceptPending: () -> Unit = {},
     val selectConversation: (String) -> Unit = {},
-    val createInvite: () -> Unit = {},
     val composerChange: (String) -> Unit = {},
     val send: () -> Unit = {},
     val sync: () -> Unit = {},
     val composeNew: () -> Unit = {},
     val openSettings: () -> Unit = {},
+    val createInvite: () -> Unit = {},
+    val openGroup: (String) -> Unit = {},
+    val renameGroup: (String) -> Unit = {},
+    val removeMember: (String) -> Unit = {},
+    val acceptPending: () -> Unit = {},
 )
 
+private val BgColor = Color(0xFFF6F7F5)
+private val BarColor = Color(0xFFEDF1EC)
+private val PanelColor = Color(0xFFF2F4F1)
+private val LineColor = Color(0xFFDCE3DC)
+private val MutedColor = Color(0xFF6C776E)
+
 /**
- * 正式聊天主界面：左会话列表 + 右消息流 + 底部输入。
+ * 正式聊天主界面。
  *
- * 语义边界：不做状态推断（不把 queued 画成已发送、不吞失败），
- * 展示全部来自 [ChatHomeState]，由应用层按内核返回值填充。
+ * 结构固定为四块，避免“某块没画出来就整片空白”：
+ * 顶栏（节点/同步/设置）｜左栏（页签列表 300dp）｜右栏（标题 + 消息/空状态 + 输入）。
  */
 @Composable
 fun ChatHomeScreen(state: ChatHomeState, handlers: ChatHomeHandlers, modifier: Modifier = Modifier) {
-    Surface(modifier = modifier.fillMaxSize(), color = Color(0xFFF6F7F5)) {
+    Surface(modifier.fillMaxSize(), color = BgColor) {
         Column(Modifier.fillMaxSize()) {
-            Row(
-                Modifier.fillMaxWidth().background(Color(0xFFEDF1EC)).padding(horizontal = 16.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("Chat", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.width(16.dp))
-                Text(
-                    state.nodeLabel,
-                    style = MaterialTheme.typography.labelMedium.copy(fontFamily = FontFamily.Monospace),
-                    color = Color(0xFF5F6B63),
-                )
-                Spacer(Modifier.weight(1f))
-                TextButton(onClick = handlers.sync, enabled = !state.busy) { Text("同步") }
-                TextButton(onClick = handlers.openSettings) { Text("设置") }
+            TopBar(state, handlers)
+            HorizontalDivider(color = LineColor)
+            Row(Modifier.fillMaxWidth().weight(1f)) {
+                LeftPane(state, handlers)
+                // 注意：Row 里必须用 VerticalDivider；HorizontalDivider 会撑满整行宽度，把右栏挤成 0 宽（这就是“右边空白”）
+                VerticalDivider(color = LineColor)
+                RightPane(state = state, handlers = handlers, modifier = Modifier.weight(1f).fillMaxHeight())
             }
-            HorizontalDivider(color = Color(0xFFDCE3DC))
-            Row(Modifier.fillMaxSize()) {
-                Column(Modifier.width(280.dp).fillMaxHeight().background(Color(0xFFF2F4F1))) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        for ((key, label) in listOf("conversations" to "会话", "contacts" to "联系人", "groups" to "群组")) {
-                            val active = state.tab == key
-                            TextButton(onClick = { handlers.selectTab(key) }) {
-                                Text(
-                                    label,
-                                    style = MaterialTheme.typography.labelMedium,
-                                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
-                                )
-                            }
+        }
+    }
+    state.groupDetail?.let { detail ->
+        GroupDetailDialog(detail, handlers)
+    }
+}
+
+@Composable
+private fun TopBar(state: ChatHomeState, handlers: ChatHomeHandlers) {
+    Row(
+        Modifier.fillMaxWidth().background(BarColor).padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("Chat", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.width(16.dp))
+        Text(
+            state.nodeLabel,
+            style = MaterialTheme.typography.labelMedium.copy(fontFamily = FontFamily.Monospace),
+            color = Color(0xFF5F6B63),
+        )
+        Spacer(Modifier.weight(1f))
+        TextButton(onClick = handlers.sync, enabled = !state.busy) { Text("同步") }
+        TextButton(onClick = handlers.openSettings) { Text("设置") }
+    }
+}
+
+@Composable
+private fun LeftPane(state: ChatHomeState, handlers: ChatHomeHandlers) {
+    Column(Modifier.width(300.dp).fillMaxHeight().background(PanelColor)) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            for ((key, label) in listOf("conversations" to "会话", "contacts" to "联系人", "groups" to "群组")) {
+                TextButton(onClick = { handlers.selectTab(key) }) {
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = if (state.tab == key) FontWeight.SemiBold else FontWeight.Normal,
+                    )
+                }
+            }
+        }
+        HorizontalDivider(color = LineColor)
+        Text(
+            when (state.tab) {
+                "contacts" -> if (state.contacts.isEmpty()) "还没有联系人" else "联系人 " + state.contacts.size
+                "groups" -> if (state.groups.isEmpty()) "还没有群组" else "群组 " + state.groups.size
+                else -> if (state.conversations.isEmpty()) "还没有会话" else "会话 " + state.conversations.size
+            },
+            style = MaterialTheme.typography.labelSmall,
+            color = MutedColor,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+        )
+        LazyColumn(Modifier.fillMaxWidth().weight(1f)) {
+            if (state.tab == "conversations") {
+                if (state.activeId != null && state.conversations.none { it.id == state.activeId }) {
+                    item {
+                        Column(Modifier.fillMaxWidth().background(Color(0xFFDDE7DC)).padding(12.dp)) {
+                            Text("新对话（未发送）", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                            Text(
+                                shortFingerprint(state.activeId ?: ""),
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                color = MutedColor,
+                            )
                         }
-                        Spacer(Modifier.weight(1f))
-                        if (state.tab == "conversations") {
-                            TextButton(onClick = handlers.composeNew) { Text("新对话", style = MaterialTheme.typography.labelMedium) }
-                        }
-                        if (state.tab == "contacts") {
-                            TextButton(onClick = handlers.createInvite) { Text("邀请", style = MaterialTheme.typography.labelMedium) }
-                        }
-                    }
-                    if (state.conversations.isEmpty() && !state.loading) {
-                        Text(
-                            "还没有会话。点「新对话」发第一条消息。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color(0xFF7A857C),
-                            modifier = Modifier.padding(horizontal = 12.dp),
-                        )
-                    }
-                    when (state.tab) {
-                        "contacts" -> LazyColumn(Modifier.fillMaxSize()) {
-                            if (state.contacts.isEmpty()) {
-                                item {
-                                    Text(
-                                        "还没有联系人。点「邀请」生成口令发给对方。",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color(0xFF7A857C),
-                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                    )
-                                }
-                            }
-                            items(state.contacts) { contact ->
-                                Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp)) {
-                                    Text(contact.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-                                    Text(
-                                        chat.presentation.display.shortFingerprint(contact.fingerprint),
-                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                                        color = Color(0xFF6C776E),
-                                    )
-                                    Text(
-                                        contact.state + (if (contact.canSend) "" else "（暂不可发送）"),
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (contact.canSend) Color(0xFF3E6B4A) else Color(0xFF9A6A00),
-                                    )
-                                }
-                                HorizontalDivider(color = Color(0xFFE3E8E2))
-                            }
-                        }
-                        "groups" -> LazyColumn(Modifier.fillMaxSize()) {
-                            items(state.groups) { group ->
-                                Column(
-                                    Modifier
-                                        .fillMaxWidth()
-                                        .clickable { handlers.openGroup(group.id) }
-                                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                                ) {
-                                    Text(group.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-                                    Text(
-                                        "epoch " + group.epoch + " · 成员 " + group.members + " · " + group.role,
-                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                                        color = Color(0xFF6C776E),
-                                    )
-                                }
-                                HorizontalDivider(color = Color(0xFFE3E8E2))
-                            }
-                        }
-                        else -> LazyColumn(Modifier.fillMaxSize()) {
-                            if (state.conversations.isEmpty() && !state.loading) {
-                                item {
-                                    Text(
-                                        "还没有会话。点「新对话」发第一条消息。",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color(0xFF7A857C),
-                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                    )
-                                }
-                            }
-                            // 新对话：还没入库时也要有一行，点击“新对话”才有可见反馈。
-                            if (state.activeId != null && state.conversations.none { it.id == state.activeId }) {
-                                item {
-                                Column(
-                                    Modifier
-                                        .fillMaxWidth()
-                                        .background(Color(0xFFDDE7DC))
-                                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                                ) {
-                                    Text(
-                                        "新对话（未发送）",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.Medium,
-                                    )
-                                    Text(
-                                        chat.presentation.display.shortFingerprint(state.activeId ?: ""),
-                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                                        color = Color(0xFF6C776E),
-                                    )
-                                }
-                                HorizontalDivider(color = Color(0xFFE3E8E2))
-                                }
-                            }
-                            items(state.conversations) { item ->
-                                val selected = item.id == state.activeId
-                                Column(
-                                    Modifier
-                                        .fillMaxWidth()
-                                        .background(if (selected) Color(0xFFDDE7DC) else Color.Transparent)
-                                        .clickable { handlers.selectConversation(item.id) }
-                                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                                ) {
-                                    Text(item.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-                                    Text(
-                                        item.subtitle,
-                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                                        color = Color(0xFF6C776E),
-                                    )
-                                }
-                                HorizontalDivider(color = Color(0xFFE3E8E2))
-                            }
-                        }
+                        HorizontalDivider(color = LineColor)
                     }
                 }
-                HorizontalDivider(color = Color(0xFFDCE3DC))
-                Column(Modifier.weight(1f).fillMaxHeight()) {
-                    // 打开会话/新对话后：右栏要有标题和空状态，否则用户看到的就是一片空白。
-                    val activeTitle = state.conversations.firstOrNull { it.id == state.activeId }?.title
-                        ?: if (state.activeId != null) "新对话（未发送）" else "未选择会话"
-                    Row(
-                        Modifier.fillMaxWidth().background(Color(0xFFF2F4F1)).padding(horizontal = 16.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                items(state.conversations) { item ->
+                    val selected = item.id == state.activeId
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .background(if (selected) Color(0xFFDDE7DC) else Color.Transparent)
+                            .clickable { handlers.selectConversation(item.id) }
+                            .padding(12.dp),
                     ) {
-                        Text(activeTitle, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                        Spacer(Modifier.width(12.dp))
-                        if (state.busy) {
-                            Text("处理中…", style = MaterialTheme.typography.labelSmall, color = Color(0xFF9A6A00))
-                        }
-                    }
-                    HorizontalDivider(color = Color(0xFFE3E8E2))
-                    if (state.messages.isEmpty()) {
-                        Column(
-                            Modifier.weight(1f).fillMaxWidth().padding(24.dp),
-                            verticalArrangement = Arrangement.Center,
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                        ) {
-                            Text(
-                                if (state.activeId == null) "先在左边选一个会话，或点「新对话」" else "还没有消息",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = Color(0xFF6C776E),
-                                textAlign = TextAlign.Center,
-                            )
-                            Spacer(Modifier.height(6.dp))
-                            Text(
-                                if (state.activeId == null) "" else "在下面输入框写第一条消息，按 Enter 或点「发送」",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = Color(0xFF8A948C),
-                                textAlign = TextAlign.Center,
-                            )
-                        }
-                    }
-                    if (state.error != null) {
+                        Text(item.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
                         Text(
-                            state.error,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color(0xFFB3261E),
-                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            item.subtitle,
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                            color = MutedColor,
                         )
                     }
-                    val listState = rememberLazyListState()
-                    LaunchedEffect(state.messages.size, state.activeId) {
-                        if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
-                    }
-                    LazyColumn(
-                        state = listState,
-                        modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        items(state.messages) { message ->
-                            Row(
-                                Modifier.fillMaxWidth(),
-                                horizontalArrangement = if (message.mine) Arrangement.End else Arrangement.Start,
-                            ) {
-                                Column(
-                                    Modifier
-                                        .width(420.dp)
-                                        .background(if (message.mine) Color(0xFFDCEBDD) else Color(0xFFFFFFFF))
-                                        .padding(10.dp),
-                                ) {
-                                    Text(
-                                        message.label + "  " + message.status,
-                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                                        color = Color(0xFF6C776E),
-                                    )
-                                    // 真实聊天里也走 Markdown 安全子集渲染（与预览一致：无 HTML、链接不可点）。
-                                    MarkdownMessage(document = renderMarkdown(message.body))
-                                }
-                            }
-                        }
-                    }
-                    if (state.notice.isNotEmpty()) {
+                    HorizontalDivider(color = LineColor)
+                }
+            } else if (state.tab == "contacts") {
+                items(state.contacts) { contact ->
+                    Column(Modifier.fillMaxWidth().padding(12.dp)) {
+                        Text(contact.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
                         Text(
-                            state.notice,
+                            shortFingerprint(contact.fingerprint),
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                            color = MutedColor,
+                        )
+                        Text(
+                            contact.state + (if (contact.canSend) "" else "（暂不可发送）"),
                             style = MaterialTheme.typography.labelSmall,
-                            color = Color(0xFF5F6B63),
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                            color = if (contact.canSend) Color(0xFF3E6B4A) else Color(0xFF9A6A00),
                         )
                     }
-                    val composerFocus = remember { FocusRequester() }
-                    LaunchedEffect(state.activeId) { runCatching { composerFocus.requestFocus() } }
-                    Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        OutlinedTextField(
-                            value = state.composer,
-                            onValueChange = handlers.composerChange,
-                            modifier = Modifier.weight(1f).focusRequester(composerFocus),
-                            placeholder = { Text("输入消息，Enter 发送") },
-                            maxLines = 4,
-                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                            keyboardActions = KeyboardActions(onSend = { handlers.send() }),
-                            enabled = !state.busy,
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Button(onClick = handlers.send, enabled = !state.busy && state.composer.isNotBlank()) { Text("发送") }
-                    }
+                    HorizontalDivider(color = LineColor)
                 }
+            } else {
+                items(state.groups) { group ->
+                    Column(Modifier.fillMaxWidth().clickable { handlers.openGroup(group.id) }.padding(12.dp)) {
+                        Text(group.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+                        Text(
+                            "epoch " + group.epoch + " · 成员 " + group.members + " · " + group.role,
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                            color = MutedColor,
+                        )
+                    }
+                    HorizontalDivider(color = LineColor)
+                }
+            }
+        }
+        HorizontalDivider(color = LineColor)
+        Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            when (state.tab) {
+                "contacts" -> TextButton(onClick = handlers.createInvite) { Text("邀请口令") }
+                "groups" -> Text("点群可查看成员", style = MaterialTheme.typography.labelSmall, color = MutedColor)
+                else -> TextButton(onClick = handlers.composeNew) { Text("新对话") }
             }
         }
     }
 }
-/** 群详情对话框：成员列表 + 改群名 + 移除成员 + 接受待处理变更。 */
+
 @Composable
-fun GroupDetailDialog(
-    detail: ChatGroupDetail,
-    handlers: ChatHomeHandlers,
-    onClose: () -> Unit,
-) {
+private fun RightPane(state: ChatHomeState, handlers: ChatHomeHandlers, modifier: Modifier = Modifier) {
+    val activeTitle = state.conversations.firstOrNull { it.id == state.activeId }?.title
+        ?: if (state.activeId != null) "新对话（未发送）" else "未选择会话"
+    Column(modifier) {
+        Row(
+            Modifier.fillMaxWidth().background(PanelColor).padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(activeTitle, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.width(12.dp))
+            if (state.busy) {
+                Text("处理中…", style = MaterialTheme.typography.labelSmall, color = Color(0xFF9A6A00))
+            }
+        }
+        HorizontalDivider(color = LineColor)
+        if (state.error != null) {
+            Text(
+                state.error,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFFB3261E),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+        }
+        if (state.messages.isEmpty()) {
+            Column(
+                Modifier.fillMaxWidth().weight(1f).padding(24.dp),
+                verticalArrangement = Arrangement.Center,
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    if (state.activeId == null) "先在左边选一个会话，或点左下角「新对话」" else "还没有消息",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MutedColor,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(6.dp))
+                if (state.activeId != null) {
+                    Text(
+                        "在下面输入框写第一条消息，按 Enter 或点「发送」",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color(0xFF8A948C),
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            }
+        } else {
+            val listState = rememberLazyListState()
+            LaunchedEffect(state.messages.size, state.activeId) {
+                listState.animateScrollToItem(state.messages.size - 1)
+            }
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                items(state.messages) { message ->
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = if (message.mine) Arrangement.End else Arrangement.Start,
+                    ) {
+                        Column(
+                            Modifier
+                                .width(460.dp)
+                                .background(if (message.mine) Color(0xFFDCEBDD) else Color.White)
+                                .padding(10.dp),
+                        ) {
+                            Text(
+                                message.label + "  " + message.status,
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                color = MutedColor,
+                            )
+                            MarkdownMessage(document = renderMarkdown(message.body))
+                        }
+                    }
+                }
+            }
+        }
+        if (state.notice.isNotEmpty()) {
+            Text(
+                state.notice,
+                style = MaterialTheme.typography.labelSmall,
+                color = Color(0xFF5F6B63),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            )
+        }
+        HorizontalDivider(color = LineColor)
+        val composerFocus = remember { FocusRequester() }
+        LaunchedEffect(state.activeId) { runCatching { composerFocus.requestFocus() } }
+        Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = state.composer,
+                onValueChange = handlers.composerChange,
+                modifier = Modifier.weight(1f).focusRequester(composerFocus),
+                placeholder = { Text("输入消息，Enter 发送") },
+                maxLines = 4,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(onSend = { handlers.send() }),
+                enabled = !state.busy,
+            )
+            Spacer(Modifier.width(8.dp))
+            Button(onClick = handlers.send, enabled = !state.busy && state.composer.isNotBlank()) { Text("发送") }
+        }
+    }
+}
+
+@Composable
+private fun GroupDetailDialog(detail: ChatGroupDetail, handlers: ChatHomeHandlers) {
     var name by remember { mutableStateOf(detail.name) }
     AlertDialog(
-        onDismissRequest = onClose,
+        onDismissRequest = { },
         title = { Text("群组 · " + detail.name) },
         text = {
             Column(Modifier.width(560.dp)) {
                 Text(
                     "epoch " + detail.epoch + " · 我的角色 " + detail.role + " · 成员 " + detail.members.size,
                     style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                    color = Color(0xFF6C776E),
+                    color = MutedColor,
                 )
                 Spacer(Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -427,24 +400,19 @@ fun GroupDetailDialog(
                     Button(onClick = { handlers.renameGroup(name.trim()) }, enabled = name.trim().isNotEmpty()) { Text("改名") }
                 }
                 if (detail.pendingCount > 0) {
-                    Spacer(Modifier.height(8.dp))
                     Text(
-                        "有 " + detail.pendingCount + " 条待处理变更（他人提案需要本机打包）",
+                        "有 " + detail.pendingCount + " 条待处理变更",
                         style = MaterialTheme.typography.labelSmall,
                         color = Color(0xFF9A6A00),
                     )
-                    TextButton(onClick = { handlers.acceptPending() }) { Text("接受待处理变更") }
+                    TextButton(onClick = handlers.acceptPending) { Text("接受待处理变更") }
                 }
-                Spacer(Modifier.height(8.dp))
-                LazyColumn(Modifier.height(240.dp).fillMaxWidth()) {
+                LazyColumn(Modifier.fillMaxWidth().height(240.dp)) {
                     items(detail.members) { member ->
-                        Row(
-                            Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
+                        Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text(
-                                    chat.presentation.display.shortFingerprint(member.credential),
+                                    shortFingerprint(member.credential),
                                     style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                                 )
                                 Text(
@@ -453,18 +421,18 @@ fun GroupDetailDialog(
                                         (if (member.muted) " · 已禁言" else "") +
                                         (if (member.pending) " · 待生效" else ""),
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = Color(0xFF6C776E),
+                                    color = MutedColor,
                                 )
                             }
                             if (!member.isLocal) {
                                 TextButton(onClick = { handlers.removeMember(member.credential) }) { Text("移除") }
                             }
                         }
-                        HorizontalDivider(color = Color(0xFFE3E8E2))
+                        HorizontalDivider(color = LineColor)
                     }
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onClose) { Text("关闭") } },
+        confirmButton = { TextButton(onClick = { }) { Text("关闭") } },
     )
 }

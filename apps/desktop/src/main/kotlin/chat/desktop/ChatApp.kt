@@ -28,10 +28,9 @@ import chat.bridge.createSyncService
 import chat.presentation.AppFacade
 import chat.presentation.UseCaseResult
 import chat.ui.chat.ChatContactItem
+import chat.ui.chat.ChatConversationItem
 import chat.ui.chat.ChatGroupDetail
 import chat.ui.chat.ChatGroupMemberItem
-import chat.ui.chat.GroupDetailDialog
-import chat.ui.chat.ChatConversationItem
 import chat.ui.chat.ChatGroupItem
 import chat.ui.chat.ChatHomeHandlers
 import chat.ui.chat.ChatHomeScreen
@@ -125,7 +124,6 @@ fun ChatAppRoot() {
                 )
             }
         },
-        closeGroup = { state = state.copy(groupDetail = null) },
         renameGroup = { newName ->
             scope.launch {
                 val current = state.groupDetail ?: return@launch
@@ -235,10 +233,6 @@ fun ChatAppRoot() {
 
     ChatHomeScreen(state = state, handlers = handlers)
 
-    state.groupDetail?.let { detail ->
-        GroupDetailDialog(detail = detail, handlers = handlers, onClose = { state = state.copy(groupDetail = null) })
-    }
-
     if (settingsOpen) {
         NodeSettingsDialog(
             config = nodeConfig,
@@ -264,6 +258,8 @@ private class ChatEnvironment {
     var lastNotice: String = ""
     private var identity: chat.api.IdentityService? = null
     private var databasePath: String? = null
+    /** 消息/群/同步用的正式库，**不能**和身份库共用同一个文件（身份库只放身份与联系人）。 */
+    private var storePath: String? = null
     private var masterKey: String? = null
     private var groupId: String? = null
     private var mlsGroupKey: String? = null
@@ -284,21 +280,42 @@ private class ChatEnvironment {
         val dir = File(System.getProperty("user.home"), ".chat-desktop").apply { mkdirs() }
         val database = File(dir, "identity.db").absolutePath
         databasePath = database
+        val chatDatabase = File(dir, "chat.db").absolutePath
+        storePath = chatDatabase
         val key = "0".repeat(64)
         masterKey = key
 
         val identityService = runCatching { createIdentityService() }.getOrNull()
         if (identityService == null) { lastStatus = "身份服务不可用"; return@withContext }
         identity = identityService
-        val opened = runCatching { identityService.openPersisted(database, key, nodeIdDefault) }
+        var opened = runCatching { identityService.openPersisted(database, key, nodeIdDefault) }
+        var legacyNote = ""
+        if (opened.isFailure) {
+            // 兼容早期版本：那时身份库和消息库共用同一个文件，旧库会被判为不兼容。
+            // 做法：把旧文件**改名保留**（不删数据），再建一个新的身份库，并把原因写到提示里。
+            val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss").format(java.util.Date())
+            val moved = mutableListOf<String>()
+            for (suffix in listOf("", "-wal", "-shm")) {
+                val source = File(database + suffix)
+                if (source.exists()) {
+                    val target = File(database + ".legacy-" + stamp + suffix)
+                    if (source.renameTo(target)) moved += target.name
+                }
+            }
+            if (moved.isNotEmpty()) {
+                opened = runCatching { identityService.openPersisted(database, key, nodeIdDefault) }
+                legacyNote = "（旧身份库不兼容，已改名保留：" + moved.joinToString(", ") + "，已新建身份库）"
+            }
+        }
         runCatching { identityService.close() }
         if (opened.isFailure) {
-            lastStatus = "身份库打开失败";
-            lastNotice = opened.exceptionOrNull()?.message ?: ""
+            val reason = (opened.exceptionOrNull()?.message ?: "未知原因").replace(Regex("[\r\n]"), " ").take(140)
+            lastStatus = "身份库打开失败：" + reason
+            lastNotice = reason + legacyNote
             return@withContext
         }
 
-        val groupService = runCatching { createGroupService(database, key, nodeIdDefault) }.getOrNull()
+        val groupService = runCatching { createGroupService(chatDatabase, key, nodeIdDefault) }.getOrNull()
         if (groupService != null) {
             val list = runCatching { groupService.listGroups() }.getOrNull()
             val existing = list?.groups?.firstOrNull { !it.dissolved && !it.left }
@@ -317,9 +334,9 @@ private class ChatEnvironment {
 
         val localStore = runCatching { createLocalStore() }.getOrNull()
         if (localStore == null) { lastStatus = "存储服务不可用"; return@withContext }
-        val storeOpened = runCatching { localStore.open(database, key) }
+        val storeOpened = runCatching { localStore.open(chatDatabase, key) }
         if (storeOpened.isFailure) {
-            lastStatus = "本地库打开失败";
+            lastStatus = "本地库打开失败"
             lastNotice = storeOpened.exceptionOrNull()?.message ?: ""
             return@withContext
         }
@@ -341,7 +358,7 @@ private class ChatEnvironment {
         }
         mlsGroupKey?.let { runCatching { localStore.configureSendGroup(it) } }
         lastStatus = nodeLabel(config)
-        lastNotice = if (config.isConfigured) {
+        lastNotice = legacyNote + if (config.isConfigured) {
             "已配置节点；会话与消息来自本地加密库"
         } else {
             "先点右上角「设置」填节点地址（例如 https://106.54.223.171:8443）"
@@ -360,7 +377,7 @@ private class ChatEnvironment {
 
     /** 读群详情（成员/角色/待处理）。读之前先让出写者，读完重开 store。 */
     suspend fun loadGroupDetail(groupId: String): ChatGroupDetail? = withContext(Dispatchers.IO) {
-        val database = databasePath ?: return@withContext null
+        val database = storePath ?: return@withContext null
         val key = masterKey ?: return@withContext null
         runCatching { store?.close() }
         val snapshot = runCatching {
@@ -388,7 +405,7 @@ private class ChatEnvironment {
     }
 
     suspend fun renameGroup(groupId: String, newName: String): String = withContext(Dispatchers.IO) {
-        val database = databasePath ?: return@withContext "本地库未就绪"
+        val database = storePath ?: return@withContext "本地库未就绪"
         val key = masterKey ?: return@withContext "本地库未就绪"
         runCatching { store?.close() }
         val attempt = runCatching {
@@ -403,7 +420,7 @@ private class ChatEnvironment {
     }
 
     suspend fun removeMember(groupId: String, credential: String): String = withContext(Dispatchers.IO) {
-        val database = databasePath ?: return@withContext "本地库未就绪"
+        val database = storePath ?: return@withContext "本地库未就绪"
         val key = masterKey ?: return@withContext "本地库未就绪"
         runCatching { store?.close() }
         val attempt = runCatching {
@@ -418,7 +435,7 @@ private class ChatEnvironment {
     }
 
     suspend fun acceptPending(groupId: String): String = withContext(Dispatchers.IO) {
-        val database = databasePath ?: return@withContext "本地库未就绪"
+        val database = storePath ?: return@withContext "本地库未就绪"
         val key = masterKey ?: return@withContext "本地库未就绪"
         runCatching { store?.close() }
         val attempt = runCatching {
@@ -445,6 +462,7 @@ private class ChatEnvironment {
     /** 侧栏数据：身份摘要 + 联系人 + 群组（读之前先让出写者，读完再把 store 打开）。 */
     suspend fun loadSide(): SideData = withContext(Dispatchers.IO) {
         val database = databasePath
+        val chatDatabase = storePath
         val key = masterKey
         if (database == null || key == null) return@withContext SideData(emptyList(), emptyList(), emptyList())
         runCatching { store?.close() }
@@ -470,7 +488,7 @@ private class ChatEnvironment {
             }
             runCatching { identityService.close() }
         }
-        val groupService = runCatching { createGroupService(database, key, nodeIdDefault) }.getOrNull()
+        val groupService = runCatching { createGroupService(chatDatabase ?: database, key, nodeIdDefault) }.getOrNull()
         if (groupService != null) {
             runCatching { groupService.listGroups() }.getOrNull()?.groups?.forEach { group ->
                 val members = runCatching { groupService.snapshot(group.groupId) }.getOrNull()?.members?.size ?: 0
@@ -484,7 +502,7 @@ private class ChatEnvironment {
             }
             runCatching { groupService.shutdown() }
         }
-        val reopened = runCatching { createLocalStore().also { it.open(database, key) } }.getOrNull()
+        val reopened = runCatching { createLocalStore().also { it.open(chatDatabase ?: database, key) } }.getOrNull()
         if (reopened != null) {
             store = reopened
             facade = AppFacade(reopened)
@@ -534,7 +552,7 @@ private class ChatEnvironment {
     suspend fun syncOnce(config: NodeConfig): String = ioLock.withLock { syncOnceLocked(config) }
 
     private suspend fun syncOnceLocked(config: NodeConfig): String = withContext(Dispatchers.IO) {
-        val database = databasePath ?: return@withContext "本地库未就绪"
+        val database = storePath ?: return@withContext "本地库未就绪"
         val key = masterKey ?: return@withContext "本地库未就绪"
         val group = groupId ?: return@withContext "还没有群：先发一条消息"
         val endpoint = config.endpointUrl.trim()

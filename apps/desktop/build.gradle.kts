@@ -328,6 +328,9 @@ val jpackageAppImage = tasks.register<Exec>("jpackageAppImage") {
         "--runtime-image", jlinkRuntimeDir.get().asFile.absolutePath,
         "--dest", stageDir.absolutePath,
         "--java-options", "-Dfile.encoding=UTF-8",
+        // 打包产物用 Chat.exe 启动时，必须让 JNA 找到 app\native 下的 chat_ffi.dll，
+        // 否则 UniffiLib 静态初始化失败（现象：界面报 "Could not initialize class uniffi.chat_ffi.UniffiLib"）。
+        "--java-options", "-Djna.library.path=\$APPDIR\\native",
     )
     doFirst {
         if (stageDir.exists()) stageDir.deleteRecursively()

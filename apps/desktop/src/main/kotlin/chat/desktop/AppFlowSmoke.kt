@@ -106,7 +106,16 @@ private suspend fun run(endpoint: String, nodeId: String, nodeKey: String, finge
         reopened.configureSendGroup(mlsGroupKey)
         log("PASS store reopened after sync")
         val reopenedMessages = reopened.listMessages(conversation, null, 5)
-        log("messages visible after sync: " + reopenedMessages.items.size)
+        log("messages visible after sync (same conversation): " + reopenedMessages.items.size)
+        for (item in reopenedMessages.items) { log("  message: " + item.messageId + " mine=" + item.mine + " body=" + item.body.take(40)) }
+        // 发出去的消息到底落在哪个会话里？把本地会话列出来看。
+        val conversations = reopened.listConversations(null, 10)
+        log("conversations in the local store: " + conversations.items.size)
+        for (item in conversations.items) { log("  conv: " + item.conversationId + " preview=" + item.preview.take(40)) }
+        val sendStep = local.let { null }
+        if (reopenedMessages.items.none { it.mine }) {
+            log("NOTE: no outbound message is visible in this conversation after send+sync")
+        }
         log("APP FLOW: PASS (user settings + send + sync all work against " + endpoint + ")")
         return 0
     } catch (error: Throwable) {
