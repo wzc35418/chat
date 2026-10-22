@@ -98,6 +98,7 @@ data class ChatHomeState(
     val busy: Boolean = false,
     val nodeLabel: String = "节点未配置",
     val groupDetail: ChatGroupDetail? = null,
+    val diagnostics: List<String>? = null,
 )
 
 class ChatHomeHandlers(
@@ -113,6 +114,8 @@ class ChatHomeHandlers(
     val renameGroup: (String) -> Unit = {},
     val removeMember: (String) -> Unit = {},
     val acceptPending: () -> Unit = {},
+    val diagnose: () -> Unit = {},
+    val closeDiagnostics: () -> Unit = {},
 )
 
 private val BgColor = Color(0xFFF6F7F5)
@@ -144,6 +147,9 @@ fun ChatHomeScreen(state: ChatHomeState, handlers: ChatHomeHandlers, modifier: M
     state.groupDetail?.let { detail ->
         GroupDetailDialog(detail, handlers)
     }
+    state.diagnostics?.let { lines ->
+        DiagnosticsDialog(lines, handlers.closeDiagnostics)
+    }
 }
 
 @Composable
@@ -160,6 +166,7 @@ private fun TopBar(state: ChatHomeState, handlers: ChatHomeHandlers) {
             color = Color(0xFF5F6B63),
         )
         Spacer(Modifier.weight(1f))
+        TextButton(onClick = handlers.diagnose) { Text("自检") }
         TextButton(onClick = handlers.sync, enabled = !state.busy) { Text("同步") }
         TextButton(onClick = handlers.openSettings) { Text("设置") }
     }
@@ -434,5 +441,36 @@ private fun GroupDetailDialog(detail: ChatGroupDetail, handlers: ChatHomeHandler
             }
         },
         confirmButton = { TextButton(onClick = { }) { Text("关闭") } },
+    )
+}
+
+/** 连接自检结果（真实网络请求的逐步结论，失败带稳定原因）。 */
+@Composable
+private fun DiagnosticsDialog(lines: List<String>, onClose: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("连接自检") },
+        text = {
+            Column(Modifier.width(620.dp)) {
+                if (lines.isEmpty()) {
+                    Text("还没有结果", style = MaterialTheme.typography.bodySmall, color = MutedColor)
+                }
+                LazyColumn(Modifier.fillMaxWidth().height(320.dp)) {
+                    items(lines) { line ->
+                        Text(
+                            line,
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                            color = when {
+                                line.startsWith("FAIL") -> Color(0xFFB3261E)
+                                line.startsWith("PASS") -> Color(0xFF3E6B4A)
+                                else -> MutedColor
+                            },
+                            modifier = Modifier.padding(vertical = 2.dp),
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onClose) { Text("关闭") } },
     )
 }

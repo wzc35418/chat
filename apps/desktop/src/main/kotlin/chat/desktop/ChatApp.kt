@@ -211,6 +211,14 @@ fun ChatAppRoot() {
                 reloadConversations()
             }
         },
+        diagnose = {
+            scope.launch {
+                state = state.copy(busy = true, notice = "自检中…")
+                val result = env.diagnose(nodeConfig)
+                state = state.copy(busy = false, diagnostics = result.lines, notice = result.summary)
+            }
+        },
+        closeDiagnostics = { state = state.copy(diagnostics = null) },
         openSettings = { settingsOpen = true },
     )
 
@@ -364,6 +372,34 @@ private class ChatEnvironment {
             "先点右上角「设置」填节点地址（例如 https://106.54.223.171:8443）"
         }
     }
+
+    /** 连接自检：节点证书/health/node_id + 本地身份与群状态（全部真实请求，不伪造通过）。 */
+    suspend fun diagnose(config: NodeConfig): Diagnostics = withContext(Dispatchers.IO) {
+        val lines = mutableListOf<String>()
+        val steps = NodeSelfCheck.run(config.endpointUrl, config.tlsFingerprints, config.nodeId)
+        steps.forEach { step ->
+            lines += (if (step.ok) "PASS " else "FAIL ") + step.name + "：" + step.detail
+        }
+        val failures = steps.count { !it.ok }
+        val identityLine = if (databasePath == null) {
+            lines += "FAIL identity：身份库未打开"
+            "身份未就绪"
+        } else {
+            lines += "PASS identity：本地身份库已打开（" + File(databasePath!!).name + "）"
+            "身份就绪"
+        }
+        lines += if (groupId == null) "FAIL group：还没有群（点「新对话」发消息会自动建群）" else "PASS group：已绑定群 " + shortGroup(groupId!!)
+        lines += if (store == null) "FAIL store：本地消息库未打开" else "PASS store：本地消息库已打开"
+        val summary = if (failures == 0) {
+            "自检通过（" + steps.size + " 项网络检查）；" + identityLine
+        } else {
+            "自检有 " + failures + " 项失败，见明细"
+        }
+        Diagnostics(lines, summary)
+    }
+
+    private fun shortGroup(groupId: String): String =
+        if (groupId.length <= 18) groupId else groupId.take(10) + "…" + groupId.takeLast(6)
 
     /**
      * 证书固定：自签名节点必须配指纹，否则 https 请求会因不受信任而失败。
@@ -664,3 +700,6 @@ private data class SideData(
     val contacts: List<ChatContactItem>,
     val groups: List<ChatGroupItem>,
 )
+
+/** 自检结果：逐行明细 + 一句话结论。 */
+private data class Diagnostics(val lines: List<String>, val summary: String)
