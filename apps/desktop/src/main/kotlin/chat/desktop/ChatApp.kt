@@ -219,6 +219,77 @@ fun ChatAppRoot() {
             }
         },
         closeDiagnostics = { state = state.copy(diagnostics = null) },
+        openPairing = { state = state.copy(pairing = chat.ui.chat.ChatPairingState()) },
+        closePairing = {
+            env.endPairing()
+            state = state.copy(pairing = null, notice = "配对会话已结束")
+        },
+        pairingMyKeyPackage = {
+            scope.launch {
+                val current = state.pairing ?: return@launch
+                state = state.copy(pairing = current.copy(busy = true))
+                val result = runCatching { env.exportKeyPackagePack() }
+                val pack = result.getOrElse { "" }
+                state = state.copy(
+                    pairing = state.pairing?.copy(
+                        busy = false,
+                        myKeyPackage = pack,
+                        result = state.pairing?.result.orEmpty() + if (result.isSuccess) {
+                            listOf("PASS 已导出我的 KeyPackage（发给对方）")
+                        } else {
+                            listOf("FAIL 导出失败：" + (result.exceptionOrNull()?.message ?: "未知原因"))
+                        },
+                    ),
+                )
+            }
+        },
+        pairingPeerKeyPackageChange = { text ->
+            val current = state.pairing ?: return@ChatHomeHandlers
+            state = state.copy(pairing = current.copy(peerKeyPackage = text))
+        },
+        pairingCreateGroup = {
+            scope.launch {
+                val current = state.pairing ?: return@launch
+                state = state.copy(pairing = current.copy(busy = true))
+                val result = runCatching { env.createGroupWithPeerKeyPackage(current.peerKeyPackage, "配对群") }
+                state = state.copy(
+                    pairing = state.pairing?.copy(
+                        busy = false,
+                        invitePack = result.getOrElse { "" },
+                        result = state.pairing?.result.orEmpty() + if (result.isSuccess) {
+                            listOf("PASS 已建群并生成邀请包（发给对方）")
+                        } else {
+                            listOf("FAIL 建群失败：" + (result.exceptionOrNull()?.message ?: "未知原因"))
+                        },
+                    ),
+                )
+            }
+        },
+        pairingInvitePackChange = { text ->
+            val current = state.pairing ?: return@ChatHomeHandlers
+            state = state.copy(pairing = current.copy(invitePack = text))
+        },
+        pairingJoin = {
+            scope.launch {
+                val current = state.pairing ?: return@launch
+                state = state.copy(pairing = current.copy(busy = true))
+                val result = runCatching { env.joinFromInvitePack(current.invitePack) }
+                state = state.copy(
+                    pairing = state.pairing?.copy(
+                        busy = false,
+                        result = state.pairing?.result.orEmpty() + if (result.isSuccess) {
+                            listOf("PASS " + result.getOrThrow())
+                        } else {
+                            listOf("FAIL 入群失败：" + (result.exceptionOrNull()?.message ?: "未知原因"))
+                        },
+                    ),
+                )
+                if (result.isSuccess) {
+                    val side = env.loadSide()
+                    state = state.copy(groups = side.groups, contacts = side.contacts)
+                }
+            }
+        },
         openSettings = { settingsOpen = true },
     )
 
@@ -271,8 +342,11 @@ private class ChatEnvironment {
     private var masterKey: String? = null
     private var groupId: String? = null
     private var mlsGroupKey: String? = null
+    var currentConfig: NodeConfig? = null
     private var myAccountId: String = ""
     private var myDeviceId: String = ""
+    /** 配对会话期间持有的 ChatCore（KeyPackage 的私钥材料在它里面，入群必须用它）。 */
+    private var pairingCore: uniffi.chat_ffi.ChatCoreFfi? = null
 
     private val nodeIdDefault = "node:1:" + "0a".repeat(32)
 
@@ -282,6 +356,7 @@ private class ChatEnvironment {
     }
 
     suspend fun start(config: NodeConfig) = withContext(Dispatchers.IO) {
+        currentConfig = config
         applyTransportTrust(config)
         if (facade != null) {
             lastStatus = nodeLabel(config)
@@ -377,6 +452,74 @@ private class ChatEnvironment {
         } else {
             "先点右上角「设置」填节点地址（例如 https://106.54.223.171:8443）"
         }
+    }
+
+    /**
+     * 配对第 1 步：导出**我的** KeyPackage 包（发给对方，对方用它建群）。
+     *
+     * 这里打开的 ChatCore **故意不关**：KeyPackage 的私钥材料只存在于这个实例里，
+     * 第 3 步入群必须复用同一个实例，否则内核会拒绝（INVALID_STATE_TRANSITION）。
+     * 代价：配对会话期间本地库让出写者（界面会提示“配对中，暂不可发送”）。
+     */
+    suspend fun exportKeyPackagePack(): String = withContext(Dispatchers.IO) {
+        val chatDb = storePath ?: throw IllegalStateException("本地库未就绪")
+        val key = masterKey ?: throw IllegalStateException("本地库未就绪")
+        runCatching { store?.close() }
+        store = null
+        facade = null
+        val core = pairingCore ?: runCatching { uniffi.chat_ffi.ChatCoreFfi.open(chatDb, key) }.getOrNull()
+            ?: throw IllegalStateException("打开配对核心失败")
+        pairingCore = core
+        val identityDb = databasePath ?: throw IllegalStateException("身份库未就绪")
+        runCatching { core.enrollLocalIdentity(identityDb, key) }
+        val pack = PairingPack.encodeKeyPackage(core.keyPackageCredential(), core.exportKeyPackage())
+        "配对中：本地库已让出写者\n\n" + pack
+    }
+
+    /** 配对第 2 步：用对方的 KeyPackage 建群 → 登记节点 → 产出邀请包（给对方粘贴）。 */
+    suspend fun createGroupWithPeerKeyPackage(packText: String, name: String): String = withContext(Dispatchers.IO) {
+        val chatDb = storePath ?: throw IllegalStateException("本地库未就绪")
+        val key = masterKey ?: throw IllegalStateException("本地库未就绪")
+        val config = currentConfig ?: throw IllegalStateException("先配置节点")
+        val endpoint = config.endpointUrl.trim()
+        if (endpoint.isEmpty()) throw IllegalStateException("节点未配置")
+        val keyHex = config.nodePublicKeyHex.trim().ifEmpty {
+            NodeSelfCheck.fetchNodePublicKeyHex(endpoint, config.tlsFingerprints).orEmpty()
+        }
+        val peer = PairingPack.parseKeyPackage(packText)
+        runCatching { store?.close() }
+        store = null
+        facade = null
+        val core = pairingCore ?: uniffi.chat_ffi.ChatCoreFfi.open(chatDb, key)
+        pairingCore = core
+        applyTransportTrust(config)
+        val created = core.createGroupWithInviteeKeyPackage(name, peer.credential, peer.keyPackage, core.keyPackageCredential())
+        core.groupRegisterOnNode(created.group.groupId, endpoint, config.nodeId.trim().ifEmpty { "node-public" }, keyHex)
+        val head = core.pullState(created.group.groupId) ?: throw IllegalStateException("登记后仍拿不到 verified head")
+        PairingPack.encodeInvite(created.invite, head)
+    }
+
+    /** 配对第 3 步：用邀请包入群（必须与第 1 步同一个 ChatCore 实例）。 */
+    suspend fun joinFromInvitePack(packText: String): String = withContext(Dispatchers.IO) {
+        val core = pairingCore ?: throw IllegalStateException("先点「导出我的 KeyPackage」并保持这次配对不关闭")
+        val pack = PairingPack.parseInvite(packText)
+        val joined = core.joinGroupFromWelcome(pack.invite.name, pack.invite, pack.head)
+        // 入群完成：关掉配对核心，把本地库还回界面。
+        runCatching { pairingCore?.close() }
+        pairingCore = null
+        val chatDb = storePath ?: throw IllegalStateException("本地库未就绪")
+        val key = masterKey ?: throw IllegalStateException("本地库未就绪")
+        reopenStore(chatDb, key)
+        groupId = joined.groupId
+        mlsGroupKey = joined.mlsGroupKey
+        mlsGroupKey?.let { runCatching { store?.configureSendGroup(it) } }
+        "已入群：" + joined.groupId.take(16) + "… epoch=" + joined.epoch
+    }
+
+    /** 结束配对会话（不动已入群的群）。 */
+    fun endPairing() {
+        runCatching { pairingCore?.close() }
+        pairingCore = null
     }
 
     /** 连接自检：节点证书/health/node_id + 本地身份与群状态（全部真实请求，不伪造通过）。 */

@@ -58,6 +58,11 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 - [x] **R-12：SYNC 重试/退避与信箱轮询状态机。** `crates/sync/src/{retry,mailbox,send,clock,ids,error}.rs`：指数退避（1s×2 上限 60s、抖动 ±20%、Retry-After 作下界且夹到 5 分钟、预算耗尽终态、只有成功才重置计数）、信箱轮询（游标只前进、同 id 去重且内容不同 `INVALID_CANDIDATE`、乱序暂存 512 条、双预算、ACK 失败保留进度、空页退避）、发送调度（SubmissionId 由 draft/epoch/attempt 确定性派生、unknown 只 QueryExisting 不重发不重加密、租约语义与 storage 一致）。验证：`cargo test -p chat-sync` 33 passed，clippy 0 警告。
 - [x] **R-185：修掉一个真实 flaky 测试（identity invite 篡改）。** `crates/identity/src/invite.rs::tampered_body_is_rejected` 原先用 `replace_body_byte(..., 0x5a)` 固定写入；**当随机 nonce 那一位本来就是 0x5a 时"篡改"其实没改**，签名仍有效 → 全量跑到 532 个用例时随机失败（本轮实测命中）。改为新增 `flip_body_byte`（写入值与原字节相同则再 +1，保证必然不同），并从该用例改用它。重跑 `cargo test --workspace` → **1111 passed / 0 failed**。这类修复的价值在于：**它让"全绿"变得可信**——否则每次失败都要人去猜是不是环境问题。
 - [x] **R-191（Lead）：收一轮后自动重载会话消息。** syncOnce 成功后若已选中会话，顺手走 PRESENTATION 门面 `openConversation` 重载消息并更新提示（`收一轮：拉取 N / 落库 N；当前会话共 N 条`）；失败时显式错误码。`docs/manual-test-guide.md` 新增第 14 节（收一轮与导出 KeyPackage 的操作步骤、单次使用语义、限制）。验证：compileKotlin 通过；Gradle 11 任务 BUILD SUCCESSFUL；verify-project PASS。
+- [x] **R-306（Lead）：把已验证的配对流程接进界面（顶栏「配对」三按钮）。** 
+**实现**：`ChatEnvironment` 新增 `exportKeyPackagePack()` / `createGroupWithPeerKeyPackage(pack, name)` / `joinFromInvitePack(pack)` / `endPairing()`；全部走 `ChatCoreFfi`（同一个 `chat.db` 正式库），进入配对时**让出本地库写者**（关闭 store、清 facade），入群成功后 `reopenStore()` 把库交还界面并把 `groupId`/`mlsGroupKey` 切到新群。UI 新增「配对」对话框：① 导出我的 KeyPackage ② 粘贴对方 KeyPackage → 建群 → 生成邀请包 ③ 粘贴邀请包 → 入群，结果逐行 PASS/FAIL。
+**关键约束（已写进代码注释）**：KeyPackage 的私钥材料只存在于**那一个** `ChatCoreFfi` 实例，所以第 1 步与第 3 步必须是**同一次配对会话**；关掉重开会让内核报 `INVALID_STATE_TRANSITION`（诚实失败，不假装成功）。
+**验证**：`compileKotlin` 通过；重建 app-image 后 `Chat.exe` 启动存活；截屏确认顶栏为 **配对 · 自检 · 同步 · 设置**、界面无错误；交付 zip `15682F5A…D00D`。底层链路已由 `tools/verify-pairing.ps1` → `PAIRING: PASS` 证明（R-305）。
+**诚实边界**：① 配对**对话框的点击流程**无法脚本验证（GUI 不能自动点），只有编译 + 启动 + 截屏；② 配对期间本地库被让出，**不能同时发消息**；③ 中途重启应用需重新导出 KeyPackage。
 - [x] **R-305（Lead）：入群配对包端到端**打通**（PAIRING: PASS）——上次的“卡住”是我脚本的问题。** 
 **真正的卡因**：`tools/verify-pairing.ps1` 里有一行 `openssl s_client -connect … -quiet`，它会**等 stdin 不返回**，导致整个脚本挂住、`smoke.log` 一直是空的。删掉这行后立刻跑通（不是产品代码的问题）。
 **另外两处必要的修正**：① 冒烟里补 `configureTransportTrust(<本地节点证书指纹>)`——自签名节点不固定指纹时 `registerOnNode` 会卡在 TLS 重试；② Gradle `JavaExec` 不转发 `-D`，统一改成 `-Ppairing.*` → `systemProperty`。

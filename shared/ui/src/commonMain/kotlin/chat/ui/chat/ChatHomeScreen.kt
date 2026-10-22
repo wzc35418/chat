@@ -99,6 +99,16 @@ data class ChatHomeState(
     val nodeLabel: String = "节点未配置",
     val groupDetail: ChatGroupDetail? = null,
     val diagnostics: List<String>? = null,
+    val pairing: ChatPairingState? = null,
+)
+
+/** 配对（入群）对话框状态：三个步骤各一块文本，结果逐行显示。 */
+data class ChatPairingState(
+    val myKeyPackage: String = "",
+    val peerKeyPackage: String = "",
+    val invitePack: String = "",
+    val result: List<String> = emptyList(),
+    val busy: Boolean = false,
 )
 
 class ChatHomeHandlers(
@@ -114,8 +124,15 @@ class ChatHomeHandlers(
     val renameGroup: (String) -> Unit = {},
     val removeMember: (String) -> Unit = {},
     val acceptPending: () -> Unit = {},
-    val diagnose: () -> Unit = {},
-    val closeDiagnostics: () -> Unit = {},
+    val diagnose: () -> Unit = { },
+    val closeDiagnostics: () -> Unit = { },
+    val openPairing: () -> Unit = { },
+    val closePairing: () -> Unit = { },
+    val pairingMyKeyPackage: () -> Unit = { },
+    val pairingPeerKeyPackageChange: (String) -> Unit = { },
+    val pairingCreateGroup: () -> Unit = { },
+    val pairingInvitePackChange: (String) -> Unit = { },
+    val pairingJoin: () -> Unit = { },
 )
 
 private val BgColor = Color(0xFFF6F7F5)
@@ -150,6 +167,9 @@ fun ChatHomeScreen(state: ChatHomeState, handlers: ChatHomeHandlers, modifier: M
     state.diagnostics?.let { lines ->
         DiagnosticsDialog(lines, handlers.closeDiagnostics)
     }
+    state.pairing?.let { pairing ->
+        PairingDialog(pairing, handlers)
+    }
 }
 
 @Composable
@@ -166,6 +186,7 @@ private fun TopBar(state: ChatHomeState, handlers: ChatHomeHandlers) {
             color = Color(0xFF5F6B63),
         )
         Spacer(Modifier.weight(1f))
+        TextButton(onClick = handlers.openPairing) { Text("配对") }
         TextButton(onClick = handlers.diagnose) { Text("自检") }
         TextButton(onClick = handlers.sync, enabled = !state.busy) { Text("同步") }
         TextButton(onClick = handlers.openSettings) { Text("设置") }
@@ -472,5 +493,69 @@ private fun DiagnosticsDialog(lines: List<String>, onClose: () -> Unit) {
             }
         },
         confirmButton = { TextButton(onClick = onClose) { Text("关闭") } },
+    )
+}
+
+/** 配对对话框：导出我的 KeyPackage → 用对方 KeyPackage 建群 → 用邀请包入群。 */
+@Composable
+private fun PairingDialog(pairing: ChatPairingState, handlers: ChatHomeHandlers) {
+    AlertDialog(
+        onDismissRequest = handlers.closePairing,
+        title = { Text("配对：两个人进同一个群") },
+        text = {
+            Column(Modifier.width(680.dp)) {
+                Text(
+                    "① 点「导出我的 KeyPackage」→ 把文本发给对方\n" +
+                        "② 对方粘贴后用「建群」→ 把邀请包发回给你\n" +
+                        "③ 你粘贴邀请包点「入群」",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MutedColor,
+                )
+                Spacer(Modifier.height(8.dp))
+                Button(onClick = handlers.pairingMyKeyPackage, enabled = !pairing.busy) { Text("① 导出我的 KeyPackage") }
+                OutlinedTextField(
+                    value = pairing.myKeyPackage,
+                    onValueChange = { },
+                    label = { Text("我的 KeyPackage（复制给对方）") },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 3,
+                    maxLines = 5,
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = pairing.peerKeyPackage,
+                    onValueChange = handlers.pairingPeerKeyPackageChange,
+                    label = { Text("对方的 KeyPackage（粘贴到这里）") },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 3,
+                    maxLines = 5,
+                )
+                Spacer(Modifier.height(4.dp))
+                Button(onClick = handlers.pairingCreateGroup, enabled = !pairing.busy) { Text("② 用对方 KeyPackage 建群 → 生成邀请包") }
+                OutlinedTextField(
+                    value = pairing.invitePack,
+                    onValueChange = handlers.pairingInvitePackChange,
+                    label = { Text("邀请包（粘贴到这里，或复制给对方）") },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 3,
+                    maxLines = 5,
+                )
+                Spacer(Modifier.height(4.dp))
+                Button(onClick = handlers.pairingJoin, enabled = !pairing.busy) { Text("③ 用邀请包入群") }
+                if (pairing.result.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    LazyColumn(Modifier.fillMaxWidth().height(120.dp)) {
+                        items(pairing.result) { line ->
+                            Text(
+                                line,
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                color = if (line.startsWith("FAIL")) Color(0xFFB3261E) else Color(0xFF3E6B4A),
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = handlers.closePairing) { Text("关闭") } },
     )
 }
