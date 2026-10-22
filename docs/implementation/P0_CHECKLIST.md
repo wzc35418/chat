@@ -211,3 +211,13 @@ RUST_EXIT=0  LOCKED_EXIT=0  VERIFY_EXIT=0  GRADLE_EXIT=0  ANDROID_EXIT=0
 - [x] 故障注入三项通过：杀节点（`FAULT INJECTION: PASS`）、网络分区（`PARTITION: PASS`）、数据库只读（`DISK FAULT: PASS`）。
 - [x] soak 资源采样（冷启动 15 轮内存 13.8→14.2 MB、db 0→0.42 MB；稳态 30 条 p50 160 ms）。
 - [ ] 未覆盖：拉取路径在链路死掉时的语义、失败窗口的端到端验证、磁盘写满/写入中途失败、丢包抖动、长稳并发、P2P 中继/多平台/MSI。
+
+## 2026-10-23 第七批次结论（R-292…R-309）
+
+- [x] 默认入口改为真实聊天界面；`--p0` 才进实验室。
+- [x] 修掉 11 个真 bug，其中两个影响交付：`Chat.exe` 缺 `-Djna.library.path` 导致 FFI 全废、发送后出站消息不落库。
+- [x] 会话 = 群（列表来自群状态，新对话 = 新建群）；`conversationIdFor` 映射 `grp:1:<hex>` → `conv:1:<hex>`。
+- [x] 配对三按钮（导出 KeyPackage / 建群生成邀请包 / 入群）接进界面；底层 `PAIRING: PASS`。
+- [x] 自检按钮（证书/health/node_id + 身份/群/库逐行 PASS-FAIL）。
+- [x] 终局回归：12 阶段 + appflow + pairing + 3 soak + 3 故障注入 **全 PASS**。
+- [ ] 未覆盖：多会话/多群分流、附件、配对中断恢复、真正双机公网配对、后台常驻、MSI、长稳并发。
