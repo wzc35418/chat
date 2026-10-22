@@ -99,6 +99,22 @@ powershell -ExecutionPolicy Bypass -File tools\verify-package.ps1    # 结构 + 
 .\gradlew.bat :apps:desktop:presentationChecks --offline            # 展示层断言
 ```
 
+## 二点五、终局回归套件（7 个，一次跑齐）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
+  -RemoteEndpoint https://106.54.223.171:8443 -RemoteNodeId node-public `
+  -RemoteFingerprint 13be2f93162bd121cba6a91d4e05c22900dcc06abcd92cf843bd5ed772b8a053   # 12 阶段
+powershell -ExecutionPolicy Bypass -File tools\soak.ps1 -Iterations 10                        # 冷启动 soak
+powershell -ExecutionPolicy Bypass -File tools\soak.ps1 -Reuse 10 -Endpoint https://106.54.223.171:8443 `
+  -NodeId node-public -Fingerprint 13be2f93…                                                 # 稳态 soak
+powershell -ExecutionPolicy Bypass -File tools\soak-faults.ps1                               # 杀节点
+powershell -ExecutionPolicy Bypass -File tools\soak-partition.ps1                            # 半死链路
+powershell -ExecutionPolicy Bypass -File tools\soak-disk.ps1                                 # 数据库只读
+```
+
+最近一次结果（2026-10-23，`build/final-regression-20261023.log`）：**7 个套件全 PASS**；remote 64.6s、冷启动 p50 2075ms、公网稳态 p50 3855ms、三种故障注入全部如实失败。
+
 ## 三、手工检查点（4 个，5 分钟）
 
 1. 双击 `build/dist/app-image/Chat/Chat.exe` → 能启动；
