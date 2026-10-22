@@ -36,17 +36,19 @@ $exit = 1
 try {
     Start-Sleep -Seconds 3
     $endpoint = 'https://127.0.0.1:' + $Port
-    $health = (& $openssl s_client -connect ('127.0.0.1:' + $Port) -quiet 2>&1 | Out-Null)
     $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
     if (-not $curl) { Write-Host 'SKIP pairing: curl.exe missing'; exit 3 }
     $body = (& curl.exe -s --insecure ($endpoint + '/v1/health') 2>&1 | Out-String)
     $match = [regex]::Match($body, '"node_public_key"\s*:\s*"([0-9a-fA-F]{64})"')
     if (-not $match.Success) { Write-Host 'FAIL pairing: node public key not found'; exit 1 }
     $nodeKey = $match.Groups[1].Value
+    $printed = (& $openssl x509 -in $cert -noout -fingerprint -sha256 2>&1 | Out-String)
+    $fp = ([regex]::Match($printed, 'Fingerprint=([0-9A-Fa-f:]+)').Groups[1].Value -replace ':', '').ToLowerInvariant()
+    if ($fp.Length -ne 64) { Write-Host 'FAIL pairing: cannot read fixture fingerprint'; exit 1 }
     Write-Host ('node: ' + $endpoint + ' key=' + $nodeKey.Substring(0, 12) + '…')
     . (Join-Path $root 'tools/activate.ps1')
     cmd /c (".\gradlew.bat :apps:desktop:pairingSmoke --offline --console=plain --max-workers=1 " +
-        "-Dpairing.endpoint=" + $endpoint + " -Dpairing.nodeId=" + $NodeId + " -Dpairing.nodeKey=" + $nodeKey +
+        "-Ppairing.endpoint=" + $endpoint + " -Ppairing.nodeId=" + $NodeId + " -Ppairing.nodeKey=" + $nodeKey + " -Ppairing.fingerprint=" + $fp +
         " > " + (Join-Path $logDir 'smoke.log') + " 2>&1")
     $exit = $LASTEXITCODE
     if ($exit -eq 0) {

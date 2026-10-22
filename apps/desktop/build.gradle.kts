@@ -164,6 +164,9 @@ tasks.register<JavaExec>("pairingSmoke") {
     dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("chat.desktop.PairingSmokeKt")
+    listOf("endpoint", "nodeId", "nodeKey", "fingerprint").forEach { key ->
+        providers.gradleProperty("pairing." + key).orNull?.let { systemProperty("pairing." + key, it) }
+    }
     systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
     systemProperty("file.encoding", "UTF-8")
     systemProperty("stdout.encoding", "UTF-8")

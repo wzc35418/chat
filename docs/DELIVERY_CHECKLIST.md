@@ -123,6 +123,14 @@ powershell -ExecutionPolicy Bypass -File tools\verify-app-flow.ps1
 
 期望 `APP FLOW: PASS`（指纹固定 → 建群/登记 → `sendDispatch: status=accepted settled=true` → 同步）。最近一次实测：`sync: fetched=2 applied=1 skipped=1`。
 
+### 2.12 入群配对包（本地节点，约 1 分钟）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\verify-pairing.ps1
+```
+
+期望 `PAIRING: PASS`（KeyPackage → 建群 → 邀请包 → 入群，两端同群同 epoch）。
+
 ## 三、手工检查点（4 个，5 分钟）
 
 1. 双击 `build/dist/app-image/Chat/Chat.exe` → 能启动；

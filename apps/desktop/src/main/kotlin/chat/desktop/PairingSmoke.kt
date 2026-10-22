@@ -22,14 +22,22 @@ fun main(args: Array<String>) {
     val endpoint = args.getOrNull(0) ?: System.getProperty("pairing.endpoint")
     val nodeId = args.getOrNull(1) ?: System.getProperty("pairing.nodeId")
     val nodeKey = args.getOrNull(2) ?: System.getProperty("pairing.nodeKey")
+    val fingerprint = args.getOrNull(3) ?: System.getProperty("pairing.fingerprint")
     if (endpoint.isNullOrBlank() || nodeId.isNullOrBlank() || nodeKey.isNullOrBlank()) {
         println("usage: PairingSmokeKt <endpoint> <nodeId> <nodeKey> (or -Dpairing.endpoint/... )")
         kotlin.system.exitProcess(2)
     }
-    runBlockingMain(endpoint, nodeId, nodeKey)
+    runBlockingMain(endpoint, nodeId, nodeKey, fingerprint.orEmpty())
 }
 
-private fun runBlockingMain(endpoint: String, nodeId: String, nodeKey: String): Unit {
+private fun runBlockingMain(endpoint: String, nodeId: String, nodeKey: String, fingerprint: String): Unit {
+    // 自签名节点必须固定证书指纹，否则 registerOnNode / health 会卡在 TLS 重试上（R-297 的“卡住”就是这个）。
+    if (fingerprint.isNotBlank()) {
+        runCatching { uniffi.chat_ffi.configureTransportTrust(listOf(fingerprint)) }
+        log("transport trust pinned: " + fingerprint.take(12) + "...")
+    } else {
+        log("WARN no fingerprint given; self-signed node requests will not be pinned")
+    }
     val dir = Files.createTempDirectory("chat-pairing-smoke-").toFile()
     var bob: ChatCoreFfi? = null
     var alice: ChatCoreFfi? = null
