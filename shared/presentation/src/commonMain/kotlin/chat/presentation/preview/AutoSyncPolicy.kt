@@ -33,6 +33,12 @@ object AutoSyncPolicy {
         }
     }
 
+    /** 有真正入库的新消息才值得打扰用户（零新增不弹通知）。 */
+    fun shouldNotify(applied: Int): Boolean = applied > 0
+
+    /** 通知文案：只说"来了几条"，不带正文（正文可能敏感）。 */
+    fun notificationBody(applied: Int): String = "收到 " + applied + " 条新消息"
+
     /** 连续失败时的提示（明确离线与会继续重试，不伪装成功）。 */
     fun describeFailure(failures: Int, reason: String?): String {
         val head = if (looksOffline(failures)) {

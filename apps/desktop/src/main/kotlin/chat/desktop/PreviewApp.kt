@@ -615,6 +615,14 @@ fun main() = application {
 
     var syncService by remember { mutableStateOf<chat.api.SyncService?>(null) }
 
+    val trayNotifications = remember {
+        runCatching { TrayNotifications().also { runCatching { it.installIcon() } } }.getOrNull()
+    }
+    val lifecycle = remember {
+        DesktopLifecycle { exitApplication() }
+    }
+
+
     // 后台自动同步：每 60 秒（失败后指数退避）拉一次；失败不弹错误条，但状态必须可见。
     LaunchedEffect(syncService) {
         var failures = 0
@@ -624,9 +632,25 @@ fun main() = application {
             runCatching { service.syncOnce() }
                 .onSuccess { once ->
                     failures = 0
+                    val applied = once.applied.toInt()
                     storeState = storeState.withSyncOnce(once).copy(
-                        notice = chat.presentation.preview.AutoSyncPolicy.describeSuccess(once.fetched.toInt(), once.applied.toInt()),
+                        notice = chat.presentation.preview.AutoSyncPolicy.describeSuccess(once.fetched.toInt(), applied),
                     )
+                    // 有新消息才通知；没有托盘/不支持时**不假装**已弹（只在应用内提示里说明）。
+                    if (chat.presentation.preview.AutoSyncPolicy.shouldNotify(applied)) {
+                        val notifications = trayNotifications
+                        if (notifications != null && notifications.isSupported()) {
+                            runCatching {
+                                notifications.show(
+                                    chat.platform.NotificationRequest(
+                                        "Chat",
+                                        chat.presentation.preview.AutoSyncPolicy.notificationBody(applied),
+                                        "auto-sync",
+                                    ),
+                                )
+                            }
+                        }
+                    }
                 }
                 .onFailure { error ->
                     failures += 1
@@ -637,12 +661,6 @@ fun main() = application {
         }
     }
 
-    val trayNotifications = remember {
-        runCatching { TrayNotifications().also { runCatching { it.installIcon() } } }.getOrNull()
-    }
-    val lifecycle = remember {
-        DesktopLifecycle { exitApplication() }
-    }
 
     suspend fun ensureSyncService(): chat.api.SyncService? {
         syncService?.let { return it }

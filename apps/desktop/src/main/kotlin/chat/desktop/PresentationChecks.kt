@@ -1407,6 +1407,11 @@ private fun checkRawErrorPresentation() {
     check(chat.presentation.preview.AutoSyncPolicy.describeFailure(1, null).contains("抖动")) { "第 1 次失败应为抖动" }
     check(chat.presentation.preview.AutoSyncPolicy.describeFailure(2, "NODE_UNAVAILABLE").contains("离线")) { "第 2 次失败应说离线" }
 
+    // 3f) 通知策略：只有真的入库了新消息才通知，且文案不带正文
+    check(!chat.presentation.preview.AutoSyncPolicy.shouldNotify(0)) { "零新增不应通知" }
+    check(chat.presentation.preview.AutoSyncPolicy.shouldNotify(1)) { "有新消息应通知" }
+    check(chat.presentation.preview.AutoSyncPolicy.notificationBody(3).contains("3 条")) { "通知文案应报条数" }
+
     // 4) 未知码走回退，不崩
     val unknown = chat.presentation.display.presentRawError("SOME_NEW_CODE", null)
     check(unknown.title == "操作未完成") { "未知码应回退，实际：" + unknown.title }
