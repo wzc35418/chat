@@ -84,6 +84,14 @@ powershell -ExecutionPolicy Bypass -File tools\soak-partition.ps1
 
 期望 `PARTITION: PASS`；注意 B 阶段会等约 **26 秒**才报 `NODE_UNAVAILABLE`（语义正确、体验待优化）。
 
+### 2.10 存储只读（节点不得谎报成功，约 40 秒）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\soak-disk.ps1
+```
+
+期望 `DISK FAULT: PASS`（B 阶段节点启动失败并报 `STORAGE_FAILURE`，客户端如实失败）。
+
 ### 3. 应用本体冒烟
 
 ```powershell
