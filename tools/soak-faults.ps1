@@ -103,6 +103,7 @@ try {
         Get-Content $c.Log -Tail 8 | Out-Host
         $violations += 1
     }
+    Write-Host ''
 } finally {
     Get-Process -Name chat-node -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 }

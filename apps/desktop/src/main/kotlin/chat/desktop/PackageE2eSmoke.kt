@@ -111,8 +111,16 @@ fun main(args: Array<String>): Unit = runBlocking {
         println("PASS group created: " + snapshot.groupId + " epoch=" + snapshot.epoch)
         val groupKey = snapshot.mlsGroupKey
         // 关键一步：本地建群必须在节点登记，否则节点会 rejected（R-182 的缺口）。
+        // CHAT_DOUBLE_TRY=1 时跳过节点登记：这个模式只测“链路已死”时的失败语义，
+        // 登记本身要走网络，节点停着的话会在 setup 阶段就失败，测不到发送路径。
+        val doubleTryMode = System.getenv("CHAT_DOUBLE_TRY") == "1"
+        if (doubleTryMode) {
+            println("INFO double-try mode: skipping node registration (setup stays local)")
+        }
+        if (!doubleTryMode) {
         val registered = groups.registerOnNode(snapshot.groupId, endpoint, nodeId, nodeKey)
         println("PASS group registered on node: " + registered.groupId + " seq=" + registered.registeredSeq)
+        }
         groups.shutdown()
 
         store.open(dbPath, "0".repeat(64))
@@ -152,6 +160,35 @@ fun main(args: Array<String>): Unit = runBlocking {
 
         dispatched = store.sendDispatch(draft.draftId)
         println("PASS sendDispatch: " + dispatched.status)
+        }
+
+        // CHAT_DOUBLE_TRY=1：同一进程内“先失败一次、再试一次”，用来观察失败窗口内的自适应预检。
+        // 只能在节点不可达的场景下跑（见 tools/soak-faults.ps1 的 phase D）。
+        if (System.getenv("CHAT_DOUBLE_TRY") == "1") {
+            val firstStarted = System.nanoTime()
+            val firstHex = (java.util.UUID.randomUUID().toString().replace("-", "") +
+                java.util.UUID.randomUUID().toString().replace("-", "")).substring(0, 64)
+            val firstDraft = store.createDraft("conv:1:" + firstHex, "op:1:" + firstHex, "double-try first")
+            val first = sendWithRecovery(store, firstDraft.draftId)
+            val firstMs = (System.nanoTime() - firstStarted) / 1_000_000
+            val secondStarted = System.nanoTime()
+            val secondHex = (java.util.UUID.randomUUID().toString().replace("-", "") +
+                java.util.UUID.randomUUID().toString().replace("-", "")).substring(0, 64)
+            val secondDraft = store.createDraft("conv:1:" + secondHex, "op:1:" + secondHex, "double-try second")
+            val second = sendWithRecovery(store, secondDraft.draftId)
+            val secondMs = (System.nanoTime() - secondStarted) / 1_000_000
+            println("DOUBLE_TRY first=" + firstMs + "ms second=" + secondMs + "ms")
+            println("DOUBLE_TRY first_ok=" + first.ok + " second_ok=" + second.ok)
+            println("DOUBLE_TRY second_reason=" + (second.failure?.message ?: "none"))
+            if (first.ok || second.ok) {
+                println("FAIL double-try: an attempt claimed success while the node was down")
+                failures += 1
+            } else if (secondMs >= firstMs * 7 / 10) {
+                println("FAIL double-try: second attempt was not faster (" + secondMs + "ms vs " + firstMs + "ms)")
+                failures += 1
+            } else {
+                println("PASS double-try: second attempt faster (" + secondMs + "ms vs " + firstMs + "ms)")
+            }
         }
 
         // CHAT_REPEAT=N：同一身份/群**稳态**连发 N 条（用于 soak 的 -Reuse 模式）。
