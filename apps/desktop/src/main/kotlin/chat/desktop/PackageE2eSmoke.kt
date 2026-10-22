@@ -154,6 +154,28 @@ fun main(args: Array<String>): Unit = runBlocking {
         println("PASS sendDispatch: " + dispatched.status)
         }
 
+        // CHAT_REPEAT=N：同一身份/群**稳态**连发 N 条（用于 soak 的 -Reuse 模式）。
+        val repeatCount = System.getenv("CHAT_REPEAT")?.toIntOrNull() ?: 0
+        if (repeatCount > 0 && dispatched != null) {
+            var sentReuse = 0
+            for (index in 1..repeatCount) {
+                val started = System.nanoTime()
+                val reuseHex = (java.util.UUID.randomUUID().toString().replace("-", "") +
+                    java.util.UUID.randomUUID().toString().replace("-", "")).substring(0, 64)
+                val reuse = store.createDraft("conv:1:" + reuseHex, "op:1:" + reuseHex, "reuse hello " + index)
+                val outcome = sendWithRecovery(store, reuse.draftId)
+                val ms = (System.nanoTime() - started) / 1_000_000
+                if (!outcome.ok) {
+                    println("FAIL repeat " + index + " failed: " + (outcome.failure?.message ?: "unknown"))
+                    failures += 1
+                    break
+                }
+                sentReuse += 1
+                println("REPEAT " + index + " ok ms=" + ms + " steps=" + outcome.steps.joinToString("->"))
+            }
+            println("PASS repeat flow: " + sentReuse + "/" + repeatCount + " sent in one process")
+        }
+
         val draftStatus = store.draftStatusView(draft.draftId)
         println("INFO draft status after dispatch: " + (draftStatus?.status ?: "unknown"))
         if (dispatched != null && dispatched.status == "accepted" && dispatched.settled) {

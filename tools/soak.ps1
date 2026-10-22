@@ -12,7 +12,8 @@ param(
     [string]$Endpoint = '',
     [string]$NodeId = 'soak-node',
     [string]$Fingerprint = '',
-    [int]$Port = 8490
+    [int]$Port = 8490,
+    [int]$Reuse = 0
 )
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
@@ -29,6 +30,7 @@ foreach ($p in @($java, $jar, $native)) {
     if (-not (Test-Path $p)) { Write-Host ('SKIP soak: packaged artifact missing (' + $p + ')'); exit 3 }
 }
 
+# -Reuse N: 同一进程内同一身份/群连发 N 条（稳态），只跑 1 个进程；否则每次冷启动。
 $nodeProc = $null
 $dataDir = Join-Path $logDir 'node-data'
 if ([string]::IsNullOrWhiteSpace($Endpoint)) {
@@ -60,6 +62,40 @@ if ([string]::IsNullOrWhiteSpace($Endpoint)) {
 }
 
 Write-Host ('endpoint: ' + $Endpoint + ' (node ' + $NodeId + ')')
+if ($Reuse -gt 0) {
+    Write-Host ('mode: steady-state (one process, ' + $Reuse + ' messages on the same identity)')
+    $env:CHAT_REPEAT = [string]$Reuse
+    $log = Join-Path $logDir 'reuse.log'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    & $java ('-Djna.library.path=' + $native) '-cp' $jar 'chat.desktop.PackageE2eSmokeKt' $Endpoint $NodeId '-' $Fingerprint *> $log
+    $code = $LASTEXITCODE
+    $sw.Stop()
+    Remove-Item Env:CHAT_REPEAT -ErrorAction SilentlyContinue
+    if ($nodeProc -and -not $nodeProc.HasExited) { Stop-Process -Id $nodeProc.Id -Force -ErrorAction SilentlyContinue }
+    $text = Get-Content $log -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $text) { $text = '' }
+    $latencies = [regex]::Matches($text, 'REPEAT \d+ ok ms=(\d+)') | ForEach-Object { [int]$_.Groups[1].Value } | Sort-Object
+    $sentMatch = [regex]::Match($text, 'PASS repeat flow: (\d+)/(\d+) sent')
+    Get-Content $log -Tail 12 | Out-Host
+    Write-Host ''
+    Write-Host '===== soak summary (steady-state) ====='
+    if ($sentMatch.Success) {
+        Write-Host ('messages sent: ' + $sentMatch.Groups[1].Value + '/' + $sentMatch.Groups[2].Value)
+    } else {
+        Write-Host 'messages sent: unknown (repeat flow line missing)'
+    }
+    if ($latencies.Count -gt 0) {
+        $p50 = $latencies[[int][math]::Floor(($latencies.Count - 1) * 0.5)]
+        $p95 = $latencies[[int][math]::Ceiling(($latencies.Count - 1) * 0.95)]
+        Write-Host ('per-message ms: p50=' + $p50 + ' p95=' + $p95 + ' max=' + $latencies[$latencies.Count - 1])
+    }
+    Write-Host ('wall: ' + [math]::Round($sw.Elapsed.TotalSeconds, 1) + ' s')
+    Write-Host ('logs: ' + $logDir)
+    if ($code -eq 0 -and $sentMatch.Success -and $sentMatch.Groups[1].Value -eq $sentMatch.Groups[2].Value) { Write-Host 'SOAK: PASS'; exit 0 }
+    Write-Host 'SOAK: FAIL'
+    exit 1
+}
+
 Write-Host ('iterations: ' + $Iterations)
 $results = @()
 $failCodes = @{}
