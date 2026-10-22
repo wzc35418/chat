@@ -38,6 +38,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import chat.presentation.display.renderMarkdown
+import chat.ui.MarkdownMessage
 
 /** 左侧会话列表的一项。 */
 data class ChatConversationItem(
@@ -298,7 +300,8 @@ fun ChatHomeScreen(state: ChatHomeState, handlers: ChatHomeHandlers, modifier: M
                                         style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
                                         color = Color(0xFF6C776E),
                                     )
-                                    Text(message.body, style = MaterialTheme.typography.bodyMedium)
+                                    // 真实聊天里也走 Markdown 安全子集渲染（与预览一致：无 HTML、链接不可点）。
+                                    MarkdownMessage(document = renderMarkdown(message.body))
                                 }
                             }
                         }
