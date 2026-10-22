@@ -203,3 +203,11 @@ RUST_EXIT=0  LOCKED_EXIT=0  VERIFY_EXIT=0  GRADLE_EXIT=0  ANDROID_EXIT=0
 - [x] 产物新鲜度断言 + 交付 zip 完整性验证（`ZIP CHECK: PASS`）。
 - [x] 后台自动同步与托盘通知（有就弹、没有不假装）。
 - [ ] 未做：长稳/并发/资源曲线/故障注入、MSI（环境限制）、后台常驻、多平台、`AppFacade` 完整重写、P2P 中继接线。
+
+## 2026-10-23 第六批次结论（R-278…R-289）
+
+- [x] 发送前预检：无条件版**实测更差已回滚**；改为**失败窗口内自适应**（健康链路零开销，公网 p50 2872 ms）。
+- [x] **修复“结果未确定被当成成功”**：`SendFlow` 显式判断 `status==accepted && settled`。
+- [x] 故障注入三项通过：杀节点（`FAULT INJECTION: PASS`）、网络分区（`PARTITION: PASS`）、数据库只读（`DISK FAULT: PASS`）。
+- [x] soak 资源采样（冷启动 15 轮内存 13.8→14.2 MB、db 0→0.42 MB；稳态 30 条 p50 160 ms）。
+- [ ] 未覆盖：拉取路径在链路死掉时的语义、失败窗口的端到端验证、磁盘写满/写入中途失败、丢包抖动、长稳并发、P2P 中继/多平台/MSI。
