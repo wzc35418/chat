@@ -39,6 +39,8 @@ import chat.ui.chat.ChatHomeState
 import chat.ui.chat.ChatMessageItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.Instant
@@ -170,33 +172,35 @@ fun ChatAppRoot() {
         },
         send = {
             val body = state.composer.trim()
-            val facade = env.facade
-            val store = env.store
             val conversationId = state.activeId
             if (body.isEmpty()) {
                 state = state.copy(notice = "正文为空")
-            } else if (facade == null || store == null) {
+            } else if (env.facade == null) {
                 state = state.copy(notice = env.lastNotice)
             } else if (conversationId == null) {
                 state = state.copy(notice = "先点「新对话」或选一个会话")
             } else {
                 scope.launch {
                     state = state.copy(busy = true, error = null, notice = "发送中…")
-                    val hex = UUID.randomUUID().toString().replace("-", "") + UUID.randomUUID().toString().replace("-", "")
-                    when (val draft = facade.submitComposer(conversationId, "op:1:" + hex.substring(0, 64), body)) {
-                        is UseCaseResult.Failed -> state = state.copy(busy = false, error = draft.message)
-                        is UseCaseResult.Ok -> {
-                            val outcome = sendWithRecovery(store, draft.value.draftId)
-                            val notice = if (outcome.ok) {
-                                "已发送（" + outcome.steps.joinToString(" → ") + "）"
-                            } else {
-                                "发送失败：" + (outcome.failure?.message ?: "未知原因")
-                            }
-                            state = state.copy(busy = false, composer = "", notice = notice)
-                            openConversation(conversationId)
-                            reloadConversations()
-                        }
+                    val outcome = env.sendMessage(conversationId, body)
+                    if (outcome.ok) {
+                        // 发送成功后自动同步一次，用户不必再手动点「同步」。
+                        val synced = env.syncOnce(nodeConfig)
+                        state = state.copy(
+                            busy = false,
+                            composer = "",
+                            notice = "已发送（" + outcome.steps.joinToString(" → ") + "）；" + synced,
+                        )
+                    } else {
+                        val code = outcome.failure?.let { failureCode(it) } ?: "UNKNOWN"
+                        state = state.copy(
+                            busy = false,
+                            error = code + "：" + (outcome.failure?.message ?: "未知原因"),
+                            notice = "发送失败（" + outcome.steps.joinToString(" → ") + "）",
+                        )
                     }
+                    openConversation(conversationId)
+                    reloadConversations()
                 }
             }
         },
@@ -211,6 +215,23 @@ fun ChatAppRoot() {
         },
         openSettings = { settingsOpen = true },
     )
+
+    // 自动同步：每 30 秒在后台拉一次（发送后也会立刻同步一次）。
+    // 只在配置了节点、且界面空闲时触发，避免与发送抢写者。
+    LaunchedEffect(nodeConfig.isConfigured, nodeConfig.endpointUrl) {
+        if (!nodeConfig.isConfigured) return@LaunchedEffect
+        while (true) {
+            kotlinx.coroutines.delay(30_000)
+            if (!state.busy && env.facade != null) {
+                val result = env.syncOnce(nodeConfig)
+                if (result.startsWith("同步：")) {
+                    state = state.copy(notice = "自动" + result)
+                    state.activeId?.let { openConversation(it) }
+                    reloadConversations()
+                }
+            }
+        }
+    }
 
     ChatHomeScreen(state = state, handlers = handlers)
 
@@ -235,6 +256,8 @@ fun ChatAppRoot() {
 
 /** 应用级服务：identity / store / facade / 群与同步。 */
 private class ChatEnvironment {
+    /** 单写者：发送与同步都会动库，必须串行（同步还要临时关库）。 */
+    private val ioLock = Mutex()
     var store: LocalStore? = null
     var facade: AppFacade? = null
     var lastStatus: String = "未初始化"
@@ -493,8 +516,24 @@ private class ChatEnvironment {
         token
     }
 
+    /** 发送：写草稿 → prepare → dispatch；结果如实返回（未知结果不算成功）。 */
+    suspend fun sendMessage(conversationId: String, body: String): SendOutcome = ioLock.withLock {
+        withContext(Dispatchers.IO) {
+            val currentFacade = facade ?: return@withContext SendOutcome(emptyList(), IllegalStateException("本地库未就绪"))
+            val currentStore = store ?: return@withContext SendOutcome(emptyList(), IllegalStateException("本地库未就绪"))
+            val hex = java.util.UUID.randomUUID().toString().replace("-", "") +
+                java.util.UUID.randomUUID().toString().replace("-", "")
+            when (val draft = currentFacade.submitComposer(conversationId, "op:1:" + hex.substring(0, 64), body)) {
+                is UseCaseResult.Failed -> SendOutcome(emptyList(), IllegalStateException(draft.message))
+                is UseCaseResult.Ok -> sendWithRecovery(currentStore, draft.value.draftId)
+            }
+        }
+    }
+
     /** 同步必须独占写者：关 store → 同步 → 重开 store（与既有约束一致）。 */
-    suspend fun syncOnce(config: NodeConfig): String = withContext(Dispatchers.IO) {
+    suspend fun syncOnce(config: NodeConfig): String = ioLock.withLock { syncOnceLocked(config) }
+
+    private suspend fun syncOnceLocked(config: NodeConfig): String = withContext(Dispatchers.IO) {
         val database = databasePath ?: return@withContext "本地库未就绪"
         val key = masterKey ?: return@withContext "本地库未就绪"
         val group = groupId ?: return@withContext "还没有群：先发一条消息"
