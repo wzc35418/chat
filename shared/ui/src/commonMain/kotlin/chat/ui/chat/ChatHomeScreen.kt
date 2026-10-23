@@ -102,7 +102,17 @@ data class ChatHomeState(
     val diagnostics: List<String>? = null,
     /** 失败草稿：失败后仍可重试/对账，避免用户以为只能重发新消息。 */
     val failedDraftId: String? = null,
+    /** 接受邀请对话框状态（null = 关闭）。 */
+    val invite: ChatInviteState? = null,
     val pairing: ChatPairingState? = null,
+)
+
+/** 接受邀请（加好友）对话框状态。 */
+data class ChatInviteState(
+    val token: String = "",
+    val displayName: String = "",
+    val result: List<String> = emptyList(),
+    val busy: Boolean = false,
 )
 
 /** 配对（入群）对话框状态：三个步骤各一块文本，结果逐行显示。 */
@@ -128,6 +138,12 @@ class ChatHomeHandlers(
     val retryFailed: () -> Unit = { },
     val reconcileFailed: () -> Unit = { },
     val dismissFailed: () -> Unit = { },
+    val openInviteDialog: () -> Unit = { },
+    val closeInviteDialog: () -> Unit = { },
+    val inviteTokenChange: (String) -> Unit = { },
+    val inviteNameChange: (String) -> Unit = { },
+    val invitePreview: () -> Unit = { },
+    val inviteAccept: () -> Unit = { },
     val renameGroup: (String) -> Unit = {},
     val removeMember: (String) -> Unit = {},
     val acceptPending: () -> Unit = {},
@@ -176,6 +192,9 @@ fun ChatHomeScreen(state: ChatHomeState, handlers: ChatHomeHandlers, modifier: M
     }
     state.pairing?.let { pairing ->
         PairingDialog(pairing, handlers)
+    }
+    state.invite?.let { invite ->
+        AcceptInviteDialog(invite, handlers)
     }
 }
 
@@ -303,7 +322,10 @@ private fun LeftPane(state: ChatHomeState, handlers: ChatHomeHandlers) {
         HorizontalDivider(color = LineColor)
         Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
             when (state.tab) {
-                "contacts" -> TextButton(onClick = handlers.createInvite) { Text("邀请口令") }
+                "contacts" -> {
+                    TextButton(onClick = handlers.createInvite) { Text("生成邀请") }
+                    TextButton(onClick = handlers.openInviteDialog) { Text("接受邀请") }
+                }
                 "groups" -> Text("点群可查看成员", style = MaterialTheme.typography.labelSmall, color = MutedColor)
                 else -> TextButton(onClick = handlers.composeNew) { Text("新对话") }
             }
@@ -584,5 +606,57 @@ private fun PairingDialog(pairing: ChatPairingState, handlers: ChatHomeHandlers)
             }
         },
         confirmButton = { TextButton(onClick = handlers.closePairing) { Text("关闭") } },
+    )
+}
+
+/** 接受邀请：粘贴口令 → 预览 → 接受（建立联系人）。 */
+@Composable
+private fun AcceptInviteDialog(invite: ChatInviteState, handlers: ChatHomeHandlers) {
+    AlertDialog(
+        onDismissRequest = handlers.closeInviteDialog,
+        title = { Text("接受邀请（加好友）") },
+        text = {
+            Column(Modifier.width(620.dp)) {
+                Text(
+                    "把对方给你的邀请口令（inv1.… ）粘贴到这里，先「预览」确认邀请人，再「接受」。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MutedColor,
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = invite.token,
+                    onValueChange = handlers.inviteTokenChange,
+                    label = { Text("邀请口令") },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 2,
+                    maxLines = 4,
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = invite.displayName,
+                    onValueChange = handlers.inviteNameChange,
+                    label = { Text("给对方起的名字（可留空）") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = handlers.invitePreview, enabled = !invite.busy) { Text("预览") }
+                    TextButton(onClick = handlers.inviteAccept, enabled = !invite.busy) { Text("接受") }
+                }
+                if (invite.result.isNotEmpty()) {
+                    LazyColumn(Modifier.fillMaxWidth().height(120.dp)) {
+                        items(invite.result) { line ->
+                            Text(
+                                line,
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                                color = if (line.startsWith("FAIL")) Color(0xFFB3261E) else Color(0xFF3E6B4A),
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = handlers.closeInviteDialog) { Text("关闭") } },
     )
 }

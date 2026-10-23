@@ -158,6 +158,17 @@ tasks.register<JavaExec>("appFlowSmoke") {
     systemProperty("stdout.encoding", "UTF-8")
 }
 
+tasks.register<JavaExec>("inviteFlowSmoke") {
+    group = "verification"
+    description = "邀请口令往返（IDENTITY）：A 生成 -> B 预览 -> B 接受 -> B 联系人里出现 A。不需要网络。"
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.InviteFlowSmokeKt")
+    systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+}
+
 tasks.register<JavaExec>("diagnoseHintsSmoke") {
     group = "verification"
     description = "诊断建议映射（纯函数，无网络）：构造自检结果，断言给出的建议正确。"

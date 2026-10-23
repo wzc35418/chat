@@ -171,6 +171,41 @@ fun ChatAppRoot() {
             }
         },
         dismissFailed = { state = state.copy(failedDraftId = null) },
+        openInviteDialog = { state = state.copy(invite = chat.ui.chat.ChatInviteState()) },
+        closeInviteDialog = { state = state.copy(invite = null) },
+        inviteTokenChange = { text -> state = state.copy(invite = state.invite?.copy(token = text)) },
+        inviteNameChange = { text -> state = state.copy(invite = state.invite?.copy(displayName = text)) },
+        invitePreview = {
+            val current = state.invite ?: return@ChatHomeHandlers
+            scope.launch {
+                state = state.copy(invite = current.copy(busy = true))
+                val result = env.previewInviteToken(current.token.trim())
+                state = state.copy(
+                    invite = state.invite?.copy(
+                        busy = false,
+                        result = state.invite?.result.orEmpty() + result,
+                    ),
+                )
+            }
+        },
+        inviteAccept = {
+            val current = state.invite ?: return@ChatHomeHandlers
+            scope.launch {
+                state = state.copy(invite = current.copy(busy = true))
+                val name = current.displayName.trim().ifEmpty { "好友" }
+                val result = env.acceptInviteToken(current.token.trim(), name)
+                state = state.copy(
+                    invite = state.invite?.copy(
+                        busy = false,
+                        result = state.invite?.result.orEmpty() + result,
+                    ),
+                )
+                if (!result.startsWith("FAIL")) {
+                    val side = env.loadSide()
+                    state = state.copy(contacts = side.contacts, groups = side.groups)
+                }
+            }
+        },
         renameGroup = { newName ->
             scope.launch {
                 val current = state.groupDetail ?: return@launch
@@ -936,6 +971,56 @@ private class ChatEnvironment {
     }
 
     /** 生成邀请口令（24 小时有效）；失败返回 null，由界面显式提示。 */
+    /** 预览邀请口令（只验签/过期/绑定，不建立联系人）。 */
+    suspend fun previewInviteToken(token: String): String = withContext(Dispatchers.IO) {
+        val database = databasePath ?: return@withContext "身份库未就绪"
+        val key = masterKey ?: return@withContext "身份库未就绪"
+        runCatching { store?.close() }
+        store = null
+        facade = null
+        val service = runCatching { createIdentityService() }.getOrNull()
+        val result = if (service == null) {
+            "FAIL 身份服务不可用"
+        } else {
+            runCatching {
+                service.openPersisted(database, key, nodeIdDefault)
+                val summary = service.previewInvite(token)
+                "邀请有效：邀请人 " + shortIdForUi(summary.accountId) + "，过期时间 " +
+                    java.text.SimpleDateFormat("yyyy-MM-dd HH:mm").format(java.util.Date(summary.expiresAtMillis))
+            }.getOrElse { error ->
+                "FAIL " + failureCode(error) + "：" + (error.message ?: "")
+            }.also { runCatching { service.close() } }
+        }
+        reopenStore(storePath ?: database, key)
+        result
+    }
+
+    /** 接受邀请口令：建立联系人（state=requested）。 */
+    suspend fun acceptInviteToken(token: String, displayName: String): String = withContext(Dispatchers.IO) {
+        val database = databasePath ?: return@withContext "FAIL 身份库未就绪"
+        val key = masterKey ?: return@withContext "FAIL 身份库未就绪"
+        runCatching { store?.close() }
+        store = null
+        facade = null
+        val service = runCatching { createIdentityService() }.getOrNull()
+        val result = if (service == null) {
+            "FAIL 身份服务不可用"
+        } else {
+            runCatching {
+                service.openPersisted(database, key, nodeIdDefault)
+                val contact = service.acceptInvite(token, displayName)
+                "已加入联系人：" + contact.displayName + "（" + contact.state + "，可发送=" + contact.canSend + "）"
+            }.getOrElse { error ->
+                "FAIL " + failureCode(error) + "：" + (error.message ?: "")
+            }.also { runCatching { service.close() } }
+        }
+        reopenStore(storePath ?: database, key)
+        result
+    }
+
+    private fun shortIdForUi(value: String): String =
+        if (value.length <= 20) value else value.take(10) + "…" + value.takeLast(6)
+
     suspend fun createInvite(): String? = withContext(Dispatchers.IO) {
         val database = databasePath ?: return@withContext null
         val key = masterKey ?: return@withContext null
@@ -1120,7 +1205,7 @@ fun conversationIdFor(groupId: String): String =
     if (groupId.startsWith("grp:1:")) "conv:1:" + groupId.removePrefix("grp:1:") else groupId
 
 /** 界面版本标记：用来区分“你打开的是哪一版”（写进顶栏，避免再用旧包判断新功能）。 */
-const val UI_REVISION = "R-321"
+const val UI_REVISION = "R-322"
 
 /**
  * 无界面启动诊断（`Chat.exe --diagnose`）：把“界面为什么空白/发不出去”变成一段可复制的日志。
