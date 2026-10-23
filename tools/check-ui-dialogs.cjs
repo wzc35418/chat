@@ -105,8 +105,43 @@ for (const root of roots) {
   }
 }
 
+
+// ── 第二遍：按钮/可点区域不允许“看着能点但什么都不做” ─────────────────────
+const CLICKABLE = /(?:^|[^\w.])(Button|TextButton|OutlinedButton|FilledTonalButton|IconButton)\s*\(/g;
+const EMPTY_BLOCK = /^(?:\{\s*\}|\{\s*\(\)\s*->\s*\}|\{\s*_\s*->\s*\})$/;
+for (const root of roots) {
+  for (const file of walk(root)) {
+    const source = fs.readFileSync(file, 'utf8');
+    const relative = path.relative(path.join(__dirname, '..'), file).replace(/\\/g, '/');
+    let match;
+    while ((match = CLICKABLE.exec(source)) !== null) {
+      const line = source.slice(0, match.index).split('\n').length;
+      const block = argsAfter(source, match.index);
+      if (!block) continue;
+      const onClick = block.text.match(/onClick\s*=\s*(\{[^}]*\}|[A-Za-z_][\w.]*)/);
+      if (!onClick) {
+        problems.push(relative + ':' + line + ' ' + match[1] + ' 没有 onClick（点了不会有事发生）');
+      } else if (EMPTY_BLOCK.test(onClick[1].trim())) {
+        // 例外：**显式禁用**的占位按钮（enabled = false）不算“点了没反应”——它本来就不可点。
+        const disabled = /enabled\s*=\s*false/.test(block.text);
+        if (!disabled) {
+          problems.push(relative + ':' + line + ' ' + match[1] + ' 的 onClick 是空 lambda（按钮点了没反应）');
+        }
+      }
+    }
+    const clickableMatcher = /\.clickable\s*(?:\([^)]*\))?\s*(\{[^}]*\})/g;
+    let clickableMatch;
+    while ((clickableMatch = clickableMatcher.exec(source)) !== null) {
+      if (EMPTY_BLOCK.test(clickableMatch[1].trim())) {
+        const line = source.slice(0, clickableMatch.index).split('\n').length;
+        problems.push(relative + ':' + line + ' clickable 是空 lambda（点了没反应）');
+      }
+    }
+  }
+}
+
 if (problems.length === 0) {
-  console.log('UI DIALOGS: PASS（' + dialogs + ' 个对话框都有可用关闭路径）');
+  console.log('UI DIALOGS: PASS（' + dialogs + ' 个对话框都有可用关闭路径；按钮/clickable 无空 onClick）');
   process.exit(0);
 }
 console.log('UI DIALOGS: FAIL（' + problems.length + ' 处问题 / 共 ' + dialogs + ' 个对话框）');

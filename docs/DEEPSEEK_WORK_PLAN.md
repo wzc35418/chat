@@ -58,6 +58,11 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 - [x] **R-12：SYNC 重试/退避与信箱轮询状态机。** `crates/sync/src/{retry,mailbox,send,clock,ids,error}.rs`：指数退避（1s×2 上限 60s、抖动 ±20%、Retry-After 作下界且夹到 5 分钟、预算耗尽终态、只有成功才重置计数）、信箱轮询（游标只前进、同 id 去重且内容不同 `INVALID_CANDIDATE`、乱序暂存 512 条、双预算、ACK 失败保留进度、空页退避）、发送调度（SubmissionId 由 draft/epoch/attempt 确定性派生、unknown 只 QueryExisting 不重发不重加密、租约语义与 storage 一致）。验证：`cargo test -p chat-sync` 33 passed，clippy 0 警告。
 - [x] **R-185：修掉一个真实 flaky 测试（identity invite 篡改）。** `crates/identity/src/invite.rs::tampered_body_is_rejected` 原先用 `replace_body_byte(..., 0x5a)` 固定写入；**当随机 nonce 那一位本来就是 0x5a 时"篡改"其实没改**，签名仍有效 → 全量跑到 532 个用例时随机失败（本轮实测命中）。改为新增 `flip_body_byte`（写入值与原字节相同则再 +1，保证必然不同），并从该用例改用它。重跑 `cargo test --workspace` → **1111 passed / 0 failed**。这类修复的价值在于：**它让"全绿"变得可信**——否则每次失败都要人去猜是不是环境问题。
 - [x] **R-191（Lead）：收一轮后自动重载会话消息。** syncOnce 成功后若已选中会话，顺手走 PRESENTATION 门面 `openConversation` 重载消息并更新提示（`收一轮：拉取 N / 落库 N；当前会话共 N 条`）；失败时显式错误码。`docs/manual-test-guide.md` 新增第 14 节（收一轮与导出 KeyPackage 的操作步骤、单次使用语义、限制）。验证：compileKotlin 通过；Gradle 11 任务 BUILD SUCCESSFUL；verify-project PASS。
+- [x] **R-315（Lead）：按钮级自检——找“看着能点但什么都不做”的按钮。** 
+`tools/check-ui-dialogs.cjs` 增加第二遍扫描：`Button / TextButton / OutlinedButton / FilledTonalButton / IconButton` 的 `onClick`、以及 `Modifier.clickable { }`，**空 lambda 一律报错**；唯一例外是**显式禁用**（`enabled = false`）的占位按钮——它本来就不可点。
+**真实源码扫描结果**：只命中 1 处 `PreviewChatScreen.kt:1203`「解锁（尚未接入）」，它是 `enabled = false` 的**故意占位**（`contentDescription = "解锁，尚未接入"`），不是 bug —— 于是把这条规则写成“禁用即豁免”，并在注释里写明理由。
+**负向样本（必须报错才算数）**：样本里放 ① 空 `onDismissRequest`、② 空 confirmButton、③ 空 `Button(onClick = { })`、④ 空 `clickable { }`、⑤ 一个 `enabled = false` 的占位按钮 → 检查器报 **5 处**问题（占位按钮被正确豁免）。真实源码 → `UI DIALOGS: PASS（4 个对话框都有可用关闭路径；按钮/clickable 无空 onClick）`。
+**已接入 `verify-project.cjs`**，每轮自动跑。
 - [x] **R-314（Lead）：把“对话框必须能关”变成自动检查（issue #1 的根因防复发）。** 
 新增 `tools/check-ui-dialogs.cjs`：扫 `shared/ui` 与 `apps/desktop` 里每个 `AlertDialog(` / `DialogWindow(`，**按圆括号/大括号配平**取出参数块，要求 ① `onDismissRequest` 存在且不是空 lambda；② `confirmButton` / `dismissButton` 存在且 `onClick` 不是空 lambda；③ 至少有一个按钮。**已接入 `tools/verify-project.cjs`**（每轮都会跑）。
 **顺带做了负向测试**（证明检查器不是摆设）：`UI_DIALOG_ROOTS=build/dialog-negative` 指向一个故意写坏的样本 → `UI DIALOGS: FAIL（2 处问题）`（`onDismissRequest 是空 lambda` / `confirmButton 的 onClick 是空 lambda`）；真实源码 → `UI DIALOGS: PASS（4 个对话框都有可用关闭路径）`。
