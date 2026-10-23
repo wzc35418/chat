@@ -212,3 +212,8 @@ powershell -ExecutionPolicy Bypass -File tools\verify-pairing.ps1
 5. **只有 Windows 凭据实现**：macOS/Linux 走口令派生但未验证；
 6. **`AppFacade` 未完整收敛**：面板仍各自调 service（已收敛错误码与发送链路）；
 7. **无 soak 数据**：没有连续运行/压力测试结论。
+
+
+## 目标状态（第 199 轮判定）
+
+**保持 `active`**：A 口径 100% / B 口径 ≈90%。判定依据与“改判条件”见 [docs/GOAL_STATUS_199.md](docs/GOAL_STATUS_199.md)。

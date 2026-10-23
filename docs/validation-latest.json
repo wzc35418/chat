@@ -1,11 +1,15 @@
 {
   "date": "2026-10-18",
-  "status": "PASS",
+  "status": "FAIL",
   "scope": "delivery-structure-only",
   "checks": [
     {
       "status": "PASS",
       "message": "函数目录与源码位置、唯一ID、契约字段、调用引用已检查：197"
+    },
+    {
+      "status": "FAIL",
+      "message": "失效链接 docs/DELIVERY_CHECKLIST.md -> docs/GOAL_STATUS_199.md"
     },
     {
       "status": "PASS",
@@ -41,7 +45,7 @@
     },
     {
       "status": "PASS",
-      "message": "文档索引：68 篇文档都被引用"
+      "message": "文档索引：69 篇文档都被引用"
     }
   ],
   "limitations": [
@@ -51,7 +55,7 @@
   ],
   "dialogs": "UI DIALOGS: PASS（5 个对话框都有可用关闭路径；按钮/clickable 无空 onClick）",
   "unreferencedDocs": [],
-  "fileCount": 747,
+  "fileCount": 748,
   "functionCount": 197,
   "markdownLinks": 1713
 }
