@@ -122,6 +122,7 @@ class ChatHomeHandlers(
     val openSettings: () -> Unit = {},
     val createInvite: () -> Unit = {},
     val openGroup: (String) -> Unit = {},
+    val closeGroup: () -> Unit = { },
     val renameGroup: (String) -> Unit = {},
     val removeMember: (String) -> Unit = {},
     val acceptPending: () -> Unit = {},
@@ -415,7 +416,7 @@ private fun RightPane(state: ChatHomeState, handlers: ChatHomeHandlers, modifier
 private fun GroupDetailDialog(detail: ChatGroupDetail, handlers: ChatHomeHandlers) {
     var name by remember { mutableStateOf(detail.name) }
     AlertDialog(
-        onDismissRequest = { },
+        onDismissRequest = handlers.closeGroup,
         title = { Text("群组 · " + detail.name) },
         text = {
             Column(Modifier.width(560.dp)) {
@@ -470,7 +471,7 @@ private fun GroupDetailDialog(detail: ChatGroupDetail, handlers: ChatHomeHandler
                 }
             }
         },
-        confirmButton = { TextButton(onClick = { }) { Text("关闭") } },
+        confirmButton = { TextButton(onClick = handlers.closeGroup) { Text("关闭") } },
     )
 }
 

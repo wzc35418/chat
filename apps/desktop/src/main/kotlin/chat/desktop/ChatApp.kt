@@ -136,6 +136,7 @@ fun ChatAppRoot() {
                 )
             }
         },
+        closeGroup = { state = state.copy(groupDetail = null) },
         renameGroup = { newName ->
             scope.launch {
                 val current = state.groupDetail ?: return@launch
@@ -1020,4 +1021,4 @@ fun conversationIdFor(groupId: String): String =
     if (groupId.startsWith("grp:1:")) "conv:1:" + groupId.removePrefix("grp:1:") else groupId
 
 /** 界面版本标记：用来区分“你打开的是哪一版”（写进顶栏，避免再用旧包判断新功能）。 */
-const val UI_REVISION = "R-312"
+const val UI_REVISION = "R-313"
