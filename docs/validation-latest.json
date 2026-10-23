@@ -34,6 +34,10 @@
     {
       "status": "PASS",
       "message": "crates/node-services/migrations/0001_initial.sql：DDL执行成功，17张表，空库完整性/外键检查成功"
+    },
+    {
+      "status": "PASS",
+      "message": "UI DIALOGS: PASS（4 个对话框都有可用关闭路径）"
     }
   ],
   "limitations": [
@@ -41,7 +45,8 @@
     "未验证 MLS/密码学/跨端/网络/部署行为",
     "SQL仅在内存普通SQLite中验证，不证明加密存储可用"
   ],
-  "fileCount": 737,
+  "dialogs": "UI DIALOGS: PASS（4 个对话框都有可用关闭路径）",
+  "fileCount": 738,
   "functionCount": 197,
   "markdownLinks": 1702
 }

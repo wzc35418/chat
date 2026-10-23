@@ -91,6 +91,17 @@
       ok(p+'：DDL执行成功，'+count+'张表，空库完整性/外键检查成功'); db.close();
     }
   }catch(e){fail('SQLite草案检查失败：'+e.message);}
+  // UI 对话框自检（廉价）：每个 AlertDialog/DialogWindow 必须有关闭路径。
+  // 来源：issue #1（群组详情对话框关不掉，因为 onDismissRequest 与「关闭」都是空 lambda）。
+  try {
+    const { execFileSync } = require('node:child_process');
+    const out = execFileSync(process.execPath, [path.join(root, 'tools/check-ui-dialogs.cjs')], { encoding: 'utf8' });
+    report.dialogs = out.trim();
+    ok(out.trim());
+  } catch (error) {
+    const text = String(error.stdout || error.message || '').trim();
+    fail('UI对话框自检失败：' + text);
+  }
   report.fileCount=files.length;
   report.functionCount=catalog.count;
   report.markdownLinks=links;

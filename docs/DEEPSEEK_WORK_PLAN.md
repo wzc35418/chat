@@ -58,6 +58,11 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 - [x] **R-12：SYNC 重试/退避与信箱轮询状态机。** `crates/sync/src/{retry,mailbox,send,clock,ids,error}.rs`：指数退避（1s×2 上限 60s、抖动 ±20%、Retry-After 作下界且夹到 5 分钟、预算耗尽终态、只有成功才重置计数）、信箱轮询（游标只前进、同 id 去重且内容不同 `INVALID_CANDIDATE`、乱序暂存 512 条、双预算、ACK 失败保留进度、空页退避）、发送调度（SubmissionId 由 draft/epoch/attempt 确定性派生、unknown 只 QueryExisting 不重发不重加密、租约语义与 storage 一致）。验证：`cargo test -p chat-sync` 33 passed，clippy 0 警告。
 - [x] **R-185：修掉一个真实 flaky 测试（identity invite 篡改）。** `crates/identity/src/invite.rs::tampered_body_is_rejected` 原先用 `replace_body_byte(..., 0x5a)` 固定写入；**当随机 nonce 那一位本来就是 0x5a 时"篡改"其实没改**，签名仍有效 → 全量跑到 532 个用例时随机失败（本轮实测命中）。改为新增 `flip_body_byte`（写入值与原字节相同则再 +1，保证必然不同），并从该用例改用它。重跑 `cargo test --workspace` → **1111 passed / 0 failed**。这类修复的价值在于：**它让"全绿"变得可信**——否则每次失败都要人去猜是不是环境问题。
 - [x] **R-191（Lead）：收一轮后自动重载会话消息。** syncOnce 成功后若已选中会话，顺手走 PRESENTATION 门面 `openConversation` 重载消息并更新提示（`收一轮：拉取 N / 落库 N；当前会话共 N 条`）；失败时显式错误码。`docs/manual-test-guide.md` 新增第 14 节（收一轮与导出 KeyPackage 的操作步骤、单次使用语义、限制）。验证：compileKotlin 通过；Gradle 11 任务 BUILD SUCCESSFUL；verify-project PASS。
+- [x] **R-314（Lead）：把“对话框必须能关”变成自动检查（issue #1 的根因防复发）。** 
+新增 `tools/check-ui-dialogs.cjs`：扫 `shared/ui` 与 `apps/desktop` 里每个 `AlertDialog(` / `DialogWindow(`，**按圆括号/大括号配平**取出参数块，要求 ① `onDismissRequest` 存在且不是空 lambda；② `confirmButton` / `dismissButton` 存在且 `onClick` 不是空 lambda；③ 至少有一个按钮。**已接入 `tools/verify-project.cjs`**（每轮都会跑）。
+**顺带做了负向测试**（证明检查器不是摆设）：`UI_DIALOG_ROOTS=build/dialog-negative` 指向一个故意写坏的样本 → `UI DIALOGS: FAIL（2 处问题）`（`onDismissRequest 是空 lambda` / `confirmButton 的 onClick 是空 lambda`）；真实源码 → `UI DIALOGS: PASS（4 个对话框都有可用关闭路径）`。
+**过程里修了检查器自己的两个假阳性**：最初用“第一个 `{` 开始配平”误把 `title = {` 当参数块（4 个假报）；改用**圆括号配平**；按钮块又用非贪婪正则被 `config.copy(` 截断（1 个假报）；改成**大括号配平**。**检查器本身也要用负向样本验证**。
+**验证**：`verify-project.cjs` → `VERIFY=0`，输出里 `UI DIALOGS: PASS`；无源码改动（本轮只加检查）。
 - [x] **R-313（Lead，用户 issue #1 驱动）：修「群组详情对话框关不掉」。** 
 **根因**：R-307 重写 `ChatHomeScreen` 时，`GroupDetailDialog` 的 `onDismissRequest` 与「关闭」按钮都被写成了 `{ }`（空 lambda），并且 `ChatHomeHandlers` 里根本没有 `closeGroup` 回调——对话框只能靠点外面关，而 `onDismissRequest` 也是空的，于是**完全关不掉**。
 **修复**：`ChatHomeHandlers` 新增 `closeGroup`；`onDismissRequest = handlers.closeGroup`；「关闭」按钮改为 `onClick = handlers.closeGroup`；`ChatApp` 侧接 `state = state.copy(groupDetail = null)`。版本号升到 **R-313**（顶栏可见，便于确认跑的是新包）。

@@ -221,3 +221,11 @@ RUST_EXIT=0  LOCKED_EXIT=0  VERIFY_EXIT=0  GRADLE_EXIT=0  ANDROID_EXIT=0
 - [x] 自检按钮（证书/health/node_id + 身份/群/库逐行 PASS-FAIL）。
 - [x] 终局回归：12 阶段 + appflow + pairing + 3 soak + 3 故障注入 **全 PASS**。
 - [ ] 未覆盖：多会话/多群分流、附件、配对中断恢复、真正双机公网配对、后台常驻、MSI、长稳并发。
+
+## 2026-10-23 第八批次（R-310…R-314）
+
+- [x] 交付文档定稿（A 100% / B ≈ 90% + 产物哈希 + 一页验收）。
+- [x] **修发送失败根因**：身份未登记进消息库（`enrollIntoStore`），用真实库验证 `dispatch=accepted`。
+- [x] 修「群组详情对话框关不掉」（issue #1：`onDismissRequest` 与「关闭」都是空 lambda）。
+- [x] 新增 `tools/check-ui-dialogs.cjs` 并接入 `verify-project`（含负向样本验证）。
+- [ ] 未做：两台真机公网配对、附件、后台常驻、MSI、长稳并发。
