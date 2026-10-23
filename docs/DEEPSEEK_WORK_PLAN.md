@@ -58,6 +58,11 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 - [x] **R-12：SYNC 重试/退避与信箱轮询状态机。** `crates/sync/src/{retry,mailbox,send,clock,ids,error}.rs`：指数退避（1s×2 上限 60s、抖动 ±20%、Retry-After 作下界且夹到 5 分钟、预算耗尽终态、只有成功才重置计数）、信箱轮询（游标只前进、同 id 去重且内容不同 `INVALID_CANDIDATE`、乱序暂存 512 条、双预算、ACK 失败保留进度、空页退避）、发送调度（SubmissionId 由 draft/epoch/attempt 确定性派生、unknown 只 QueryExisting 不重发不重加密、租约语义与 storage 一致）。验证：`cargo test -p chat-sync` 33 passed，clippy 0 警告。
 - [x] **R-185：修掉一个真实 flaky 测试（identity invite 篡改）。** `crates/identity/src/invite.rs::tampered_body_is_rejected` 原先用 `replace_body_byte(..., 0x5a)` 固定写入；**当随机 nonce 那一位本来就是 0x5a 时"篡改"其实没改**，签名仍有效 → 全量跑到 532 个用例时随机失败（本轮实测命中）。改为新增 `flip_body_byte`（写入值与原字节相同则再 +1，保证必然不同），并从该用例改用它。重跑 `cargo test --workspace` → **1111 passed / 0 failed**。这类修复的价值在于：**它让"全绿"变得可信**——否则每次失败都要人去猜是不是环境问题。
 - [x] **R-191（Lead）：收一轮后自动重载会话消息。** syncOnce 成功后若已选中会话，顺手走 PRESENTATION 门面 `openConversation` 重载消息并更新提示（`收一轮：拉取 N / 落库 N；当前会话共 N 条`）；失败时显式错误码。`docs/manual-test-guide.md` 新增第 14 节（收一轮与导出 KeyPackage 的操作步骤、单次使用语义、限制）。验证：compileKotlin 通过；Gradle 11 任务 BUILD SUCCESSFUL；verify-project PASS。
+- [x] **R-326（Lead）：群详情补「待处理提案明细 / 复制群 ID / 能力边界说明」。** 
+**查清了一个能力缺口**：`GroupService` **没有**“把新成员加入**已有**群”的接口（只有 `createWithInviteeKeyPackage` 新建含对方的群）。所以这次**没有**做假的“邀请好友进群”按钮，而是在群详情里**明说**这一点，并给出可行替代（用「配对」新建含对方的群）。
+**新增**：① 待处理提案明细（`operation` + `base epoch → target epoch` + 新增/移除人数，来自内核 `GroupSnapshot.pending`）；② 「复制群 ID」（`copyText` 复用剪贴板助手）；③ 一段**能力边界说明**（“当前内核没有加入已有群的接口”）。版本 **R-326**。
+**验证**：`compileKotlin` 通过；`Chat.exe` 重建启动（日志三条齐全）；`tools/verify-diagnose.ps1` → **`DIAGNOSE JSON: PASS`（12 项检查、0 失败、2 个会话）**；`verify-project` PASS；交付 zip `D388CD63…A56D`。
+**说明**：这一轮的价值在于**把一个做不了的按钮换成一句真话**，而不是再加一个点了没反应的入口。
 - [x] **R-325（Lead）：`--diagnose --json` + 自动断言脚本 `tools/verify-diagnose.ps1`。** 
 **产出**：`--diagnose --json` 输出**一行 JSON**（`endpoint / nodeId / fingerprints / checks[] / conversations[] / result / allOk`），并写 `~/.chat-desktop/diagnose-<ts>.json`；`tools/verify-diagnose.ps1` 跑打包运行时、解析 JSON 并断言：字段齐全、**`allOk` 与每项 `ok` 必须一致**（既防“谎报全绿”，也防“明明全绿却报失败”）、`allOk=true` 时 `result` 必须以 PASS 开头、`checks` 非空。
 **实测**：`checks: 12（FAIL 0）` / `conversations: 2` / `result: PASS…` / **`DIAGNOSE JSON: PASS`**；JSON 落到 `build/diagnose-json-20261023-224826.json`。

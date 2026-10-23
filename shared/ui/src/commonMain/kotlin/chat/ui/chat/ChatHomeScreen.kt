@@ -73,6 +73,12 @@ data class ChatGroupDetail(
     val role: String,
     val members: List<ChatGroupMemberItem>,
     val pendingCount: Int,
+    /** 待处理提案（内核 GroupPending）：operation=add_members/remove_members/self_update。 */
+    val pendingOperation: String = "",
+    val pendingBaseEpoch: Int = 0,
+    val pendingTargetEpoch: Int = 0,
+    val pendingAdded: Int = 0,
+    val pendingRemoved: Int = 0,
 )
 
 data class ChatMessageItem(
@@ -483,12 +489,29 @@ private fun GroupDetailDialog(detail: ChatGroupDetail, handlers: ChatHomeHandler
                 }
                 if (detail.pendingCount > 0) {
                     Text(
-                        "有 " + detail.pendingCount + " 条待处理变更",
+                        "待处理：" + detail.pendingOperation + "（base epoch " + detail.pendingBaseEpoch +
+                            " → target " + detail.pendingTargetEpoch + "，新增 " + detail.pendingAdded +
+                            " 人，移除 " + detail.pendingRemoved + " 人）",
                         style = MaterialTheme.typography.labelSmall,
                         color = Color(0xFF9A6A00),
                     )
                     TextButton(onClick = handlers.acceptPending) { Text("接受待处理变更") }
                 }
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "群 ID：" + shortFingerprint(detail.id),
+                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                        color = MutedColor,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = { handlers.copyText(detail.id) }) { Text("复制群 ID") }
+                }
+                Text(
+                    "说明：当前内核**没有**“把新成员加入已有群”的接口；要邀请别人，只能用「配对」新建一个包含对方的群。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF7A857C),
+                )
                 LazyColumn(Modifier.fillMaxWidth().height(240.dp)) {
                     items(detail.members) { member ->
                         Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {

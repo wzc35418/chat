@@ -871,6 +871,11 @@ private class ChatEnvironment {
                 )
             },
             pendingCount = snapshot.pendingMembers.size,
+            pendingOperation = snapshot.pending?.operation ?: "",
+            pendingBaseEpoch = snapshot.pending?.baseEpoch ?: 0,
+            pendingTargetEpoch = snapshot.pending?.targetEpoch ?: 0,
+            pendingAdded = snapshot.pending?.added ?: 0,
+            pendingRemoved = snapshot.pending?.removed ?: 0,
         )
     }
 
@@ -1216,7 +1221,7 @@ fun conversationIdFor(groupId: String): String =
     if (groupId.startsWith("grp:1:")) "conv:1:" + groupId.removePrefix("grp:1:") else groupId
 
 /** 界面版本标记：用来区分“你打开的是哪一版”（写进顶栏，避免再用旧包判断新功能）。 */
-const val UI_REVISION = "R-325"
+const val UI_REVISION = "R-326"
 
 /**
  * 无界面启动诊断（`Chat.exe --diagnose`）：把“界面为什么空白/发不出去”变成一段可复制的日志。
