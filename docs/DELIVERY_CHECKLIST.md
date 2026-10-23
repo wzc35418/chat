@@ -216,4 +216,4 @@ powershell -ExecutionPolicy Bypass -File tools\verify-pairing.ps1
 
 ## 目标状态（第 199 轮判定）
 
-**保持 `active`**：A 口径 100% / B 口径 ≈90%。判定依据与“改判条件”见 [docs/GOAL_STATUS_199.md](docs/GOAL_STATUS_199.md)。
+**保持 `active`**：A 口径 100% / B 口径 ≈90%。判定依据与“改判条件”见 [docs/GOAL_STATUS_199.md](GOAL_STATUS_199.md)。
