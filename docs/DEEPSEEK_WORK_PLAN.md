@@ -58,6 +58,21 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 - [x] **R-12：SYNC 重试/退避与信箱轮询状态机。** `crates/sync/src/{retry,mailbox,send,clock,ids,error}.rs`：指数退避（1s×2 上限 60s、抖动 ±20%、Retry-After 作下界且夹到 5 分钟、预算耗尽终态、只有成功才重置计数）、信箱轮询（游标只前进、同 id 去重且内容不同 `INVALID_CANDIDATE`、乱序暂存 512 条、双预算、ACK 失败保留进度、空页退避）、发送调度（SubmissionId 由 draft/epoch/attempt 确定性派生、unknown 只 QueryExisting 不重发不重加密、租约语义与 storage 一致）。验证：`cargo test -p chat-sync` 33 passed，clippy 0 警告。
 - [x] **R-185：修掉一个真实 flaky 测试（identity invite 篡改）。** `crates/identity/src/invite.rs::tampered_body_is_rejected` 原先用 `replace_body_byte(..., 0x5a)` 固定写入；**当随机 nonce 那一位本来就是 0x5a 时"篡改"其实没改**，签名仍有效 → 全量跑到 532 个用例时随机失败（本轮实测命中）。改为新增 `flip_body_byte`（写入值与原字节相同则再 +1，保证必然不同），并从该用例改用它。重跑 `cargo test --workspace` → **1111 passed / 0 failed**。这类修复的价值在于：**它让"全绿"变得可信**——否则每次失败都要人去猜是不是环境问题。
 - [x] **R-191（Lead）：收一轮后自动重载会话消息。** syncOnce 成功后若已选中会话，顺手走 PRESENTATION 门面 `openConversation` 重载消息并更新提示（`收一轮：拉取 N / 落库 N；当前会话共 N 条`）；失败时显式错误码。`docs/manual-test-guide.md` 新增第 14 节（收一轮与导出 KeyPackage 的操作步骤、单次使用语义、限制）。验证：compileKotlin 通过；Gradle 11 任务 BUILD SUCCESSFUL；verify-project PASS。
+- [x] **R-320（Lead）：`Chat.exe --diagnose` 无界面诊断（一行命令拿到可复制的报告）。** 
+**为什么**：上一轮“界面空白”只能靠我加日志、你截图来回猜。现在 `--diagnose` 会依次做：读节点配置 → 启动服务（身份/群/库，带 `[chat]` 步骤日志）→ 连接自检（证书指纹/health/node_id/TLS/延迟 + 身份/群/库）→ 列会话，**并把整段写成 UTF-8 文件**（Windows 控制台编码不可靠，文件更稳）。退出码：0 全绿 / 1 有 FAIL / 2 服务没起来。
+**实测**（`java -cp … chat.desktop.MainKt --diagnose`，等价于 `Chat.exe --diagnose`）：
+```
+[diag] node config: endpoint=https://106.54.223.171:8443 node_id=node-public fingerprints=1 publicKey=(empty)
+[diag] PASS cert_fingerprint：服务端证书 = 配置指纹（13be2f93162bd121…）
+[diag] PASS health：HTTP 200
+[diag] PASS node_id：与配置一致：node-public
+[diag] PASS tls_info：证书剩余 3647 天
+[diag] PASS identity / group / store：均就绪
+[diag] conversations: 2 —— 群 2、我的会话（各 epoch=1、成员 2）
+[diag] RESULT: PASS（服务就绪，连接自检全绿）
+```
+**产物**：报告落在 `%USERPROFILE%\.chat-desktop\diagnose-<时间戳>.txt`（UTF-8，实测中文正常）；`Chat.cfg` 增加 `-Dstdout.encoding=UTF-8` / `-Dstderr.encoding=UTF-8`。
+**注意（诚实）**：Windows 控制台直接看输出仍可能乱码（取决于代码页），**以生成的报告文件为准**。
 - [x] **R-317…R-319（Lead）：修“界面没有会话/空白”，并把群登记改成发送前懒执行。** 
 **真 bug（我自己引入的）**：R-317 为了“选中会话不再等网络”，把群登记挪到 `start()` 里，结果多了**第二段群服务会话**，`store.open(chat.db)` 变成失败（界面表现为「还没有会话」，而库里其实有两个群）。**诊断方式**：给 `start()` 加逐步 stdout（`[chat] start / group resolved / store opened`），用 `java -cp` 跑并抓日志 —— 一眼看出少了 `store opened` 那行。
 **修复**：登记改为**发送前懒执行** `ensureGroupRegistered()`（`ioLock` 内、只做一次、失败不阻塞发送），`start()` 恢复成“读群 → 开库”两条直线；`reloadConversations()` 加 `runCatching` + 兜底（读失败给出原因，列表为空时至少显示已绑定的群，不把用户挡在「还没有会话」）。

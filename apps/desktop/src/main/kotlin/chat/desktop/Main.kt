@@ -17,6 +17,10 @@ import chat.ui.P0Screen
  * 避免用户被开发用界面误导。
  */
 fun main(args: Array<String>) {
+    // 无界面诊断：`Chat.exe --diagnose` 打印“启动 + 自检 + 会话”日志后退出。
+    if (args.contains("--diagnose")) {
+        kotlin.system.exitProcess(runStartupDiagnostics())
+    }
     val showP0 = args.contains("--p0")
     application {
         if (showP0) {

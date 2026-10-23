@@ -1118,3 +1118,56 @@ fun conversationIdFor(groupId: String): String =
 
 /** 界面版本标记：用来区分“你打开的是哪一版”（写进顶栏，避免再用旧包判断新功能）。 */
 const val UI_REVISION = "R-319"
+
+/**
+ * 无界面启动诊断（`Chat.exe --diagnose`）：把“界面为什么空白/发不出去”变成一段可复制的日志。
+ *
+ * 依次做：读配置 → 启动服务（身份/群/库）→ 连接自检 → 列会话。
+ * 退出码：0 = 全绿；1 = 有 FAIL 行；2 = 服务都没起来。
+ */
+fun runStartupDiagnostics(): Int {
+    val lines = mutableListOf<String>()
+    fun out(line: String) {
+        println(line)
+        lines += line
+    }
+    val configStore = NodeConfigStore(NodeConfigStore.defaultFile())
+    val config = runCatching { configStore.load() }.getOrDefault(NodeConfig())
+    out("[diag] node config: endpoint=" + config.endpointUrl + " node_id=" + config.nodeId +
+        " fingerprints=" + config.tlsFingerprints.size + " publicKey=" + (if (config.nodePublicKeyHex.isBlank()) "(empty)" else "set"))
+    val env = ChatEnvironment()
+    val code = kotlinx.coroutines.runBlocking {
+        runCatching { env.start(config) }
+        out("[diag] start status: " + env.lastStatus)
+        out("[diag] start notice: " + env.lastNotice)
+        out("[diag] bound group: " + (env.boundGroup()?.first ?: "none"))
+        if (env.facade == null) {
+            out("[diag] RESULT: services did not start (identity/store)")
+            return@runBlocking 2
+        }
+        val diagnostics = runCatching { env.diagnose(config) }.getOrNull()
+        if (diagnostics == null) {
+            out("[diag] RESULT: diagnose threw")
+            return@runBlocking 1
+        }
+        diagnostics.lines.forEach { out("[diag] " + it) }
+        out("[diag] summary: " + diagnostics.summary)
+        val conversations = runCatching { env.listGroupConversations() }.getOrDefault(emptyList())
+        out("[diag] conversations: " + conversations.size)
+        conversations.forEach { out("[diag]  - " + it.name + " epoch=" + it.epoch + " members=" + it.members) }
+        env.endPairing()
+        runCatching { env.store?.close() }
+        if (diagnostics.lines.any { it.startsWith("FAIL") }) 1 else 0
+    }
+    out("[diag] RESULT: " + when (code) {
+        0 -> "PASS（服务就绪，连接自检全绿）"
+        2 -> "FAIL（服务没起来）"
+        else -> "FAIL（自检有失败项）"
+    })
+    // 同时写一份 UTF-8 报告：Windows 控制台编码不可靠，复制文件比复制终端更稳。
+    val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss").format(java.util.Date())
+    val report = File(File(System.getProperty("user.home"), ".chat-desktop").apply { mkdirs() }, "diagnose-" + stamp + ".txt")
+    runCatching { report.writeText(lines.joinToString(System.lineSeparator()), Charsets.UTF_8) }
+        .onSuccess { println("[diag] report written: " + report.absolutePath) }
+    return code
+}

@@ -1,3 +1,11 @@
+# （应用侧排查第一步）
+
+```powershell
+build\dist\app-image\Chat\Chat.exe --diagnose
+```
+
+会打印并在 `%USERPROFILE%\.chat-desktop\diagnose-<时间戳>.txt` 写一份 UTF-8 报告：节点配置、服务启动、证书指纹/health/node_id、身份/群/库、会话列表。**界面空白或发不出去时，先跑这一条**，把报告内容发出来即可定位。
+
 # 节点运维手册（chat-node on Windows Server）
 
 对象：`106.54.223.171:8443` 这台自建节点。目标：**任何人拿到这份文档 + 一台能连的机器，都能判断它是好是坏、并把它弄回来。**
