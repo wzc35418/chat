@@ -114,7 +114,11 @@ fun ChatAppRoot() {
                 // 兜底：群服务临时读不出来时，至少把已绑定的群显示成一个会话（不伪造成员数）。
                 env.boundGroup()?.let { (id, name) -> items = listOf(ChatConversationItem(id, name, "已绑定群")) }
             }
-            state = state.copy(conversations = items, loading = false)
+            val withPreview = items.map { item ->
+                val preview = runCatching { env.lastMessagePreview(item.id) }.getOrDefault("")
+                if (preview.isBlank()) item else item.copy(subtitle = preview)
+            }
+            state = state.copy(conversations = withPreview, loading = false)
             if (state.activeId == null && items.isNotEmpty()) {
                 openConversation(items.first().id)
             }
@@ -568,6 +572,18 @@ private class ChatEnvironment {
         } else {
             "先点右上角「设置」填节点地址（例如 https://106.54.223.171:8443）"
         }
+    }
+
+    /** 会话最近一条消息的预览（无消息或会话不存在时返回空串）。 */
+    suspend fun lastMessagePreview(groupId: String): String = withContext(Dispatchers.IO) {
+        val currentStore = store ?: return@withContext ""
+        val conversationId = conversationIdFor(groupId)
+        val page = runCatching { currentStore.listMessages(conversationId, null, 1) }.getOrNull()
+        val message = page?.items?.lastOrNull() ?: return@withContext ""
+        val time = java.text.SimpleDateFormat("HH:mm").format(java.util.Date(message.createdAtMillis))
+        val who = if (message.mine) "我" else "对方"
+        val body = message.body.replace(Regex("[\\r\\n]+"), " ").take(24)
+        time + " " + who + "：" + body
     }
 
     /** 已绑定的群（id + 名称）；用于会话列表为空时的兜底，避免“还没有会话”把用户挡在门外。 */
@@ -1223,7 +1239,7 @@ fun conversationIdFor(groupId: String): String =
     if (groupId.startsWith("grp:1:")) "conv:1:" + groupId.removePrefix("grp:1:") else groupId
 
 /** 界面版本标记：用来区分“你打开的是哪一版”（写进顶栏，避免再用旧包判断新功能）。 */
-const val UI_REVISION = "R-327"
+const val UI_REVISION = "R-328"
 
 /**
  * 无界面启动诊断（`Chat.exe --diagnose`）：把“界面为什么空白/发不出去”变成一段可复制的日志。
