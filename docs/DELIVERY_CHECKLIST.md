@@ -25,7 +25,9 @@ powershell -ExecutionPolicy Bypass -File tools\verify-zip.ps1
 
 当前产物：`Chat.exe` `644E1672…5BD36`；`app.jar` `FA29A6EA…DCC33`；`Chat-app-0.1.0.zip` `9BF370CD…405D5`（82.8 MB）。
 
-最近一次全绿：第 177 轮（`build/final-regression-177.log`），8 个套件全 PASS。
+最近一次全绿：**第 194 轮**（`build/verify-all-194b.log` + `build/final-rest-194.log`），8 类套件全 PASS（12 阶段 / appflow / pairing / diagnose / 2 soak / 3 故障 / 真实库）。
+
+新增诊断入口与真机验证操作单：`Chat.exe --diagnose`（报告）、`--diagnose --json`（机器读）、`docs/TWO_DEVICE_CHECKLIST.md`（两台机器 6 步配对）。
 # 交付清单（一页看完）
 
 最后更新：2026-10-21（第 139 轮）。这份文件只放**能立刻执行**的东西。

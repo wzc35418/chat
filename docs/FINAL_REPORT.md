@@ -301,3 +301,32 @@ powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
 ### 最后一句
 
 这 180 轮里，最值钱的不是加了多少功能，而是**学会了用真实界面截图和真实错误码来推翻自己的判断**——`UniffiLib` 加载失败、`grp id / conv id` 混用、出站消息不落库，这三个如果只看代码“看起来对”，一个都发现不了。
+## 十六、第 196 轮交付定稿（最终数字与产物）
+
+| 口径 | 数值 | 依据 |
+| --- | --- | --- |
+| **A：功能闭环** | **100%** | 12 阶段 + 应用链路 + 配对 + 诊断 JSON + 3 soak + 3 故障 + 真实库发送，全部 PASS（第 194 轮） |
+| **B：生产就绪** | **≈ 90%** | 界面可用、可诊断、可自检；仍缺真机公网配对与长稳/并发 |
+
+### 产物（当前）
+
+| 产物 | 路径 | SHA-256 |
+| --- | --- | --- |
+| 免 JDK 启动器 | `build/dist/app-image/Chat/Chat.exe` | `644E16725B6F5E61B693158F25877DB1A7B04827BE27912C12A9B9FC8FE5BD36` |
+| 业务包 | `build/dist/app-image/Chat/app/app.jar` | `E73B069B7045BEF29B1FD81ACC3BE45F127E1FBCD1E762604D161790ADA3FED7` |
+| 完整分发包 | `build/dist/Chat-app-0.1.0.zip` | `699FBFD666C4BE120B3E244DDCD4EBB69E5EDF8DD334A8ADC5441F17C039734B`（82.91 MB） |
+
+### 现在可用的诊断入口（三条）
+
+```powershell
+# 1) 人读报告（写 UTF-8 文件到 ~/.chat-desktop/diagnose-<ts>.txt）
+build\dist\app-image\Chat\Chat.exe --diagnose
+# 2) 机器读 JSON（供脚本断言）
+build\dist\app-image\Chat\Chat.exe --diagnose --json
+# 3) 自动断言（12 项检查 + allOk 一致性）
+powershell -ExecutionPolicy Bypass -File tools\verify-diagnose.ps1
+```
+
+### 唯一剩余的硬缺口
+
+**两台真机通过公网配对 → 建群 → 双向发消息**。操作单已写好：`docs/TWO_DEVICE_CHECKLIST.md`（6 步 + 记录表 + 已知会失败的地方）。这一步不需要写代码，只需要第二台设备。
