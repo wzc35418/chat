@@ -158,6 +158,16 @@ tasks.register<JavaExec>("appFlowSmoke") {
     systemProperty("stdout.encoding", "UTF-8")
 }
 
+tasks.register<JavaExec>("diagnoseHintsSmoke") {
+    group = "verification"
+    description = "诊断建议映射（纯函数，无网络）：构造自检结果，断言给出的建议正确。"
+    dependsOn("classes")
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.DiagnoseHintsSmokeKt")
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+}
+
 tasks.register<JavaExec>("userDbSmoke") {
     group = "verification"
     description = "用用户真实本地库（~/.chat-desktop）验证发送：登记群 -> prepare -> dispatch(accepted) -> 本地可见。"

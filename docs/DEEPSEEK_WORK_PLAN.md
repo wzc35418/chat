@@ -58,6 +58,11 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 - [x] **R-12：SYNC 重试/退避与信箱轮询状态机。** `crates/sync/src/{retry,mailbox,send,clock,ids,error}.rs`：指数退避（1s×2 上限 60s、抖动 ±20%、Retry-After 作下界且夹到 5 分钟、预算耗尽终态、只有成功才重置计数）、信箱轮询（游标只前进、同 id 去重且内容不同 `INVALID_CANDIDATE`、乱序暂存 512 条、双预算、ACK 失败保留进度、空页退避）、发送调度（SubmissionId 由 draft/epoch/attempt 确定性派生、unknown 只 QueryExisting 不重发不重加密、租约语义与 storage 一致）。验证：`cargo test -p chat-sync` 33 passed，clippy 0 警告。
 - [x] **R-185：修掉一个真实 flaky 测试（identity invite 篡改）。** `crates/identity/src/invite.rs::tampered_body_is_rejected` 原先用 `replace_body_byte(..., 0x5a)` 固定写入；**当随机 nonce 那一位本来就是 0x5a 时"篡改"其实没改**，签名仍有效 → 全量跑到 532 个用例时随机失败（本轮实测命中）。改为新增 `flip_body_byte`（写入值与原字节相同则再 +1，保证必然不同），并从该用例改用它。重跑 `cargo test --workspace` → **1111 passed / 0 failed**。这类修复的价值在于：**它让"全绿"变得可信**——否则每次失败都要人去猜是不是环境问题。
 - [x] **R-191（Lead）：收一轮后自动重载会话消息。** syncOnce 成功后若已选中会话，顺手走 PRESENTATION 门面 `openConversation` 重载消息并更新提示（`收一轮：拉取 N / 落库 N；当前会话共 N 条`）；失败时显式错误码。`docs/manual-test-guide.md` 新增第 14 节（收一轮与导出 KeyPackage 的操作步骤、单次使用语义、限制）。验证：compileKotlin 通过；Gradle 11 任务 BUILD SUCCESSFUL；verify-project PASS。
+- [x] **R-321（Lead）：自检结果翻译成「建议」，并用纯函数冒烟验证映射。** 
+新增 `DiagnoseHints`（纯函数，无网络）：把 `NodeSelfCheck` 的失败模式映射成**可执行建议**——指纹未配置→去 `fingerprint.txt` 填；指纹不一致→可能换过证书、核对后可同时保留新旧指纹；TLS 握手失败→查 8443 端口与 cert/key；health 失败→查进程与防火墙；node_id 不符→用 `inspect-node.ps1` 看真实值；证书过期→跑 `rotate-certificate.ps1`；延迟高→跨洲正常、别当故障；身份/群/库失败→各自的处置。**未知失败模式不给假建议。**
+**验证（这是重点）**：新增 `diagnoseHintsSmoke` 任务，用**构造出来的**自检结果做 6 条断言 —— 未配置指纹 / 指纹不一致 / health 失败 / node_id 不符 / **全绿时不产生建议** / **未知失败模式返回空**，全部 `PASS`（`DIAGNOSE HINTS: PASS`）。不需要网络，可反复跑。
+**接入**：`--diagnose` 报告与界面「自检」对话框都会在明细后追加 `建议：…` 行；版本标记 **R-321**。实测全绿时报告里**没有**多余建议（第 5–17 行），符合“没病不唠叨”。
+**诚实边界**：建议是**经验规则**，不是自动修复；跨洲延迟那一条只给判断依据，不做任何自动动作。
 - [x] **R-320（Lead）：`Chat.exe --diagnose` 无界面诊断（一行命令拿到可复制的报告）。** 
 **为什么**：上一轮“界面空白”只能靠我加日志、你截图来回猜。现在 `--diagnose` 会依次做：读节点配置 → 启动服务（身份/群/库，带 `[chat]` 步骤日志）→ 连接自检（证书指纹/health/node_id/TLS/延迟 + 身份/群/库）→ 列会话，**并把整段写成 UTF-8 文件**（Windows 控制台编码不可靠，文件更稳）。退出码：0 全绿 / 1 有 FAIL / 2 服务没起来。
 **实测**（`java -cp … chat.desktop.MainKt --diagnose`，等价于 `Chat.exe --diagnose`）：

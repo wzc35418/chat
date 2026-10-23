@@ -4,7 +4,7 @@
 build\dist\app-image\Chat\Chat.exe --diagnose
 ```
 
-会打印并在 `%USERPROFILE%\.chat-desktop\diagnose-<时间戳>.txt` 写一份 UTF-8 报告：节点配置、服务启动、证书指纹/health/node_id、身份/群/库、会话列表。**界面空白或发不出去时，先跑这一条**，把报告内容发出来即可定位。
+会打印并在 `%USERPROFILE%\.chat-desktop\diagnose-<时间戳>.txt` 写一份 UTF-8 报告：节点配置、服务启动、证书指纹/health/node_id、身份/群/库、会话列表。**界面空白或发不出去时，先跑这一条**，报告里失败项后面会跟 `建议：…`（例如“去 fingerprint.txt 填指纹”“用 inspect-node.ps1 看真实 node_id”）。把报告内容发出来即可定位。
 
 # 节点运维手册（chat-node on Windows Server）
 

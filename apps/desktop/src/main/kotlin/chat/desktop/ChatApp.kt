@@ -780,6 +780,9 @@ private class ChatEnvironment {
         } else {
             "自检有 " + failures + " 项失败，见明细"
         }
+        // 把“失败”翻译成“接下来做什么”（纯函数，已单独冒烟验证）。
+        val hints = DiagnoseHints.suggest(steps)
+        hints.forEach { lines += "建议：" + it }
         Diagnostics(lines, summary)
     }
 
@@ -1117,7 +1120,7 @@ fun conversationIdFor(groupId: String): String =
     if (groupId.startsWith("grp:1:")) "conv:1:" + groupId.removePrefix("grp:1:") else groupId
 
 /** 界面版本标记：用来区分“你打开的是哪一版”（写进顶栏，避免再用旧包判断新功能）。 */
-const val UI_REVISION = "R-319"
+const val UI_REVISION = "R-321"
 
 /**
  * 无界面启动诊断（`Chat.exe --diagnose`）：把“界面为什么空白/发不出去”变成一段可复制的日志。
