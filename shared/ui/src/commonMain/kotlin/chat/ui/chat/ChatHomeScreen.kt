@@ -379,9 +379,9 @@ private fun RightPane(state: ChatHomeState, handlers: ChatHomeHandlers, modifier
                                 .padding(10.dp),
                         ) {
                             Text(
-                                message.label + "  " + message.status,
+                                message.label + "  " + message.status + (if (message.mine) "  · 已发送" else ""),
                                 style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                                color = MutedColor,
+                                color = if (message.mine) Color(0xFF3E6B4A) else MutedColor,
                             )
                             MarkdownMessage(document = renderMarkdown(message.body))
                         }

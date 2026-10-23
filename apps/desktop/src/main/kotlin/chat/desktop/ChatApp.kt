@@ -98,12 +98,21 @@ fun ChatAppRoot() {
     // 会话 = 群：列表直接来自群状态（不再用假会话 id）。
     fun reloadConversations() {
         scope.launch {
-            val items = env.listGroupConversations().map { conversation ->
+            val loaded = runCatching { env.listGroupConversations() }
+            if (loaded.isFailure) {
+                state = state.copy(loading = false, notice = "读取会话失败：" + (loaded.exceptionOrNull()?.message ?: "未知原因"))
+                return@launch
+            }
+            var items = loaded.getOrThrow().map { conversation ->
                 ChatConversationItem(
                     id = conversation.groupId,
                     title = conversation.name,
                     subtitle = "epoch " + conversation.epoch + " · 成员 " + conversation.members,
                 )
+            }
+            if (items.isEmpty()) {
+                // 兜底：群服务临时读不出来时，至少把已绑定的群显示成一个会话（不伪造成员数）。
+                env.boundGroup()?.let { (id, name) -> items = listOf(ChatConversationItem(id, name, "已绑定群")) }
             }
             state = state.copy(conversations = items, loading = false)
             if (state.activeId == null && items.isNotEmpty()) {
@@ -393,6 +402,9 @@ private class ChatEnvironment {
     private var masterKey: String? = null
     private var groupId: String? = null
     private var mlsGroupKey: String? = null
+    /** 当前绑定群的显示名（会话列表兜底用）。 */
+    private var groupName: String = ""
+    private var registeredOnce: Boolean = false
     var currentConfig: NodeConfig? = null
     private var myAccountId: String = ""
     private var myDeviceId: String = ""
@@ -421,8 +433,9 @@ private class ChatEnvironment {
         val key = "0".repeat(64)
         masterKey = key
 
+        println("[chat] start: identity.db=" + database + " chat.db=" + chatDatabase)
         val identityService = runCatching { createIdentityService() }.getOrNull()
-        if (identityService == null) { lastStatus = "身份服务不可用"; return@withContext }
+        if (identityService == null) { lastStatus = "身份服务不可用"; println("[chat] identity service unavailable"); return@withContext }
         identity = identityService
         var opened = runCatching { identityService.openPersisted(database, key, nodeIdDefault) }
         var legacyNote = ""
@@ -453,6 +466,7 @@ private class ChatEnvironment {
         runCatching { identityService.enrollIntoStore(chatDatabase, key) }
         runCatching { identityService.close() }
         if (opened.isFailure) {
+            println("[chat] identity open FAILED: " + (opened.exceptionOrNull()?.message ?: ""))
             val reason = (opened.exceptionOrNull()?.message ?: "未知原因").replace(Regex("[\r\n]"), " ").take(140)
             lastStatus = "身份库打开失败：" + reason
             lastNotice = reason + legacyNote
@@ -465,27 +479,33 @@ private class ChatEnvironment {
             val existing = list?.groups?.firstOrNull { !it.dissolved && !it.left }
             if (existing != null) {
                 groupId = existing.groupId
+                groupName = existing.name.ifBlank { existing.groupId }
                 mlsGroupKey = runCatching { groupService.snapshot(existing.groupId) }.getOrNull()?.mlsGroupKey
             } else {
                 val created = runCatching { groupService.createGroup("我的会话") }.getOrNull()
                 if (created != null) {
                     groupId = created.groupId
+                    groupName = created.name.ifBlank { "我的会话" }
                     mlsGroupKey = created.mlsGroupKey
                 }
             }
             runCatching { groupService.shutdown() }
+            println("[chat] group resolved: " + (groupId ?: "none") + " name=" + groupName)
+        } else {
+            println("[chat] group service unavailable")
         }
-
         val localStore = runCatching { createLocalStore() }.getOrNull()
         if (localStore == null) { lastStatus = "存储服务不可用"; return@withContext }
         val storeOpened = runCatching { localStore.open(chatDatabase, key) }
         if (storeOpened.isFailure) {
+            println("[chat] store open FAILED: " + (storeOpened.exceptionOrNull()?.message ?: ""))
             lastStatus = "本地库打开失败"
             lastNotice = storeOpened.exceptionOrNull()?.message ?: ""
             return@withContext
         }
         store = localStore
         facade = AppFacade(localStore)
+        println("[chat] store opened; facade ready")
 
         val endpoint = config.endpointUrl.trim()
         if (endpoint.isNotEmpty()) {
@@ -508,6 +528,9 @@ private class ChatEnvironment {
             "先点右上角「设置」填节点地址（例如 https://106.54.223.171:8443）"
         }
     }
+
+    /** 已绑定的群（id + 名称）；用于会话列表为空时的兜底，避免“还没有会话”把用户挡在门外。 */
+    fun boundGroup(): Pair<String, String>? = groupId?.let { it to groupName.ifBlank { it } }
 
     /** 一个「会话」= 一个群（同一份 MLS 状态，不做假会话）。 */
     data class GroupConversation(
@@ -587,31 +610,9 @@ private class ChatEnvironment {
         runCatching { store?.close() }
         store = null
         facade = null
-        val config = currentConfig
         val snapshot = runCatching {
             val service = createGroupService(chatDb, key, nodeIdDefault)
-            try {
-                val view = service.snapshot(targetGroupId)
-                // 老版本的群从没在节点登记过 → 提交会被节点拒（表现为“发送失败”）。
-                // 登记是幂等的，这里每次选中会话都补一次。
-                val endpoint = config?.endpointUrl?.trim().orEmpty()
-                if (endpoint.isNotEmpty()) {
-                    val keyHex = config?.nodePublicKeyHex?.trim()?.ifEmpty {
-                        NodeSelfCheck.fetchNodePublicKeyHex(endpoint, config?.tlsFingerprints ?: emptyList()).orEmpty()
-                    }.orEmpty()
-                    runCatching {
-                        service.registerOnNode(
-                            targetGroupId,
-                            endpoint,
-                            config?.nodeId?.trim()?.ifEmpty { "node-public" }.orEmpty(),
-                            keyHex.ifEmpty { null },
-                        )
-                    }
-                }
-                view
-            } finally {
-                runCatching { service.shutdown() }
-            }
+            try { service.snapshot(targetGroupId) } finally { runCatching { service.shutdown() } }
         }.getOrNull()
         reopenStore(chatDb, key)
         if (snapshot == null) return@withContext false
@@ -687,6 +688,34 @@ private class ChatEnvironment {
     fun endPairing() {
         runCatching { pairingCore?.close() }
         pairingCore = null
+    }
+
+    /** 发送前保证群已在节点登记（幂等；只做一次）。放在这里而不是启动时，避免拖慢启动。 */
+    private suspend fun ensureGroupRegistered() = withContext(Dispatchers.IO) {
+        if (registeredOnce) return@withContext
+        val target = groupId ?: return@withContext
+        val config = currentConfig ?: return@withContext
+        val endpoint = config.endpointUrl.trim()
+        if (endpoint.isEmpty()) return@withContext
+        val chatDb = storePath ?: return@withContext
+        val key = masterKey ?: return@withContext
+        val keyHex = config.nodePublicKeyHex.trim().ifEmpty {
+            NodeSelfCheck.fetchNodePublicKeyHex(endpoint, config.tlsFingerprints).orEmpty()
+        }
+        runCatching { store?.close() }
+        store = null
+        facade = null
+        val outcome = runCatching {
+            val service = createGroupService(chatDb, key, nodeIdDefault)
+            try {
+                service.registerOnNode(target, endpoint, config.nodeId.trim().ifEmpty { "node-public" }, keyHex.ifEmpty { null })
+            } finally {
+                runCatching { service.shutdown() }
+            }
+        }
+        reopenStore(chatDb, key)
+        registeredOnce = outcome.isSuccess
+        println("[chat] ensureGroupRegistered ok=" + outcome.isSuccess + " err=" + (outcome.exceptionOrNull()?.message ?: ""))
     }
 
     /** 重试一条失败草稿（内核 sendRetry：重建并换新 SubmissionId）。 */
@@ -929,6 +958,7 @@ private class ChatEnvironment {
     /** 发送：写草稿 → prepare → dispatch；结果如实返回（未知结果不算成功）。 */
     suspend fun sendMessage(conversationId: String, body: String): SendOutcome = ioLock.withLock {
         withContext(Dispatchers.IO) {
+            ensureGroupRegistered()
             val currentFacade = facade ?: return@withContext SendOutcome(emptyList(), IllegalStateException("本地库未就绪"))
             val currentStore = store ?: return@withContext SendOutcome(emptyList(), IllegalStateException("本地库未就绪"))
             val hex = java.util.UUID.randomUUID().toString().replace("-", "") +
@@ -1087,4 +1117,4 @@ fun conversationIdFor(groupId: String): String =
     if (groupId.startsWith("grp:1:")) "conv:1:" + groupId.removePrefix("grp:1:") else groupId
 
 /** 界面版本标记：用来区分“你打开的是哪一版”（写进顶栏，避免再用旧包判断新功能）。 */
-const val UI_REVISION = "R-316"
+const val UI_REVISION = "R-319"
