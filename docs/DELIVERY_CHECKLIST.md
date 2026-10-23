@@ -151,7 +151,17 @@ powershell -ExecutionPolicy Bypass -File tools\verify-app-flow.ps1
 
 期望 `APP FLOW: PASS`（指纹固定 → 建群/登记 → `sendDispatch: status=accepted settled=true` → 同步）。最近一次实测：`sync: fetched=2 applied=1 skipped=1`。
 
-### 2.12 入群配对包（本地节点，约 1 分钟）
+### 2.12 用真实本地库验证发送（约 40 秒，需节点在线）
+
+```powershell
+$body = (curl.exe -s --insecure https://106.54.223.171:8443/v1/health | Out-String)
+$key = [regex]::Match($body, '"node_public_key"\s*:\s*"([0-9a-f]{64})"').Groups[1].Value
+cmd /c (".\gradlew.bat :apps:desktop:userDbSmoke --offline -Puser.endpoint=https://106.54.223.171:8443 -Puser.nodeId=node-public -Puser.nodeKey=$key -Puser.fingerprint=13be2f93162bd121cba6a91d4e05c22900dcc06abcd92cf843bd5ed772b8a053")
+```
+
+期望 `USER DB: PASS`（`dispatch: status=accepted`）。注意：先关掉正在运行的 Chat.exe，否则会 `storage is locked`。
+
+### 2.13 入群配对包（本地节点，约 1 分钟）
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\verify-pairing.ps1

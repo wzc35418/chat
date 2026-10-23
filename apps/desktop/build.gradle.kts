@@ -158,6 +158,20 @@ tasks.register<JavaExec>("appFlowSmoke") {
     systemProperty("stdout.encoding", "UTF-8")
 }
 
+tasks.register<JavaExec>("userDbSmoke") {
+    group = "verification"
+    description = "用用户真实本地库（~/.chat-desktop）验证发送：登记群 -> prepare -> dispatch(accepted) -> 本地可见。"
+    dependsOn("classes", rootProject.tasks.named("prepareRustHost"))
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.UserDbSmokeKt")
+    systemProperty("jna.library.path", rootProject.layout.buildDirectory.dir("native/host").get().asFile.absolutePath)
+    listOf("endpoint", "nodeId", "nodeKey", "fingerprint").forEach { key ->
+        providers.gradleProperty("user." + key).orNull?.let { systemProperty("user." + key, it) }
+    }
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+}
+
 tasks.register<JavaExec>("pairingSmoke") {
     group = "verification"
     description = "配对包往返：KeyPackage 包 → 邀请包 → Welcome 入群（copy/paste 文本，不依赖网络）。"

@@ -58,6 +58,12 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 - [x] **R-12：SYNC 重试/退避与信箱轮询状态机。** `crates/sync/src/{retry,mailbox,send,clock,ids,error}.rs`：指数退避（1s×2 上限 60s、抖动 ±20%、Retry-After 作下界且夹到 5 分钟、预算耗尽终态、只有成功才重置计数）、信箱轮询（游标只前进、同 id 去重且内容不同 `INVALID_CANDIDATE`、乱序暂存 512 条、双预算、ACK 失败保留进度、空页退避）、发送调度（SubmissionId 由 draft/epoch/attempt 确定性派生、unknown 只 QueryExisting 不重发不重加密、租约语义与 storage 一致）。验证：`cargo test -p chat-sync` 33 passed，clippy 0 警告。
 - [x] **R-185：修掉一个真实 flaky 测试（identity invite 篡改）。** `crates/identity/src/invite.rs::tampered_body_is_rejected` 原先用 `replace_body_byte(..., 0x5a)` 固定写入；**当随机 nonce 那一位本来就是 0x5a 时"篡改"其实没改**，签名仍有效 → 全量跑到 532 个用例时随机失败（本轮实测命中）。改为新增 `flip_body_byte`（写入值与原字节相同则再 +1，保证必然不同），并从该用例改用它。重跑 `cargo test --workspace` → **1111 passed / 0 failed**。这类修复的价值在于：**它让"全绿"变得可信**——否则每次失败都要人去猜是不是环境问题。
 - [x] **R-191（Lead）：收一轮后自动重载会话消息。** syncOnce 成功后若已选中会话，顺手走 PRESENTATION 门面 `openConversation` 重载消息并更新提示（`收一轮：拉取 N / 落库 N；当前会话共 N 条`）；失败时显式错误码。`docs/manual-test-guide.md` 新增第 14 节（收一轮与导出 KeyPackage 的操作步骤、单次使用语义、限制）。验证：compileKotlin 通过；Gradle 11 任务 BUILD SUCCESSFUL；verify-project PASS。
+- [x] **R-312（Lead，用户“发不出去”驱动）：根因是**身份没登记进消息库**，已修，并用**用户真实库**验证发送成功。** 
+**根因**：发送链路要求“本地身份已登记进**消息库**（chat.db）”，而 `ChatApp` 从来没调用过 `identity.enrollIntoStore(chatDb, key)`。于是 `sendPrepare` 直接抛 `INVALID_STATE_TRANSITION: the local identity is not enrolled in this database`——旧界面上表现为一句空白的 `发送失败（）`。
+**证据链（三轮定位）**：① 新增 `UserDbSmoke`（直接用 `~/.chat-desktop` 的真实身份库/消息库/群，不新建任何东西）；② 第一次跑 `storage is locked`（残留 JVM）→ 清掉后重跑；③ 得到 `the local identity is not enrolled in this database` → 补 `enrollIntoStore` 后：`PASS identity enrolled into chat.db`、`PASS 群已登记到节点 seq=0`、**`send dispatch: status=accepted settled=true detail=node accepted the message`**、`messages in this conversation: 2`、`USER DB: PASS`。
+**同时修**：① 启动时**补登记群到节点**（老版本的群从没登记，提交会被拒）；② 失败提示不再空白：`发送失败（步骤）` + `错误码：原因`（原因缺失时回退异常类名）；③ 顶栏加**版本标记 `· R-312`**，用于区分“你打开的是哪一版”。
+**验证**：`compileKotlin` 通过；`Chat.exe` 重建后启动存活并截屏（顶栏 `· R-312`、无错误行、两个会话可见）；交付 zip `F55B0D68…4BD2`。
+**诚实边界**：`UserDbSmoke` 验证的是**发送 + 本地落库**；对方是否收到仍未用第二台真机验证。
 - [x] **R-311（Lead，第 180 轮收尾）：交代与交接。** 
 `FINAL_REPORT.md` 新增「第 180 轮收尾」：明确**目标保持 `active`**（六条能力仍不成立）；列出**现在能做什么 5 条**（有证据）与**不能做什么 4 条**（含“不能声称跨公网双人聊天”——配对仅本地节点验证）；给出**三条接手路径**（继续开发 / 小范围试用 / 归档）各自第一步；并给出 **164 → 180 的净变化表**（入口/界面能力/打包可用性/出站消息/双人/B 口径 88%→90%）。
 **净变化里最重要的一行**：164 轮时 `Chat.exe` 里 `UniffiLib` 加载失败、等于**打包产物不可用**；180 轮已修复并有冷启动截屏证据。

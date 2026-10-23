@@ -97,6 +97,7 @@ data class ChatHomeState(
     val error: String? = null,
     val busy: Boolean = false,
     val nodeLabel: String = "节点未配置",
+    val revision: String = "",
     val groupDetail: ChatGroupDetail? = null,
     val diagnostics: List<String>? = null,
     val pairing: ChatPairingState? = null,
@@ -185,6 +186,14 @@ private fun TopBar(state: ChatHomeState, handlers: ChatHomeHandlers) {
             style = MaterialTheme.typography.labelMedium.copy(fontFamily = FontFamily.Monospace),
             color = Color(0xFF5F6B63),
         )
+        if (state.revision.isNotEmpty()) {
+            Spacer(Modifier.width(10.dp))
+            Text(
+                "· " + state.revision,
+                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                color = Color(0xFF9AA39C),
+            )
+        }
         Spacer(Modifier.weight(1f))
         TextButton(onClick = handlers.openPairing) { Text("配对") }
         TextButton(onClick = handlers.diagnose) { Text("自检") }

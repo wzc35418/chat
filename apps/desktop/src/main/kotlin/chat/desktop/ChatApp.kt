@@ -58,7 +58,7 @@ fun ChatAppRoot() {
     val scope = rememberCoroutineScope()
     val nodeConfigStore = remember { NodeConfigStore(NodeConfigStore.defaultFile()) }
     var nodeConfig by remember { mutableStateOf(runCatching { nodeConfigStore.load() }.getOrDefault(NodeConfig())) }
-    var state by remember { mutableStateOf(ChatHomeState()) }
+    var state by remember { mutableStateOf(ChatHomeState(revision = UI_REVISION)) }
     var settingsOpen by remember { mutableStateOf(false) }
     val env = remember { ChatEnvironment() }
 
@@ -209,11 +209,16 @@ fun ChatAppRoot() {
                             notice = "已发送（" + outcome.steps.joinToString(" → ") + "）；" + synced,
                         )
                     } else {
-                        val code = outcome.failure?.let { failureCode(it) } ?: "UNKNOWN"
+                        val failure = outcome.failure
+                        val code = failure?.let { failureCode(it) } ?: "UNKNOWN_RESULT"
+                        val detail = failure?.message?.takeIf { it.isNotBlank() }
+                            ?: failure?.let { it::class.java.simpleName }
+                            ?: "未知原因"
+                        val steps = outcome.steps.ifEmpty { listOf("未完成任何步骤") }.joinToString(" → ")
                         state = state.copy(
                             busy = false,
-                            error = code + "：" + (outcome.failure?.message ?: "未知原因"),
-                            notice = "发送失败（" + outcome.steps.joinToString(" → ") + "）",
+                            error = code + "：" + detail,
+                            notice = "发送失败（" + steps + "）",
                         )
                     }
                     openConversation(conversationId)
@@ -415,6 +420,10 @@ private class ChatEnvironment {
             myAccountId = account.accountId
             myDeviceId = account.deviceId
         } }
+        // 关键：发送链路要求“身份已登记进**消息库**”（chat.db），否则 sendPrepare 直接
+        // INVALID_STATE_TRANSITION: the local identity is not enrolled in this database。
+        // 这里在启动时补一次（幂等）。
+        runCatching { identityService.enrollIntoStore(chatDatabase, key) }
         runCatching { identityService.close() }
         if (opened.isFailure) {
             val reason = (opened.exceptionOrNull()?.message ?: "未知原因").replace(Regex("[\r\n]"), " ").take(140)
@@ -551,9 +560,31 @@ private class ChatEnvironment {
         runCatching { store?.close() }
         store = null
         facade = null
+        val config = currentConfig
         val snapshot = runCatching {
             val service = createGroupService(chatDb, key, nodeIdDefault)
-            try { service.snapshot(targetGroupId) } finally { runCatching { service.shutdown() } }
+            try {
+                val view = service.snapshot(targetGroupId)
+                // 老版本的群从没在节点登记过 → 提交会被节点拒（表现为“发送失败”）。
+                // 登记是幂等的，这里每次选中会话都补一次。
+                val endpoint = config?.endpointUrl?.trim().orEmpty()
+                if (endpoint.isNotEmpty()) {
+                    val keyHex = config?.nodePublicKeyHex?.trim()?.ifEmpty {
+                        NodeSelfCheck.fetchNodePublicKeyHex(endpoint, config?.tlsFingerprints ?: emptyList()).orEmpty()
+                    }.orEmpty()
+                    runCatching {
+                        service.registerOnNode(
+                            targetGroupId,
+                            endpoint,
+                            config?.nodeId?.trim()?.ifEmpty { "node-public" }.orEmpty(),
+                            keyHex.ifEmpty { null },
+                        )
+                    }
+                }
+                view
+            } finally {
+                runCatching { service.shutdown() }
+            }
         }.getOrNull()
         reopenStore(chatDb, key)
         if (snapshot == null) return@withContext false
@@ -987,3 +1018,6 @@ private data class Diagnostics(val lines: List<String>, val summary: String)
 /** 协议里会话 id 与群 id 是两套命名空间：群 grp:1:<hex> 对应会话 conv:1:<同一 hex>。 */
 fun conversationIdFor(groupId: String): String =
     if (groupId.startsWith("grp:1:")) "conv:1:" + groupId.removePrefix("grp:1:") else groupId
+
+/** 界面版本标记：用来区分“你打开的是哪一版”（写进顶栏，避免再用旧包判断新功能）。 */
+const val UI_REVISION = "R-312"
