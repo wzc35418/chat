@@ -9,7 +9,7 @@
     },
     {
       "status": "PASS",
-      "message": "本地Markdown链接及显式函数锚点已检查：1702"
+      "message": "本地Markdown链接及显式函数锚点已检查：1713"
     },
     {
       "status": "PASS",
@@ -38,6 +38,10 @@
     {
       "status": "PASS",
       "message": "UI DIALOGS: PASS（5 个对话框都有可用关闭路径；按钮/clickable 无空 onClick）"
+    },
+    {
+      "status": "PASS",
+      "message": "文档索引：68 篇文档都被引用"
     }
   ],
   "limitations": [
@@ -46,7 +50,8 @@
     "SQL仅在内存普通SQLite中验证，不证明加密存储可用"
   ],
   "dialogs": "UI DIALOGS: PASS（5 个对话框都有可用关闭路径；按钮/clickable 无空 onClick）",
+  "unreferencedDocs": [],
   "fileCount": 747,
   "functionCount": 197,
-  "markdownLinks": 1702
+  "markdownLinks": 1713
 }

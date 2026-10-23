@@ -222,20 +222,50 @@ RUST_EXIT=0  LOCKED_EXIT=0  VERIFY_EXIT=0  GRADLE_EXIT=0  ANDROID_EXIT=0
 - [x] 终局回归：12 阶段 + appflow + pairing + 3 soak + 3 故障注入 **全 PASS**。
 - [ ] 未覆盖：多会话/多群分流、附件、配对中断恢复、真正双机公网配对、后台常驻、MSI、长稳并发。
 
-## 2026-10-23 第八批次（R-310…R-314）
+## 2026-10-23 第八批次结论（R-310…R-331，已合并中间记录）
+
+### 交付与修复
 
 - [x] 交付文档定稿（A 100% / B ≈ 90% + 产物哈希 + 一页验收）。
 - [x] **修发送失败根因**：身份未登记进消息库（`enrollIntoStore`），用真实库验证 `dispatch=accepted`。
 - [x] 修「群组详情对话框关不掉」（issue #1：`onDismissRequest` 与「关闭」都是空 lambda）。
-- [x] 新增 `tools/check-ui-dialogs.cjs` 并接入 `verify-project`（含负向样本验证）。
-- [ ] 未做：两台真机公网配对、附件、后台常驻、MSI、长稳并发。
+- [x] 修我自己引入的回归：把群登记塞进 `start()` 导致 `store.open` 失败、会话列表空白。
+- [x] 修 `发送失败（）` 空提示（改为 `错误码：原因`）。
 
-## 2026-10-23 第八批次结论（R-310…R-330）
+### 诊断能力
 
-- [x] `--diagnose`（文本/JSON/建议/环境 4 项）与 `verify-diagnose.ps1` 自动断言。
-- [x] 复制按钮 + 剪贴板往返冒烟；加好友闭环（邀请口令）+ `inviteFlowSmoke`。
-- [x] 发送乐观气泡、会话列表预览、群详情增强（待处理明细/复制群 ID/边界说明）。
-- [x] 对话框与按钮自检（`check-ui-dialogs.cjs`，含负向样本）。
-- [x] 修：身份未 enroll 到消息库导致发送全失败；群详情关不掉（issue #1）。
-- [x] 终局回归全绿（12 阶段 + 3 soak + 3 故障 + appflow + pairing + diagnose + userDb）。
-- [ ] 未做：真机公网配对、加入已有群、附件上传、未读计数、压测/MSI/多平台。
+- [x] `--diagnose`（人读报告，UTF-8 文件）+ `--diagnose --json`（机器读）+ `verify-diagnose.ps1`（自动断言）。
+- [x] 诊断建议 `DiagnoseHints`（失败→可执行建议；未知失败不给假建议）+ `diagnoseHintsSmoke`。
+- [x] 环境检查 `EnvironmentChecks`（剪贴板/数据目录/磁盘/端口）+ `envChecksSmoke`（含负例）。
+- [x] 对话框与按钮自检 `check-ui-dialogs.cjs`（含负向样本）并接入 `verify-project`。
+
+### 界面能力
+
+- [x] 复制按钮（KeyPackage / 邀请包 / 提示行）+ `clipboardSmoke`（中文/换行往返）。
+- [x] 加好友闭环（邀请口令：预览→接受）+ `inviteFlowSmoke`。
+- [x] 发送乐观气泡（`我 · 发送中…`，未确认不画成已发送）。
+- [x] 会话列表预览（`HH:mm 我：正文前 24 字`，取不到退回 epoch 信息）。
+- [x] 群详情增强（待处理提案明细 / 复制群 ID / **能力边界说明**）。
+
+### 回归
+
+- [x] 终局回归全绿（12 阶段 + 3 soak + 3 故障 + appflow + pairing + diagnose + userDb，见第 194 轮日志）。
+- [ ] 未做：真机公网配对（唯一硬缺口，操作单见 `docs/TWO_DEVICE_CHECKLIST.md`）、加入已有群（内核无接口）、附件上传（内核未接线）、未读计数、压测/MSI/多平台、配对中断恢复。
+
+## 复核记录（每条 ✅ 对应的证据命令）
+
+| 结论 | 证据 |
+| --- | --- |
+| 12 阶段全绿 | `tools\verify-all.ps1 -RemoteEndpoint …` → `overall: PASS` |
+| 应用链路可发 | `tools\verify-app-flow.ps1` → `dispatch: accepted settled=true` |
+| 双人配对可入群 | `tools\verify-pairing.ps1` → `PAIRING: PASS` |
+| 诊断可断言 | `tools\verify-diagnose.ps1` → `DIAGNOSE JSON: PASS` |
+| 真实库可发 | `gradlew :apps:desktop:userDbSmoke -Puser.*` → `USER DB: PASS` |
+| 三种故障如实失败 | `soak-faults.ps1` / `soak-partition.ps1` / `soak-disk.ps1` |
+| 剪贴板可用 | `gradlew :apps:desktop:clipboardSmoke` → `CLIPBOARD SMOKE: PASS` |
+| 加好友可用 | `gradlew :apps:desktop:inviteFlowSmoke` → `INVITE SMOKE: PASS` |
+| 建议映射正确 | `gradlew :apps:desktop:diagnoseHintsSmoke` → `DIAGNOSE HINTS: PASS` |
+| 环境检查正确（含负例） | `gradlew :apps:desktop:envChecksSmoke` → `ENV CHECKS: PASS` |
+| UI 无死按钮 | `node tools\check-ui-dialogs.cjs` → `UI DIALOGS: PASS` |
+
+**复核结论（第 197 轮）**：上述 11 条证据均在**第 194 轮及之后**真实运行过；唯一没有证据的勾选项为“真机公网配对”，故它仍是未勾选状态。

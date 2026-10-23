@@ -102,6 +102,30 @@
     const text = String(error.stdout || error.message || '').trim();
     fail('UI对话框自检失败：' + text);
   }
+  // 文档索引一致性（非致命）：docs/ 下每个 .md 至少被 README 或某篇文档引用一次。
+  try {
+    const docDir = path.join(root, 'docs');
+    const walkDocs = (dir, out = []) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walkDocs(full, out);
+        else if (entry.name.endsWith('.md')) out.push(full);
+      }
+      return out;
+    };
+    const docs = walkDocs(docDir);
+    const corpus = docs.map((file) => fs.readFileSync(file, 'utf8')).join('\n') + fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    const unreferenced = docs.filter((file) => {
+      const relative = path.relative(root, file).replace(/\\/g, '/');
+      const base = path.basename(file);
+      return !corpus.includes(relative) && !corpus.includes(base);
+    }).map((file) => path.relative(root, file).replace(/\\/g, '/'));
+    report.unreferencedDocs = unreferenced;
+    if (unreferenced.length === 0) ok('文档索引：' + docs.length + ' 篇文档都被引用');
+    else ok('文档索引：' + docs.length + ' 篇，' + unreferenced.length + ' 篇未被引用（非致命）：' + unreferenced.slice(0, 6).join(', '));
+  } catch (error) {
+    ok('文档索引检查跳过：' + error.message);
+  }
   report.fileCount=files.length;
   report.functionCount=catalog.count;
   report.markdownLinks=links;

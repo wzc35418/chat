@@ -125,3 +125,26 @@ powershell -File tools\verify-all.ps1 -TargetDir C:\chat-target  # 把 cargo tar
 **还不能做什么**：跨机器/跨网段（无中继）、插件安全隔离（权限门不是沙箱）、OS 凭据库、后台通知、安装器/自动更新。
 
 细节见 [SHIPPING.md](docs/SHIPPING.md)（基线与限制）、[manual-test-guide.md](docs/manual-test-guide.md)（15 节手工测试）、[COVERAGE_SNAPSHOT.md](docs/implementation/COVERAGE_SNAPSHOT.md)（模块覆盖与缺口）。
+
+## 文档索引（按用途）
+
+**验收与交付**
+
+- [docs/DELIVERY_CHECKLIST.md](docs/DELIVERY_CHECKLIST.md) — 一页验收（6 组命令 + 产物哈希）
+- [docs/FINAL_REPORT.md](docs/FINAL_REPORT.md) — 最终报告（口径、证据、能力边界、接手路径）
+- [docs/SHIPPING.md](docs/SHIPPING.md) — 基线历史与各轮回归数字
+- [docs/TWO_DEVICE_CHECKLIST.md](docs/TWO_DEVICE_CHECKLIST.md) — **两台真机公网配对 6 步操作单**
+
+**运维与排障**
+
+- [docs/OPS_RUNBOOK.md](docs/OPS_RUNBOOK.md) — 节点巡检/自启/日志/备份/换证书/故障对照
+- `Chat.exe --diagnose`（人读报告）、`Chat.exe --diagnose --json`（机器读）
+- [docs/P0_NODE_ACCEPTANCE.md](docs/P0_NODE_ACCEPTANCE.md) — 节点验收
+
+**开发与过程**
+
+- [docs/DEEPSEEK_WORK_PLAN.md](docs/DEEPSEEK_WORK_PLAN.md) — 逐轮工作记录（含每轮证据）
+- [docs/implementation/P0_CHECKLIST.md](docs/implementation/P0_CHECKLIST.md) — P0 勾选与**复核记录**
+- [docs/BATCH_181_200.md](docs/BATCH_181_200.md) — 第八批次总结（R-310…R-330）
+- [docs/PROJECT_GUIDE.md](docs/PROJECT_GUIDE.md) — 代码结构与约定
+- [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) — 依赖与离线构建
