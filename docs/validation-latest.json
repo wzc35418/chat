@@ -13,7 +13,7 @@
     },
     {
       "status": "PASS",
-      "message": "本地Markdown链接及显式函数锚点已检查：1713"
+      "message": "本地Markdown链接及显式函数锚点已检查：1715"
     },
     {
       "status": "PASS",
@@ -57,5 +57,5 @@
   "unreferencedDocs": [],
   "fileCount": 748,
   "functionCount": 197,
-  "markdownLinks": 1713
+  "markdownLinks": 1715
 }

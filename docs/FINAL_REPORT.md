@@ -352,3 +352,67 @@ powershell -ExecutionPolicy Bypass -File tools\verify-diagnose.ps1
 
 - 六句**全部仍然成立**，但其中两句的**理由**要改写：缺的不是“托盘/自动同步的实现”，而是**正式界面没接线 + 没有常驻形态**；
 | 这也解释了为什么 B 口径只能到 ≈90%：差的不是功能数量，而是**真机端到端证据**与**交付形态**（安装器/常驻/压测）。
+## 十八、第 200 轮最终交代
+
+### 一句话
+
+> 这套系统现在**能被验证**（8 类套件全绿、三条诊断入口、每条结论都能对上一条命令）；但**还不能被别人拿去用**——差一次真机端到端和一种交付形态。
+
+### 目标状态（本轮读到的真实值）
+
+```
+goal    goal-f70ea7f4-1af9-41c8-a39c-9643e7cce618
+phase   active（未标 complete）
+rounds  200 / 200
+A 口径  100%（功能闭环，有回归证据）
+B 口径  ≈90%（界面可用、可诊断；缺真机端到端与交付形态）
+```
+
+不标完成的三条硬理由与改判条件见 [docs/GOAL_STATUS_199.md](GOAL_STATUS_199.md)。
+
+### 你现在该做的第一件事
+
+```powershell
+# 1) 确认手上是这一版（顶栏应显示 · R-328）
+build\dist\app-image\Chat\Chat.exe
+# 2) 看一眼全绿（12 项检查 + 4 项环境检查）
+build\dist\app-image\Chat\Chat.exe --diagnose
+```
+
+然后按 **[docs/TWO_DEVICE_CHECKLIST.md](TWO_DEVICE_CHECKLIST.md)** 用两台机器跑一遍（6 步、约 15 分钟）。**这是唯一能把 B 口径从 ≈90% 往上推的动作**，而且不需要我写代码。
+
+### 三条接手路径
+
+| 路径 | 适合 | 第一步 | 注意 |
+| --- | --- | --- | --- |
+| **继续开发** | 想把它做成产品 | `tools\verify-all.ps1`（12 阶段）确认基线全绿 | 先做真机端到端，再谈新功能 |
+| **小范围试用** | 给自己人用 | 服务器跑 `register-service.ps1` 注册开机任务；日常 `deploy\inspect-node.ps1 -Local` | 别对外称“加密聊天产品”；节点 `seed.hex` 必须备份 |
+| **归档** | 暂时不做 | 保存 `build\dist\Chat-app-0.1.0.zip` + `deploy\node-bundle` + `docs/` | 私钥/种子丢了，群和身份就找不回 |
+
+### 全量证据一览（都能自己跑）
+
+| 套件 | 命令 | 最近结果 |
+| --- | --- | --- |
+| 12 阶段（含公网） | `tools\verify-all.ps1 -RemoteEndpoint …` | PASS（remote 54.7s） |
+| 应用链路 | `tools\verify-app-flow.ps1` | PASS（`dispatch accepted settled=true`） |
+| 双人配对（本地节点） | `tools\verify-pairing.ps1` | PASS（两端同 epoch） |
+| 诊断自断言 | `tools\verify-diagnose.ps1` | PASS（12 项 0 失败） |
+| 真实库发送 | `gradlew :apps:desktop:userDbSmoke -Puser.*` | PASS（`dispatch accepted`） |
+| soak 冷/公网 | `tools\soak.ps1 -Iterations 10` / `-Reuse 10` | 10/10（p50 1948ms / 3501ms） |
+| 三种故障 | `soak-faults` / `soak-partition` / `soak-disk` | 全 PASS，零谎报 |
+| UI 无死按钮 | `node tools\check-ui-dialogs.cjs` | PASS（4 个对话框都有关闭路径） |
+
+### 这 200 轮我最想留下的话
+
+1. **先怀疑工具，再怀疑产品**：一次“卡住”是我脚本里 `openssl s_client` 等 stdin；一次“界面空白”是 Gradle daemon 锁。
+2. **验证路径必须等于用户路径**：`java -cp` 全绿，而 `Chat.exe` 里 FFI 根本没加载；`verify-app-flow` 全绿，而应用从未把身份 enroll 进消息库。
+3. **优化不要塞进启动路径**：为“切换更快”把群登记挪进 `start()`，换来“会话列表空白”。
+4. **失败信息要自带码与原因**：`发送失败（）` 这种空提示，等于没有信息。
+5. **做不了的功能，说真话比做假按钮有价值**：“邀请进已有群”内核没有接口，我在界面上写明，而不是放一个点了没反应的按钮。
+
+### 交接清单（最简版）
+
+- 产物：`Chat.exe` `644E1672…5BD36`；`app.jar` `E73B069B…FED7`；zip `699FBFD6…734B`（82.91 MB）
+- 节点：`https://106.54.223.171:8443` / `node-public` / 指纹 `13be2f93…a053`（约 3647 天后到期，到期前需 `rotate-certificate.ps1`）
+- 文档入口：`docs/DELIVERY_CHECKLIST.md`（一页验收）→ `docs/TWO_DEVICE_CHECKLIST.md`（真机操作单）→ `docs/GOAL_STATUS_199.md`（状态与改判条件）
+- 已知缺口：真机公网配对未验 / 无 MSI / 无后台常驻 / 附件未接线 / 加入已有群无接口 / 无长稳并发 / 仅 Windows
