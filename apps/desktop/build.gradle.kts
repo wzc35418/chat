@@ -158,6 +158,16 @@ tasks.register<JavaExec>("appFlowSmoke") {
     systemProperty("stdout.encoding", "UTF-8")
 }
 
+tasks.register<JavaExec>("clipboardSmoke") {
+    group = "verification"
+    description = "剪贴板往返（含中文/换行）：邀请口令、KeyPackage、邀请包全靠它交付。"
+    dependsOn("classes")
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.ClipboardSmokeKt")
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+}
+
 tasks.register<JavaExec>("inviteFlowSmoke") {
     group = "verification"
     description = "邀请口令往返（IDENTITY）：A 生成 -> B 预览 -> B 接受 -> B 联系人里出现 A。不需要网络。"

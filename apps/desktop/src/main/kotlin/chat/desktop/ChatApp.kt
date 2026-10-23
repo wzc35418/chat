@@ -188,6 +188,10 @@ fun ChatAppRoot() {
                 )
             }
         },
+        copyText = { text ->
+            val ok = copyToClipboard(text)
+            state = state.copy(notice = if (ok) "已复制到剪贴板（" + text.length + " 字符）" else "复制失败：剪贴板不可用")
+        },
         inviteAccept = {
             val current = state.invite ?: return@ChatHomeHandlers
             scope.launch {
@@ -1205,7 +1209,7 @@ fun conversationIdFor(groupId: String): String =
     if (groupId.startsWith("grp:1:")) "conv:1:" + groupId.removePrefix("grp:1:") else groupId
 
 /** 界面版本标记：用来区分“你打开的是哪一版”（写进顶栏，避免再用旧包判断新功能）。 */
-const val UI_REVISION = "R-322"
+const val UI_REVISION = "R-323"
 
 /**
  * 无界面启动诊断（`Chat.exe --diagnose`）：把“界面为什么空白/发不出去”变成一段可复制的日志。

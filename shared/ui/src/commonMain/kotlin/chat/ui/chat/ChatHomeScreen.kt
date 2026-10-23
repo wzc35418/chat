@@ -144,6 +144,7 @@ class ChatHomeHandlers(
     val inviteNameChange: (String) -> Unit = { },
     val invitePreview: () -> Unit = { },
     val inviteAccept: () -> Unit = { },
+    val copyText: (String) -> Unit = { },
     val renameGroup: (String) -> Unit = {},
     val removeMember: (String) -> Unit = {},
     val acceptPending: () -> Unit = {},
@@ -424,12 +425,16 @@ private fun RightPane(state: ChatHomeState, handlers: ChatHomeHandlers, modifier
             }
         }
         if (state.notice.isNotEmpty()) {
-            Text(
-                state.notice,
-                style = MaterialTheme.typography.labelSmall,
-                color = Color(0xFF5F6B63),
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-            )
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    state.notice,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF5F6B63),
+                    modifier = Modifier.weight(1f),
+                )
+                // 邀请口令、错误码都靠“复制”交给别人；没有复制按钮时用户只能手选文本。
+                TextButton(onClick = { handlers.copyText(state.notice) }) { Text("复制提示") }
+            }
         }
         HorizontalDivider(color = LineColor)
         val composerFocus = remember { FocusRequester() }
@@ -562,6 +567,11 @@ private fun PairingDialog(pairing: ChatPairingState, handlers: ChatHomeHandlers)
                 )
                 Spacer(Modifier.height(8.dp))
                 Button(onClick = handlers.pairingMyKeyPackage, enabled = !pairing.busy) { Text("① 导出我的 KeyPackage") }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (pairing.myKeyPackage.isNotEmpty()) {
+                        TextButton(onClick = { handlers.copyText(pairing.myKeyPackage) }) { Text("复制我的 KeyPackage") }
+                    }
+                }
                 OutlinedTextField(
                     value = pairing.myKeyPackage,
                     onValueChange = { },
@@ -581,6 +591,9 @@ private fun PairingDialog(pairing: ChatPairingState, handlers: ChatHomeHandlers)
                 )
                 Spacer(Modifier.height(4.dp))
                 Button(onClick = handlers.pairingCreateGroup, enabled = !pairing.busy) { Text("② 用对方 KeyPackage 建群 → 生成邀请包") }
+                if (pairing.invitePack.isNotEmpty()) {
+                    TextButton(onClick = { handlers.copyText(pairing.invitePack) }) { Text("复制邀请包") }
+                }
                 OutlinedTextField(
                     value = pairing.invitePack,
                     onValueChange = handlers.pairingInvitePackChange,
