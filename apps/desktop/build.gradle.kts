@@ -158,6 +158,16 @@ tasks.register<JavaExec>("appFlowSmoke") {
     systemProperty("stdout.encoding", "UTF-8")
 }
 
+tasks.register<JavaExec>("envChecksSmoke") {
+    group = "verification"
+    description = "环境自检（剪贴板/数据目录/磁盘/节点端口）：含一条故意不可达端口的负例。"
+    dependsOn("classes")
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("chat.desktop.EnvironmentChecksSmokeKt")
+    systemProperty("file.encoding", "UTF-8")
+    systemProperty("stdout.encoding", "UTF-8")
+}
+
 tasks.register<JavaExec>("clipboardSmoke") {
     group = "verification"
     description = "剪贴板往返（含中文/换行）：邀请口令、KeyPackage、邀请包全靠它交付。"

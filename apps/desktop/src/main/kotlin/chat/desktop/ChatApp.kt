@@ -814,10 +814,17 @@ private class ChatEnvironment {
         }
         lines += if (groupId == null) "FAIL group：还没有群（点「新对话」发消息会自动建群）" else "PASS group：已绑定群 " + shortGroup(groupId!!)
         lines += if (store == null) "FAIL store：本地消息库未打开" else "PASS store：本地消息库已打开"
-        val summary = if (failures == 0) {
-            "自检通过（" + steps.size + " 项网络检查）；" + identityLine
+        // 环境项（剪贴板/数据目录/磁盘/端口）：和业务无关，但经常是“看起来坏了”的原因。
+        val dataDir = databasePath?.let { File(it).parentFile } ?: File(System.getProperty("user.home"), ".chat-desktop")
+        val envChecks = EnvironmentChecks.run(dataDir, config.endpointUrl)
+        envChecks.forEach { check ->
+            lines += (if (check.ok) "PASS " else "FAIL ") + check.name + "：" + check.detail
+        }
+        val envFailures = envChecks.count { !it.ok }
+        val summary = if (failures == 0 && envFailures == 0) {
+            "自检通过（" + steps.size + " 项网络检查 + " + envChecks.size + " 项环境检查）；" + identityLine
         } else {
-            "自检有 " + failures + " 项失败，见明细"
+            "自检有 " + (failures + envFailures) + " 项失败，见明细"
         }
         // 把“失败”翻译成“接下来做什么”（纯函数，已单独冒烟验证）。
         val hints = DiagnoseHints.suggest(steps)
@@ -1209,7 +1216,7 @@ fun conversationIdFor(groupId: String): String =
     if (groupId.startsWith("grp:1:")) "conv:1:" + groupId.removePrefix("grp:1:") else groupId
 
 /** 界面版本标记：用来区分“你打开的是哪一版”（写进顶栏，避免再用旧包判断新功能）。 */
-const val UI_REVISION = "R-323"
+const val UI_REVISION = "R-324"
 
 /**
  * 无界面启动诊断（`Chat.exe --diagnose`）：把“界面为什么空白/发不出去”变成一段可复制的日志。

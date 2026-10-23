@@ -58,6 +58,12 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 - [x] **R-12：SYNC 重试/退避与信箱轮询状态机。** `crates/sync/src/{retry,mailbox,send,clock,ids,error}.rs`：指数退避（1s×2 上限 60s、抖动 ±20%、Retry-After 作下界且夹到 5 分钟、预算耗尽终态、只有成功才重置计数）、信箱轮询（游标只前进、同 id 去重且内容不同 `INVALID_CANDIDATE`、乱序暂存 512 条、双预算、ACK 失败保留进度、空页退避）、发送调度（SubmissionId 由 draft/epoch/attempt 确定性派生、unknown 只 QueryExisting 不重发不重加密、租约语义与 storage 一致）。验证：`cargo test -p chat-sync` 33 passed，clippy 0 警告。
 - [x] **R-185：修掉一个真实 flaky 测试（identity invite 篡改）。** `crates/identity/src/invite.rs::tampered_body_is_rejected` 原先用 `replace_body_byte(..., 0x5a)` 固定写入；**当随机 nonce 那一位本来就是 0x5a 时"篡改"其实没改**，签名仍有效 → 全量跑到 532 个用例时随机失败（本轮实测命中）。改为新增 `flip_body_byte`（写入值与原字节相同则再 +1，保证必然不同），并从该用例改用它。重跑 `cargo test --workspace` → **1111 passed / 0 failed**。这类修复的价值在于：**它让"全绿"变得可信**——否则每次失败都要人去猜是不是环境问题。
 - [x] **R-191（Lead）：收一轮后自动重载会话消息。** syncOnce 成功后若已选中会话，顺手走 PRESENTATION 门面 `openConversation` 重载消息并更新提示（`收一轮：拉取 N / 落库 N；当前会话共 N 条`）；失败时显式错误码。`docs/manual-test-guide.md` 新增第 14 节（收一轮与导出 KeyPackage 的操作步骤、单次使用语义、限制）。验证：compileKotlin 通过；Gradle 11 任务 BUILD SUCCESSFUL；verify-project PASS。
+- [x] **R-324（Lead）：`--diagnose` 增加 4 项环境检查（剪贴板 / 数据目录 / 磁盘余量 / 节点端口）。** 
+**为什么**：这三类误判最常见——用户说“复制不了”（远程桌面/无桌面会话）、说“存不下”（目录权限/磁盘满）、说“连不上”（其实是端口没通，不是协议问题）。现在一条命令都给结论。
+**实现**：`EnvironmentChecks.run(dataDir, endpoint)` 纯本地 + 3 s 超时：① 剪贴板写读往返；② 数据目录写探针文件再删；③ `usableSpace ≥ 100 MB`；④ 按 URI 取 host/port 做 TCP 握手（只连不发协议）。接入 `--diagnose` 与界面「自检」，summary 变成 `5 项网络检查 + 4 项环境检查`。版本 **R-324**。
+**验证（含负例）**：新增 `envChecksSmoke`，6 条断言全 PASS —— 其中包括**故意指向 `127.0.0.1:59999` 的不可达端口必须判定失败**、**非法地址也要给结论而不抛异常**。
+**实测报告**（`~/.chat-desktop/diagnose-20261023-224348.txt`）：`PASS clipboard` / `PASS data_dir` / `PASS disk_space：387576 MB 可用` / `PASS node_port：106.54.223.171:8443 可达` / `summary: 自检通过（5 项网络检查 + 4 项环境检查）`。交付 zip `D663F4FB…BC5C`。
+**边界**：TCP 握手成功 ≠ 协议可用（协议层由 health/node_id 两项覆盖）；磁盘检查只看可用空间，不预测增长。
 - [x] **R-323（Lead）：加「复制」按钮（邀请口令 / KeyPackage / 邀请包 / 提示行），并给剪贴板做往返冒烟。** 
 **为什么**：邀请口令、KeyPackage、邀请包全靠“复制粘贴”交给对方；没有复制按钮时用户只能手选长文本，容易漏字符——而这种错误在界面上完全看不出来。
 **实现**：`copyToClipboard/readClipboard`（AWT，失败返回 false 不抛给 UI）；配对对话框加「复制我的 KeyPackage」「复制邀请包」；右下提示行加「复制提示」（邀请口令、错误码都能一键复制）；复制后提示改成 `已复制到剪贴板（N 字符）`。版本标记 **R-323**。
