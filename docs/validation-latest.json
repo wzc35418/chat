@@ -46,7 +46,7 @@
     "SQL仅在内存普通SQLite中验证，不证明加密存储可用"
   ],
   "dialogs": "UI DIALOGS: PASS（5 个对话框都有可用关闭路径；按钮/clickable 无空 onClick）",
-  "fileCount": 744,
+  "fileCount": 745,
   "functionCount": 197,
   "markdownLinks": 1702
 }

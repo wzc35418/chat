@@ -19,7 +19,8 @@ import chat.ui.P0Screen
 fun main(args: Array<String>) {
     // 无界面诊断：`Chat.exe --diagnose` 打印“启动 + 自检 + 会话”日志后退出。
     if (args.contains("--diagnose")) {
-        kotlin.system.exitProcess(runStartupDiagnostics())
+        // --diagnose --json：输出机器可读的一行 JSON（供 tools/verify-diagnose.ps1 断言）。
+        kotlin.system.exitProcess(runStartupDiagnostics(json = args.contains("--json")))
     }
     val showP0 = args.contains("--p0")
     application {

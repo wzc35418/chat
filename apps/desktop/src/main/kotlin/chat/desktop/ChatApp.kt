@@ -1216,7 +1216,7 @@ fun conversationIdFor(groupId: String): String =
     if (groupId.startsWith("grp:1:")) "conv:1:" + groupId.removePrefix("grp:1:") else groupId
 
 /** 界面版本标记：用来区分“你打开的是哪一版”（写进顶栏，避免再用旧包判断新功能）。 */
-const val UI_REVISION = "R-324"
+const val UI_REVISION = "R-325"
 
 /**
  * 无界面启动诊断（`Chat.exe --diagnose`）：把“界面为什么空白/发不出去”变成一段可复制的日志。
@@ -1224,7 +1224,7 @@ const val UI_REVISION = "R-324"
  * 依次做：读配置 → 启动服务（身份/群/库）→ 连接自检 → 列会话。
  * 退出码：0 = 全绿；1 = 有 FAIL 行；2 = 服务都没起来。
  */
-fun runStartupDiagnostics(): Int {
+fun runStartupDiagnostics(json: Boolean = false): Int {
     val lines = mutableListOf<String>()
     fun out(line: String) {
         println(line)
@@ -1263,10 +1263,57 @@ fun runStartupDiagnostics(): Int {
         2 -> "FAIL（服务没起来）"
         else -> "FAIL（自检有失败项）"
     })
+    if (json) {
+        val payload = buildDiagnoseJson(config, lines)
+        println(payload)
+        val jsonStamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss").format(java.util.Date())
+        val jsonFile = File(File(System.getProperty("user.home"), ".chat-desktop"), "diagnose-" + jsonStamp + ".json")
+        runCatching { jsonFile.writeText(payload, Charsets.UTF_8) }
+        return code
+    }
     // 同时写一份 UTF-8 报告：Windows 控制台编码不可靠，复制文件比复制终端更稳。
     val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss").format(java.util.Date())
     val report = File(File(System.getProperty("user.home"), ".chat-desktop").apply { mkdirs() }, "diagnose-" + stamp + ".txt")
     runCatching { report.writeText(lines.joinToString(System.lineSeparator()), Charsets.UTF_8) }
         .onSuccess { println("[diag] report written: " + report.absolutePath) }
     return code
+}
+
+/** 把诊断结果压成一行 JSON（机器可读；给 tools/verify-diagnose.ps1 用）。 */
+private fun buildDiagnoseJson(config: NodeConfig, lines: List<String>): String {
+    fun escape(value: String): String = buildString {
+        for (ch in value) {
+            when (ch) {
+                '\\' -> append("\\\\")
+                '"' -> append("\\\"")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                else -> if (ch < ' ') append(" ") else append(ch)
+            }
+        }
+    }
+    val checks = lines.filter { it.startsWith("[diag] PASS ") || it.startsWith("[diag] FAIL ") }.map { line ->
+        val body = line.removePrefix("[diag] ")
+        val ok = body.startsWith("PASS ")
+        val rest = body.removePrefix("PASS ").removePrefix("FAIL ")
+        val at = rest.indexOf("：")
+        val name = if (at > 0) rest.substring(0, at) else rest
+        val detail = if (at > 0) rest.substring(at + 1) else ""
+        "{\"name\":\"" + escape(name) + "\",\"ok\":" + ok + ",\"detail\":\"" + escape(detail) + "\"}"
+    }
+    val conversations = lines.filter { it.startsWith("[diag]  - ") }.map { line ->
+        "{\"summary\":\"" + escape(line.removePrefix("[diag]  - ")) + "\"}"
+    }
+    val resultLine = lines.lastOrNull { it.startsWith("[diag] RESULT: ") } ?: "[diag] RESULT: UNKNOWN"
+    return buildString {
+        append("{\"endpoint\":\"" + escape(config.endpointUrl) + "\"")
+        append(",\"nodeId\":\"" + escape(config.nodeId) + "\"")
+        append(",\"fingerprints\":" + config.tlsFingerprints.size)
+        append(",\"checks\":[" + checks.joinToString(",") + "]")
+        append(",\"conversations\":[" + conversations.joinToString(",") + "]")
+        append(",\"result\":\"" + escape(resultLine.removePrefix("[diag] RESULT: ")) + "\"")
+        append(",\"allOk\":" + checks.all { it.contains("\"ok\":true") })
+        append("}")
+    }
 }
