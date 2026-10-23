@@ -416,3 +416,20 @@ powershell -ExecutionPolicy Bypass -File tools\verify-all.ps1 `
 | `soak-faults` / `soak-partition` / `soak-disk` | **PASS** | 杀节点 / 半死链路 26371ms 如实失败 / 库只读 `STORAGE_FAILURE` |
 
 **口径说明**：公网 p50 3–4 s 属**跨洲网络正常**（新西兰 ↔ 上海），不作为缺陷；本地链路 p50 约 2 s（含每次冷启动建库）。
+
+## 终局回归（第 194 轮，2026-10-23，含应用/诊断/真实库）
+
+日志：`build/verify-all-194b.log`（12 阶段）、`build/final-rest-194.log`（其余 8 项）。
+
+| 套件 | 结果 | 关键数字 |
+| --- | --- | --- |
+| `verify-all`（12 阶段，含公网） | **PASS** | remote **54.7s**；android 79.9s；gradle 37.4s；two-device 7.4s |
+| `verify-app-flow`（应用链路，公网） | **PASS** | `dispatch: accepted settled=true` |
+| `verify-pairing`（本地节点配对） | **PASS** | KeyPackage→邀请包→入群，两端同 epoch |
+| `verify-diagnose`（诊断 JSON 自断言） | **PASS** | 12 项检查 / 0 失败 / 2 个会话 |
+| soak 冷启动 10 轮 | **PASS** | 10/10，p50 **1948 ms**；内存 13.8→14.1 MB |
+| soak 公网稳态 10 条 | **PASS** | 10/10，p50 **3501 ms**，p95 5324 ms |
+| `soak-faults` / `soak-partition` / `soak-disk` | **PASS** | 杀节点 / 半死链路 **26310 ms 如实失败** / 库只读 `STORAGE_FAILURE` |
+| `userDbSmoke`（真实本地库发送） | **PASS** | `dispatch: accepted`，`messages: 4` |
+
+**过程记录（诚实）**：本轮第一次跑 `verify-all` 时 **gradle 阶段卡住 >10 分钟**（前一次后台任务留下的 daemon 锁）。处置：`gradlew --stop` + 杀掉残留 java + 单独探针 `compileKotlin`（30s BUILD SUCCESSFUL），再重跑即正常。**这不是产品问题，是我并行跑构建的代价**。

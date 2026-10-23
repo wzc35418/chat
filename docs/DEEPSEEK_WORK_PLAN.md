@@ -58,6 +58,10 @@ DeepSeek，请继续在 `shared/ui` 和 `shared/presentation` 的现有边界内
 - [x] **R-12：SYNC 重试/退避与信箱轮询状态机。** `crates/sync/src/{retry,mailbox,send,clock,ids,error}.rs`：指数退避（1s×2 上限 60s、抖动 ±20%、Retry-After 作下界且夹到 5 分钟、预算耗尽终态、只有成功才重置计数）、信箱轮询（游标只前进、同 id 去重且内容不同 `INVALID_CANDIDATE`、乱序暂存 512 条、双预算、ACK 失败保留进度、空页退避）、发送调度（SubmissionId 由 draft/epoch/attempt 确定性派生、unknown 只 QueryExisting 不重发不重加密、租约语义与 storage 一致）。验证：`cargo test -p chat-sync` 33 passed，clippy 0 警告。
 - [x] **R-185：修掉一个真实 flaky 测试（identity invite 篡改）。** `crates/identity/src/invite.rs::tampered_body_is_rejected` 原先用 `replace_body_byte(..., 0x5a)` 固定写入；**当随机 nonce 那一位本来就是 0x5a 时"篡改"其实没改**，签名仍有效 → 全量跑到 532 个用例时随机失败（本轮实测命中）。改为新增 `flip_body_byte`（写入值与原字节相同则再 +1，保证必然不同），并从该用例改用它。重跑 `cargo test --workspace` → **1111 passed / 0 failed**。这类修复的价值在于：**它让"全绿"变得可信**——否则每次失败都要人去猜是不是环境问题。
 - [x] **R-191（Lead）：收一轮后自动重载会话消息。** syncOnce 成功后若已选中会话，顺手走 PRESENTATION 门面 `openConversation` 重载消息并更新提示（`收一轮：拉取 N / 落库 N；当前会话共 N 条`）；失败时显式错误码。`docs/manual-test-guide.md` 新增第 14 节（收一轮与导出 KeyPackage 的操作步骤、单次使用语义、限制）。验证：compileKotlin 通过；Gradle 11 任务 BUILD SUCCESSFUL；verify-project PASS。
+- [x] **R-329（Lead）：终局全量回归（12 阶段 + 应用链路 + 配对 + 诊断 JSON + 3 soak + 3 故障 + 真实库）——全绿。** 
+`verify-all` 12 阶段 PASS（remote **54.7s**、android 79.9s、gradle 37.4s、two-device 7.4s、package 16.9s）；`verify-app-flow` PASS（`dispatch accepted settled=true`）；`verify-pairing` PASS（两端同 epoch）；`verify-diagnose` PASS（12 项 0 失败）；冷启动 soak 10/10（p50 1948ms）；公网稳态 10/10（p50 3501ms）；faults/partition/disk 全 PASS（半死链路 26310ms 如实失败）；`userDbSmoke` PASS（accepted，4 条消息本地可见）。
+**过程诚实记录**：第一次跑 `verify-all` 时 gradle 阶段卡住 >10 分钟——原因是**上一条后台任务遗留的 Gradle daemon 锁**；`gradlew --stop` + 清残留 java + 单独探针验证（30s 成功）后重跑即正常。**是并行跑构建的代价，不是产品缺陷。**
+结果写入 `SHIPPING.md`「终局回归（第 194 轮）」。
 - [x] **R-328（Lead）：会话列表显示「最近一条消息」预览。** 
 **问题**：会话列表第二行原来显示 `epoch 1 · 成员 2`，和“聊天列表”的直觉不符——用户想在列表里看到最近说了什么。
 **实现**：`ChatEnvironment.lastMessagePreview(groupId)`（`listMessages(conv, null, 1)`，会话不存在返回空串）→ `reloadConversations()` 用它替换副标题，格式 `HH:mm 我：正文前 24 字`（换行压成空格）。取不到就退回 epoch 信息，不显示假数据。版本 **R-328**。
