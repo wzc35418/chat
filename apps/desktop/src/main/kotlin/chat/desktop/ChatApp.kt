@@ -137,6 +137,31 @@ fun ChatAppRoot() {
             }
         },
         closeGroup = { state = state.copy(groupDetail = null) },
+        retryFailed = {
+            val draftId = state.failedDraftId
+            if (draftId != null) {
+                scope.launch {
+                    state = state.copy(busy = true, notice = "重试中…")
+                    val result = env.retryDraft(draftId)
+                    state = state.copy(busy = false, notice = result.first, error = result.second)
+                    if (result.third) state = state.copy(failedDraftId = null)
+                    state.activeId?.let { openConversation(it) }
+                }
+            }
+        },
+        reconcileFailed = {
+            val draftId = state.failedDraftId
+            if (draftId != null) {
+                scope.launch {
+                    state = state.copy(busy = true, notice = "对账中…（按 SubmissionId 查上一次提交）")
+                    val result = env.reconcileDraft(draftId)
+                    state = state.copy(busy = false, notice = result.first, error = result.second)
+                    if (result.third) state = state.copy(failedDraftId = null)
+                    state.activeId?.let { openConversation(it) }
+                }
+            }
+        },
+        dismissFailed = { state = state.copy(failedDraftId = null) },
         renameGroup = { newName ->
             scope.launch {
                 val current = state.groupDetail ?: return@launch
@@ -219,7 +244,8 @@ fun ChatAppRoot() {
                         state = state.copy(
                             busy = false,
                             error = code + "：" + detail,
-                            notice = "发送失败（" + steps + "）",
+                            notice = "发送失败（" + steps + "）；可以点「重试」或「对账」",
+                            failedDraftId = outcome.draftId,
                         )
                     }
                     openConversation(conversationId)
@@ -663,6 +689,46 @@ private class ChatEnvironment {
         pairingCore = null
     }
 
+    /** 重试一条失败草稿（内核 sendRetry：重建并换新 SubmissionId）。 */
+    suspend fun retryDraft(draftId: String): Triple<String, String?, Boolean> = ioLock.withLock {
+        withContext(Dispatchers.IO) {
+            val currentStore = store ?: return@withContext Triple("本地库未就绪", "CORE_CLOSED：本地库未就绪", false)
+            runCatching { currentStore.sendRetry(draftId) }.fold(
+                onSuccess = { step ->
+                    val ok = step.status == "accepted" && step.settled
+                    Triple(
+                        if (ok) "重试成功（" + step.status + "）" else "重试结果：" + step.status,
+                        null,
+                        ok,
+                    )
+                },
+                onFailure = { error ->
+                    Triple("重试失败", failureCode(error) + "：" + (error.message ?: ""), false)
+                },
+            )
+        }
+    }
+
+    /** 对账一条结果未知的草稿（内核 sendReconcile：按 SubmissionId 查真实结果）。 */
+    suspend fun reconcileDraft(draftId: String): Triple<String, String?, Boolean> = ioLock.withLock {
+        withContext(Dispatchers.IO) {
+            val currentStore = store ?: return@withContext Triple("本地库未就绪", "CORE_CLOSED：本地库未就绪", false)
+            runCatching { currentStore.sendReconcile(draftId) }.fold(
+                onSuccess = { step ->
+                    val ok = step.status == "accepted" && step.settled
+                    Triple(
+                        if (ok) "对账结果：" + step.status + "（已确认送达）" else "对账结果：" + step.status,
+                        null,
+                        ok,
+                    )
+                },
+                onFailure = { error ->
+                    Triple("对账失败", failureCode(error) + "：" + (error.message ?: ""), false)
+                },
+            )
+        }
+    }
+
     /** 连接自检：节点证书/health/node_id + 本地身份与群状态（全部真实请求，不伪造通过）。 */
     suspend fun diagnose(config: NodeConfig): Diagnostics = withContext(Dispatchers.IO) {
         val lines = mutableListOf<String>()
@@ -1021,4 +1087,4 @@ fun conversationIdFor(groupId: String): String =
     if (groupId.startsWith("grp:1:")) "conv:1:" + groupId.removePrefix("grp:1:") else groupId
 
 /** 界面版本标记：用来区分“你打开的是哪一版”（写进顶栏，避免再用旧包判断新功能）。 */
-const val UI_REVISION = "R-313"
+const val UI_REVISION = "R-316"

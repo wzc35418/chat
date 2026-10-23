@@ -100,6 +100,8 @@ data class ChatHomeState(
     val revision: String = "",
     val groupDetail: ChatGroupDetail? = null,
     val diagnostics: List<String>? = null,
+    /** 失败草稿：失败后仍可重试/对账，避免用户以为只能重发新消息。 */
+    val failedDraftId: String? = null,
     val pairing: ChatPairingState? = null,
 )
 
@@ -123,6 +125,9 @@ class ChatHomeHandlers(
     val createInvite: () -> Unit = {},
     val openGroup: (String) -> Unit = {},
     val closeGroup: () -> Unit = { },
+    val retryFailed: () -> Unit = { },
+    val reconcileFailed: () -> Unit = { },
+    val dismissFailed: () -> Unit = { },
     val renameGroup: (String) -> Unit = {},
     val removeMember: (String) -> Unit = {},
     val acceptPending: () -> Unit = {},
@@ -382,6 +387,18 @@ private fun RightPane(state: ChatHomeState, handlers: ChatHomeHandlers, modifier
                         }
                     }
                 }
+            }
+        }
+        if (state.failedDraftId != null) {
+            Row(
+                Modifier.fillMaxWidth().background(Color(0xFFFFF4E5)).padding(horizontal = 16.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("上一条没发出去", style = MaterialTheme.typography.labelSmall, color = Color(0xFF9A6A00))
+                Spacer(Modifier.width(12.dp))
+                TextButton(onClick = handlers.retryFailed) { Text("重试") }
+                TextButton(onClick = handlers.reconcileFailed) { Text("对账") }
+                TextButton(onClick = handlers.dismissFailed) { Text("忽略") }
             }
         }
         if (state.notice.isNotEmpty()) {

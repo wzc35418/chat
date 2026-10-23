@@ -4,7 +4,7 @@ import chat.api.LocalStore
 import chat.presentation.display.FROZEN_AUTO_RETRY_CODES
 
 /** 一次「发送」的结果：要么成功（prepare→dispatch 都过），要么带失败步骤与原始异常。 */
-data class SendOutcome(val steps: List<String>, val failure: Throwable?) {
+data class SendOutcome(val steps: List<String>, val failure: Throwable?, val draftId: String? = null) {
     val ok: Boolean get() = failure == null
 }
 
@@ -24,9 +24,9 @@ internal suspend fun sendNow(store: LocalStore, draftId: String): SendOutcome {
         steps += "prepared"
         store.sendDispatch(draftId)
         steps += "accepted"
-        SendOutcome(steps.toList(), null)
+        SendOutcome(steps.toList(), null, draftId)
     } catch (error: Throwable) {
-        SendOutcome(steps.toList(), error)
+        SendOutcome(steps.toList(), error, draftId)
     }
 }
 
@@ -44,7 +44,7 @@ internal suspend fun sendWithRecovery(store: LocalStore, draftId: String): SendO
         store.sendPrepare(draftId)
         steps += "prepared"
     } catch (error: Throwable) {
-        return SendOutcome(steps.toList(), error)
+        return SendOutcome(steps.toList(), error, draftId)
     }
     try {
         val view = store.sendDispatch(draftId)
@@ -62,22 +62,23 @@ internal suspend fun sendWithRecovery(store: LocalStore, draftId: String): SendO
                         "发送结果未确定（status=" + view.status + "）：必须按 SubmissionId 对账，不要重发"
                     },
                 ),
+                draftId,
             )
         }
         steps += "accepted"
-        return SendOutcome(steps.toList(), null)
+        return SendOutcome(steps.toList(), null, draftId)
     } catch (first: Throwable) {
         val code = failureCode(first)
         if (code !in FROZEN_AUTO_RETRY_CODES) {
             steps += "dispatch-failed(" + code + ")"
-            return SendOutcome(steps.toList(), first)
+            return SendOutcome(steps.toList(), first, draftId)
         }
         steps += "retry(" + code + ")"
         return try {
             store.sendRetry(draftId)
             store.sendDispatch(draftId)
             steps += "accepted-after-retry"
-            SendOutcome(steps.toList(), null)
+            SendOutcome(steps.toList(), null, draftId)
         } catch (second: Throwable) {
             val secondCode = failureCode(second)
             steps += "retry-failed(" + secondCode + ")"
@@ -86,7 +87,7 @@ internal suspend fun sendWithRecovery(store: LocalStore, draftId: String): SendO
                     steps += if (reconciled.settled) "reconciled(" + reconciled.status + ")" else "reconcile-pending"
                 }
                 .onFailure { steps += "reconcile-failed" }
-            SendOutcome(steps.toList(), second)
+            SendOutcome(steps.toList(), second, draftId)
         }
     }
 }
