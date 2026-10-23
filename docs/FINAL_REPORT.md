@@ -330,3 +330,25 @@ powershell -ExecutionPolicy Bypass -File tools\verify-diagnose.ps1
 ### 唯一剩余的硬缺口
 
 **两台真机通过公网配对 → 建群 → 双向发消息**。操作单已写好：`docs/TWO_DEVICE_CHECKLIST.md`（6 步 + 记录表 + 已知会失败的地方）。这一步不需要写代码，只需要第二台设备。
+## 十七、第 198 轮复核：六句「不能说的话」逐条验证（不照抄旧结论）
+
+做法：对每句话找**当前代码/日志证据**，能推翻的推翻、该改口径的改口径。
+
+| # | 原说法 | 本轮复核 | 结论 |
+| --- | --- | --- | --- |
+| 1 | 不能说「两台真机通过公网配对成功」 | `tools/verify-pairing.ps1` 用的是**本地节点**（127.0.0.1:8496）；`verify-all` 的 `two-device` 阶段是**脚本 A/B**（`TwoDeviceSmoke`），`remote` 阶段是**单客户端**跨机器。三处都不等于“两台机器的界面互相配对”。`docs/TWO_DEVICE_CHECKLIST.md` 尚未执行 | **仍成立** |
+| 2 | 不能说生产可用 | soak 是**秒级样本**（10 条）；`tools/` 下没有 `*concurrent*` / `*stress*` 脚本；`build/dist` 无 `.msi`；`ChatApp` 里没有 autostart/常驻代码 | **仍成立** |
+| 3 | 不能说穿透 NAT | `crates/core` 里 `iroh` 只出现在一行**注释**（`p0 contains real ephemeral MLS/iroh verification`），消息路径是自建 HTTP 节点（`node_submitter` / `attachment_node`），**没有任何 iroh 调用** | **仍成立** |
+| 4 | 不能说证书自动轮换 | 全仓 `renew_certificate|autoRenew|auto_renew` 匹配数 = **0**；只有手动 `deploy/rotate-certificate.ps1` 与`OPS_RUNBOOK` 的操作步骤 | **仍成立** |
+| 5 | 不能说多平台 | 凭据实现只有 `DpapiKeySlot.kt`（Windows DPAPI）+ `CredentialManagerSmoke.kt`（Windows 凭据管理器）；Android 仅编译通过（`android` 阶段），未跑过运行时 | **仍成立** |
+| 6 | 不能说配对可中断续做 | `ChatEnvironment.pairingCore` 是**内存字段**（`private var pairingCore: ChatCoreFfi?`），没有任何落盘；关掉应用即失效 | **仍成立** |
+
+### 复核中需要**改口径**的两处（以前说得不准确）
+
+1. **“没有托盘通知”是错的**：`TrayNotifications.kt` 存在并实现了 `java.awt.SystemTray` 通知，`PlatformSmoke` 与 `PreviewApp` 都在用。准确说法是：**托通知已实现，但正式聊天界面（`ChatApp`）没有使用它**（`ChatApp.kt` 中 `TrayNotifications|Notifications` 匹配数 = 0）。
+2. **“没有后台自动同步”也不准确**：`ChatApp` 有 `LaunchedEffect` 每 **30 秒**自动同步（发送后立刻同步一次）。准确说法是：**有前台轮询式自动同步，没有后台常驻/开机自启**（autostart 相关代码匹配数 = 0）。
+
+### 复核结论
+
+- 六句**全部仍然成立**，但其中两句的**理由**要改写：缺的不是“托盘/自动同步的实现”，而是**正式界面没接线 + 没有常驻形态**；
+| 这也解释了为什么 B 口径只能到 ≈90%：差的不是功能数量，而是**真机端到端证据**与**交付形态**（安装器/常驻/压测）。
