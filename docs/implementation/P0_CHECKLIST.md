@@ -229,3 +229,13 @@ RUST_EXIT=0  LOCKED_EXIT=0  VERIFY_EXIT=0  GRADLE_EXIT=0  ANDROID_EXIT=0
 - [x] 修「群组详情对话框关不掉」（issue #1：`onDismissRequest` 与「关闭」都是空 lambda）。
 - [x] 新增 `tools/check-ui-dialogs.cjs` 并接入 `verify-project`（含负向样本验证）。
 - [ ] 未做：两台真机公网配对、附件、后台常驻、MSI、长稳并发。
+
+## 2026-10-23 第八批次结论（R-310…R-330）
+
+- [x] `--diagnose`（文本/JSON/建议/环境 4 项）与 `verify-diagnose.ps1` 自动断言。
+- [x] 复制按钮 + 剪贴板往返冒烟；加好友闭环（邀请口令）+ `inviteFlowSmoke`。
+- [x] 发送乐观气泡、会话列表预览、群详情增强（待处理明细/复制群 ID/边界说明）。
+- [x] 对话框与按钮自检（`check-ui-dialogs.cjs`，含负向样本）。
+- [x] 修：身份未 enroll 到消息库导致发送全失败；群详情关不掉（issue #1）。
+- [x] 终局回归全绿（12 阶段 + 3 soak + 3 故障 + appflow + pairing + diagnose + userDb）。
+- [ ] 未做：真机公网配对、加入已有群、附件上传、未读计数、压测/MSI/多平台。
