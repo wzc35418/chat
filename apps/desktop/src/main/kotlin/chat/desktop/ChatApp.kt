@@ -272,13 +272,14 @@ fun ChatAppRoot() {
                 state = state.copy(notice = "先点「新对话」或选一个会话")
             } else {
                 scope.launch {
-                    state = state.copy(busy = true, error = null, notice = "发送中…")
+                    state = state.copy(busy = true, error = null, notice = "发送中…", pendingBody = body)
                     val outcome = env.sendMessage(conversationId, body)
                     if (outcome.ok) {
                         // 发送成功后自动同步一次，用户不必再手动点「同步」。
                         val synced = env.syncOnce(nodeConfig)
                         state = state.copy(
                             busy = false,
+                            pendingBody = "",
                             composer = "",
                             notice = "已发送（" + outcome.steps.joinToString(" → ") + "）；" + synced,
                         )
@@ -291,6 +292,7 @@ fun ChatAppRoot() {
                         val steps = outcome.steps.ifEmpty { listOf("未完成任何步骤") }.joinToString(" → ")
                         state = state.copy(
                             busy = false,
+                            pendingBody = "",
                             error = code + "：" + detail,
                             notice = "发送失败（" + steps + "）；可以点「重试」或「对账」",
                             failedDraftId = outcome.draftId,
@@ -1221,7 +1223,7 @@ fun conversationIdFor(groupId: String): String =
     if (groupId.startsWith("grp:1:")) "conv:1:" + groupId.removePrefix("grp:1:") else groupId
 
 /** 界面版本标记：用来区分“你打开的是哪一版”（写进顶栏，避免再用旧包判断新功能）。 */
-const val UI_REVISION = "R-326"
+const val UI_REVISION = "R-327"
 
 /**
  * 无界面启动诊断（`Chat.exe --diagnose`）：把“界面为什么空白/发不出去”变成一段可复制的日志。

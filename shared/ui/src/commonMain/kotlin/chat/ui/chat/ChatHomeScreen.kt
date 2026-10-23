@@ -107,6 +107,8 @@ data class ChatHomeState(
     val groupDetail: ChatGroupDetail? = null,
     val diagnostics: List<String>? = null,
     /** 失败草稿：失败后仍可重试/对账，避免用户以为只能重发新消息。 */
+    /** 正在发送的正文：先画一条「发送中…」，避免用户以为没反应。 */
+    val pendingBody: String = "",
     val failedDraftId: String? = null,
     /** 接受邀请对话框状态（null = 关闭）。 */
     val invite: ChatInviteState? = null,
@@ -428,6 +430,20 @@ private fun RightPane(state: ChatHomeState, handlers: ChatHomeHandlers, modifier
                 TextButton(onClick = handlers.retryFailed) { Text("重试") }
                 TextButton(onClick = handlers.reconcileFailed) { Text("对账") }
                 TextButton(onClick = handlers.dismissFailed) { Text("忽略") }
+            }
+            if (state.pendingBody.isNotEmpty()) {
+                Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.End) {
+                    Column(
+                        Modifier.width(460.dp).background(Color(0xFFF0F4EF)).padding(10.dp),
+                    ) {
+                        Text(
+                            "我  · 发送中…",
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                            color = Color(0xFF9A6A00),
+                        )
+                        MarkdownMessage(document = renderMarkdown(state.pendingBody))
+                    }
+                }
             }
         }
         if (state.notice.isNotEmpty()) {
